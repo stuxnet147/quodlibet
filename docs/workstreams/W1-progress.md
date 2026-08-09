@@ -222,7 +222,7 @@ undefined 전파 규칙은 로어링과 맞물려 있습니다.
 
 ### 4. 타입 폭: void, typedef, cast
 
-커밋: `c6de799`
+커밋: `4880e40`
 
 조율자의 기준선이 `unsupported_type` 53.86% 와 `unsupported_pointer` 43.91% 를 지목했고, val 1,050 본문에서 `unsupported_type` 694건의 서명을 직접 뜯어보니 두 가지가 지배적이었습니다.
 
