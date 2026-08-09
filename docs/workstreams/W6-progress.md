@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-WU4. `src/cache.c` 로 BLAKE3 identity 기반 persistent artifact/evidence cache 를 만드는 중입니다.
+W6.md 의 다섯 항목을 모두 닫았습니다. 마지막 커밋 후 전 구성 검증을 정리하는 중입니다.
 
 ## 작업 단위
 
@@ -14,8 +14,8 @@ WU4. `src/cache.c` 로 BLAKE3 identity 기반 persistent artifact/evidence cache
 | WU1 | rewrite rule catalogue (W6.md 2번) | 완료 | (아래) |
 | WU2 | 독립 merge replay checker `src/egraph_check.c` (1번) | 완료 | (아래) |
 | WU3 | 증거 우선 결합 `src/combine.c` (3번) | 완료 | (아래) |
-| WU4 | persistent artifact/evidence cache `src/cache.c` (4번) | 진행 중 | |
-| WU5 | cache key 완전성 통합 검증 (5번) | 대기 | |
+| WU4 | persistent artifact/evidence cache `src/cache.c` (4번) | 완료 | (아래) |
+| WU5 | cache key 완전성 통합 검증 (5번) | 완료 | (아래) |
 
 ## 설계 결정
 
@@ -80,10 +80,27 @@ e-graph 는 순수 term engine 이고 UB/poison/effect 를 모르므로(`egraph.
 
 검증: `ctest --preset windows-clang` 369/369 통과.
 
+### WU4 와 WU5 가 실제로 넣은 것
+
+`src/cache.c` 는 BLAKE3 cache key 로 artifact 와 evidence envelope 을 디스크에 보관합니다. 위치는 호출자가 정하고 모듈이 스스로 디렉터리를 고르지 않습니다.
+
+설계 결정:
+
+- **record 마다 content digest 와 encoding 전체 digest 를 싣고 load 마다 둘 다 검증**합니다. 저장된 key 도 record 안에 적어 조회 key 와 비교하므로, 파일이 엉뚱한 자리로 가도 다른 질문의 답으로 쓰이지 않습니다.
+- **검증 실패는 miss 가 아니라 거부**이고 통계에서도 분리합니다. 잘못된 답을 주는 저장소가 비어 있는 저장소처럼 보이면 안 됩니다.
+- **같은 key 에 다른 내용을 저장하면 `ALREADY_EXISTS`** 이고 덮어쓰지 않습니다. 한 key 에 두 답이 있다는 것은 key 가 축을 빠뜨렸다는 뜻이고, 덮어쓰면 그 결함이 조용한 오답이 됩니다.
+- evidence record 는 envelope 의 identity 를 같이 저장해 load 시 cache key 를 **다시 계산**합니다. 파일에 적힌 key 를 믿지 않습니다.
+
+WU5 는 `tests/test_cache_key.cpp` 16개로 축을 하나씩 바꿔 key 가 움직이는지, 그리고 저장소가 실제로 두 답을 분리해 돌려주는지를 함께 확인합니다. semantic contract 는 problem artifact digest 를 통해 key 에 들어가므로 relation, UB policy, observation projection 과 두 observation mode, compiler/codegen 집합, target feature, precondition, 양쪽 source 를 각각 변주했습니다.
+
+**backend version 은 전용 필드가 없습니다.** `method_version` 이나 canonical option 에 실려야 하며, 시험이 이 요구를 양쪽에서 고정합니다. option 에 backend 를 적으면 key 가 갈리는 것과, 아무 데도 적지 않으면 두 solver 빌드가 같은 key 로 충돌한다는 것을 모두 확인합니다. 이것이 W6.md 5번이 막으려는 결함 그 자체입니다.
+
+검증: `ctest --preset windows-clang` 397/397 통과.
+
 ## 막힌 것
 
 없습니다.
 
 ## 다음에 할 것
 
-WU4 persistent cache. BLAKE3 identity 로 디스크에 저장하고 재사용하며 위치는 호출자가 정합니다. 이어서 WU5 cache key 완전성 통합 검증입니다.
+W6.md 의 다섯 항목은 모두 닫혔습니다. `todo.md` 의 W6 절 중 AIG/SAT certificate checker, concrete differential refutation, CHC/PDR 은 각각 W10 과 다른 워크스트림 소관이라 이 지시서 범위 밖입니다.

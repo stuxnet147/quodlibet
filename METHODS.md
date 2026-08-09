@@ -791,3 +791,44 @@ combines to `BOUNDED_CLEAN`.
 Ordering among equally valid results is declaration order, then evidence
 digest, then input position. Worker completion time is recorded on the input
 and never consulted.
+
+### The persistent store
+
+`src/cache.c` keeps artifacts and evidence envelopes on disk under the
+BLAKE3 cache key. The caller names the directory; the module never picks one.
+
+Every record carries the digest of its content and a digest over its whole
+encoding, and both are verified on load. The key it was stored under is
+written into the record and compared with the key being looked up, so a file
+that ends up in the wrong place cannot answer for another question. An
+evidence record additionally stores the identity the envelope was built from
+and recomputes the cache key on load rather than trusting the one the file was
+filed under. A record that fails any of these checks is refused, and a refusal
+is counted separately from a miss: a store handing out wrong answers must not
+look like an empty one.
+
+Storing the same content under an existing key succeeds. Storing different
+content under a key that already holds some is `ALREADY_EXISTS`, never an
+overwrite. Two different answers filed under one key means the key is missing
+an axis, and that is exactly the defect rule 9 exists to prevent.
+
+### Cache key completeness
+
+`ql_cache_key_compute` builds the key from five things: the artifact digest,
+the semantic-problem digest, the method name, the method version, and the
+method's canonical options. Every axis a run depends on has to reach one of
+those five.
+
+The semantic contract reaches the key through the problem artifact, whose
+digest binds the relation, the UB policy, the observation projection and both
+observation modes, the dialect and target profile, the compiler and codegen
+sets, the target features, the precondition, and both sources. The
+`tests/test_cache_key.cpp` suite varies each of those one at a time and
+requires both that the key moves and that the store then keeps the two answers
+apart.
+
+The solver backend has no field of its own. It must ride in the method version
+or in the canonical options, and the same suite states that requirement from
+both sides: it fixes that a backend named in the options separates the keys,
+and it demonstrates the collision that follows when the backend is named
+nowhere.
