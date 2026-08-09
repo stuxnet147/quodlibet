@@ -6,17 +6,19 @@
 
 ## 워크스트림 현황
 
-갱신일: 2026-08-10
+갱신일: 2026-08-10 (통합 2회차, `main` 시험 150/150)
 
 | 코드 | 이름 | GOAL | 상태 | 담당 |
 |---|---|---|---|---|
-| W1 | semantic-c-frontend | G5 전반, G8, G9 | 진행 | 병렬 세션 |
-| W2 | exact-backend | G5 후반 | 진행 | 병렬 세션 |
-| W3 | runtime-services | G1, G2, G3 | 진행 | 병렬 세션 |
-| W4 | bindings-and-coverage | G4, G9 측정 | 대기 | 미배정 |
-| W0 | 조율, 프로파일링, VM | G6, G7 | 진행 | 조율자 |
+| W1 | semantic-c-frontend | G5 전반, G8, G9 | 진행. IR verifier 와 concrete interpreter 통합됨. 다음은 퍼저와 타입/포인터 확장 | 병렬 세션 |
+| W2 | exact-backend | G5 후반 | 진행. source-signature artifact 와 problem schema v2 통합됨. 다음은 product/miter | 병렬 세션 |
+| W3 | runtime-services | G1, G2, G3 | 진행. **G1 닫힘**. 다음은 예산 | 병렬 세션 |
+| W4 | bindings-and-coverage | G4, G9 측정 | 커버리지 측정은 조율자가 완료. 파이썬 바인딩은 슬롯 대기 | 미배정 |
+| W0 | 조율, 프로파일링, VM | G6, G7 | 진행. 커버리지 기준선 완료. 다음은 VTune | 조율자 |
 
 조율 규칙은 `GOAL.md` 의 "진행 규칙" 절입니다. `CMakeLists.txt`, `GOAL.md`, 이 표는 조율자가 소유합니다.
+
+**닫힌 GOAL: G1.** 나머지 여덟은 열려 있습니다.
 
 ## 완료한 기반 마일스톤
 

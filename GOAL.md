@@ -18,14 +18,14 @@
 
 **요구.** 저부하, 견고, 고속, 스레드 세이프. 로그 레벨과 상세도를 사용자가 설정. **직접 구현하지 않고 외부 라이브러리를 벤더링해서 배선한다.**
 
-**종료 조건**
+**종료 조건 (2026-08-10 닫힘)**
 
-- [ ] 외부 로깅 라이브러리를 `third_party/` 에 SHA-256 고정으로 벤더링하고 `DEPENDENCIES.md` 에 선정 근거와 라이선스를 적었다
-- [ ] 공개 C API 로 레벨(최소 trace..fatal)과 상세도(소스 위치, 스레드 id, 타임스탬프 정밀도, 카테고리)를 런타임에 설정할 수 있다
-- [ ] 스레드 세이프하고, 여러 워커에서 동시에 기록해도 줄이 섞이지 않는다는 것을 시험이 고정한다
-- [ ] **비활성 레벨 호출의 오버헤드를 측정해서 수치로 적었다** (호출당 ns). 추정이 아니라 측정이다
-- [ ] 로깅 ON/OFF 두 구성 모두 CTest 전체 통과
-- [ ] 공개 ABI 계약(`struct_size`, `abi_version`)을 깨지 않는다
+- [x] 외부 로깅 라이브러리를 `third_party/` 에 SHA-256 고정으로 벤더링하고 `DEPENDENCIES.md` 에 선정 근거와 라이선스를 적었다 - zf_log 0.4.1, MIT, 순수 C
+- [x] 공개 C API 로 레벨(최소 trace..fatal)과 상세도(소스 위치, 스레드 id, 타임스탬프 정밀도, 카테고리)를 런타임에 설정할 수 있다 - `include/quodlibet/log.h`, 축별 독립성은 `EveryVerbosityAxisIsIndependent` 가 고정
+- [x] 스레드 세이프하고, 여러 워커에서 동시에 기록해도 줄이 섞이지 않는다는 것을 시험이 고정한다 - `ConcurrentWritersNeverInterleaveALine`
+- [x] **비활성 레벨 호출의 오버헤드를 측정해서 수치로 적었다** (호출당 ns). 추정이 아니라 측정이다 - **0.071 ns/호출**, 방법과 기계는 `docs/runtime-services/logging.md`
+- [x] 로깅 ON/OFF 두 구성 모두 CTest 전체 통과 - 양쪽 150/150 (`QL_ENABLE_LOGGING` 옵션)
+- [x] 공개 ABI 계약(`struct_size`, `abi_version`)을 깨지 않는다
 
 ## G2. 실행 예산과 메모리 예산
 

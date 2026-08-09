@@ -12,6 +12,7 @@ include(GNUInstallDirs)
 option(QL_BUILD_SHARED "Build libquodlibet as a shared library" OFF)
 option(QL_BUILD_TESTS "Build native tests" ON)
 option(QL_ENABLE_BITWUZLA "Enable the canonical Bitwuzla SMT backend" ON)
+option(QL_ENABLE_LOGGING "Compile the logging service" ON)
 set(QL_BITWUZLA_EXECUTABLE "" CACHE FILEPATH
     "Override path to a Bitwuzla 0.9.1 executable")
 
@@ -96,6 +97,12 @@ target_compile_definitions(quodlibet PRIVATE QL_BUILDING_LIBRARY)
 if(QL_ENABLE_BITWUZLA)
     target_compile_definitions(quodlibet PRIVATE
         QL_BITWUZLA_EXECUTABLE="${QL_BITWUZLA_EXECUTABLE}")
+endif()
+if(NOT QL_ENABLE_LOGGING)
+    # src/log.c keeps the whole public API callable in this configuration and
+    # compiles no engine, so a caller's logging call sites still build. The
+    # definition is private because only the implementation reads it.
+    target_compile_definitions(quodlibet PRIVATE QL_ENABLE_LOGGING=0)
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(quodlibet PRIVATE _POSIX_C_SOURCE=200112L)
