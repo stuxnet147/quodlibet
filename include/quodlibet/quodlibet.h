@@ -21,6 +21,7 @@
 #include "quodlibet/problem.h"
 #include "quodlibet/product.h"
 #include "quodlibet/proof_method.h"
+#include "quodlibet/replay.h"
 #include "quodlibet/registry.h"
 #include "quodlibet/scheduler.h"
 #include "quodlibet/semantics.h"
