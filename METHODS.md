@@ -356,6 +356,41 @@ Important options include SAT solver, circuit simplification passes, memory and
 trace bounds, integer multiplier strategy, certificate format, proof checker,
 and a maximum bit budget.
 
+#### The circuit layer
+
+`src/aig.c` is the and-inverter graph the miter is built in. It knows nothing
+about the IR; it is a circuit library with a CNF exit, and it is tested against
+ordinary C arithmetic rather than against the lowering that will use it.
+
+Inversion lives on the edge, not in a node, so the negations a bit-level
+encoding produces in bulk cost nothing. Every construction goes through one
+`ql_aig_and` that folds constants, collapses the four one-operand identities,
+and structurally hashes the result with its operands in a normal order. Two
+syntactically identical subcircuits therefore become one node. That matters for
+a miter specifically: the two functions share their input wires, so the parts
+of them that agree collapse into each other before a solver is ever started.
+
+The bit-vector layer is a ripple-carry adder, a shift-and-add multiplier
+truncated to the operand width, a restoring divider that carries one extra
+remainder bit, barrel shifters, and the four ordered comparisons, with signed
+comparison expressed as the unsigned one on sign-flipped operands.
+
+**Partial operations are totalized here, not decided here.** Division by zero
+yields the SMT-LIB result, an all-ones quotient and the dividend as the
+remainder; a shift at or beyond the width yields zero, zero, or the sign bit;
+signed division overflow wraps. This matches what the SMT encoding already
+does, and for the same reason: the circuit must be total, and whether the C
+program was allowed to perform the operation is the UB guard's question. A
+circuit that answered it would be answering it twice, in two places that could
+disagree.
+
+CNF export is Tseitin over the cone of influence of one root, so a part of the
+graph the root does not reach costs the solver nothing. The DIMACS bytes are
+deterministic, which is what lets a query digest identify the question. A root
+that folded to a constant is reported as trivially true or trivially false
+rather than sent to a solver; a trivial answer is still an answer this encoding
+produced and never a checked proof.
+
 ### Bounded symbolic execution
 
 Recommended method name: `search.bounded-symbolic`.

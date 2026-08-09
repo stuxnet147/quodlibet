@@ -1,6 +1,7 @@
 #ifndef QUODLIBET_H
 #define QUODLIBET_H
 
+#include "quodlibet/aig.h"
 #include "quodlibet/allocator.h"
 #include "quodlibet/artifact.h"
 #include "quodlibet/budget.h"

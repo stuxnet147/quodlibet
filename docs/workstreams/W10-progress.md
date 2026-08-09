@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-5단계(concrete differential)를 끝냈습니다. 다음은 2단계(AIG 하강)입니다.
+AIG 회로 계층(`src/aig.c`)을 끝냈습니다. 다음은 IR -> AIG 하강과 miter 를 `src/proof_aigsat.c` 에 넣는 것입니다.
 
 ## 끝난 작업 단위
 
@@ -40,12 +40,30 @@ cake_lpr(경로 C, HOL4 로 기계어까지 검증)은 첫 절단에 넣지 않�
 
 `include/quodlibet/proof_diff.h`, `src/proof_diff.c`, `tests/test_proof_diff.cpp` 13개 시험. `src/builtins.c` 에 등록을 한 줄 추가하고 `include/quodlibet/quodlibet.h` 에 헤더를 넣었습니다. `METHODS.md` 의 concrete differential 절에 구현 결정을 적었습니다. CTest 280/280 통과입니다.
 
+### 4. AIG 회로 계층 (2단계 전반)
+
+`include/quodlibet/aig.h`, `src/aig.c`, `tests/test_aig.cpp` 12개 시험. `METHODS.md` AIG/SAT 절에 회로 계층 소절을 넣었습니다. CTest 292/292 통과입니다.
+
+담은 것은 이렇습니다.
+
+- and-inverter graph. 반전은 edge 에 싣고 node 를 쓰지 않습니다. 상수 folding, 한쪽 피연산자 항등식 네 개, 피연산자 정규 순서 + 구조 해싱
+- bit-vector 계층: ripple-carry 덧셈, 폭을 유지하는 shift-and-add 곱셈, 나머지를 한 비트 넓게 잡는 restoring 나눗셈(부호 있음/없음), barrel shift 세 종류, 비교 네 개와 eq, mux, zext/sext/trunc, reduce or/and
+- 구체 평가기(`ql_aig_evaluate`). node 색인이 곧 위상 순서라 재귀 없이 한 번 훑습니다
+- CNF: 루트 하나의 cone of influence 에 대한 Tseitin, 결정적 DIMACS 바이트, input 색인에서 DIMACS 변수로 가는 표
+
 ## 내린 설계 결정
 
 - **신뢰는 checker 한 곳으로 모읍니다.** solver 도 elaborator 도 신뢰하지 않습니다. 이것이 이 워크스트림이 `prove.smt-product` 와 다른 유일한 이유입니다
 - **LRAT 를 씁니다.** DRAT checker 는 전파 탐색을 스스로 해야 해서 커집니다. LRAT 는 antecedent 가 붙어 있어 checker 가 재생만 하면 되고, 그래서 감사 가능한 크기가 됩니다
 - **solver 와 checker 는 실행 파일입니다.** `libquodlibet` 은 둘 다 링크하지 않습니다. 기존 Bitwuzla adapter(`src/solver.c`)의 snapshot / deadline / 출력 상한 패턴을 그대로 따릅니다
 - **checker 는 교체 가능합니다.** method option 이 실행 파일과 형식을 받고, envelope 이 어떤 checker 가 무엇을 검사했는지 기록합니다
+
+### AIG 쪽
+
+- **부분 연산은 여기서 totalize 하고 여기서 판정하지 않습니다.** 0 으로 나누기는 SMT-LIB 값(몫은 all ones, 나머지는 피제수), 폭 이상 shift 는 0/0/부호비트, signed division overflow 는 wrap 입니다. 회로는 total 해야 하고, 그 연산이 허용된 것이냐는 UB guard 의 질문입니다. 회로가 그것까지 답하면 같은 질문에 답하는 곳이 두 군데가 되고 둘이 어긋날 수 있습니다. SMT 인코딩이 이미 하는 것과 같은 선택입니다
+- **구조 해싱이 miter 에서 값을 냅니다.** 좌우가 input wire 를 공유하므로 서로 같은 부분이 solver 를 부르기 전에 한 node 로 붕괴합니다. `EqualSubcircuitsOfTwoFunctionsCollapseIntoOneNode` 가 이것을 고정합니다
+- **`src/aig.c` 는 IR 을 모릅니다.** 회로 라이브러리이고 시험은 IR 하강이 아니라 평범한 C 산술과 대조합니다. 4비트 두 피연산자 전수(256쌍)로 모든 연산을 겁니다. IR -> AIG 하강은 `src/proof_aigsat.c` 로 갑니다
+- **CNF 는 루트 하나의 cone of influence 만 냅니다.** 루트가 닿지 않는 회로는 solver 에게 비용이 0 입니다. 루트가 상수로 folding 되면 solver 를 부르지 않고 trivially true/false 로 보고하며, 그것은 checked proof 가 아닙니다
 
 ### `refute.concrete-differential` 쪽
 
@@ -66,6 +84,6 @@ Kissat 과 drat-trim 은 둘 다 `unistd.h`, `sys/resource.h`, `sys/time.h` 를 
 
 ## 다음에 할 것
 
-1. 2단계. loop-free scalar IR 의 AIG 하강(`src/aig.c`). 메모리를 쓰는 IR 은 인코딩하지 않고 `UNKNOWN`
+1. 2단계 후반. loop-free scalar IR 을 AIG 로 하강하고 miter 를 만든다(`src/proof_aigsat.c`). 메모리와 effect 를 쓰는 IR 은 인코딩하지 않고 `UNKNOWN`
 2. 벤더링. kissat rel-4.0.4 와 drat-trim 을 SHA-256 pin 으로 `scripts/vendor.sh` 에 넣고 `third_party/CMakeLists.txt` 에 실행 파일 target 을 만든다. Windows 이식 마찰을 여기에 기록한다
 3. 3단계와 4단계. miter -> CNF, solver 와 checker 실행, checker 통과 뒤에만 `checked_proof=true` (`src/proof_aigsat.c`)
