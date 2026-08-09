@@ -4,6 +4,37 @@
 
 ## 지금 하는 것
 
+WU12. (B) solver 세션 객체. 조율자가 W7 대기 조건을 완화해 착수했습니다. 아래 설계와 진행 상태를 그대로 두어 세션이 끊겨도 이어갈 수 있게 합니다.
+
+### (B) 설계 (조율자 승인 형태 (2) 명시적 세션 객체)
+
+**목표.** 판정마다 하던 스냅샷 복사 + 생성 시 해시 + 버전 프로브를 워커당 한 번으로 줄입니다. per-check 무결성 해시 두 번은 판정마다 그대로 돕니다.
+
+**승인 조건 다섯.**
+
+1. 세션 옵션 구조체에 `struct_size` + `abi_version`, append-only 규약
+2. 세션은 계약상 스레드 비안전, 워커당 하나. 문서와 시험에 박기
+3. 세션 생성 시 snapshot digest 를 세션에 기록. per-check 무결성 해시 두 번과 envelope 의 판정별 digest 기록은 유지
+4. 세션 해제가 결정적으로 스냅샷을 지우는지 시험으로
+5. bindings 의 `check_batch` 이전까지 이 단위에 포함
+
+**배선 경로 (확인한 것).**
+
+- `ql_solver_descriptor_v1` (`include/quodlibet/solver.h:155`) 은 `struct_size` 와 `void *reserved[8]` 이 있어 append-only 로 넓힐 수 있습니다. 여기에 세션을 받는 create 콜백을 더합니다.
+- `ql_run_context_v1` (`include/quodlibet/method.h:33`) 도 `struct_size` 와 `reserved[8]` 이 있고, **`run_check` (`src/proof_smt.c:359`) 가 이미 이 context 를 받습니다.** 세션 핸들을 여기에 실어 내리면 pipeline 과 method 시그니처를 안 바꿉니다. 이것이 가장 짧은 건전한 경로입니다.
+- `ql_check` (`bindings/python/src/ql_check.c`) 가 판정마다 registry 를 새로 만드는 지점이 재사용의 반대편입니다. 파이썬 쪽에 세션 객체를 노출하고 `check(session=...)` 로 받아 context 에 실어야 합니다.
+
+**작업 순서.** 각 단계를 따로 커밋하고 각각 검증합니다. 중간에 끊겨도 브랜치가 성한 상태로 남습니다.
+
+1. 코어: `ql_solver_session` 타입과 옵션 구조체, create/destroy, 스냅샷 소유 이전. 어댑터 안에서만 쓰고 시험 추가 (조건 1, 3, 4)
+2. 배선: `ql_run_context_v1` 에 세션 필드 append, `run_check` 가 있으면 재사용
+3. bindings: 파이썬 세션 객체와 `check_batch` 이전 (조건 5)
+4. 측정: 판정당 before/after 와 `ETXTBSY` 잔존 재측정
+
+**진행: 1단계 시작 전.**
+
+### 이전 상태
+
 W1 의 `_with_tree` API 와 W9 의 VM threading 리포트를 기다립니다. W8 이 혼자 닫을 수 있는 G6 항목은 전부 닫혔습니다.
 
 ## 인수한 상태 (조율자로부터)
