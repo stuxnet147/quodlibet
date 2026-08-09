@@ -6,7 +6,11 @@
 # fetch -> rebase the branch onto main -> ff-only merge -> build -> ctest ->
 # push. Any failure stops right there: a broken rebase leaves the temp branch
 # for inspection, a red test leaves main unpushed.
-set -eu
+#
+# pipefail is load-bearing: ctest is piped through tail, and without it the
+# pipeline reported tail's exit status, so a red suite got pushed once
+# (2026-08-10) before this line existed.
+set -euo pipefail
 
 branch="${1:?usage: integrate.sh <remote-branch-name>}"
 preset="${PRESET:-windows-clang}"

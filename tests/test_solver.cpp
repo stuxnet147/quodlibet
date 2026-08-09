@@ -118,7 +118,11 @@ struct InheritedPipeTestProcessMode {
             return;
         }
         if (mode == "holder") {
-            std::this_thread::sleep_for(std::chrono::milliseconds(750));
+            /* Must outlive QL_PROCESS_DRAIN_GRACE_MS (5000ms): the parent
+               exits immediately, and the property under test is that the
+               transport gives up on the still-open inherited pipes at the
+               drain deadline instead of waiting for this process. */
+            std::this_thread::sleep_for(std::chrono::milliseconds(6500));
             std::_Exit(0);
         }
         if (mode == "version-parent") {
@@ -741,10 +745,11 @@ TEST(BitwuzlaTransport, BoundsInheritedPipesAfterDirectChildExit) {
     EXPECT_EQ(QL_STATUS_IO_ERROR, status) << error.message;
     EXPECT_EQ(nullptr, solver);
     EXPECT_NE(nullptr, std::strstr(error.message, "drain deadline"));
-    // ASan/UBSan builds spend several seconds copying and hashing the large
-    // instrumented executable. Keep this below CTest's 30-second timeout while
-    // the transport error above verifies that pipe draining itself is bounded.
-    EXPECT_LT(elapsed, std::chrono::seconds(15));
+    // The drain deadline itself is 5 seconds, and ASan/UBSan builds spend
+    // several more copying and hashing the large instrumented executable.
+    // Keep this below CTest's 30-second timeout while the transport error
+    // above verifies that pipe draining itself is bounded.
+    EXPECT_LT(elapsed, std::chrono::seconds(20));
     EXPECT_EQ(snapshots_before, private_solver_snapshots());
 }
 
