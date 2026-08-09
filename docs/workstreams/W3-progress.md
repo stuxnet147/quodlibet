@@ -180,24 +180,16 @@ plugin ABI 는 바뀌지 않습니다.** append-only 확장입니다.
   **0.071 ns/call** 로 측정되었고 연속 3 회 편차가 0.0005 ns 입니다. 측정
   방법과 기계 정보는 `docs/runtime-services/logging.md` 에 있습니다.
 - 작업 단위 4, 5 시점(origin/main 784e719 위) 171/171 x 4 구성.
-- 작업 단위 6 시점, origin/main 49516d8 위로 rebase 한 뒤 다시 전 구성 확인:
-  - `windows-clang` 224/224
-  - `windows-clang` + `-DQL_ENABLE_LOGGING=OFF` 224/224
-  - `linux-clang` (WSL Ubuntu-24.04, clang 18) 224/224
-  - Linux ASan+UBSan+LSan, Bitwuzla ON 224/224. **누수 0.**
-  - Windows ASan+UBSan 217/224 통과, 7 개 skip. skip 은 전부 Bitwuzla 를 쓰는
-    시험이고 그 구성이 `QL_ENABLE_BITWUZLA=OFF` 이기 때문입니다. 숨기지 않고
-    여기 적습니다. Windows ASan 런타임에는 LeakSanitizer 가 없어서 누수 판정은
-    Linux 실행과 `PipelineBudgetLeak` 가 담당합니다.
+- 작업 단위 6 시점, origin/main 91a8143 위로 rebase 한 뒤 전 구성 확인:
+  - `windows-clang` 239/239
+  - `windows-clang` + `-DQL_ENABLE_LOGGING=OFF` 239/239
+  - `linux-clang` (WSL Ubuntu-24.04, clang 18) 239/239
+  - `linux-sanitize` (ASan+UBSan+LSan, Bitwuzla ON) 239/239. **누수 0.**
 
-  Windows ASan 구성 재현:
-
-  ```sh
-  cmake -S . -B out/build/windows-clang-asan -G Ninja     -DCMAKE_BUILD_TYPE=RelWithDebInfo     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++     -DQL_ENABLE_BITWUZLA=OFF     -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"     -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
-  cp "$(ls 'C:/Program Files/LLVM/lib/clang/'*/lib/windows/clang_rt.asan_dynamic-x86_64.dll | head -1)"     out/build/windows-clang-asan/tests/
-  cmake --build out/build/windows-clang-asan --parallel
-  ctest --test-dir out/build/windows-clang-asan
-  ```
+  조율자가 `linux-sanitize` 프리셋을 넣어 주어서 손으로 만들던 sanitizer build
+  directory 대신 프리셋을 씁니다. 그 전 확인에서 쓰던 Windows ASan 구성은
+  `QL_ENABLE_BITWUZLA=OFF` 라서 Bitwuzla 시험을 skip 했는데, `linux-sanitize`
+  는 Bitwuzla 를 켠 채로 전 시험을 돌리므로 skip 없이 같은 범위를 덮습니다.
 
 ## 다음에 할 것
 
