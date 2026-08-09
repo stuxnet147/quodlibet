@@ -13,12 +13,19 @@ struct ql_plugin_handle {
     const ql_plugin_v1 *descriptor;
 };
 
+static size_t proof_extension_size(void) {
+    return offsetof(ql_plugin_v1, proof_method_count) +
+           sizeof(((ql_plugin_v1 *)0)->proof_method_count);
+}
+
 ql_status QL_CALL ql_plugin_load(ql_registry *registry, const char *path,
                                  ql_plugin_handle **output, ql_error *error) {
     const ql_allocator *allocator;
     ql_plugin_handle *handle;
     ql_plugin_init_v1_fn initialize = NULL;
     const ql_plugin_v1 *descriptor = NULL;
+    const ql_proof_method_v1 *proof_methods = NULL;
+    size_t proof_method_count = 0u;
     void *symbol = NULL;
     ql_status status;
     size_t index;
@@ -91,10 +98,50 @@ ql_status QL_CALL ql_plugin_load(ql_registry *registry, const char *path,
         allocator->deallocate(allocator->user_data, handle);
         return QL_STATUS_ABI_MISMATCH;
     }
+    if (descriptor->struct_size > offsetof(ql_plugin_v1, proof_methods) &&
+        descriptor->struct_size < proof_extension_size()) {
+        ql_error_set(error, QL_STATUS_ABI_MISMATCH,
+                     "plugin '%s' returned a partial proof-method extension",
+                     path);
+        if (descriptor->shutdown != NULL) {
+            descriptor->shutdown();
+        }
+        uv_dlclose(&handle->library);
+        allocator->deallocate(allocator->user_data, handle);
+        return QL_STATUS_ABI_MISMATCH;
+    }
+    if (descriptor->struct_size >= proof_extension_size()) {
+        proof_methods = descriptor->proof_methods;
+        proof_method_count = descriptor->proof_method_count;
+        if (proof_method_count != 0u && proof_methods == NULL) {
+            ql_error_set(error, QL_STATUS_ABI_MISMATCH,
+                         "plugin '%s' declares proof methods without descriptors",
+                         path);
+            if (descriptor->shutdown != NULL) {
+                descriptor->shutdown();
+            }
+            uv_dlclose(&handle->library);
+            allocator->deallocate(allocator->user_data, handle);
+            return QL_STATUS_ABI_MISMATCH;
+        }
+    }
     handle->descriptor = descriptor;
     for (index = 0u; index < descriptor->method_count; ++index) {
         status = ql_internal_registry_register_owned(
             registry, &descriptor->methods[index], handle, error);
+        if (status != QL_STATUS_OK) {
+            ql_internal_registry_unregister_owner(registry, handle);
+            if (descriptor->shutdown != NULL) {
+                descriptor->shutdown();
+            }
+            uv_dlclose(&handle->library);
+            allocator->deallocate(allocator->user_data, handle);
+            return status;
+        }
+    }
+    for (index = 0u; index < proof_method_count; ++index) {
+        status = ql_internal_registry_register_proof_owned(
+            registry, &proof_methods[index], handle, error);
         if (status != QL_STATUS_OK) {
             ql_internal_registry_unregister_owner(registry, handle);
             if (descriptor->shutdown != NULL) {

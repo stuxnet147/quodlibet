@@ -1,9 +1,9 @@
 # Dependency decisions
 
 Quodlibet vendors small, reusable native components instead of rebuilding
-platform code or solver infrastructure. Every required source archive is pinned
-and SHA-256 verified by `scripts/vendor.sh`. Configuration and ordinary builds
-are offline.
+platform code or solver infrastructure. Every required upstream archive is
+pinned and SHA-256 verified by `scripts/vendor.sh`. Configuration and ordinary
+builds are offline.
 
 ## Core dependencies
 
@@ -60,14 +60,45 @@ lowering, and undefined-behavior policy remain later frontend stages.
 Sources: <https://github.com/tree-sitter/tree-sitter>,
 <https://github.com/tree-sitter/tree-sitter-c>
 
+## Solver backends
+
+Quodlibet does not implement an SMT solver. Its canonical SMT backend is the
+official Bitwuzla 0.9.1 distribution. The solver-neutral ABI and deterministic
+SMT-LIB2 encoder are orchestration boundaries only: every satisfiability result
+is produced by Bitwuzla and records the exact backend identity in its evidence.
+
+### Bitwuzla 0.9.1
+
+The checksum-locked official Linux and Windows x86-64 static release bundles
+are vendored. Quodlibet invokes their command-line frontend through an argument
+vector and pipes, without a shell. This keeps the C host ABI stable and avoids
+mixing the MinGW C++ ABI used by the official Windows archive with Quodlibet's
+MSVC-ABI Clang build. A compatible direct C API adapter may be added as an
+optimization, but it must preserve the same public solver contract and result
+classification.
+
+The Linux executable still uses the host's glibc, libstdc++, libgcc, GMP 6 ABI
+(`libgmp.so.10`) and MPFR 4 ABI (`libmpfr.so.6`). Its newest imported symbol
+versions are `GLIBC_2.38` and `GLIBCXX_3.4.32`, so the bundled default targets
+glibc-based x86-64 systems meeting those versions. Older glibc and musl systems
+must set `QL_BITWUZLA_EXECUTABLE` to their own compatible Bitwuzla 0.9.1 build.
+Configuration runs the selected binary and requires an exact `0.9.1` response,
+so an incompatible runtime fails before compilation. The Windows executable is
+used from its official self-contained release bundle.
+
+Bitwuzla supports the bit-vector, array, floating-point and uninterpreted
+function theories needed by the SMT product-program method. The vendored
+binary is also the parser and solver for generated SMT-LIB2; Quodlibet does not
+evaluate those terms itself.
+
+Source: <https://github.com/bitwuzla/bitwuzla>
+
 ## Planned optional proof backends
 
-Solver libraries will be adapters, not dependencies of `libquodlibet`.
+Other solver libraries remain adapters, not dependencies of `libquodlibet`.
 
 - Kissat rel-4.0.4 is the initial SAT candidate for bit-blasted and AIG-miter
   obligations.
-- Bitwuzla 0.9.1 is the initial SMT candidate for bit vectors, arrays,
-  floating-point terms, and uninterpreted functions.
 - cvc5 remains a later candidate for quantified obligations, CHC-adjacent
   workflows, and proof production where its feature set is needed.
 
@@ -75,8 +106,7 @@ Backend versions belong to each plugin's evidence metadata and cache key. A
 backend may only return a proved verdict when the selected trust policy accepts
 its certificate or trusted result path.
 
-Sources: <https://github.com/arminbiere/kissat>,
-<https://github.com/bitwuzla/bitwuzla>, <https://github.com/cvc5/cvc5>
+Sources: <https://github.com/arminbiere/kissat>, <https://github.com/cvc5/cvc5>
 
 ## Update policy
 

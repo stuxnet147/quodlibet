@@ -7,6 +7,47 @@ set(QL_REQUIRED_VENDOR_DIRECTORIES
     tree-sitter-c
 )
 
+set(QL_BITWUZLA_BUNDLED FALSE)
+if(QL_ENABLE_BITWUZLA)
+    set(ql_bitwuzla_bundle_directory "")
+    set(ql_bitwuzla_bundle_executable "")
+    set(ql_bitwuzla_bundle_sha256 "")
+
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
+        if(WIN32)
+            set(ql_bitwuzla_bundle_directory bitwuzla-windows-x86_64)
+            set(ql_bitwuzla_bundle_executable
+                "${CMAKE_CURRENT_SOURCE_DIR}/${ql_bitwuzla_bundle_directory}/bin/bitwuzla.exe")
+            set(ql_bitwuzla_bundle_sha256
+                ce880e5402abc0df542b8c1f9f65e57ba9353690848d3f2d69054ff2f29cc796)
+        elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            set(ql_bitwuzla_bundle_directory bitwuzla-linux-x86_64)
+            set(ql_bitwuzla_bundle_executable
+                "${CMAKE_CURRENT_SOURCE_DIR}/${ql_bitwuzla_bundle_directory}/bin/bitwuzla")
+            set(ql_bitwuzla_bundle_sha256
+                d98164badcd34c12ccbbd9e5aab9373854bb187e79f99ccda4ec2aa9951c0eab)
+        endif()
+    endif()
+
+    if("${QL_BITWUZLA_EXECUTABLE}" STREQUAL "")
+        if("${ql_bitwuzla_bundle_executable}" STREQUAL "")
+            message(FATAL_ERROR
+                "No pinned Bitwuzla bundle exists for this target; set "
+                "QL_BITWUZLA_EXECUTABLE to a runnable Bitwuzla 0.9.1 binary")
+        endif()
+        set(QL_BITWUZLA_EXECUTABLE "${ql_bitwuzla_bundle_executable}"
+            CACHE FILEPATH "Override path to a Bitwuzla 0.9.1 executable" FORCE)
+    endif()
+
+    if("${QL_BITWUZLA_EXECUTABLE}" STREQUAL
+       "${ql_bitwuzla_bundle_executable}")
+        set(QL_BITWUZLA_BUNDLED TRUE)
+        list(APPEND QL_REQUIRED_VENDOR_DIRECTORIES
+            "${ql_bitwuzla_bundle_directory}")
+    endif()
+endif()
+
 if(BUILD_TESTING AND QL_BUILD_TESTS)
     list(APPEND QL_REQUIRED_VENDOR_DIRECTORIES googletest)
 endif()
@@ -18,6 +59,35 @@ foreach(vendor_directory IN LISTS QL_REQUIRED_VENDOR_DIRECTORIES)
             "Run ./scripts/vendor.sh from ${PROJECT_SOURCE_DIR}")
     endif()
 endforeach()
+
+if(QL_ENABLE_BITWUZLA)
+    if(NOT EXISTS "${QL_BITWUZLA_EXECUTABLE}")
+        message(FATAL_ERROR
+            "Missing Bitwuzla executable: ${QL_BITWUZLA_EXECUTABLE}")
+    endif()
+    if(QL_BITWUZLA_BUNDLED)
+        file(SHA256 "${QL_BITWUZLA_EXECUTABLE}" ql_bitwuzla_actual_sha256)
+        if(NOT ql_bitwuzla_actual_sha256 STREQUAL ql_bitwuzla_bundle_sha256)
+            message(FATAL_ERROR
+                "Bitwuzla executable checksum mismatch: ${QL_BITWUZLA_EXECUTABLE}")
+        endif()
+    endif()
+    execute_process(
+        COMMAND "${QL_BITWUZLA_EXECUTABLE}" --version
+        RESULT_VARIABLE ql_bitwuzla_version_result
+        OUTPUT_VARIABLE ql_bitwuzla_version
+        ERROR_VARIABLE ql_bitwuzla_version_error
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_STRIP_TRAILING_WHITESPACE
+        TIMEOUT 10)
+    if(NOT ql_bitwuzla_version_result EQUAL 0 OR
+       NOT ql_bitwuzla_version STREQUAL "0.9.1")
+        message(FATAL_ERROR
+            "Bitwuzla 0.9.1 is not runnable: ${QL_BITWUZLA_EXECUTABLE}\n"
+            "stdout: ${ql_bitwuzla_version}\n"
+            "stderr: ${ql_bitwuzla_version_error}")
+    endif()
+endif()
 
 set(LIBUV_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(LIBUV_BUILD_TESTS OFF CACHE BOOL "" FORCE)

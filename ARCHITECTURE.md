@@ -172,34 +172,53 @@ with this envelope:
   "expression": {
     "op": "and",
     "args": [
-      { "op": "ule", "lhs": { "arg": 1 }, "rhs": 4096 },
+      {
+        "op": "ule",
+        "left": { "op": "arg", "index": 1 },
+        "right": {
+          "op": "int", "signed": false, "width": 64, "value": "4096"
+        }
+      },
       {
         "op": "valid_range",
-        "pointer": { "arg": 0 },
-        "offset": 0,
-        "bytes": { "arg": 1 },
-        "access": "read_write",
+        "range": {
+          "pointer": { "op": "arg", "index": 0 },
+          "offset": {
+            "op": "int", "signed": true, "width": 64, "value": "0"
+          },
+          "bytes": { "op": "arg", "index": 1 }
+        },
+        "read": true,
+        "write": true,
         "alignment": 4,
         "nullable": false,
-        "alias_group": "input"
+        "alias_group": 1
       }
     ]
   }
 }
 ```
 
-The common expression vocabulary reserves boolean connectives, typed integer
-comparisons and arithmetic, `valid_range`, `aligned`, and `disjoint`. A valid
-pointer range names the pointer argument, signed byte offset, symbolic or
-constant byte extent, read/write permission, alignment, nullability, and an
-optional alias group. The JSON envelope is validated by the core now. The
-semantic frontend must type-check every expression and lower it into the same
-IR as the functions before a proof method may claim a proved verdict.
+The common expression vocabulary implements boolean connectives, typed integer
+comparisons and modular arithmetic, `valid_range`, `aligned`, and `disjoint`.
+A valid pointer range names the pointer argument, signed byte offset, symbolic
+or constant byte extent, read/write permission, alignment, nullability, and an
+alias group. `ql_precondition_parse` type-checks these nodes against a versioned
+signature and binds canonical JSON plus the signature to one digest.
 
-The initial IR vocabulary reserves explicit types for bit vectors, floats,
-pointers, memory, and event traces, plus effect bits for memory, calls,
-volatile access, atomics, I/O, and undefined behavior. The concrete IR encoding
-is intentionally not frozen in this milestone.
+The current `quodlibet.problem` schema predates that resolved signature and
+does not yet bind the typed-precondition digest to both C functions. Therefore
+a non-null precondition in a v1 problem is storage and configuration only; it
+is not sufficient evidence for a `PROVED_*` verdict. The next problem schema
+must record both resolved source-signature digests, their input mapping, and the
+typed-precondition digest before such a verdict is eligible.
+
+IR schema v1 defines explicit types for bit vectors, floats, pointers, memory,
+and event traces, plus effect bits for memory, calls, volatile access, atomics,
+I/O, and undefined behavior. It is an acyclic typed SSA artifact with stable
+little-endian serialization and a content digest. Source integer signedness is
+carried by operation choice, not by bit-vector types, so source signatures must
+remain a separate artifact.
 
 ## Trust boundary and next layers
 

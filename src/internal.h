@@ -8,6 +8,9 @@ ql_status ql_internal_registry_register_owned(ql_registry *registry,
                                               const ql_method_v1 *method,
                                               const void *owner,
                                               ql_error *error);
+ql_status ql_internal_registry_register_proof_owned(
+    ql_registry *registry, const ql_proof_method_v1 *proof_method,
+    const void *owner, ql_error *error);
 void ql_internal_registry_unregister_owner(ql_registry *registry,
                                            const void *owner);
 const ql_allocator *ql_internal_registry_allocator(

@@ -11,6 +11,9 @@ include(GNUInstallDirs)
 
 option(QL_BUILD_SHARED "Build libquodlibet as a shared library" OFF)
 option(QL_BUILD_TESTS "Build native tests" ON)
+option(QL_ENABLE_BITWUZLA "Enable the canonical Bitwuzla SMT backend" ON)
+set(QL_BITWUZLA_EXECUTABLE "" CACHE FILEPATH
+    "Override path to a Bitwuzla 0.9.1 executable")
 
 if(BUILD_TESTING AND QL_BUILD_TESTS)
     enable_language(CXX)
@@ -52,9 +55,14 @@ set(QL_CORE_SOURCES
 # production library.
 file(GLOB QL_OPTIONAL_CORE_SOURCES CONFIGURE_DEPENDS LIST_DIRECTORIES false
     "${CMAKE_CURRENT_SOURCE_DIR}/src/c_frontend.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/c_lower.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/egraph.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/evidence.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ir.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/precondition.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/problem.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_method.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/solver.c"
 )
 list(APPEND QL_CORE_SOURCES ${QL_OPTIONAL_CORE_SOURCES})
 
@@ -69,6 +77,10 @@ target_include_directories(quodlibet
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_definitions(quodlibet PRIVATE QL_BUILDING_LIBRARY)
+if(QL_ENABLE_BITWUZLA)
+    target_compile_definitions(quodlibet PRIVATE
+        QL_BITWUZLA_EXECUTABLE="${QL_BITWUZLA_EXECUTABLE}")
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(quodlibet PRIVATE _POSIX_C_SOURCE=200112L)
 endif()
@@ -110,6 +122,31 @@ add_executable(quodlibet_cli cli/main.c)
 set_target_properties(quodlibet_cli PROPERTIES OUTPUT_NAME quodlibet)
 target_link_libraries(quodlibet_cli PRIVATE quodlibet::quodlibet)
 
+if(QL_ENABLE_BITWUZLA)
+    if(WIN32)
+        set(QL_BITWUZLA_RUNTIME_NAME bitwuzla.exe)
+    else()
+        set(QL_BITWUZLA_RUNTIME_NAME bitwuzla)
+    endif()
+    add_custom_command(TARGET quodlibet_cli POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${QL_BITWUZLA_EXECUTABLE}"
+            "$<TARGET_FILE_DIR:quodlibet_cli>/${QL_BITWUZLA_RUNTIME_NAME}"
+        VERBATIM)
+endif()
+
 if(BUILD_TESTING AND QL_BUILD_TESTS)
     add_subdirectory(tests)
+endif()
+
+install(TARGETS quodlibet quodlibet_cli
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY include/quodlibet
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(QL_ENABLE_BITWUZLA)
+    install(PROGRAMS "${QL_BITWUZLA_EXECUTABLE}"
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+        RENAME "${QL_BITWUZLA_RUNTIME_NAME}")
 endif()

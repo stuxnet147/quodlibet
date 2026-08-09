@@ -16,6 +16,10 @@ typedef struct ql_plugin_v1 {
     size_t method_count;
     void (QL_CALL *shutdown)(void);
     void *reserved[8];
+    /* Optional append-only extension. Descriptors decorate entries in methods
+       and are discovered automatically while the plugin is loaded. */
+    const ql_proof_method_v1 *proof_methods;
+    size_t proof_method_count;
 } ql_plugin_v1;
 
 typedef ql_status (QL_CALL *ql_plugin_init_v1_fn)(

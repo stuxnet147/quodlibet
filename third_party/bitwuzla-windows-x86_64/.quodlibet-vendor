@@ -1,0 +1,5 @@
+version=0.9.1
+sha256=d4f623c47409e54254b3f3ce1bd8a7e4a601b19bace5e98113a11bd933ab181f
+payload=bin/bitwuzla.exe
+payload_sha256=ce880e5402abc0df542b8c1f9f65e57ba9353690848d3f2d69054ff2f29cc796
+source=https://github.com/bitwuzla/bitwuzla/releases/download/0.9.1/Bitwuzla-Win64-x86_64-static.zip

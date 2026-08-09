@@ -337,7 +337,7 @@ the target interface described above and require corresponding plugins.
       "method": "prove.smt-product",
       "depends_on": ["lower"],
       "options": {
-        "solver": "z3",
+        "solver": "bitwuzla-0.9.1",
         "timeout_ms": 30000,
         "memory_encoding": "arrays",
         "unroll": 32

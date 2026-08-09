@@ -12,13 +12,13 @@ the corresponding vendored directories.
 | Tree-sitter | v0.26.12 | MIT | Incremental parsing runtime |
 | tree-sitter-c | v0.24.2 | MIT | Generated C grammar |
 | GoogleTest | v1.17.0 | BSD-3-Clause | Test-only framework |
+| Bitwuzla | 0.9.1 | MIT | Canonical SMT backend on Windows and Linux x86-64 |
 
 Planned optional adapters:
 
 | Project | Pinned version | License | Intended use |
 | --- | --- | --- | --- |
 | Kissat | rel-4.0.4 | MIT | SAT and AIG-miter backend |
-| Bitwuzla | 0.9.1 | MIT | Bit-vector, array, floating-point and UF SMT backend |
 
 Adding or updating a dependency requires an explicit version, an upstream
 archive checksum, a license review, and successful Windows and Linux CI.

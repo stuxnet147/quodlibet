@@ -4,7 +4,7 @@ Quodlibet configures and builds without network access. Run
 `./scripts/vendor.sh` once to download the exact, checksum-locked upstream
 archives into this directory. The script never replaces an existing directory.
 
-Required sources:
+Required sources and release artifacts:
 
 | Directory | Version | Purpose |
 | --- | --- | --- |
@@ -15,12 +15,19 @@ Required sources:
 | `tree-sitter` | 0.26.12 | Error-tolerant incremental parsing runtime |
 | `tree-sitter-c` | 0.24.2 | Generated C grammar |
 | `googletest` | 1.17.0 | GoogleTest unit tests, excluded when tests are disabled |
+| `bitwuzla-linux-x86_64` | 0.9.1 | Canonical SMT backend for Linux x86-64 |
+| `bitwuzla-windows-x86_64` | 0.9.1 | Canonical SMT backend for Windows x86-64 |
 
-The source URL and SHA-256 checksum are recorded both in `scripts/vendor.sh`
-and in each generated `.quodlibet-vendor` marker. Upstream license files remain
-inside their respective source directories.
+The source URL and archive SHA-256 checksum are recorded both in
+`scripts/vendor.sh` and in each generated `.quodlibet-vendor` marker. The two
+Bitwuzla executable payloads have an additional checksum. Upstream license
+files remain inside their respective directories.
 
-Solver backends are deliberately not core dependencies. Kissat 4.0.4 and
-Bitwuzla 0.9.1 are the first planned adapters. They will be optional plugins so
-that the host remains small and different proof methods can be combined without
-forcing one solver stack on every build.
+Bitwuzla 0.9.1 is the canonical SMT solver. Quodlibet vendors the official
+static release bundles and invokes the matching executable without a shell.
+The host does not contain an SMT implementation. Other proof backends remain
+plugins so users can compose methods without changing this solver boundary.
+The bundled Linux executable requires `GLIBC_2.38`, `GLIBCXX_3.4.32`,
+`libgcc_s.so.1`, `libgmp.so.10`, and `libmpfr.so.6`. Older glibc and musl hosts
+must provide a compatible Bitwuzla 0.9.1 through `QL_BITWUZLA_EXECUTABLE`.
+CMake verifies that the selected executable runs and reports exactly 0.9.1.

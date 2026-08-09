@@ -6,8 +6,12 @@
 *.cmake text eol=lf
 CMakeLists.txt text eol=lf
 *.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
 *.md text eol=lf
 *.sh text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
 
 *.png binary
 *.jpg binary

@@ -1,0 +1,10 @@
+prefix=D:/a/bitwuzla/bitwuzla/build/install
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: bitwuzla
+Description: bitwuzla: bitwuzla
+Version: 0.9.1
+Requires: gmp >= 6.3, mpfr >= 4.2.1
+Libs: -L${libdir} -lbitwuzla -lpsapi -lbitwuzlals -lbitwuzlabv -lbitwuzlabb
+Cflags: -I${includedir}

@@ -1,9 +1,9 @@
 # quodlibet
 
 Quodlibet is a native C17 foundation for composing function-equivalence
-methods. It is not yet an equivalence checker: this milestone establishes the
-portable host, contracts, and plugin boundary on which C frontends and proof
-engines can be added independently.
+methods. It is not yet an end-to-end equivalence checker: this milestone
+establishes the portable host, semantic data, solver boundary, and plugin model
+on which checked proof pipelines can be assembled.
 
 The current foundation provides:
 
@@ -21,18 +21,28 @@ The current foundation provides:
   and their complete semantic contract;
 - restricted-C eligibility and function/type inventory without pretending that
   syntax analysis is semantic lowering;
+- a typed, immutable SSA IR with explicit effects, UB guards, traps,
+  termination, memory, and event traces;
+- a loop-free integer and `_Bool` C lowering slice with explicit conversions,
+  control flow, PHI nodes, and definedness predicates;
+- a typed and canonical input-precondition AST for integer constraints, valid
+  pointer ranges, alignment, and disjointness;
+- a pure Bool/bit-vector e-graph with bounded saturation and replayable merge
+  evidence;
+- a solver-neutral ABI backed by the pinned Bitwuzla 0.9.1 process adapter,
+  with real SAT/model and UNSAT-metadata results;
 - capability checks for user-selected e-graph, SMT, AIG/SAT, bounded execution,
   concrete differential, CHC/PDR, and extension methods;
 - deterministic BLAKE3 cache identities and method-independent evidence
   envelopes;
-- pinned, checksum-verified sources in `third_party`;
+- pinned, checksum-verified dependencies in `third_party`;
 - native tests exercised on Windows and Linux.
 
 ## Build
 
 Prerequisites are CMake 3.21 or newer, Ninja, a C17 compiler, a C++17 compiler
 for GoogleTest, Git Bash on Windows, and a POSIX shell on Linux. Dependency
-downloads require `curl`, `tar`, and `sha256sum` only once.
+downloads require `curl`, `tar`, `unzip`, and `sha256sum` only once.
 
 ```sh
 cd D:/projects/machine-model/python/quodlibet
@@ -42,6 +52,10 @@ cd D:/projects/machine-model/python/quodlibet
 
 The first command is idempotent for an unchanged dependency lock. CMake never
 downloads source code during configuration.
+
+The bundled Linux Bitwuzla executable targets glibc-based x86-64 systems with
+`GLIBC_2.38` and `GLIBCXX_3.4.32`. On older glibc or musl systems, configure
+with `-DQL_BITWUZLA_EXECUTABLE=/absolute/path/to/bitwuzla-0.9.1`.
 
 Equivalent explicit commands are:
 
@@ -109,12 +123,13 @@ nodes, so call `ql_c_syntax_tree_has_errors` before accepting the syntax. The
 cursor API traverses both named and anonymous nodes and exposes byte and UTF-8
 row/column ranges.
 
-This layer only establishes C syntax. It does not run a preprocessor, resolve
-names or types, apply implicit conversions, construct semantic control flow, or
-decide undefined behavior. No semantic lowering, SAT/SMT adapter, proof checker,
-cache, or actual equivalence method is included yet. `builtin.identity` exists
-to exercise the host contract. See `ARCHITECTURE.md` for the fixed execution
-semantics and next layers.
+This layer only establishes C syntax. It does not run a preprocessor or prove
+source semantics. The separate `c_frontend` eligibility layer and `c_lower`
+vertical slice currently handle loop-free integer and `_Bool` functions; loops,
+pointers, calls, volatile and atomic operations return an explicit unsupported
+result. There is still no product-program equivalence method, counterexample
+replayer, or complete checked-proof path. See `ARCHITECTURE.md` for the exact
+boundaries.
 
 ## Semantic contract
 
@@ -141,7 +156,10 @@ PIC and non-PIC x86-64 Linux SysV code, with target feature groups selectable by
 the caller. Exact compiler versions and an explicit C standard were not stored
 in the corpus, so Quodlibet does not silently claim either. Input assumptions,
 including symbolic readable/writable pointer ranges, are supplied through the
-versioned `precondition_json` field described in `ARCHITECTURE.md`.
+versioned `precondition_json` field described in `ARCHITECTURE.md`. The typed
+precondition parser is implemented, but binding its signature digest to both
+lowered C functions and the problem artifact remains required before a method
+may claim `PROVED_*` for a non-null precondition.
 
 ## Proof method selection
 

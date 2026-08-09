@@ -2,3 +2,4 @@
 /out/
 /Testing/
 compile_commands.json
+/third_party/.quodlibet-vendor.*
