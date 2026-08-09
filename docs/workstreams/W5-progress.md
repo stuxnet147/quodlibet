@@ -74,7 +74,7 @@ disjointness, 첫 페이지, wrap 없음 세 제약은 **다시 만들지 않습
 
 ### 1. SMT-LIB builder 의 array 지원
 
-커밋: `4db9068`
+커밋: `171cc25`
 
 `ql_smt2_builder` 에 `(Array ...)` 를 선언하고 정의하는 함수가 없었습니다(`declare_bool`, `declare_bv`, `define_bool`, `define_bv` 뿐). 메모리를 배열로 인코딩하려면 prefix 안에 `(declare-const mem0 (Array (_ BitVec 64) (_ BitVec 8)))` 이 필요하고, 이것은 side 인코딩보다 앞서야 하므로 별도 artifact 로 뗄 수 없습니다.
 
@@ -90,7 +90,7 @@ disjointness, 첫 페이지, wrap 없음 세 제약은 **다시 만들지 않습
 
 ### 2. miter, replay, 관찰 축의 메모리 확장
 
-커밋: `16f4b15`
+커밋: `9f46c4e`
 
 D1..D4 를 그대로 구현했고, D5 는 **폐기하고 더 정직한 방식으로 바꿨습니다**(아래 D6).
 
