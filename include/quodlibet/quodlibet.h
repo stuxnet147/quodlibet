@@ -3,6 +3,7 @@
 
 #include "quodlibet/allocator.h"
 #include "quodlibet/artifact.h"
+#include "quodlibet/budget.h"
 #include "quodlibet/c_frontend.h"
 #include "quodlibet/c_lower.h"
 #include "quodlibet/c_syntax.h"

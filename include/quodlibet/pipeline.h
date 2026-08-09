@@ -1,6 +1,7 @@
 #ifndef QUODLIBET_PIPELINE_H
 #define QUODLIBET_PIPELINE_H
 
+#include "quodlibet/budget.h"
 #include "quodlibet/registry.h"
 #include "quodlibet/scheduler.h"
 
@@ -32,6 +33,17 @@ QL_API ql_status QL_CALL ql_pipeline_run(
     ql_pipeline *pipeline, ql_scheduler *scheduler, ql_artifact *input,
     const ql_cancel_token *cancel_token, ql_pipeline_result **output,
     ql_error *error);
+
+/* Same run, under an execution budget. Each node runs inside its own
+   QL_BUDGET_SCOPE_NODE scope and sees the budget through the run context's
+   cancellation predicate. When any axis is exhausted the run stops, releases
+   every artifact produced so far, and returns QL_STATUS_CANCELLED for a time
+   axis or QL_STATUS_OUT_OF_MEMORY for the memory axis; no partial result is
+   handed back. A null budget behaves exactly like ql_pipeline_run. */
+QL_API ql_status QL_CALL ql_pipeline_run_with_budget(
+    ql_pipeline *pipeline, ql_scheduler *scheduler, ql_artifact *input,
+    const ql_cancel_token *cancel_token, ql_budget *budget,
+    ql_pipeline_result **output, ql_error *error);
 QL_API void QL_CALL ql_pipeline_result_destroy(ql_pipeline_result *result);
 QL_API size_t QL_CALL ql_pipeline_result_count(
     const ql_pipeline_result *result);

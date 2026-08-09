@@ -70,16 +70,16 @@ one line into another.
 
 ### Builds without the engine
 
-`QL_ENABLE_LOGGING=0` compiles the engine out. The whole API stays callable and
-returns the same statuses, `ql_log_available()` returns zero, no record is ever
-emitted, and a sink handed to `ql_log_set_sink` is closed immediately so the
-caller is not left believing its callback owns a live subscription.
+`-DQL_ENABLE_LOGGING=OFF` compiles the engine out. The whole API stays callable
+and returns the same statuses, `ql_log_available()` returns zero, no record is
+ever emitted, and a sink handed to `ql_log_set_sink` is closed immediately so
+the caller is not left believing its callback owns a live subscription.
 
 ```sh
 cmake -S . -B out/build/windows-clang-nolog -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_C_FLAGS="-DQL_ENABLE_LOGGING=0"
+  -DQL_ENABLE_LOGGING=OFF
 cmake --build out/build/windows-clang-nolog --parallel
 ctest --test-dir out/build/windows-clang-nolog
 ```
@@ -126,13 +126,13 @@ Measured on 2026-08-10.
 | Step with a disabled call site | 0.1045 ns |
 | **Disabled call overhead** | **0.071 ns per call** |
 | Spread over three consecutive runs | 0.0709 to 0.0714 ns per call |
-| Same measurement in a `QL_ENABLE_LOGGING=0` build | 0.067 ns per call |
+| Same measurement in a `QL_ENABLE_LOGGING=OFF` build | 0.067 ns per call |
 
 At the measured clock this is roughly a third of a cycle per call site: the
 guard is a load of a level-one-resident global, a compare and a
 predicted-not-taken branch, and the out-of-order engine absorbs most of it into
 surrounding work. The two build configurations agree because the guard is the
-same code either way; `QL_ENABLE_LOGGING=0` removes the engine behind it, not
+same code either way; `QL_ENABLE_LOGGING=OFF` removes the engine behind it, not
 the check.
 
 The CTest case asserts only a loose ceiling of 25 ns per call. It is there to

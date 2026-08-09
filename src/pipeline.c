@@ -45,11 +45,19 @@ typedef struct ql_pipeline_task {
     ql_artifact **node_outputs;
     ql_artifact *initial_input;
     const ql_cancel_token *cancel_token;
+    ql_budget *budget;
     size_t node_index;
     uint64_t run_id;
     ql_status status;
     ql_error error;
 } ql_pipeline_task;
+
+/* The run context carries one cancellation predicate, so the token and the
+   budget are presented to a method through a single state. */
+typedef struct ql_pipeline_cancel_state {
+    const ql_cancel_token *token;
+    ql_budget_scope *scope;
+} ql_pipeline_cancel_state;
 
 static atomic_uint_fast64_t next_run_id = UINT64_C(1);
 
@@ -526,7 +534,12 @@ cleanup:
 }
 
 static uint32_t QL_CALL cancellation_requested(const void *state) {
-    return ql_cancel_token_is_requested((const ql_cancel_token *)state);
+    const ql_pipeline_cancel_state *combined = state;
+
+    if (ql_cancel_token_is_requested(combined->token)) {
+        return 1u;
+    }
+    return ql_budget_scope_is_cancelled(combined->scope);
 }
 
 static ql_status QL_CALL run_pipeline_node(void *user_data, ql_error *error) {
@@ -537,6 +550,8 @@ static ql_status QL_CALL run_pipeline_node(void *user_data, ql_error *error) {
     size_t input_count;
     void *instance = NULL;
     ql_run_context_v1 context;
+    ql_pipeline_cancel_state cancel_state;
+    ql_budget_scope *scope = NULL;
     ql_status status;
     size_t index;
     uint32_t instance_ready = node->method->create == NULL;
@@ -549,6 +564,16 @@ static ql_status QL_CALL run_pipeline_node(void *user_data, ql_error *error) {
         task->status = QL_STATUS_CANCELLED;
         *error = task->error;
         return task->status;
+    }
+    if (task->budget != NULL) {
+        status = ql_budget_scope_begin(task->budget, NULL,
+                                       QL_BUDGET_SCOPE_NODE, node->name,
+                                       &scope, &task->error);
+        if (status != QL_STATUS_OK) {
+            task->status = status;
+            *error = task->error;
+            return task->status;
+        }
     }
     if (node->dependency_count == 0u) {
         root_input[0] = task->initial_input;
@@ -594,11 +619,13 @@ static ql_status QL_CALL run_pipeline_node(void *user_data, ql_error *error) {
             goto cleanup;
         }
     }
+    cancel_state.token = task->cancel_token;
+    cancel_state.scope = scope;
     memset(&context, 0, sizeof(context));
     context.struct_size = sizeof(context);
     context.abi_version = QL_ABI_VERSION;
     context.host = ql_default_host();
-    context.cancel_state = task->cancel_token;
+    context.cancel_state = &cancel_state;
     context.is_cancelled = cancellation_requested;
     context.run_id = task->run_id;
     status = node->method->run(instance, &context, inputs, input_count,
@@ -606,6 +633,14 @@ static ql_status QL_CALL run_pipeline_node(void *user_data, ql_error *error) {
                                &task->error);
     if (status != QL_STATUS_OK) {
         task->status = status;
+        goto cleanup;
+    }
+    /* A node that overran its own axis does not get to keep its output. */
+    status = ql_budget_scope_check(scope, &task->error);
+    if (status != QL_STATUS_OK) {
+        task->status = status;
+        ql_artifact_release(task->node_outputs[task->node_index]);
+        task->node_outputs[task->node_index] = NULL;
         goto cleanup;
     }
     if (task->node_outputs[task->node_index] == NULL) {
@@ -640,6 +675,7 @@ cleanup:
     if (instance_ready && node->method->destroy != NULL) {
         node->method->destroy(instance);
     }
+    ql_budget_scope_end(scope);
     if (node->dependency_count != 0u) {
         task->pipeline->allocator.deallocate(
             task->pipeline->allocator.user_data, inputs);
@@ -719,6 +755,14 @@ ql_status QL_CALL ql_pipeline_run(
     ql_pipeline *pipeline, ql_scheduler *scheduler, ql_artifact *input,
     const ql_cancel_token *cancel_token, ql_pipeline_result **output,
     ql_error *error) {
+    return ql_pipeline_run_with_budget(pipeline, scheduler, input,
+                                       cancel_token, NULL, output, error);
+}
+
+ql_status QL_CALL ql_pipeline_run_with_budget(
+    ql_pipeline *pipeline, ql_scheduler *scheduler, ql_artifact *input,
+    const ql_cancel_token *cancel_token, ql_budget *budget,
+    ql_pipeline_result **output, ql_error *error) {
     ql_artifact **node_outputs = NULL;
     uint32_t level;
     uint64_t run_id;
@@ -766,6 +810,10 @@ ql_status QL_CALL ql_pipeline_run(
             status = QL_STATUS_CANCELLED;
             break;
         }
+        status = ql_budget_check(budget, error);
+        if (status != QL_STATUS_OK) {
+            break;
+        }
         for (node_index = 0u; node_index < pipeline->count; ++node_index) {
             if (pipeline->nodes[node_index].level == level) {
                 ++task_count;
@@ -793,6 +841,7 @@ ql_status QL_CALL ql_pipeline_run(
             tasks[task_index].node_outputs = node_outputs;
             tasks[task_index].initial_input = input;
             tasks[task_index].cancel_token = cancel_token;
+            tasks[task_index].budget = budget;
             tasks[task_index].node_index = node_index;
             tasks[task_index].run_id = run_id;
             tasks[task_index].status = QL_STATUS_OK;
