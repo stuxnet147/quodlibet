@@ -1,34 +1,15 @@
-/* Fuzzing of the C parser, the lowering, and the IR decoder.
+/* A bounded, deterministic fuzz campaign over the same targets the libFuzzer
+   drivers in tests/fuzz/ use.
 
-   The targets below take a byte string and must not crash on any of them.
-   They are written without a test framework so that one libFuzzer executable
-   can compile this same file with QL_FUZZ_LIBFUZZER defined and call
-   ql_fuzz_one directly, while the ordinary test build runs a bounded,
-   deterministic campaign over the same targets on every ctest run.
-
-   Not crashing is the weakest of the properties checked here. The targets
-   also assert the invariants that make the correctness devices meaningful:
-
-     - a module the decoder accepts must survive verification without
-       crashing, whether or not it verifies;
-     - a lowering that reports SUPPORTED must verify, because G8 says the
-       verifier passes on every lowering output and a mutated source is still
-       a source;
-     - a module that verifies must run in the interpreter without crashing.
-
-   A fuzzer that only checked for crashes would pass while the lowering
-   emitted IR nobody could justify. */
-
-#include "quodlibet/artifact.h"
-#include "quodlibet/c_lower.h"
-#include "quodlibet/ir_interp.h"
-#include "quodlibet/ir_verify.h"
+   The coverage-guided fuzzers only exist under the linux-fuzz preset, so this
+   is what keeps the parser, the lowering, and the IR decoder fuzzed on every
+   ctest run and on Windows. Sharing tests/fuzz/fuzz_targets.h means the two
+   cannot drift into disagreeing about what has been tested. */
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -40,9 +21,9 @@ struct Violation {
     std::string message;
 };
 
-/* A fuzz campaign that never reaches its target passes without testing
-   anything. These counters make that visible so the driver can fail on it
-   instead of reporting a green run. */
+/* A campaign that never reaches its target passes without testing anything.
+   Counting the arrivals lets the driver fail on that instead of reporting a
+   green run. */
 struct Reach {
     std::size_t parsed = 0u;
     std::size_t lowered = 0u;
@@ -53,236 +34,22 @@ struct Reach {
 Violation g_violation;
 Reach g_reach;
 
-void Require(bool condition, const char *message) {
+void Record(bool condition, const char *message) {
     if (condition || g_violation.failed) {
         return;
     }
     g_violation.failed = true;
-    g_violation.message = message;
-#if defined(QL_FUZZ_LIBFUZZER)
-    std::fprintf(stderr, "quodlibet fuzz invariant violated: %s\n", message);
-    std::abort();
-#endif
-}
-
-/* Runs the interpreter with zeroed inputs. The point is that a verified
-   module never crashes the interpreter, not what it computes. */
-void RunInterpreter(ql_ir *ir) {
-    ql_ir_view_v1 view{};
-    std::vector<std::vector<uint8_t>> storage;
-    std::vector<ql_ir_interp_input_v1> inputs;
-    ql_ir_interp_result_v1 result{};
-    ql_ir_interp_options_v1 options{};
-    ql_error error{};
-
-    view.struct_size = sizeof(view);
-    if (ql_ir_get_view(ir, &view, &error) != QL_STATUS_OK) {
-        return;
-    }
-    for (std::size_t index = 0u; index < view.value_count; ++index) {
-        ql_ir_value_view_v1 value{};
-        ql_ir_type_view_v1 type{};
-        std::size_t width;
-        value.struct_size = sizeof(value);
-        if (ql_ir_value_at(ir, index, &value, &error) != QL_STATUS_OK) {
-            return;
-        }
-        if (value.definition_kind != QL_IR_VALUE_PARAMETER) {
-            continue;
-        }
-        type.struct_size = sizeof(type);
-        if (ql_ir_type_at(ir, value.type, &type, &error) != QL_STATUS_OK) {
-            return;
-        }
-        width = type.kind == QL_IR_TYPE_BOOL ? 1u : type.bit_width;
-        if (width == 0u || width > QL_IR_INTERP_MAX_BIT_WIDTH) {
-            return;
-        }
-        storage.push_back(std::vector<uint8_t>((width + 7u) / 8u, 0u));
-        inputs.push_back(ql_ir_interp_input_v1{});
-        ql_ir_interp_input_init(&inputs.back());
-        inputs.back().value = value.id;
-    }
-    for (std::size_t index = 0u; index < inputs.size(); ++index) {
-        inputs[index].data = storage[index].data();
-        inputs[index].size = storage[index].size();
-    }
-    ql_ir_interp_options_init(&options);
-    options.step_limit = 100000u;
-    result.struct_size = sizeof(result);
-    (void)ql_ir_interp_run(nullptr, ir, inputs.empty() ? nullptr
-                                                       : inputs.data(),
-                           inputs.size(), &options, &result, &error);
-}
-
-void VerifyAndRun(ql_ir *ir, bool require_verification, const char *reason) {
-    ql_ir_verify_report_v1 report{};
-    ql_error error{};
-    report.struct_size = sizeof(report);
-    const ql_status status = ql_ir_verify(nullptr, ir, &report, &error);
-    if (require_verification) {
-        Require(status == QL_STATUS_OK, reason);
-    }
-    if (status == QL_STATUS_OK) {
-        ++g_reach.verified;
-        RunInterpreter(ir);
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* targets                                                             */
-/* ------------------------------------------------------------------ */
-
-void FuzzFrontend(const uint8_t *data, std::size_t size) {
-    ql_c_frontend_unit *unit = nullptr;
-    ql_c_frontend_unit_view view{};
-    ql_error error{};
-
-    if (ql_c_frontend_analyze(nullptr, reinterpret_cast<const char *>(data),
-                              size, &unit, &error) != QL_STATUS_OK) {
-        ql_c_frontend_unit_destroy(unit);
-        return;
-    }
-    ++g_reach.parsed;
-    view.struct_size = sizeof(view);
-    if (ql_c_frontend_unit_get_view(unit, &view, &error) == QL_STATUS_OK) {
-        for (std::size_t index = 0u; index < view.function_count; ++index) {
-            ql_c_function_view function{};
-            function.struct_size = sizeof(function);
-            if (ql_c_frontend_function_at(unit, index, &function, &error) !=
-                QL_STATUS_OK) {
-                continue;
-            }
-            for (std::size_t parameter = 0u;
-                 parameter < function.parameter_count; ++parameter) {
-                ql_c_parameter_view argument{};
-                argument.struct_size = sizeof(argument);
-                (void)ql_c_frontend_parameter_at(unit, index, parameter,
-                                                 &argument, &error);
-            }
-            for (std::size_t diagnostic = 0u;
-                 diagnostic < function.diagnostic_count; ++diagnostic) {
-                ql_c_frontend_diagnostic_view record{};
-                record.struct_size = sizeof(record);
-                (void)ql_c_frontend_function_diagnostic_at(
-                    unit, index, diagnostic, &record, &error);
-            }
-        }
-        for (std::size_t index = 0u; index < view.diagnostic_count; ++index) {
-            ql_c_frontend_diagnostic_view record{};
-            record.struct_size = sizeof(record);
-            (void)ql_c_frontend_diagnostic_at(unit, index, &record, &error);
-        }
-    }
-    ql_c_frontend_unit_destroy(unit);
-}
-
-void FuzzLowering(const uint8_t *data, std::size_t size) {
-    ql_c_frontend_unit *unit = nullptr;
-    ql_c_frontend_unit_view view{};
-    ql_error error{};
-    const char *source = reinterpret_cast<const char *>(data);
-
-    if (ql_c_frontend_analyze(nullptr, source, size, &unit, &error) !=
-        QL_STATUS_OK) {
-        ql_c_frontend_unit_destroy(unit);
-        return;
-    }
-    view.struct_size = sizeof(view);
-    if (ql_c_frontend_unit_get_view(unit, &view, &error) == QL_STATUS_OK) {
-        for (std::size_t index = 0u; index < view.function_count; ++index) {
-            ql_c_function_view function{};
-            ql_c_lower_result *result = nullptr;
-            ql_c_lower_result_view_v1 lowered{};
-            function.struct_size = sizeof(function);
-            if (ql_c_frontend_function_at(unit, index, &function, &error) !=
-                QL_STATUS_OK) {
-                continue;
-            }
-            if (ql_c_lower_selected_function(nullptr, source, size, unit,
-                                             &function, &result,
-                                             &error) != QL_STATUS_OK) {
-                ql_c_lower_result_destroy(result);
-                continue;
-            }
-            lowered.struct_size = sizeof(lowered);
-            if (ql_c_lower_result_get_view(result, &lowered, &error) ==
-                    QL_STATUS_OK &&
-                lowered.support == QL_C_LOWER_SUPPORTED) {
-                ql_ir *ir = nullptr;
-                ++g_reach.lowered;
-                Require(lowered.ir_artifact != nullptr,
-                        "a SUPPORTED lowering produced no IR artifact");
-                if (lowered.ir_artifact != nullptr &&
-                    ql_ir_open(nullptr, lowered.ir_artifact, &ir, &error) ==
-                        QL_STATUS_OK) {
-                    VerifyAndRun(ir, true,
-                                 "the lowering reported SUPPORTED but its IR "
-                                 "failed verification");
-                } else {
-                    Require(false,
-                            "a SUPPORTED lowering produced IR the decoder "
-                            "rejected");
-                }
-                ql_ir_release(ir);
-            }
-            ql_c_lower_result_destroy(result);
-        }
-    }
-    ql_c_frontend_unit_destroy(unit);
-}
-
-void FuzzIrDecoder(const uint8_t *data, std::size_t size) {
-    ql_artifact *artifact = nullptr;
-    ql_ir *ir = nullptr;
-    ql_error error{};
-
-    if (ql_artifact_create(nullptr, QL_ARTIFACT_KIND_IR, 1u, data, size,
-                           &artifact, &error) != QL_STATUS_OK) {
-        return;
-    }
-    if (ql_ir_open(nullptr, artifact, &ir, &error) == QL_STATUS_OK) {
-        ++g_reach.decoded;
-        /* A decoded module need not verify: the decoder guarantees structure,
-           not the guard obligations the verifier adds. It must not crash the
-           verifier, which is what this call checks. */
-        VerifyAndRun(ir, false, nullptr);
-        ql_ir_release(ir);
-    }
-    ql_artifact_release(artifact);
+    g_violation.message = message != nullptr ? message : "(no reason given)";
 }
 
 }  // namespace
-
-void FuzzOne(const uint8_t *data, std::size_t size) {
-    if (size == 0u) {
-        return;
-    }
-    switch (data[0] % 3u) {
-    case 0u:
-        FuzzFrontend(data + 1u, size - 1u);
-        break;
-    case 1u:
-        FuzzLowering(data + 1u, size - 1u);
-        break;
-    default:
-        FuzzIrDecoder(data + 1u, size - 1u);
-        break;
-    }
-}
-
 }  // namespace ql_fuzz
 
-#if defined(QL_FUZZ_LIBFUZZER)
+#define QL_FUZZ_REQUIRE(condition_, message_) \
+    ::ql_fuzz::Record((condition_) != 0, (message_))
+#define QL_FUZZ_REACHED(kind_) (++::ql_fuzz::g_reach.kind_)
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, std::size_t size) {
-    ql_fuzz::FuzzOne(data, size);
-    return 0;
-}
-
-#else
-
-#include <iostream>
+#include "fuzz/fuzz_targets.h"
 
 #include <gtest/gtest.h>
 
@@ -311,6 +78,10 @@ const char *const kSeeds[] = {
     "short f(short a, short b) { return a + b; }",
     "int f(int a, int b) { return b != 0 && a / b > 1; }",
     "_Bool f(int a) { return a > 0; }",
+    "void f(int a) { int b; b = a + 1; }",
+    ("typedef int TYP_0;\ntypedef TYP_0 TYP_1;\n"
+     "TYP_1 f(TYP_0 a) { return (TYP_1)(a + 1); }"),
+    "typedef int *TYP_0;\nint f(TYP_0 a) { return 0; }",
     "int f(int *p) { return *p; }",
     "struct s { int a; };\nint f(struct s v) { return v.a; }",
     "int f(void) { for (;;) { } }",
@@ -320,17 +91,17 @@ const char *const kSeeds[] = {
     "",
 };
 
-/* A pool of tokens the C grammar cares about. Splicing these in reaches
-   syntactically interesting inputs that pure byte flipping almost never
-   produces. */
+/* Tokens the C grammar cares about. Splicing these in reaches syntactically
+   interesting inputs that pure byte flipping almost never produces. */
 const char *const kTokens[] = {
-    "int",   "unsigned", "long",  "short",  "char",  "_Bool", "void",
-    "if",    "else",     "while", "return", "goto",  "switch", "case",
-    "const", "volatile", "_Atomic", "struct", "union", "enum", "static",
-    "*",     "&",        "[",     "]",      "(",     ")",     "{",
-    "}",     ";",        ",",     "/",      "%",     "<<",    ">>",
-    "?",     ":",        "->",    ".",      "...",   "sizeof", "0x",
-    "9223372036854775808", "'\\0'", "\"\"", "\\", "\n", "//", "/*",
+    "int",   "unsigned", "long",    "short",  "char",  "_Bool",  "void",
+    "if",    "else",     "while",   "return", "goto",  "switch", "case",
+    "const", "volatile", "_Atomic", "struct", "union", "enum",   "static",
+    "typedef", "TYP_0",  "*",       "&",      "[",     "]",      "(",
+    ")",     "{",        "}",       ";",      ",",     "/",      "%",
+    "<<",    ">>",       "?",       ":",      "->",    ".",      "...",
+    "sizeof", "0x",      "9223372036854775808", "'\\0'", "\"\"", "\\",
+    "\n",    "//",       "/*",
 };
 
 /* `gentle` keeps most of the seed intact. Heavy mutation is what reaches the
@@ -363,8 +134,8 @@ std::string Mutate(const std::string &input, uint64_t *state, bool gentle) {
             break;
         case 2u: {
             const char *token =
-                kTokens[NextRandom(state) % (sizeof(kTokens) /
-                                             sizeof(kTokens[0]))];
+                kTokens[NextRandom(state) %
+                        (sizeof(kTokens) / sizeof(kTokens[0]))];
             const std::size_t at =
                 output.empty() ? 0u : NextRandom(state) % output.size();
             output.insert(at, token);
@@ -380,8 +151,8 @@ std::string Mutate(const std::string &input, uint64_t *state, bool gentle) {
             break;
         case 4u: {
             const char *seed =
-                kSeeds[NextRandom(state) % (sizeof(kSeeds) /
-                                            sizeof(kSeeds[0]))];
+                kSeeds[NextRandom(state) %
+                       (sizeof(kSeeds) / sizeof(kSeeds[0]))];
             const std::size_t at =
                 output.empty() ? 0u : NextRandom(state) % output.size();
             output.insert(at, seed);
@@ -466,15 +237,16 @@ std::vector<uint8_t> MutateBytes(const std::vector<uint8_t> &input,
             break;
         case 2u:
             /* Counts and offsets live in little-endian 32-bit fields, so
-               raising one whole field is far more likely to reach a table
-               extent than flipping single bits. */
+               raising one whole field reaches a table extent far more often
+               than flipping single bits does. */
             if (output.size() >= 4u) {
                 const std::size_t at =
-                    (NextRandom(state) % (output.size() - 3u)) & ~std::size_t{3u};
-                const uint32_t value =
-                    static_cast<uint32_t>(NextRandom(state) % 5u == 0u
-                                              ? UINT32_MAX
-                                              : NextRandom(state) % 0x10000u);
+                    (NextRandom(state) % (output.size() - 3u)) &
+                    ~std::size_t{3u};
+                const uint32_t value = static_cast<uint32_t>(
+                    NextRandom(state) % 5u == 0u ? UINT32_MAX
+                                                 : NextRandom(state) %
+                                                       0x10000u);
                 std::memcpy(output.data() + at, &value, sizeof(value));
             }
             break;
@@ -492,18 +264,9 @@ std::vector<uint8_t> MutateBytes(const std::vector<uint8_t> &input,
     return output;
 }
 
-/* The leading byte selects the target, so it has to survive being zero. */
-std::string Frame(char target, const std::string &body) {
-    std::string framed;
-    framed.push_back(target);
-    framed.append(body);
-    return framed;
-}
-
 ql_fuzz::Reach ExpectNoViolation() {
     const ql_fuzz::Reach reach = ql_fuzz::g_reach;
-    EXPECT_FALSE(ql_fuzz::g_violation.failed)
-        << ql_fuzz::g_violation.message;
+    EXPECT_FALSE(ql_fuzz::g_violation.failed) << ql_fuzz::g_violation.message;
     /* Printing the reach keeps the campaign honest in the log: a run whose
        counts collapse is a run that stopped testing what it claims to. */
     std::cout << "[  REACH   ] parsed=" << reach.parsed
@@ -520,9 +283,10 @@ TEST(Fuzz, ParserSurvivesMutatedSources) {
     for (std::size_t round = 0u; round < 30000u; ++round) {
         const std::string seed =
             kSeeds[NextRandom(&state) % (sizeof(kSeeds) / sizeof(kSeeds[0]))];
-        const std::string framed = Frame('\0', Mutate(seed, &state, false));
-        ql_fuzz::FuzzOne(reinterpret_cast<const uint8_t *>(framed.data()),
-                         framed.size());
+        const std::string mutated = Mutate(seed, &state, false);
+        ql_fuzz_frontend(
+            reinterpret_cast<const unsigned char *>(mutated.data()),
+            mutated.size());
     }
     EXPECT_GT(ExpectNoViolation().parsed, 0u);
 }
@@ -534,10 +298,11 @@ TEST(Fuzz, LoweringNeverReportsSupportedForIrThatFailsVerification) {
             kSeeds[NextRandom(&state) % (sizeof(kSeeds) / sizeof(kSeeds[0]))];
         /* Three rounds in four keep most of the seed intact so the campaign
            actually reaches the lowering; the fourth mutates hard. */
-        const std::string framed =
-            Frame('\x01', Mutate(seed, &state, (round & 3u) != 0u));
-        ql_fuzz::FuzzOne(reinterpret_cast<const uint8_t *>(framed.data()),
-                         framed.size());
+        const std::string mutated =
+            Mutate(seed, &state, (round & 3u) != 0u);
+        ql_fuzz_lowering(
+            reinterpret_cast<const unsigned char *>(mutated.data()),
+            mutated.size());
     }
     /* If no mutated source ever lowers, this test says nothing about the
        lowering, so an empty reach is a failure. */
@@ -549,9 +314,8 @@ TEST(Fuzz, IrDecoderSurvivesMutatedArtifacts) {
     uint64_t state = UINT64_C(0x2c9a7e5510b3d641);
     ASSERT_FALSE(seed.empty());
     for (std::size_t round = 0u; round < 60000u; ++round) {
-        std::vector<uint8_t> input = MutateBytes(seed, &state);
-        input.insert(input.begin(), static_cast<uint8_t>(2u));
-        ql_fuzz::FuzzOne(input.data(), input.size());
+        const std::vector<uint8_t> input = MutateBytes(seed, &state);
+        ql_fuzz_ir_decoder(input.data(), input.size());
     }
     /* Mutations that never decode would only be exercising the length checks
        at the front of the reader. */
@@ -560,16 +324,16 @@ TEST(Fuzz, IrDecoderSurvivesMutatedArtifacts) {
 
 TEST(Fuzz, TargetsAcceptArbitraryBytes) {
     uint64_t state = UINT64_C(0x7b3f5d9021ce4a86);
-    for (std::size_t round = 0u; round < 30000u; ++round) {
+    for (std::size_t round = 0u; round < 20000u; ++round) {
         std::vector<uint8_t> input(NextRandom(&state) % 192u);
         for (std::size_t index = 0u; index < input.size(); ++index) {
             input[index] = static_cast<uint8_t>(NextRandom(&state));
         }
-        ql_fuzz::FuzzOne(input.data(), input.size());
+        ql_fuzz_frontend(input.data(), input.size());
+        ql_fuzz_lowering(input.data(), input.size());
+        ql_fuzz_ir_decoder(input.data(), input.size());
     }
-    ExpectNoViolation();
+    EXPECT_GT(ExpectNoViolation().parsed, 0u);
 }
 
 }  // namespace
-
-#endif
