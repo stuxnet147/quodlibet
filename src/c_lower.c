@@ -123,8 +123,14 @@ typedef struct lower_variable {
     char *name;
     size_t name_size;
     lower_type type;
-    /* Set for a pointer parameter, whose object the table declares. */
+    /* Set for a pointer whose object the table declares. */
     uint32_t has_object;
+    /* Set when this variable lives in storage rather than in an SSA value,
+       which is what taking its address requires. Its value is then whatever
+       memory holds, and `value` is unused. */
+    uint32_t is_stack;
+    /* The address of that storage, typed as a pointer to the variable. */
+    ql_ir_value_id address;
     ql_ir_value_id value;
     uint32_t initialized;
     uint32_t is_const;
@@ -138,6 +144,16 @@ typedef struct lower_object {
     ql_ir_value_id base;
     ql_ir_value_id size;
 } lower_object;
+
+/* Storage for one address-taken name. `is_parameter` marks the ones whose
+   incoming value has to be written into the slot on entry. */
+typedef struct lower_stack_slot {
+    char *name;
+    lower_type type;
+    size_t object;
+    ql_ir_value_id address;
+    uint32_t is_parameter;
+} lower_stack_slot;
 
 typedef struct lower_state {
     ql_ir_value_id *values;
@@ -183,6 +199,23 @@ typedef struct lower_context {
     ql_ir_value_id memory_value;
     lower_object *objects;
     size_t object_count;
+    size_t object_capacity;
+    /* Objects the caller supplied, which are the ones the entry block states
+       assumptions for. Anything past this the function made for itself. */
+    size_t parameter_object_count;
+    /* Names this function takes the address of, so their locals get storage
+       instead of an SSA value. */
+    char **address_taken;
+    size_t address_taken_count;
+    size_t address_taken_capacity;
+    /* The storage those names get. The IR builder requires every parameter to
+       precede the first constant and instruction, so the base and size
+       parameters are created before the entry block and the address value is
+       computed inside it. */
+    lower_stack_slot *stack_slots;
+    size_t stack_slot_count;
+    size_t stack_slot_capacity;
+    size_t body_node;
     uint32_t uses_memory;
     ql_ir_value_id true_value;
     ql_ir_value_id false_value;
@@ -686,6 +719,90 @@ static size_t typedef_declarator_name(const lower_context *context,
         return SIZE_MAX;
     }
     return SIZE_MAX;
+}
+
+/* A local only needs storage if something asks for its address. Finding that
+   out up front keeps every other local in an SSA value, where it is cheaper
+   and easier to reason about. */
+static ql_status collect_address_taken(lower_context *context,
+                                       size_t body_node, ql_error *error) {
+    size_t end = subtree_end(context, body_node);
+    size_t index;
+
+    for (index = body_node + 1u; index < end; ++index) {
+        size_t operator_node;
+        size_t argument_node;
+        char *operator_text;
+        char *name;
+        int is_address_of;
+        size_t existing;
+        ql_status status;
+
+        if (strcmp(context->nodes[index].view.kind,
+                   "pointer_expression") != 0) {
+            continue;
+        }
+        operator_node = direct_field_child(context, index, "operator");
+        argument_node = direct_field_child(context, index, "argument");
+        if (operator_node == SIZE_MAX || argument_node == SIZE_MAX ||
+            strcmp(context->nodes[argument_node].view.kind,
+                   "identifier") != 0) {
+            continue;
+        }
+        operator_text = copy_node_text(context, operator_node);
+        if (operator_text == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        is_address_of = strcmp(operator_text, "&") == 0;
+        context->allocator->deallocate(context->allocator->user_data,
+                                       operator_text);
+        if (!is_address_of) {
+            continue;
+        }
+        name = copy_node_text(context, argument_node);
+        if (name == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        for (existing = 0u; existing < context->address_taken_count;
+             ++existing) {
+            if (strcmp(context->address_taken[existing], name) == 0) {
+                break;
+            }
+        }
+        if (existing < context->address_taken_count) {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           name);
+            continue;
+        }
+        status = grow_array(context->allocator,
+                            (void **)&context->address_taken,
+                            &context->address_taken_capacity,
+                            sizeof(*context->address_taken),
+                            context->address_taken_count + 1u, error);
+        if (status != QL_STATUS_OK) {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           name);
+            return status;
+        }
+        context->address_taken[context->address_taken_count++] = name;
+    }
+    return QL_STATUS_OK;
+}
+
+
+static void release_address_taken(lower_context *context) {
+    size_t index;
+    for (index = 0u; index < context->address_taken_count; ++index) {
+        context->allocator->deallocate(context->allocator->user_data,
+                                       context->address_taken[index]);
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   context->address_taken);
+    context->address_taken = NULL;
+    context->address_taken_count = 0u;
+    context->address_taken_capacity = 0u;
 }
 
 static ql_status collect_typedefs(lower_context *context, ql_error *error) {
@@ -1825,6 +1942,9 @@ static ql_status emit_access_guard(lower_context *context,
     return emit_ub_guard(context, &guard, error);
 }
 
+static lower_value stack_address(const lower_context *context,
+                                 const lower_variable *variable);
+
 static ql_status emit_load(lower_context *context, lower_value pointer,
                            lower_value *output, ql_error *error) {
     lower_type pointee = pointer_target(pointer.type);
@@ -2049,6 +2169,20 @@ static ql_status add_variable(lower_context *context, const char *name,
     variable->name_size = name_size;
     variable->type = type;
     variable->value = value;
+    {
+        size_t slot;
+        for (slot = 0u; slot < context->stack_slot_count; ++slot) {
+            if (strcmp(context->stack_slots[slot].name, variable->name) != 0) {
+                continue;
+            }
+            /* The slot was created before the entry block; the variable only
+               binds to it now. */
+            variable->is_stack = 1u;
+            variable->address = context->stack_slots[slot].address;
+            variable->has_object = 1u;
+            break;
+        }
+    }
     variable->initialized = initialized;
     variable->is_const = is_const;
     variable->scope_depth = context->scope_depth;
@@ -2115,6 +2249,9 @@ static void restore_state(lower_context *context, const lower_state *state) {
     size_t index;
     context->memory_value = state->memory;
     for (index = 0u; index < state->count; ++index) {
+        if (context->variables[index].is_stack != 0u) {
+            continue;
+        }
         context->variables[index].value = state->values[index];
         context->variables[index].initialized = state->initialized[index];
     }
@@ -2987,6 +3124,10 @@ static ql_status lower_identifier(lower_context *context, size_t node,
     if (status != QL_STATUS_OK) {
         return status;
     }
+    if (variable->is_stack != 0u) {
+        return emit_load(context, stack_address(context, variable), output,
+                         error);
+    }
     output->value = variable->value;
     output->defined = context->true_value;
     output->type = variable->type;
@@ -3854,15 +3995,30 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
         return QL_STATUS_OK;
     }
     if (strcmp(kind, "identifier") == 0) {
-        /* A local or parameter lives in an SSA value, not in storage, so it
-           has no address to take. Giving it one means the function creating
-           an object for itself, which this slice does not do yet. Reporting
-           it as a pointer obstacle keeps the coverage tables pointed at the
-           part that is actually missing. */
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-            "taking the address of a local needs an object this slice does "
-            "not create", error);
+        char *name = copy_node_text(context, node);
+        lower_variable *variable;
+        if (name == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        variable = find_variable(context, name, strlen(name));
+        context->allocator->deallocate(context->allocator->user_data, name);
+        if (variable == NULL) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNDECLARED_IDENTIFIER, node,
+                "identifier does not name a visible local or parameter",
+                error);
+        }
+        if (variable->is_stack == 0u) {
+            /* The pre-pass decides which locals get storage, so reaching
+               here means this name was never seen with an address taken. */
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+                "this local lives in a value, not in storage", error);
+        }
+        *output = stack_address(context, variable);
+        *declared = variable->type;
+        return QL_STATUS_OK;
     }
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
@@ -4130,6 +4286,12 @@ static ql_status lower_assignment(lower_context *context, size_t node,
     if (status != QL_STATUS_OK) {
         return status;
     }
+    if (variable->is_stack != 0u) {
+        /* The value lives in storage, so writing it is a store and the
+           variable record holds nothing to update. */
+        return emit_store(context, stack_address(context, variable),
+                          converted, error);
+    }
     variable->value = converted.value;
     variable->initialized = 1u;
     variable->has_object = converted.has_object;
@@ -4330,6 +4492,18 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             return status;
         }
         variable = &context->variables[context->variable_count - 1u];
+        if (variable->is_stack != 0u) {
+            if (value_node == SIZE_MAX) {
+                /* Storage without an initialiser holds an indeterminate
+                   value, which C does not let you read and this slice does
+                   not model. Refusing beats inventing a value for it. */
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ,
+                    identifier,
+                    "a local whose address is taken needs an initialiser in "
+                    "this slice", error);
+            }
+        }
         if (value_node != SIZE_MAX) {
             lower_value value;
             lower_value converted;
@@ -4346,11 +4520,23 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             if (status != QL_STATUS_OK) {
                 return status;
             }
-            variable->value = converted.value;
-            variable->initialized = 1u;
-            /* A pointer local is only as well-founded as what was put in
-               it. */
-            variable->has_object = converted.has_object;
+            variable = &context->variables[context->variable_count - 1u];
+            if (variable->is_stack != 0u) {
+                status = emit_store(context,
+                                    stack_address(context, variable),
+                                    converted, error);
+                if (status != QL_STATUS_OK || context->unknown != 0u) {
+                    return status;
+                }
+                variable = &context->variables[context->variable_count - 1u];
+                variable->initialized = 1u;
+            } else {
+                variable->value = converted.value;
+                variable->initialized = 1u;
+                /* A pointer local is only as well-founded as what was put in
+                   it. */
+                variable->has_object = converted.has_object;
+            }
         } else if (is_const != 0u) {
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION,
@@ -4427,6 +4613,12 @@ static ql_status merge_branch_states(
     size_t index;
     for (index = 0u; index < left->count; ++index) {
         lower_variable *variable = &context->variables[index];
+        if (variable->is_stack != 0u) {
+            /* Memory already carries it, and the memory PHI below merges
+               that. A second PHI over a value it does not have would be
+               wrong. */
+            continue;
+        }
         if (left->initialized[index] == 0u ||
             right->initialized[index] == 0u) {
             variable->initialized = 0u;
@@ -4825,6 +5017,169 @@ static ql_status check_function_specifiers(lower_context *context,
         order ]
    which keeps the first N parameters lined up with the C arguments and puts
    everything the memory model needs behind them. */
+static ql_status add_object(lower_context *context, const char *label,
+                            const uint64_t *fixed_size,
+                            size_t *index_out, ql_error *error);
+
+/* The declared type of an address-taken name, found either among the
+   parameters or in the declaration that introduces it. Sizing the slot
+   correctly is what keeps an out-of-bounds access out of bounds; rounding
+   every slot up to a machine word would quietly make overruns look legal. */
+static ql_status stack_slot_type(lower_context *context, const char *name,
+                                 lower_type *output, uint32_t *is_parameter,
+                                 ql_error *error) {
+    size_t index;
+    size_t end;
+
+    *is_parameter = 0u;
+    for (index = 0u; index < context->variable_count; ++index) {
+        if (strcmp(context->variables[index].name, name) == 0) {
+            *output = context->variables[index].type;
+            *is_parameter = 1u;
+            return QL_STATUS_OK;
+        }
+    }
+    end = subtree_end(context, context->body_node);
+    for (index = context->body_node + 1u; index < end; ++index) {
+        size_t type_node;
+        size_t declaration_end;
+        size_t child;
+        lower_type base;
+        uint32_t is_const;
+        ql_status status;
+
+        if (strcmp(context->nodes[index].view.kind, "declaration") != 0) {
+            continue;
+        }
+        type_node = direct_field_child(context, index, "type");
+        if (type_node == SIZE_MAX) {
+            continue;
+        }
+        declaration_end = subtree_end(context, index);
+        for (child = index + 1u; child < declaration_end; ++child) {
+            size_t declarator = child;
+            uint32_t pointer_depth;
+            int rejected;
+            size_t named;
+            char *candidate;
+            int matches;
+
+            if (context->nodes[child].parent != index ||
+                context->nodes[child].view.field_name == NULL ||
+                strcmp(context->nodes[child].view.field_name,
+                       "declarator") != 0) {
+                continue;
+            }
+            if (strcmp(context->nodes[declarator].view.kind,
+                       "init_declarator") == 0) {
+                declarator = direct_field_child(context, declarator,
+                                                "declarator");
+            }
+            if (declarator == SIZE_MAX) {
+                continue;
+            }
+            named = member_declarator_name(context, declarator,
+                                           &pointer_depth, &rejected);
+            if (named == SIZE_MAX || rejected != 0) {
+                continue;
+            }
+            candidate = copy_node_text(context, named);
+            if (candidate == NULL) {
+                ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                return QL_STATUS_OUT_OF_MEMORY;
+            }
+            matches = strcmp(candidate, name) == 0;
+            context->allocator->deallocate(context->allocator->user_data,
+                                           candidate);
+            if (!matches) {
+                continue;
+            }
+            status = parse_local_type(context, index, type_node, &base,
+                                      &is_const, error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+            if (pointer_depth > 2u) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, named,
+                    "this slice carries at most two levels of indirection",
+                    error);
+            }
+            *output = base;
+            while (pointer_depth-- > 0u) {
+                *output = make_pointer_to(*output);
+            }
+            return QL_STATUS_OK;
+        }
+    }
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNDECLARED_IDENTIFIER,
+        context->body_node,
+        "an address is taken of a name this function does not declare",
+        error);
+}
+
+/* Every slot's base and size parameter, created while parameters may still be
+   added. Nothing is emitted here. */
+static ql_status add_stack_slot_objects(lower_context *context,
+                                        ql_error *error) {
+    size_t index;
+
+    for (index = 0u; index < context->address_taken_count; ++index) {
+        const char *name = context->address_taken[index];
+        lower_stack_slot *slot;
+        lower_type type;
+        uint32_t is_parameter;
+        char label[160];
+        size_t object;
+        ql_status status;
+
+        status = stack_slot_type(context, name, &type, &is_parameter, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        if (type.kind == QL_C_SCALAR_RECORD ||
+            type.kind == QL_C_SCALAR_VOID) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+                context->body_node,
+                "storage for a record or void local is outside this slice",
+                error);
+        }
+        if (snprintf(label, sizeof(label), "%s@%zu", name,
+                     context->object_count) < 0) {
+            ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                         "stack object label does not fit");
+            return QL_STATUS_INTERNAL_ERROR;
+        }
+        status = add_object(context, label, NULL, &object, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        status = grow_array(context->allocator,
+                            (void **)&context->stack_slots,
+                            &context->stack_slot_capacity,
+                            sizeof(*context->stack_slots),
+                            context->stack_slot_count + 1u, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        slot = &context->stack_slots[context->stack_slot_count];
+        memset(slot, 0, sizeof(*slot));
+        slot->name = copy_text(context->allocator, name, strlen(name));
+        if (slot->name == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        slot->type = type;
+        slot->object = object;
+        slot->address = QL_IR_INVALID_VALUE_ID;
+        slot->is_parameter = is_parameter;
+        ++context->stack_slot_count;
+    }
+    return QL_STATUS_OK;
+}
+
 static ql_status add_object_parameters(lower_context *context,
                                        ql_error *error) {
     lower_type u64 = address_type();
@@ -4851,36 +5206,18 @@ static ql_status add_object_parameters(lower_context *context,
     }
     for (index = 0u; index < context->variable_count; ++index) {
         const lower_variable *variable = &context->variables[index];
-        char name[128];
-        lower_object *object;
+        size_t object;
         if (variable->type.kind != QL_C_SCALAR_POINTER) {
             continue;
         }
-        object = &context->objects[next++];
-        if (snprintf(name, sizeof(name), "%s.__base", variable->name) < 0) {
-            ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
-                         "object parameter name does not fit");
-            return QL_STATUS_INTERNAL_ERROR;
-        }
-        status = ql_ir_builder_add_parameter(context->builder, u64.ir_type,
-                                             name, strlen(name),
-                                             &object->base, error);
+        status = add_object(context, variable->name, NULL, &object, error);
         if (status != QL_STATUS_OK) {
             return status;
         }
-        if (snprintf(name, sizeof(name), "%s.__size", variable->name) < 0) {
-            ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
-                         "object parameter name does not fit");
-            return QL_STATUS_INTERNAL_ERROR;
-        }
-        status = ql_ir_builder_add_parameter(context->builder, u64.ir_type,
-                                             name, strlen(name),
-                                             &object->size, error);
-        if (status != QL_STATUS_OK) {
-            return status;
-        }
+        (void)next;
     }
-    return QL_STATUS_OK;
+    context->parameter_object_count = context->object_count;
+    return add_stack_slot_objects(context, error);
 }
 
 static ql_status emit_assume(lower_context *context, ql_ir_value_id predicate,
@@ -4894,18 +5231,100 @@ static ql_status emit_assume(lower_context *context, ql_ir_value_id predicate,
    above the first page, they do not wrap, and distinct objects are disjoint.
    The interpreter checks the same three on its object table, so a run and a
    query cannot disagree about which layouts are admissible. */
-static ql_status emit_object_assumptions(lower_context *context,
-                                         ql_error *error) {
+static ql_status emit_assumptions_for_object(lower_context *context,
+                                             size_t index, ql_error *error);
+
+/* Appends one object and its base and size parameters. Callers past the entry
+   block pass a known size, which an assumption pins so that nothing is free
+   to pick a different one. */
+static ql_status add_object(lower_context *context, const char *label,
+                            const uint64_t *fixed_size, size_t *index_out,
+                            ql_error *error) {
+    lower_type u64 = address_type();
+    lower_object *object;
+    char name[160];
+    ql_status status;
+
+    status = ensure_ir_type(context, &u64, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = grow_array(context->allocator, (void **)&context->objects,
+                        &context->object_capacity,
+                        sizeof(*context->objects),
+                        context->object_count + 1u, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    object = &context->objects[context->object_count];
+    memset(object, 0, sizeof(*object));
+    if (snprintf(name, sizeof(name), "%s.__base", label) < 0) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "object parameter name does not fit");
+        return QL_STATUS_INTERNAL_ERROR;
+    }
+    status = ql_ir_builder_add_parameter(context->builder, u64.ir_type, name,
+                                         strlen(name), &object->base, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    if (snprintf(name, sizeof(name), "%s.__size", label) < 0) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "object parameter name does not fit");
+        return QL_STATUS_INTERNAL_ERROR;
+    }
+    status = ql_ir_builder_add_parameter(context->builder, u64.ir_type, name,
+                                         strlen(name), &object->size, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    *index_out = context->object_count++;
+    if (fixed_size == NULL) {
+        return QL_STATUS_OK;
+    }
+    status = emit_assumptions_for_object(context, *index_out, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    {
+        ql_ir_value_id expected;
+        ql_ir_value_id predicate;
+        status = add_uint_constant(context, u64, *fixed_size, &expected,
+                                   error);
+        if (status == QL_STATUS_OK) {
+            status = emit_compare(context, QL_IR_OPCODE_EQ, object->size,
+                                  expected, &predicate, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_assume(context, predicate, error);
+        }
+    }
+    return status;
+}
+
+
+/* The address of a variable that lives in storage, as a value. */
+static lower_value stack_address(const lower_context *context,
+                                 const lower_variable *variable) {
+    lower_value address;
+    memset(&address, 0, sizeof(address));
+    address.value = variable->address;
+    address.type = make_pointer_to(variable->type);
+    address.defined = context->true_value;
+    address.may_ub = 0u;
+    address.has_object = 1u;
+    return address;
+}
+
+static ql_status emit_assumptions_for_object(lower_context *context,
+                                             size_t index,
+                                             ql_error *error) {
     lower_type u64 = address_type();
     ql_ir_value_id first_address;
     ql_ir_value_id zero;
-    size_t index;
     size_t other;
     ql_status status;
 
-    if (context->object_count == 0u) {
-        return QL_STATUS_OK;
-    }
     status = add_uint_constant(context, u64,
                                QL_IR_INTERP_FIRST_OBJECT_ADDRESS,
                                &first_address, error);
@@ -4915,7 +5334,7 @@ static ql_status emit_object_assumptions(lower_context *context,
     if (status != QL_STATUS_OK) {
         return status;
     }
-    for (index = 0u; index < context->object_count; ++index) {
+    {
         const lower_object *object = &context->objects[index];
         ql_ir_value_id operands[2];
         ql_ir_value_id limit;
@@ -4986,6 +5405,110 @@ static ql_status emit_object_assumptions(lower_context *context,
     return QL_STATUS_OK;
 }
 
+/* A parameter arrives as a value. If something takes its address it also
+   needs storage, so the entry block gives it a slot and writes the incoming
+   value there once. */
+static ql_status materialize_stack_slots(lower_context *context,
+                                         ql_error *error) {
+    size_t index;
+
+    for (index = 0u; index < context->stack_slot_count; ++index) {
+        lower_stack_slot *slot = &context->stack_slots[index];
+        lower_type pointer = make_pointer_to(slot->type);
+        uint64_t size = type_byte_width(context, slot->type);
+        lower_value address;
+        lower_value pointer_value;
+        ql_ir_value_id expected;
+        ql_ir_value_id predicate;
+        ql_status status;
+
+        status = emit_assumptions_for_object(context, slot->object, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        /* The size is known here, so it is pinned rather than left for a
+           solver to choose. */
+        status = add_uint_constant(context, address_type(), size, &expected,
+                                   error);
+        if (status == QL_STATUS_OK) {
+            status = emit_compare(context, QL_IR_OPCODE_EQ,
+                                  context->objects[slot->object].size,
+                                  expected, &predicate, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_assume(context, predicate, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = ensure_bool_constants(context, error);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        memset(&address, 0, sizeof(address));
+        address.value = context->objects[slot->object].base;
+        address.type = address_type();
+        address.defined = context->true_value;
+        address.has_object = 1u;
+        status = emit_pointer_of_address(context, address, pointer,
+                                         &pointer_value, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        slot->address = pointer_value.value;
+    }
+    /* Parameters entered the variable table before their slots existed, so
+       they bind here, once the addresses are computed. */
+    for (index = 0u; index < context->variable_count; ++index) {
+        lower_variable *variable = &context->variables[index];
+        size_t slot;
+        for (slot = 0u; slot < context->stack_slot_count; ++slot) {
+            if (strcmp(context->stack_slots[slot].name, variable->name) != 0) {
+                continue;
+            }
+            variable->is_stack = 1u;
+            variable->address = context->stack_slots[slot].address;
+            variable->has_object = 1u;
+            break;
+        }
+    }
+    /* A parameter arrives as a value, so its slot has to be given that value
+       once before the body runs. */
+    for (index = 0u; index < context->variable_count; ++index) {
+        lower_variable *variable = &context->variables[index];
+        lower_value incoming;
+        ql_status status;
+        if (variable->is_stack == 0u) {
+            continue;
+        }
+        memset(&incoming, 0, sizeof(incoming));
+        incoming.value = variable->value;
+        incoming.type = variable->type;
+        incoming.defined = context->true_value;
+        incoming.has_object = variable->has_object;
+        status = emit_store(context, stack_address(context, variable),
+                            incoming, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+    }
+    return QL_STATUS_OK;
+}
+
+/* The entry block states the assumptions for the objects the caller
+   supplied. Objects the function makes for itself state their own where they
+   are made, which is what lets one appear part-way through a body. */
+static ql_status emit_object_assumptions(lower_context *context,
+                                         ql_error *error) {
+    size_t index;
+    for (index = 0u; index < context->parameter_object_count; ++index) {
+        ql_status status = emit_assumptions_for_object(context, index, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+    return QL_STATUS_OK;
+}
+
 static ql_status initialize_parameters(lower_context *context,
                                        ql_error *error) {
     size_t index;
@@ -5031,30 +5554,34 @@ static ql_status initialize_parameters(lower_context *context,
             return status;
         }
     }
+    /* A pointer parameter brings an object with it, and a local whose
+       address is taken will need one later. Either way the function touches
+       memory, and the memory parameter has to exist before the body runs. */
     for (index = 0u; index < context->variable_count; ++index) {
         if (context->variables[index].type.kind == QL_C_SCALAR_POINTER) {
-            ++context->object_count;
+            context->uses_memory = 1u;
         }
     }
-    if (context->object_count != 0u) {
+    if (context->address_taken_count != 0u) {
         context->uses_memory = 1u;
-        context->objects = context->allocator->allocate(
-            context->allocator->user_data,
-            context->object_count * sizeof(*context->objects));
-        if (context->objects == NULL) {
-            context->object_count = 0u;
-            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
-            return QL_STATUS_OUT_OF_MEMORY;
-        }
-        memset(context->objects, 0,
-               context->object_count * sizeof(*context->objects));
     }
     return add_object_parameters(context, error);
 }
 
 static void cleanup_context(lower_context *context) {
+    size_t index;
+
     pop_variables(context, 0u);
     release_typedefs(context);
+    release_address_taken(context);
+    for (index = 0u; index < context->stack_slot_count; ++index) {
+        context->allocator->deallocate(context->allocator->user_data,
+                                       context->stack_slots[index].name);
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   context->stack_slots);
+    context->stack_slots = NULL;
+    context->stack_slot_count = 0u;
     context->allocator->deallocate(context->allocator->user_data,
                                    context->type_cache);
     context->type_cache = NULL;
@@ -5193,6 +5720,14 @@ ql_status QL_CALL ql_c_lower_selected_function(
         return QL_STATUS_INVALID_ARGUMENT;
     }
 
+    context.body_node = body_node;
+    status = collect_address_taken(&context, body_node, error);
+    if (status != QL_STATUS_OK) {
+        cleanup_context(&context);
+        ql_c_lower_result_destroy(result);
+        return status;
+    }
+
     status = check_function_specifiers(&context, function_node, error);
     if (status == QL_STATUS_OK && context.unknown == 0u) {
         status = ql_ir_builder_create(selected, &context.builder, error);
@@ -5226,6 +5761,9 @@ ql_status QL_CALL ql_c_lower_selected_function(
             status = emit_object_assumptions(&context, error);
         }
         if (status == QL_STATUS_OK) {
+            status = materialize_stack_slots(&context, error);
+        }
+        if (status == QL_STATUS_OK && context.unknown == 0u) {
             status = lower_compound(&context, body_node, 0u, error);
         }
     }
