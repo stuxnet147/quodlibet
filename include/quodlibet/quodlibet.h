@@ -11,6 +11,7 @@
 #include "quodlibet/evidence.h"
 #include "quodlibet/hash.h"
 #include "quodlibet/ir.h"
+#include "quodlibet/ir_interp.h"
 #include "quodlibet/ir_verify.h"
 #include "quodlibet/method.h"
 #include "quodlibet/pipeline.h"
