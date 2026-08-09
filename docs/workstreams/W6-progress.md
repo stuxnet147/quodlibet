@@ -5,15 +5,15 @@
 
 ## 지금 하는 것
 
-WU2. `src/egraph_check.c` 로 merge log 를 e-graph 코드와 독립적으로 재생하는 checker 를 만드는 중입니다.
+WU3. `src/combine.c` 로 여러 method 의 결과를 증거 우선 규칙으로 결합하는 중입니다.
 
 ## 작업 단위
 
 | 단위 | 내용 | 상태 | 커밋 |
 |---|---|---|---|
 | WU1 | rewrite rule catalogue (W6.md 2번) | 완료 | (아래) |
-| WU2 | 독립 merge replay checker `src/egraph_check.c` (1번) | 진행 중 | |
-| WU3 | 증거 우선 결합 `src/combine.c` (3번) | 대기 | |
+| WU2 | 독립 merge replay checker `src/egraph_check.c` (1번) | 완료 | (아래) |
+| WU3 | 증거 우선 결합 `src/combine.c` (3번) | 진행 중 | |
 | WU4 | persistent artifact/evidence cache `src/cache.c` (4번) | 대기 | |
 | WU5 | cache key 완전성 통합 검증 (5번) | 대기 | |
 
@@ -46,10 +46,26 @@ e-graph 는 순수 term engine 이고 UB/poison/effect 를 모르므로(`egraph.
 
 검증: `ctest --preset windows-clang` 330/330 통과.
 
+### WU2 가 실제로 넣은 것
+
+`src/egraph_check.c` 는 e-graph 엔진 코드를 부르지 않습니다. term table 과 merge log 를 데이터로 받아 자체 union-find 를 세우고 record 를 순서대로 재생하면서, 각 merge 가 앞선 record 들이 만든 상태에서 그 rule 로 정당화되는지를 직접 계산합니다. `reason` 문자열을 믿지 않습니다.
+
+설계 결정:
+
+- **class representative 를 "그 class 에서 가장 작은 식별자" 로 정의**했습니다. record 의 class snapshot 을 검사하려면 checker 가 엔진과 같은 이름을 얻어야 하는데, 엔진의 tie-breaking 을 베끼는 대신 canonical form 을 유도해서 씁니다. 어긋나면 `STALE_CLASS` 로 거부합니다.
+- **rejected 여도 merge 를 적용하고 계속 갑니다.** 첫 결함에서 멈추면 뒤의 결함이 전부 그 뒤에 숨습니다. `ReportsEveryRejectionNotOnlyTheFirst` 가 이것을 고정합니다.
+- **AXIOM 은 JUSTIFIED 가 아니라 ASSUMED** 로 따로 셉니다. axiom 이 하나라도 있으면 `all_merges_justified` 는 0 입니다.
+- **catalogue version 과 digest 가 이 빌드와 다르면 replay 를 거부**합니다. 다른 rule set 의 side condition 으로 검사하게 되기 때문입니다.
+- witness 후보가 여럿일 수 있어(양쪽 operand class 가 모두 상수를 품는 경우) 모든 후보를 시도한 뒤에만 거부합니다. 처음 후보만 보면 정당한 merge 를 오탐합니다.
+
+시험 `tests/test_egraph_check.cpp` 15개. `JustifiesEveryMergeAWideSaturationProduces` 는 엔진의 모든 rewrite 계열이 발화하는 그래프를 saturate 시켜 rejected 0 을 요구하므로, 엔진이 catalogue 와 어긋나게 rewrite 하면 깨집니다. 나머지는 위조 record(없는 side condition, 잘못된 operator, 없는 rule, stale class, 재정렬, 잘못된 congruence)를 넣어 거부를 고정합니다.
+
+검증: `ctest --preset windows-clang` 345/345 통과.
+
 ## 막힌 것
 
 없습니다.
 
 ## 다음에 할 것
 
-WU2 checker. catalogue 의 shape 과 조건 비트를 소비해서 각 merge record 를 자체 union-find 위에서 재생합니다.
+WU3 결합기. `METHODS.md` 의 "Parallel combination rules" 9개 규칙이 이미 문서에 있으므로 그것을 구현하고 규칙별 시험으로 고정합니다.

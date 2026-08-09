@@ -186,6 +186,34 @@ The e-graph itself is a pure term engine with no undefined-behaviour, effect,
 or poison semantics, so these bits are a record of what the engine assumed,
 not a claim that the frontend discharged it.
 
+#### The independent replay checker
+
+`src/egraph_check.c` shares no code with the engine. It takes a term table and
+a merge log as data, rebuilds its own union-find, and walks the records in
+sequence. For each record it asks whether the named rule justifies that merge
+in the state the earlier records produced, recomputing every side condition
+itself rather than trusting the reason string. This is the same separation
+`src/ir_verify.c` keeps from the IR builder.
+
+Each record gets one of three verdicts.
+
+- `JUSTIFIED`. The rule and the replayed state establish the merge.
+- `ASSUMED`. A trusted axiom. Nothing in the log justifies it and every
+  downstream result is relative to it, so assumed and justified are counted
+  separately and `all_merges_justified` is 0 whenever an axiom is present.
+- `REJECTED`. The merge does not follow. This is a defect in the engine, the
+  evidence, or the catalogue. It is never resolved by trusting the engine.
+
+The checker refuses a log whose rewrite catalogue version or digest it does not
+carry, because it would otherwise discharge side conditions from a different
+rule set than the one that fired. A rejected merge is still applied to the
+replay state so later records are checked against the derivation the engine
+actually had; stopping at the first defect would hide the rest.
+
+`ql_egraph_check_terms_equal` answers the equivalence the replay established,
+not the one the engine reports. A caller that wants to act on an e-graph
+`PROVED_EQUAL` asks the report, not the engine.
+
 ### SMT product program
 
 Method name: `prove.smt-product`. This is the first implemented method. The
