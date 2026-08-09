@@ -85,6 +85,7 @@ file(GLOB QL_OPTIONAL_CORE_SOURCES CONFIGURE_DEPENDS LIST_DIRECTORIES false
     "${CMAKE_CURRENT_SOURCE_DIR}/src/policy.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/precondition.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/problem.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/process_runner.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/product.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_aigsat.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_diff.c"
