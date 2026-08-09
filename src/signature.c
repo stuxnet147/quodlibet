@@ -746,12 +746,296 @@ static int normalize_spelling(const char *spelling, char *output,
     return 1;
 }
 
+/* --- Typedef resolution --------------------------------------------------- */
+
+/* The corpus this profile serves is anonymized decompiler output, where every
+   scalar arrives through a `typedef int TYP_0;` chain. Without resolution the
+   signature refuses names the lowering happily accepts, and a function whose
+   IR exists gets no signature to describe it.
+
+   The resolution is deliberately its own walk of the syntax tree rather than a
+   call into the lowering. `ql_source_signature_bind_ir` is only a real
+   cross-check while the two derive the same fact independently; sharing the
+   code would make it a restatement. */
+
+#define QL_SIGNATURE_SPELLING_CAPACITY 64u
+#define QL_SIGNATURE_TYPEDEF_DEPTH 64u
+
+typedef struct signature_typedef {
+    char name[QL_SIGNATURE_SPELLING_CAPACITY];
+    char underlying[QL_SIGNATURE_SPELLING_CAPACITY];
+    /* The declarator adds a pointer, an array, or a function. */
+    uint32_t is_indirect;
+    /* The underlying type is a struct, union, or enum specifier. */
+    uint32_t is_aggregate;
+} signature_typedef;
+
+typedef struct signature_typedefs {
+    ql_allocator allocator;
+    signature_typedef *items;
+    size_t count;
+    size_t capacity;
+} signature_typedefs;
+
+static void typedefs_dispose(signature_typedefs *table) {
+    table->allocator.deallocate(table->allocator.user_data, table->items);
+    table->items = NULL;
+    table->count = 0u;
+    table->capacity = 0u;
+}
+
+static int typedefs_add(signature_typedefs *table,
+                        const signature_typedef *entry) {
+    if (table->count == table->capacity) {
+        const size_t capacity = table->capacity == 0u ? 16u
+                                                      : table->capacity * 2u;
+        void *allocation = table->allocator.reallocate(
+            table->allocator.user_data, table->items,
+            capacity * sizeof(*table->items));
+        if (allocation == NULL) {
+            return 0;
+        }
+        table->items = (signature_typedef *)allocation;
+        table->capacity = capacity;
+    }
+    table->items[table->count++] = *entry;
+    return 1;
+}
+
+static int copy_node_spelling(const char *source, size_t source_size,
+                              const ql_source_range *range, char *output,
+                              size_t capacity) {
+    size_t length;
+
+    if (range->end_byte < range->start_byte ||
+        (size_t)range->end_byte > source_size) {
+        return 0;
+    }
+    length = (size_t)(range->end_byte - range->start_byte);
+    if (length + 1u > capacity) {
+        return 0;
+    }
+    memcpy(output, source + range->start_byte, length);
+    output[length] = '\0';
+    return 1;
+}
+
+static int node_kind_is(const ql_c_syntax_node_view *view, const char *kind) {
+    return view->kind != NULL && strcmp(view->kind, kind) == 0;
+}
+
+static int node_field_is(const ql_c_syntax_node_view *view,
+                         const char *field) {
+    return view->field_name != NULL && strcmp(view->field_name, field) == 0;
+}
+
+static ql_status cursor_view(const ql_c_syntax_cursor *cursor,
+                             ql_c_syntax_node_view *view, ql_error *error) {
+    memset(view, 0, sizeof(*view));
+    view->struct_size = sizeof(*view);
+    return ql_c_syntax_cursor_current(cursor, view, error);
+}
+
+/* Descends a declarator to the identifier it binds, reporting whether the path
+   introduced indirection. The cursor is left where it started. */
+static int declarator_name(ql_c_syntax_cursor *cursor, const char *source,
+                           size_t source_size, char *name, size_t capacity,
+                           uint32_t *is_indirect, ql_error *error) {
+    size_t depth = 0u;
+    size_t guard = 0u;
+    int found = 0;
+
+    *is_indirect = 0u;
+    while (guard++ < QL_SIGNATURE_TYPEDEF_DEPTH) {
+        ql_c_syntax_node_view view;
+        int descended = 0;
+
+        if (cursor_view(cursor, &view, error) != QL_STATUS_OK) {
+            break;
+        }
+        if (node_kind_is(&view, "type_identifier") ||
+            node_kind_is(&view, "identifier")) {
+            found = copy_node_spelling(source, source_size, &view.range, name,
+                                       capacity);
+            break;
+        }
+        if (node_kind_is(&view, "pointer_declarator") ||
+            node_kind_is(&view, "array_declarator") ||
+            node_kind_is(&view, "function_declarator")) {
+            *is_indirect = 1u;
+        } else if (!node_kind_is(&view, "parenthesized_declarator")) {
+            break;
+        }
+        if (ql_c_syntax_cursor_goto_first_child(cursor) == 0u) {
+            break;
+        }
+        ++depth;
+        do {
+            if (cursor_view(cursor, &view, error) == QL_STATUS_OK &&
+                node_field_is(&view, "declarator")) {
+                descended = 1;
+                break;
+            }
+        } while (ql_c_syntax_cursor_goto_next_sibling(cursor) != 0u);
+        if (!descended) {
+            break;
+        }
+    }
+    while (depth-- != 0u) {
+        (void)ql_c_syntax_cursor_goto_parent(cursor);
+    }
+    return found;
+}
+
+/* Reads one `type_definition` node. The cursor is left where it started. */
+static ql_status collect_one_typedef(ql_c_syntax_cursor *cursor,
+                                     const char *source, size_t source_size,
+                                     signature_typedefs *table,
+                                     ql_error *error) {
+    char underlying[QL_SIGNATURE_SPELLING_CAPACITY];
+    uint32_t is_aggregate = 0u;
+    int has_underlying = 0;
+
+    if (ql_c_syntax_cursor_goto_first_child(cursor) == 0u) {
+        return QL_STATUS_OK;
+    }
+    do {
+        ql_c_syntax_node_view view;
+        if (cursor_view(cursor, &view, error) != QL_STATUS_OK ||
+            !node_field_is(&view, "type")) {
+            continue;
+        }
+        is_aggregate = (node_kind_is(&view, "struct_specifier") ||
+                        node_kind_is(&view, "union_specifier") ||
+                        node_kind_is(&view, "enum_specifier"))
+                           ? 1u
+                           : 0u;
+        has_underlying = copy_node_spelling(source, source_size, &view.range,
+                                            underlying, sizeof(underlying));
+        break;
+    } while (ql_c_syntax_cursor_goto_next_sibling(cursor) != 0u);
+    (void)ql_c_syntax_cursor_goto_parent(cursor);
+    if (!has_underlying) {
+        return QL_STATUS_OK;
+    }
+
+    if (ql_c_syntax_cursor_goto_first_child(cursor) == 0u) {
+        return QL_STATUS_OK;
+    }
+    do {
+        ql_c_syntax_node_view view;
+        signature_typedef entry;
+        if (cursor_view(cursor, &view, error) != QL_STATUS_OK ||
+            !node_field_is(&view, "declarator")) {
+            continue;
+        }
+        memset(&entry, 0, sizeof(entry));
+        if (!declarator_name(cursor, source, source_size, entry.name,
+                             sizeof(entry.name), &entry.is_indirect, error)) {
+            continue;
+        }
+        entry.is_aggregate = is_aggregate;
+        memcpy(entry.underlying, underlying, sizeof(underlying));
+        if (!typedefs_add(table, &entry)) {
+            (void)ql_c_syntax_cursor_goto_parent(cursor);
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+    } while (ql_c_syntax_cursor_goto_next_sibling(cursor) != 0u);
+    (void)ql_c_syntax_cursor_goto_parent(cursor);
+    return QL_STATUS_OK;
+}
+
+static ql_status collect_typedefs_at(ql_c_syntax_cursor *cursor,
+                                     const char *source, size_t source_size,
+                                     signature_typedefs *table,
+                                     ql_error *error) {
+    ql_c_syntax_node_view view;
+    ql_status status = cursor_view(cursor, &view, error);
+
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    if (node_kind_is(&view, "type_definition")) {
+        status = collect_one_typedef(cursor, source, source_size, table,
+                                     error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+    if (ql_c_syntax_cursor_goto_first_child(cursor) == 0u) {
+        return QL_STATUS_OK;
+    }
+    do {
+        status = collect_typedefs_at(cursor, source, source_size, table,
+                                     error);
+        if (status != QL_STATUS_OK) {
+            break;
+        }
+    } while (ql_c_syntax_cursor_goto_next_sibling(cursor) != 0u);
+    (void)ql_c_syntax_cursor_goto_parent(cursor);
+    return status;
+}
+
+static ql_status collect_typedefs(const ql_allocator *allocator,
+                                  const char *source, size_t source_size,
+                                  signature_typedefs *table,
+                                  ql_error *error) {
+    ql_c_parser *parser = NULL;
+    ql_c_syntax_tree *tree = NULL;
+    ql_c_syntax_cursor *cursor = NULL;
+    ql_status status;
+
+    memset(table, 0, sizeof(*table));
+    table->allocator = *allocator;
+    if (source == NULL || source_size == 0u) {
+        return QL_STATUS_OK;
+    }
+    status = ql_c_parser_create(allocator, &parser, error);
+    if (status == QL_STATUS_OK) {
+        status = ql_c_parser_parse(parser, source, source_size, &tree, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = ql_c_syntax_cursor_create(tree, &cursor, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = collect_typedefs_at(cursor, source, source_size, table,
+                                     error);
+    }
+    ql_c_syntax_cursor_destroy(cursor);
+    ql_c_syntax_tree_destroy(tree);
+    ql_c_parser_destroy(parser);
+    if (status != QL_STATUS_OK) {
+        typedefs_dispose(table);
+    }
+    return status;
+}
+
+static const signature_typedef *typedefs_find(
+    const signature_typedefs *table, const char *normalized) {
+    char candidate[QL_SIGNATURE_SPELLING_CAPACITY];
+    size_t index;
+
+    for (index = 0u; index < table->count; ++index) {
+        if (!normalize_spelling(table->items[index].name, candidate,
+                                sizeof(candidate))) {
+            continue;
+        }
+        if (strcmp(candidate, normalized) == 0) {
+            return &table->items[index];
+        }
+    }
+    return NULL;
+}
+
 static ql_status type_from_inventory(const ql_c_type_inventory_v1 *inventory,
                                      uint32_t pointer_width,
+                                     const signature_typedefs *typedefs,
                                      const char *role,
                                      ql_source_type_v1 *output,
                                      ql_error *error) {
-    char normalized[64];
+    char normalized[QL_SIGNATURE_SPELLING_CAPACITY];
+    size_t chain;
     size_t index;
 
     ql_source_type_init(output, QL_SOURCE_TYPE_VOID);
@@ -779,26 +1063,55 @@ static ql_status type_from_inventory(const ql_c_type_inventory_v1 *inventory,
                      role);
         return QL_STATUS_TYPE_MISMATCH;
     }
-    if (strcmp(normalized, "void") == 0) {
-        output->kind = QL_SOURCE_TYPE_VOID;
-        return QL_STATUS_OK;
-    }
-    if (strcmp(normalized, "_Bool") == 0 || strcmp(normalized, "bool") == 0) {
-        output->kind = QL_SOURCE_TYPE_BOOL;
-        output->bit_width = 1u;
-        return QL_STATUS_OK;
-    }
-    for (index = 0u; index < sizeof(signature_integer_table) /
-                                 sizeof(signature_integer_table[0]);
-         ++index) {
-        if (strcmp(normalized, signature_integer_table[index].spelling) != 0) {
-            continue;
+    for (chain = 0u; chain < QL_SIGNATURE_TYPEDEF_DEPTH; ++chain) {
+        const signature_typedef *entry;
+
+        if (strcmp(normalized, "void") == 0) {
+            output->kind = QL_SOURCE_TYPE_VOID;
+            return QL_STATUS_OK;
         }
-        output->kind = signature_integer_table[index].is_signed != 0u
-                           ? QL_SOURCE_TYPE_SIGNED_INTEGER
-                           : QL_SOURCE_TYPE_UNSIGNED_INTEGER;
-        output->bit_width = signature_integer_table[index].bit_width;
-        return QL_STATUS_OK;
+        if (strcmp(normalized, "_Bool") == 0 ||
+            strcmp(normalized, "bool") == 0) {
+            output->kind = QL_SOURCE_TYPE_BOOL;
+            output->bit_width = 1u;
+            return QL_STATUS_OK;
+        }
+        for (index = 0u; index < sizeof(signature_integer_table) /
+                                     sizeof(signature_integer_table[0]);
+             ++index) {
+            if (strcmp(normalized,
+                       signature_integer_table[index].spelling) != 0) {
+                continue;
+            }
+            output->kind = signature_integer_table[index].is_signed != 0u
+                               ? QL_SOURCE_TYPE_SIGNED_INTEGER
+                               : QL_SOURCE_TYPE_UNSIGNED_INTEGER;
+            output->bit_width = signature_integer_table[index].bit_width;
+            return QL_STATUS_OK;
+        }
+        /* Only a name this unit actually declared is resolved. Giving a
+           meaning to a name nobody declared is a guess about a type, and a
+           wrong guess about a type is a wrong answer about the function. */
+        entry = typedefs == NULL ? NULL : typedefs_find(typedefs, normalized);
+        if (entry == NULL) {
+            break;
+        }
+        if (entry->is_indirect != 0u) {
+            output->kind = QL_SOURCE_TYPE_POINTER;
+            output->bit_width = pointer_width;
+            output->pointer_depth = 1u;
+            return QL_STATUS_OK;
+        }
+        if (entry->is_aggregate != 0u) {
+            ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                         "%s names an aggregate type, which source-signature schema v1 does not carry by value",
+                         role);
+            return QL_STATUS_TYPE_MISMATCH;
+        }
+        if (!normalize_spelling(entry->underlying, normalized,
+                                sizeof(normalized))) {
+            break;
+        }
     }
     ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
                  "%s type '%s' is not in the frozen ASM2C_GNU_V1 table", role,
@@ -810,9 +1123,20 @@ ql_status QL_CALL ql_source_signature_from_c_function(
     const ql_allocator *allocator, const ql_c_frontend_unit *unit,
     const ql_c_function_view *function, ql_c_dialect_profile c_dialect,
     ql_target_abi target_abi, ql_artifact **output, ql_error *error) {
+    return ql_source_signature_from_c_function_v2(
+        allocator, unit, function, NULL, 0u, c_dialect, target_abi, output,
+        error);
+}
+
+ql_status QL_CALL ql_source_signature_from_c_function_v2(
+    const ql_allocator *allocator, const ql_c_frontend_unit *unit,
+    const ql_c_function_view *function, const char *source,
+    size_t source_size, ql_c_dialect_profile c_dialect,
+    ql_target_abi target_abi, ql_artifact **output, ql_error *error) {
     const ql_allocator *selected = select_allocator(allocator);
     ql_source_signature_definition_v1 definition;
     ql_source_type_v1 arguments[QL_SOURCE_SIGNATURE_MAX_ARGUMENTS];
+    signature_typedefs typedefs;
     size_t index;
     ql_status status;
 
@@ -845,11 +1169,17 @@ ql_status QL_CALL ql_source_signature_from_c_function(
     definition.target_abi = target_abi;
     definition.function_name = function->name;
     definition.function_name_size = strlen(function->name);
-    status = type_from_inventory(&function->return_type,
-                                 definition.pointer_width, "return type",
-                                 &definition.return_type, error);
+    status = collect_typedefs(selected, source, source_size, &typedefs,
+                              error);
     if (status != QL_STATUS_OK) {
         return status;
+    }
+    status = type_from_inventory(&function->return_type,
+                                 definition.pointer_width, &typedefs,
+                                 "return type", &definition.return_type,
+                                 error);
+    if (status != QL_STATUS_OK) {
+        goto cleanup;
     }
     for (index = 0u; index < function->parameter_count; ++index) {
         ql_c_parameter_view parameter;
@@ -858,24 +1188,29 @@ ql_status QL_CALL ql_source_signature_from_c_function(
         status = ql_c_frontend_parameter_at(unit, function->index, index,
                                             &parameter, error);
         if (status != QL_STATUS_OK) {
-            return status;
+            goto cleanup;
         }
         status = type_from_inventory(&parameter.type,
-                                     definition.pointer_width, "parameter",
-                                     &arguments[index], error);
+                                     definition.pointer_width, &typedefs,
+                                     "parameter", &arguments[index], error);
         if (status != QL_STATUS_OK) {
-            return status;
+            goto cleanup;
         }
         if (arguments[index].kind == QL_SOURCE_TYPE_VOID) {
             ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
                          "parameter %zu has void type", index);
-            return QL_STATUS_TYPE_MISMATCH;
+            status = QL_STATUS_TYPE_MISMATCH;
+            goto cleanup;
         }
     }
     definition.arguments = function->parameter_count != 0u ? arguments : NULL;
     definition.argument_count = function->parameter_count;
-    return ql_source_signature_artifact_create(selected, &definition, output,
-                                               error);
+    status = ql_source_signature_artifact_create(selected, &definition,
+                                                 output, error);
+
+cleanup:
+    typedefs_dispose(&typedefs);
+    return status;
 }
 
 static ql_status ir_type_matches(const ql_ir *ir, ql_ir_type_id type_id,

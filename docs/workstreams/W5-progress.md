@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-3단계 완료. miter, replay, 관찰 축이 메모리까지 넓어졌고 val 코퍼스 판정률을 쟀습니다. 남은 것은 signature 의 typedef 공백이며 조율자 판단 대기입니다.
+지시서 다섯 항목이 전부 닫혔습니다. val 판정률 11/11 (100%) 입니다.
 
 ## 기준선
 
@@ -195,11 +195,52 @@ PYTHONPATH=out/build/windows-clang/bindings/python/package \
 
 `PYTHONPATH` 로 쓰는 파이썬은 CMake 가 고른 것과 같아야 합니다(이 기계에서는 3.13). 3.11 로 부르면 확장이 `PY_SSIZE_T_CLEAN` SystemError 를 냅니다. W4 영역의 별개 문제이므로 손대지 않았습니다.
 
+### 4. signature 의 typedef 해석
+
+커밋: (이 커밋)
+
+3단계 측정이 지목한 병목입니다. 조율자가 구체안을 승인했고 `bindings/python/src/ql_check.c` 수정도 이 변경에 한해 위임받았습니다.
+
+#### `ql_source_signature_from_c_function_v2`
+
+append-only 로 새 함수를 넣었습니다. v1 은 그대로 두었고(소스를 받지 않으므로 아무것도 해석하지 않습니다) 헤더에 v2 를 권장으로 적었습니다. 호출자 둘(`bindings/python/src/ql_check.c`, `tests/w2_fixtures.h`)을 v2 로 옮겼습니다.
+
+#### 해석은 로어링을 부르지 않는다
+
+`signature.c` 가 **직접 구문 트리를 훑습니다.** `ql_c_parser_parse` 로 소스를 다시 파싱하고 `ql_c_syntax_cursor` 로 `type_definition` 노드를 모아 이름과 underlying 철자, 간접성(pointer/array/function declarator), aggregate 여부를 기록합니다.
+
+로어링의 typedef 표를 빌려 쓰면 `ql_source_signature_bind_ir` 이 교차 검증이 아니라 같은 말의 반복이 됩니다. **중복 구현은 의도한 비용입니다.** `AResolvedTypedefStillBindsToTheLoweredIr` 이 두 유도가 여전히 서로를 검사한다는 것을 고정합니다.
+
+규칙입니다.
+
+- **이 unit 이 실제로 선언한 이름만** 해석합니다. 선언되지 않은 이름에 뜻을 붙이는 것은 타입에 대한 추측이고, 타입에 대한 틀린 추측은 함수에 대한 틀린 답입니다
+- 사슬은 64단계까지 따라갑니다
+- 포인터/배열/함수를 가리키는 typedef 는 포인터 인자입니다
+- struct/union/enum 을 가리키는 typedef 를 값으로 받으면 거부합니다. signature v1 에 집합 타입 kind 가 없습니다
+
+#### 결과
+
+val 판정률이 **5/11 (45.5%) 에서 11/11 (100%) 로** 올랐습니다. 포인터 함수 9건 전부 판정을 받습니다. 남은 blocking reason 은 없습니다.
+
+`tests/test_signature.cpp` 에 5개를 더했습니다. 사슬 해석, 포인터 typedef, 미선언 이름 거부, v1 의 동작 불변, bind_ir 교차 검증 유지입니다.
+
+`ctest` 277/277 통과입니다(272 + 5).
+
+#### 양 플랫폼 검증
+
+공개 ABI 에 함수를 더했으므로 두 플랫폼을 다 돌렸습니다.
+
+| 플랫폼 | 결과 |
+|---|---|
+| Windows (`windows-clang`) | 277/277 통과 |
+| Linux (WSL, `linux-clang`) | 276/276 통과 |
+
+Linux 가 하나 적은 것은 그 환경에 `pytest` 가 없어 `quodlibet.python_bindings` 시험이 **등록되지 않기** 때문입니다. 확장 모듈 자체는 거기서 빌드되고 링크되며(`_quodlibet.abi3.so`), 고친 `ql_check.c` 도 그 빌드에 들어갑니다. 그래도 **Linux 에서 바인딩 시험은 돌지 않았습니다.**
+
 ## 막힌 것
 
-- 없음. 판정률의 남은 55% 는 signature 의 typedef 공백이고, 소유가 걸쳐 있어 조율자에게 물었습니다
+- 없음
 
 ## 다음에 할 것
 
-- 조율자 답에 따라 signature 의 typedef 해석을 이 브랜치에서 열거나 W1 에 넘김
-- `todo.md` 갱신은 조율자 소유이므로 수치는 worker_done 으로 보고
+- 지시서 다섯 항목이 전부 닫혔습니다. `todo.md` 갱신은 조율자 소유이므로 수치는 worker_done 으로 보고합니다

@@ -62,10 +62,10 @@ public:
         }
         support_ = view.support;
         ir_artifact_ = view.ir_artifact;
-        return ql_source_signature_from_c_function(
-            nullptr, unit_, &function, QL_C_DIALECT_ASM2C_GNU_V1,
-            QL_TARGET_ABI_X86_64_LINUX_SYSV_LP64, &signature_artifact_,
-            error);
+        return ql_source_signature_from_c_function_v2(
+            nullptr, unit_, &function, source, source_size,
+            QL_C_DIALECT_ASM2C_GNU_V1, QL_TARGET_ABI_X86_64_LINUX_SYSV_LP64,
+            &signature_artifact_, error);
     }
 
     ql_c_lower_support support() const { return support_; }

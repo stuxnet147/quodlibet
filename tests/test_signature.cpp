@@ -270,4 +270,139 @@ TEST(SourceSignature, RejectsUnknownTypeSpellingsInsteadOfGuessing) {
                              &error));
 }
 
+/* The corpus this profile serves spells every scalar through a typedef chain,
+   so a signature that refuses those names describes almost nothing the
+   lowering accepts. */
+TEST(SourceSignature, ResolvesATypedefChainThisUnitDeclares) {
+    w2::CFunction function;
+    SignatureHandle signature;
+    ql_source_type_v1 argument{};
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(
+        &function,
+        "typedef unsigned char TYP_0;"
+        " typedef TYP_0 TYP_1;"
+        " typedef int TYP_2;"
+        " TYP_2 FUN_0(TYP_1 ARG_0){ return ARG_0; }",
+        "FUN_0"));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_source_signature_open(nullptr, function.signature_artifact(),
+                                       signature.output(), &error))
+        << error.message;
+
+    const ql_source_signature_view_v1 view = View(signature.get());
+    EXPECT_EQ(QL_SOURCE_TYPE_SIGNED_INTEGER, view.return_type.kind);
+    EXPECT_EQ(32u, view.return_type.bit_width);
+    ASSERT_EQ(1u, view.argument_count);
+    ASSERT_EQ(QL_STATUS_OK, ql_source_signature_argument_at(
+                                signature.get(), 0u, &argument, &error));
+    EXPECT_EQ(QL_SOURCE_TYPE_UNSIGNED_INTEGER, argument.kind);
+    EXPECT_EQ(8u, argument.bit_width);
+}
+
+TEST(SourceSignature, ATypedefOfAPointerIsAPointerArgument) {
+    w2::CFunction function;
+    SignatureHandle signature;
+    ql_source_type_v1 argument{};
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(
+        &function,
+        "typedef int TYP_0;"
+        " int FUN_0(TYP_0 *ARG_0){ return ARG_0[0]; }",
+        "FUN_0"));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_source_signature_open(nullptr, function.signature_artifact(),
+                                       signature.output(), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, ql_source_signature_argument_at(
+                                signature.get(), 0u, &argument, &error));
+    EXPECT_EQ(QL_SOURCE_TYPE_POINTER, argument.kind);
+    EXPECT_EQ(64u, argument.bit_width);
+}
+
+/* A name nobody declared has no meaning to recover, and inventing one would be
+   a guess about a type. */
+TEST(SourceSignature, RefusesATypedefNameThisUnitNeverDeclared) {
+    ql_c_frontend_unit *unit = nullptr;
+    ql_c_function_view function{};
+    ql_artifact *artifact = nullptr;
+    constexpr char source[] = "TYP_9 FUN_0(int ARG_0){ return ARG_0; }";
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_analyze(nullptr, source, sizeof(source) - 1u,
+                                    &unit, &error));
+    function.struct_size = sizeof(function);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_select_function(unit, "FUN_0", 5u, &function,
+                                            &error));
+    EXPECT_EQ(QL_STATUS_TYPE_MISMATCH,
+              ql_source_signature_from_c_function_v2(
+                  nullptr, unit, &function, source, sizeof(source) - 1u,
+                  QL_C_DIALECT_ASM2C_GNU_V1,
+                  QL_TARGET_ABI_X86_64_LINUX_SYSV_LP64, &artifact, &error));
+    EXPECT_NE(nullptr, std::strstr(error.message, "TYP_9"));
+    EXPECT_EQ(nullptr, artifact);
+    ql_c_frontend_unit_destroy(unit);
+}
+
+/* The v1 form is not given the source, so it cannot resolve anything. It stays
+   as it was rather than quietly changing meaning for its existing callers. */
+TEST(SourceSignature, TheFormWithoutSourceStillRefusesATypedefName) {
+    ql_c_frontend_unit *unit = nullptr;
+    ql_c_function_view function{};
+    ql_artifact *artifact = nullptr;
+    constexpr char source[] =
+        "typedef int TYP_0; TYP_0 FUN_0(TYP_0 ARG_0){ return ARG_0; }";
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_analyze(nullptr, source, sizeof(source) - 1u,
+                                    &unit, &error));
+    function.struct_size = sizeof(function);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_select_function(unit, "FUN_0", 5u, &function,
+                                            &error));
+    EXPECT_EQ(QL_STATUS_TYPE_MISMATCH,
+              ql_source_signature_from_c_function(
+                  nullptr, unit, &function, QL_C_DIALECT_ASM2C_GNU_V1,
+                  QL_TARGET_ABI_X86_64_LINUX_SYSV_LP64, &artifact, &error));
+    EXPECT_EQ(QL_STATUS_OK,
+              ql_source_signature_from_c_function_v2(
+                  nullptr, unit, &function, source, sizeof(source) - 1u,
+                  QL_C_DIALECT_ASM2C_GNU_V1,
+                  QL_TARGET_ABI_X86_64_LINUX_SYSV_LP64, &artifact, &error))
+        << error.message;
+    ql_artifact_release(artifact);
+    ql_c_frontend_unit_destroy(unit);
+}
+
+/* Resolution is a second derivation, not a restatement of the lowering's, so
+   the binding check still has something to check. */
+TEST(SourceSignature, AResolvedTypedefStillBindsToTheLoweredIr) {
+    w2::CFunction function;
+    SignatureHandle signature;
+    ql_ir *ir = nullptr;
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(
+        &function,
+        "typedef short TYP_0;"
+        " TYP_0 FUN_0(TYP_0 ARG_0){ return ARG_0; }",
+        "FUN_0"));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_source_signature_open(nullptr, function.signature_artifact(),
+                                       signature.output(), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_ir_open(nullptr, function.ir_artifact(), &ir, &error))
+        << error.message;
+    EXPECT_EQ(QL_STATUS_OK,
+              ql_source_signature_bind_ir(signature.get(), ir, &error))
+        << error.message;
+    ql_ir_release(ir);
+}
+
 }  // namespace

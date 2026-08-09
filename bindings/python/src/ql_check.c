@@ -160,10 +160,12 @@ static ql_status side_build(ql_py_side *side, const ql_allocator *allocator,
         /* Not an error. The caller turns this into UNKNOWN. */
         return QL_STATUS_OK;
     }
-    return ql_source_signature_from_c_function(
-        allocator, side->unit, &function, QL_C_DIALECT_ASM2C_GNU_V1,
-        QL_TARGET_ABI_X86_64_LINUX_SYSV_LP64, &side->signature_artifact,
-        error);
+    /* The v2 form is given the source, so a parameter spelled with a typedef
+       this unit declares resolves instead of being refused. */
+    return ql_source_signature_from_c_function_v2(
+        allocator, side->unit, &function, source, source_size,
+        QL_C_DIALECT_ASM2C_GNU_V1, QL_TARGET_ABI_X86_64_LINUX_SYSV_LP64,
+        &side->signature_artifact, error);
 }
 
 /* First lowering diagnostic, so an UNKNOWN says which construct stopped it. */

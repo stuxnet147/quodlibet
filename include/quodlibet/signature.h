@@ -122,10 +122,28 @@ QL_API ql_status QL_CALL ql_source_signature_precondition_view(
    is the frozen ASM2C_GNU_V1 table; it is deliberately independent of the
    lowering so that ql_source_signature_bind_ir() is a real cross-check rather
    than a restatement. A construct outside the frozen table is an explicit
-   QL_STATUS_TYPE_MISMATCH, never a guessed width or signedness. */
+   QL_STATUS_TYPE_MISMATCH, never a guessed width or signedness.
+
+   This form resolves no typedef, so a parameter spelled with a name this unit
+   declared is refused. Prefer the v2 form below, which is given the source and
+   resolves those names. */
 QL_API ql_status QL_CALL ql_source_signature_from_c_function(
     const ql_allocator *allocator, const ql_c_frontend_unit *unit,
     const ql_c_function_view *function, ql_c_dialect_profile c_dialect,
+    ql_target_abi target_abi, ql_artifact **output, ql_error *error);
+/* The recommended form. Given the unit's source it resolves a typedef name to
+   the type this unit declared for it, following chains and reporting a
+   typedef of a pointer, array, or function as a pointer.
+
+   Only a name this unit actually declares is resolved: giving a meaning to an
+   undeclared name would be a guess about a type, and a wrong guess about a
+   type is a wrong answer about the function. The resolution walks the syntax
+   tree itself rather than calling the lowering, which is what keeps
+   ql_source_signature_bind_ir() an independent check. */
+QL_API ql_status QL_CALL ql_source_signature_from_c_function_v2(
+    const ql_allocator *allocator, const ql_c_frontend_unit *unit,
+    const ql_c_function_view *function, const char *source,
+    size_t source_size, ql_c_dialect_profile c_dialect,
     ql_target_abi target_abi, ql_artifact **output, ql_error *error);
 
 /* Rejects any disagreement between the signature and a lowered IR function:
