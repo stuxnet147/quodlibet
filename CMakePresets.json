@@ -88,20 +88,35 @@
     {
       "name": "windows-clang",
       "configurePreset": "windows-clang",
-      "output": { "outputOnFailure": true },
-      "execution": { "noTestsAction": "error" }
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "jobs": 12
+      }
     },
     {
       "name": "linux-clang",
       "configurePreset": "linux-clang",
-      "output": { "outputOnFailure": true },
-      "execution": { "noTestsAction": "error" }
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "jobs": 12
+      }
     },
     {
       "name": "linux-sanitize",
       "configurePreset": "linux-sanitize",
-      "output": { "outputOnFailure": true },
-      "execution": { "noTestsAction": "error" }
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "jobs": 12
+      }
     }
   ]
 }
