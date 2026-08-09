@@ -19,7 +19,10 @@ typedef enum ql_c_scalar_kind {
     /* A pointer under this profile is an address and nothing else, so its
        width and signedness are the address's. What it points at is carried
        beside it by the lowering, not here. */
-    QL_C_SCALAR_POINTER
+    QL_C_SCALAR_POINTER,
+    /* A struct or union. Its layout lives in the lowering's record table,
+       which this header deliberately knows nothing about. */
+    QL_C_SCALAR_RECORD
 } ql_c_scalar_kind;
 
 /* The target ABI is LP64, so an address is 64 bits wide. */

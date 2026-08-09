@@ -5,6 +5,7 @@
 #include "quodlibet/ir_interp.h"
 
 #include <limits.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -38,16 +39,57 @@ typedef struct lower_type {
     uint32_t rank;
     uint32_t is_signed;
     /* Meaningful only when `kind` is QL_C_SCALAR_POINTER. This slice carries
-       pointers to scalars, so one level of indirection is enough. */
+       one level of indirection, to a scalar or to a record. */
     ql_c_scalar_type pointee;
+    /* The record this type is, or points at. SIZE_MAX when neither. */
+    size_t record;
     ql_ir_type_id ir_type;
 } lower_type;
+
+/* One member of a struct or union, with the byte offset the target ABI gives
+   it. */
+typedef struct lower_member {
+    char *name;
+    struct lower_type type;
+    uint64_t offset;
+} lower_member;
+
+/* A struct or union declared in this unit. Layout is computed on demand,
+   because a member can name a record declared later in the file and because
+   a record that contains itself has no layout at all. */
+typedef struct lower_record {
+    char *tag;
+    size_t body_node;
+    uint32_t is_union;
+    uint32_t layout_state;
+    lower_member *members;
+    size_t member_count;
+    size_t member_capacity;
+    uint64_t size;
+    uint32_t alignment;
+} lower_record;
+
+#define LOWER_LAYOUT_PENDING 0u
+#define LOWER_LAYOUT_RUNNING 1u
+#define LOWER_LAYOUT_DONE 2u
+
+/* An enumerator, which is an ordinary integer constant that happens to have a
+   name. */
+typedef struct lower_enumerator {
+    char *name;
+    uint64_t value;
+} lower_enumerator;
 
 typedef struct lower_value {
     ql_ir_value_id value;
     ql_ir_value_id defined;
     lower_type type;
     uint32_t may_ub;
+    /* Set when this pointer came from a parameter, directly or by
+       arithmetic. The object table is derived from the parameters, so a
+       pointer that arrived any other way has no object an access guard could
+       name. */
+    uint32_t has_object;
 } lower_value;
 
 /* One `typedef` name and the type it stands for. `underlying` is the
@@ -64,6 +106,8 @@ typedef struct lower_variable {
     char *name;
     size_t name_size;
     lower_type type;
+    /* Set for a pointer parameter, whose object the table declares. */
+    uint32_t has_object;
     ql_ir_value_id value;
     uint32_t initialized;
     uint32_t is_const;
@@ -103,6 +147,12 @@ typedef struct lower_context {
     lower_typedef *typedefs;
     size_t typedef_count;
     size_t typedef_capacity;
+    lower_record *records;
+    size_t record_count;
+    size_t record_capacity;
+    lower_enumerator *enumerators;
+    size_t enumerator_count;
+    size_t enumerator_capacity;
     size_t scope_depth;
     lower_type return_type;
     ql_ir_block_id current_block;
@@ -113,6 +163,7 @@ typedef struct lower_context {
     ql_ir_type_id bv_types[129];
     ql_ir_type_id pointer_types[129];
     ql_ir_type_id bool_pointer_type;
+    ql_ir_type_id record_pointer_type;
     /* The memory state threaded through the function, and the objects the
        access guards are written against. */
     ql_ir_value_id memory_value;
@@ -438,6 +489,7 @@ static lower_type type_from_scalar(ql_c_scalar_type scalar) {
     type.width = scalar.width;
     type.rank = scalar.rank;
     type.is_signed = scalar.is_signed;
+    type.record = SIZE_MAX;
     type.ir_type = QL_IR_INVALID_TYPE_ID;
     return type;
 }
@@ -455,10 +507,16 @@ static int type_same(lower_type left, lower_type right) {
     if (!ql_c_scalar_same(scalar_of(left), scalar_of(right))) {
         return 0;
     }
+    if (left.kind == QL_C_SCALAR_RECORD) {
+        return left.record == right.record;
+    }
     if (left.kind != QL_C_SCALAR_POINTER) {
         return 1;
     }
-    return ql_c_scalar_same(left.pointee, right.pointee);
+    if (!ql_c_scalar_same(left.pointee, right.pointee)) {
+        return 0;
+    }
+    return left.record == right.record;
 }
 
 static lower_type make_pointer_type(ql_c_scalar_type pointee) {
@@ -469,27 +527,75 @@ static lower_type make_pointer_type(ql_c_scalar_type pointee) {
     type.rank = 6u;
     type.is_signed = 0u;
     type.pointee = pointee;
+    type.record = SIZE_MAX;
     type.ir_type = QL_IR_INVALID_TYPE_ID;
     return type;
 }
 
-/* Storage width of the pointee, which is what a load or store moves. */
-static uint32_t pointee_byte_width(lower_type pointer) {
-    uint32_t bits = pointer.pointee.kind == QL_C_SCALAR_BOOL
-                        ? 8u
-                        : pointer.pointee.width;
+static lower_type make_record_pointer_type(size_t record) {
+    ql_c_scalar_type pointee;
+    lower_type type;
+    memset(&pointee, 0, sizeof(pointee));
+    pointee.kind = QL_C_SCALAR_RECORD;
+    type = make_pointer_type(pointee);
+    type.record = record;
+    return type;
+}
+
+static lower_type make_record_type(size_t record) {
+    lower_type type;
+    memset(&type, 0, sizeof(type));
+    type.kind = QL_C_SCALAR_RECORD;
+    type.record = record;
+    type.ir_type = QL_IR_INVALID_TYPE_ID;
+    return type;
+}
+
+static uint64_t record_size(const lower_context *context, size_t record);
+static uint32_t record_alignment(const lower_context *context, size_t record);
+
+/* Storage width of the pointee, which is what a load or store moves and what
+   pointer arithmetic steps by. */
+static uint64_t pointee_byte_width(const lower_context *context,
+                                   lower_type pointer) {
+    uint32_t bits;
+    if (pointer.pointee.kind == QL_C_SCALAR_RECORD) {
+        return record_size(context, pointer.record);
+    }
+    bits = pointer.pointee.kind == QL_C_SCALAR_BOOL ? 8u
+                                                    : pointer.pointee.width;
     return (bits + 7u) / 8u;
+}
+
+/* Storage width of an object of this type. */
+static uint64_t type_byte_width(const lower_context *context,
+                                lower_type type) {
+    if (type.kind == QL_C_SCALAR_RECORD) {
+        return record_size(context, type.record);
+    }
+    if (type.kind == QL_C_SCALAR_POINTER) {
+        return QL_C_POINTER_WIDTH / 8u;
+    }
+    return ((type.kind == QL_C_SCALAR_BOOL ? 8u : type.width) + 7u) / 8u;
+}
+
+static uint32_t type_alignment(const lower_context *context,
+                               lower_type type) {
+    if (type.kind == QL_C_SCALAR_RECORD) {
+        return record_alignment(context, type.record);
+    }
+    return (uint32_t)type_byte_width(context, type);
 }
 
 /* Natural alignment on the target ABI, stated the same way the interpreter
    states it: a scalar of N bytes is N-aligned when N is a power of two up to
    sixteen, and nothing else is required. */
-static uint32_t natural_alignment(uint32_t byte_width) {
+static uint32_t natural_alignment(uint64_t byte_width) {
     if (byte_width == 0u || byte_width > 16u ||
         (byte_width & (byte_width - 1u)) != 0u) {
         return 1u;
     }
-    return byte_width;
+    return (uint32_t)byte_width;
 }
 
 /* `allow_void` is set only where C admits an incomplete type: a function's
@@ -592,6 +698,209 @@ static ql_status collect_typedefs(lower_context *context, ql_error *error) {
     return QL_STATUS_OK;
 }
 
+static uint64_t record_size(const lower_context *context, size_t record) {
+    return record < context->record_count ? context->records[record].size
+                                          : 0u;
+}
+
+static uint32_t record_alignment(const lower_context *context,
+                                 size_t record) {
+    return record < context->record_count
+               ? context->records[record].alignment
+               : 1u;
+}
+
+/* Records are looked up by tag. A tagless struct can only be named where it
+   is written, which this slice does not need. */
+static size_t find_record(const lower_context *context, const char *tag,
+                          uint32_t is_union) {
+    size_t index;
+    if (tag == NULL) {
+        return SIZE_MAX;
+    }
+    for (index = 0u; index < context->record_count; ++index) {
+        const lower_record *record = &context->records[index];
+        if (record->tag != NULL && record->is_union == is_union &&
+            strcmp(record->tag, tag) == 0) {
+            return index;
+        }
+    }
+    return SIZE_MAX;
+}
+
+/* Enumerators are integer constants with names. Only values this profile can
+   state are taken; anything else stays unresolved rather than guessed. */
+static ql_status collect_enumerators(lower_context *context,
+                                     ql_error *error) {
+    size_t index;
+
+    for (index = 0u; index < context->node_count; ++index) {
+        size_t end;
+        size_t child;
+        uint64_t next_value = 0u;
+
+        if (strcmp(context->nodes[index].view.kind, "enumerator_list") != 0) {
+            continue;
+        }
+        end = subtree_end(context, index);
+        for (child = index + 1u; child < end; ++child) {
+            size_t name_node;
+            size_t value_node;
+            lower_enumerator *entry;
+            ql_status status;
+
+            if (context->nodes[child].parent != index ||
+                strcmp(context->nodes[child].view.kind, "enumerator") != 0) {
+                continue;
+            }
+            name_node = direct_field_child(context, child, "name");
+            value_node = direct_field_child(context, child, "value");
+            if (name_node == SIZE_MAX) {
+                continue;
+            }
+            if (value_node != SIZE_MAX) {
+                char *text = copy_node_text(context, value_node);
+                unsigned long long parsed = 0ull;
+                char *stop = NULL;
+                if (text == NULL) {
+                    ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                    return QL_STATUS_OUT_OF_MEMORY;
+                }
+                parsed = strtoull(text, &stop, 0);
+                if (stop == text || (stop != NULL && *stop != '\0')) {
+                    /* A computed enumerator is not a literal; leaving it out
+                       makes the identifier unresolved rather than wrong. */
+                    context->allocator->deallocate(
+                        context->allocator->user_data, text);
+                    continue;
+                }
+                context->allocator->deallocate(context->allocator->user_data,
+                                               text);
+                next_value = (uint64_t)parsed;
+            }
+            status = grow_array(context->allocator,
+                                (void **)&context->enumerators,
+                                &context->enumerator_capacity,
+                                sizeof(*context->enumerators),
+                                context->enumerator_count + 1u, error);
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+            entry = &context->enumerators[context->enumerator_count];
+            memset(entry, 0, sizeof(*entry));
+            entry->name = copy_node_text(context, name_node);
+            if (entry->name == NULL) {
+                ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                return QL_STATUS_OUT_OF_MEMORY;
+            }
+            entry->value = next_value;
+            ++context->enumerator_count;
+            ++next_value;
+        }
+    }
+    return QL_STATUS_OK;
+}
+
+static const lower_enumerator *find_enumerator(const lower_context *context,
+                                               const char *name) {
+    size_t index;
+    for (index = 0u; index < context->enumerator_count; ++index) {
+        if (strcmp(context->enumerators[index].name, name) == 0) {
+            return &context->enumerators[index];
+        }
+    }
+    return NULL;
+}
+
+static ql_status collect_records(lower_context *context, ql_error *error) {
+    size_t index;
+
+    for (index = 0u; index < context->node_count; ++index) {
+        const char *kind = context->nodes[index].view.kind;
+        uint32_t is_union;
+        size_t body;
+        size_t name_node;
+        char *tag;
+        lower_record *record;
+        ql_status status;
+
+        if (strcmp(kind, "struct_specifier") == 0) {
+            is_union = 0u;
+        } else if (strcmp(kind, "union_specifier") == 0) {
+            is_union = 1u;
+        } else {
+            continue;
+        }
+        body = direct_field_child(context, index, "body");
+        if (body == SIZE_MAX) {
+            /* A mention without a body refers to a definition elsewhere. */
+            continue;
+        }
+        name_node = direct_field_child(context, index, "name");
+        tag = name_node == SIZE_MAX ? NULL
+                                    : copy_node_text(context, name_node);
+        if (name_node != SIZE_MAX && tag == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        if (find_record(context, tag, is_union) != SIZE_MAX) {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           tag);
+            continue;
+        }
+        status = grow_array(context->allocator, (void **)&context->records,
+                            &context->record_capacity,
+                            sizeof(*context->records),
+                            context->record_count + 1u, error);
+        if (status != QL_STATUS_OK) {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           tag);
+            return status;
+        }
+        record = &context->records[context->record_count++];
+        memset(record, 0, sizeof(*record));
+        record->tag = tag;
+        record->body_node = body;
+        record->is_union = is_union;
+        record->layout_state = LOWER_LAYOUT_PENDING;
+    }
+    return QL_STATUS_OK;
+}
+
+static void release_records(lower_context *context) {
+    size_t index;
+    size_t member;
+    for (index = 0u; index < context->record_count; ++index) {
+        lower_record *record = &context->records[index];
+        for (member = 0u; member < record->member_count; ++member) {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           record->members[member].name);
+        }
+        context->allocator->deallocate(context->allocator->user_data,
+                                       record->members);
+        context->allocator->deallocate(context->allocator->user_data,
+                                       record->tag);
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   context->records);
+    context->records = NULL;
+    context->record_count = 0u;
+    context->record_capacity = 0u;
+}
+
+static void release_enumerators(lower_context *context) {
+    size_t index;
+    for (index = 0u; index < context->enumerator_count; ++index) {
+        context->allocator->deallocate(context->allocator->user_data,
+                                       context->enumerators[index].name);
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   context->enumerators);
+    context->enumerators = NULL;
+    context->enumerator_count = 0u;
+    context->enumerator_capacity = 0u;
+}
+
 static const lower_typedef *find_typedef(const lower_context *context,
                                          const char *name) {
     size_t index;
@@ -618,19 +927,308 @@ static void release_typedefs(lower_context *context) {
     context->typedef_capacity = 0u;
 }
 
+static ql_status ensure_record_layout(lower_context *context, size_t record,
+                                      size_t node, ql_error *error);
+static ql_status parse_type_spelling(lower_context *context,
+                                     const char *spelling, size_t node,
+                                     uint32_t allow_void,
+                                     lower_type *output,
+                                     ql_error *error);
+
+/* Resolves a type node together with the indirection its declarator adds.
+   This is the one place that knows how a struct, a union, an enum, a typedef
+   name, and a plain scalar each turn into a lowering type. */
+static ql_status resolve_type_node(lower_context *context, size_t type_node,
+                                   uint32_t pointer_depth, lower_type *output,
+                                   ql_error *error) {
+    const char *kind = context->nodes[type_node].view.kind;
+    ql_status status;
+
+    if (pointer_depth > 1u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, type_node,
+            "this slice carries one level of indirection", error);
+    }
+    if (strcmp(kind, "struct_specifier") == 0 ||
+        strcmp(kind, "union_specifier") == 0) {
+        const uint32_t is_union = strcmp(kind, "union_specifier") == 0;
+        size_t name_node = direct_field_child(context, type_node, "name");
+        char *tag = name_node == SIZE_MAX
+                        ? NULL
+                        : copy_node_text(context, name_node);
+        size_t record;
+        if (name_node != SIZE_MAX && tag == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        record = find_record(context, tag, is_union);
+        context->allocator->deallocate(context->allocator->user_data, tag);
+        if (record == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, type_node,
+                "struct or union has no definition in this unit", error);
+        }
+        if (pointer_depth == 0u) {
+            /* Only a member held by value needs its layout now. A pointer to
+               the enclosing record is how linked structures are written, and
+               demanding a layout here would call every one of them
+               self-containing. */
+            status = ensure_record_layout(context, record, type_node, error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+            *output = make_record_type(record);
+            return QL_STATUS_OK;
+        }
+        *output = make_record_pointer_type(record);
+        return QL_STATUS_OK;
+    }
+    {
+        char *spelling = copy_node_text(context, type_node);
+        lower_type base;
+        if (spelling == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        status = parse_type_spelling(context, spelling, type_node,
+                                     pointer_depth != 0u, &base, error);
+        context->allocator->deallocate(context->allocator->user_data,
+                                       spelling);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        if (base.kind == QL_C_SCALAR_RECORD) {
+            *output = pointer_depth == 0u
+                          ? base
+                          : make_record_pointer_type(base.record);
+            return QL_STATUS_OK;
+        }
+        *output = pointer_depth == 0u ? base
+                                      : make_pointer_type(scalar_of(base));
+        return QL_STATUS_OK;
+    }
+}
+
+/* Walks a member declarator down to its name, counting the stars on the way.
+   An array or function declarator inside a record is not laid out here. */
+static size_t member_declarator_name(const lower_context *context,
+                                     size_t declarator,
+                                     uint32_t *pointer_depth, int *rejected) {
+    size_t guard = 0u;
+
+    *pointer_depth = 0u;
+    *rejected = 0;
+    while (declarator != SIZE_MAX && guard++ < 64u) {
+        const char *kind = context->nodes[declarator].view.kind;
+        if (strcmp(kind, "field_identifier") == 0 ||
+            strcmp(kind, "identifier") == 0 ||
+            strcmp(kind, "type_identifier") == 0) {
+            return declarator;
+        }
+        if (strcmp(kind, "pointer_declarator") == 0) {
+            ++(*pointer_depth);
+            declarator = direct_field_child(context, declarator,
+                                            "declarator");
+            continue;
+        }
+        if (strcmp(kind, "parenthesized_declarator") == 0) {
+            declarator = direct_field_child(context, declarator,
+                                            "declarator");
+            continue;
+        }
+        *rejected = 1;
+        return SIZE_MAX;
+    }
+    *rejected = 1;
+    return SIZE_MAX;
+}
+
+/* x86-64 SysV layout: each member sits at the next offset its alignment
+   allows, the record's alignment is the widest member's, and the total is
+   rounded up so that an array of the record stays aligned. A union puts every
+   member at zero. */
+static ql_status ensure_record_layout(lower_context *context, size_t record,
+                                      size_t node, ql_error *error) {
+    lower_record *entry;
+    size_t body;
+    size_t end;
+    size_t child;
+    uint64_t offset = 0u;
+    uint32_t alignment = 1u;
+    ql_status status;
+
+    if (record >= context->record_count) {
+        return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+                             node, "record is not declared in this unit",
+                             error);
+    }
+    entry = &context->records[record];
+    if (entry->layout_state == LOWER_LAYOUT_DONE) {
+        return QL_STATUS_OK;
+    }
+    if (entry->layout_state == LOWER_LAYOUT_RUNNING) {
+        /* A record that contains itself by value has no layout, and Tree
+           sitter accepts the declaration, so this has to be refused rather
+           than recursed into. */
+        return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+                             node, "record contains itself by value", error);
+    }
+    entry->layout_state = LOWER_LAYOUT_RUNNING;
+    body = entry->body_node;
+    end = subtree_end(context, body);
+    for (child = body + 1u; child < end; ++child) {
+        size_t type_node;
+        size_t declarator_end;
+        size_t declarator;
+        if (context->nodes[child].parent != body ||
+            strcmp(context->nodes[child].view.kind,
+                   "field_declaration") != 0) {
+            continue;
+        }
+        type_node = direct_field_child(context, child, "type");
+        if (type_node == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION, child,
+                "record member has no type", error);
+        }
+        declarator_end = subtree_end(context, child);
+        for (declarator = child + 1u; declarator < declarator_end;
+             ++declarator) {
+            uint32_t pointer_depth;
+            int rejected;
+            size_t name_node;
+            lower_member *member;
+            lower_type member_type;
+            uint64_t member_size;
+            uint32_t member_alignment;
+            const lower_record *reread;
+
+            if (context->nodes[declarator].parent != child ||
+                context->nodes[declarator].view.field_name == NULL ||
+                strcmp(context->nodes[declarator].view.field_name,
+                       "declarator") != 0) {
+                continue;
+            }
+            name_node = member_declarator_name(context, declarator,
+                                               &pointer_depth, &rejected);
+            if (rejected != 0 || name_node == SIZE_MAX) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+                    declarator,
+                    "array, function, and bit-field members are outside this "
+                    "slice", error);
+            }
+            status = resolve_type_node(context, type_node, pointer_depth,
+                                       &member_type, error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+            if (member_type.kind == QL_C_SCALAR_VOID) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, declarator,
+                    "a record member cannot have void type", error);
+            }
+            member_size = type_byte_width(context, member_type);
+            member_alignment = type_alignment(context, member_type);
+            if (member_alignment == 0u) {
+                member_alignment = 1u;
+            }
+            /* `entry` may have been invalidated by a nested layout growing
+               the record table. */
+            status = grow_array(context->allocator,
+                                (void **)&context->records[record].members,
+                                &context->records[record].member_capacity,
+                                sizeof(lower_member),
+                                context->records[record].member_count + 1u,
+                                error);
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+            entry = &context->records[record];
+            member = &entry->members[entry->member_count];
+            memset(member, 0, sizeof(*member));
+            member->name = copy_node_text(context, name_node);
+            if (member->name == NULL) {
+                ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                return QL_STATUS_OUT_OF_MEMORY;
+            }
+            member->type = member_type;
+            if (entry->is_union != 0u) {
+                member->offset = 0u;
+                if (member_size > entry->size) {
+                    entry->size = member_size;
+                }
+            } else {
+                offset = (offset + member_alignment - 1u) /
+                         member_alignment * member_alignment;
+                member->offset = offset;
+                offset += member_size;
+            }
+            if (member_alignment > alignment) {
+                alignment = member_alignment;
+            }
+            ++entry->member_count;
+            reread = entry;
+            (void)reread;
+        }
+    }
+    entry = &context->records[record];
+    entry->alignment = alignment;
+    if (entry->is_union == 0u) {
+        entry->size = (offset + alignment - 1u) / alignment * alignment;
+    } else {
+        entry->size = (entry->size + alignment - 1u) / alignment * alignment;
+    }
+    if (entry->size == 0u) {
+        return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+                             node, "record has no members", error);
+    }
+    entry->layout_state = LOWER_LAYOUT_DONE;
+    return QL_STATUS_OK;
+}
+
 static ql_status parse_type_spelling(lower_context *context,
                                      const char *spelling, size_t node,
                                      uint32_t allow_void, lower_type *output,
                                      ql_error *error) {
     ql_c_scalar_type scalar;
     size_t hops = 0u;
+    ql_status status;
 
     /* A typedef name means whatever this unit declared it to mean. Only names
        the unit actually declares are resolved: assuming a meaning for an
        undeclared name would be a guess, and a wrong guess about a type is a
        wrong answer about the function. */
     while (!ql_c_scalar_from_spelling(spelling, &scalar)) {
-        const lower_typedef *entry = find_typedef(context, spelling);
+        const lower_typedef *entry;
+        if (strncmp(spelling, "struct", 6u) == 0 ||
+            strncmp(spelling, "union", 5u) == 0) {
+            const uint32_t is_union = spelling[0] == 'u';
+            const char *tag = spelling + (is_union ? 5u : 6u);
+            size_t record;
+            while (*tag == ' ' || *tag == '\t' || *tag == '\n') {
+                ++tag;
+            }
+            record = find_record(context, tag, is_union);
+            if (record == SIZE_MAX) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                    "struct or union has no definition in this unit", error);
+            }
+            status = ensure_record_layout(context, record, node, error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+            *output = make_record_type(record);
+            return QL_STATUS_OK;
+        }
+        if (strncmp(spelling, "enum", 4u) == 0) {
+            /* An enumeration's values are ints under this ABI, and its
+               enumerators are collected separately as named constants. */
+            *output = make_integer_type(32u, 3u, 1u);
+            return QL_STATUS_OK;
+        }
+        entry = find_typedef(context, spelling);
         if (entry == NULL) {
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
@@ -642,11 +1240,7 @@ static ql_status parse_type_spelling(lower_context *context,
                 context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
                 "typedef names a pointer, array, or function type", error);
         }
-        if (entry->is_aggregate != 0u) {
-            return lower_unknown(
-                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
-                "typedef names a struct, union, or enum type", error);
-        }
+
         if (++hops > 64u) {
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
@@ -702,14 +1296,32 @@ static ql_status type_from_inventory(lower_context *context,
         if (status != QL_STATUS_OK || context->unknown != 0u) {
             return status;
         }
-        *output = make_pointer_type(scalar_of(pointee));
+        *output = pointee.kind == QL_C_SCALAR_RECORD
+                      ? make_record_pointer_type(pointee.record)
+                      : make_pointer_type(scalar_of(pointee));
         return QL_STATUS_OK;
     }
     /* The inventory's base-kind classification is a fast syntactic hint.
        Multi-keyword integer specifiers vary in Tree-sitter shape, so the
        versioned spelling parser below is the semantic authority. */
-    return parse_type_spelling(context, inventory->base_spelling, node,
-                               allow_void, output, error);
+    {
+        ql_status status = parse_type_spelling(context,
+                                               inventory->base_spelling, node,
+                                               allow_void, output, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        if (output->kind == QL_C_SCALAR_RECORD) {
+            /* Members of a record are reachable; the whole record as a value
+               is not, because this slice has no aggregate IR value and no
+               object to give it. */
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                "a struct or union passed or returned by value is outside "
+                "this slice", error);
+        }
+        return QL_STATUS_OK;
+    }
 }
 
 static ql_status ensure_ir_type(lower_context *context, lower_type *type,
@@ -725,7 +1337,13 @@ static ql_status ensure_ir_type(lower_context *context, lower_type *type,
         lower_type pointee = type_from_scalar(type->pointee);
         ql_ir_type_id *slot;
         ql_status pointee_status;
-        if (type->pointee.kind == QL_C_SCALAR_BOOL) {
+        if (type->pointee.kind == QL_C_SCALAR_RECORD) {
+            /* A record has no IR type of its own under this profile: a
+               pointer to one is an address into bytes, and every member
+               access reinterprets it at the member's type. */
+            pointee = make_integer_type(8u, 1u, 0u);
+            slot = &context->record_pointer_type;
+        } else if (type->pointee.kind == QL_C_SCALAR_BOOL) {
             slot = &context->bool_pointer_type;
         } else {
             slot = &context->pointer_types[type->pointee.width];
@@ -1010,7 +1628,7 @@ static ql_status emit_address_of_pointer(lower_context *context,
    this rule in the IR rather than one per backend. */
 static ql_status emit_access_defined(lower_context *context,
                                      lower_value pointer,
-                                     uint32_t byte_width,
+                                     uint64_t byte_width,
                                      ql_ir_value_id *output,
                                      ql_error *error) {
     lower_type u64 = address_type();
@@ -1124,7 +1742,7 @@ static ql_status emit_access_defined(lower_context *context,
 /* Guards the access at the point it happens rather than deferring to the
    next observation, which is the tightest place the obligation can sit. */
 static ql_status emit_access_guard(lower_context *context,
-                                   lower_value pointer, uint32_t byte_width,
+                                   lower_value pointer, uint64_t byte_width,
                                    ql_ir_value_id inherited_defined,
                                    uint32_t inherited_may_ub,
                                    ql_error *error) {
@@ -1155,13 +1773,23 @@ static ql_status emit_load(lower_context *context, lower_value pointer,
     ql_ir_value_id operands[2];
     ql_status status;
 
+    if (pointer.has_object == 0u) {
+        /* Its object is not in the table, so no guard could ever justify the
+           access. Refusing here leaves an UNKNOWN rather than IR that is
+           undefined on every input, which would be worse: it would look
+           lowered and prove nothing. */
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, SIZE_MAX,
+            "dereferencing a pointer read out of memory needs an object this "
+            "slice does not declare", error);
+    }
     if (pointee.kind == QL_C_SCALAR_VOID) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
             "a pointer to void has no value to load", error);
     }
-    status = emit_access_guard(context, pointer, pointee_byte_width(
-                                                     pointer.type),
+    status = emit_access_guard(context, pointer, pointee_byte_width(context,
+                                                       pointer.type),
                                pointer.defined, pointer.may_ub, error);
     if (status != QL_STATUS_OK) {
         return status;
@@ -1190,6 +1818,12 @@ static ql_status emit_store(lower_context *context, lower_value pointer,
     uint32_t may_ub = pointer.may_ub | value.may_ub;
     ql_status status;
 
+    if (pointer.has_object == 0u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, SIZE_MAX,
+            "storing through a pointer read out of memory needs an object "
+            "this slice does not declare", error);
+    }
     if (pointee.kind == QL_C_SCALAR_VOID) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
@@ -1204,7 +1838,8 @@ static ql_status emit_store(lower_context *context, lower_value pointer,
         return status;
     }
     status = emit_access_guard(context, pointer,
-                               pointee_byte_width(pointer.type), combined,
+                               pointee_byte_width(context, pointer.type),
+                               combined,
                                may_ub, error);
     if (status != QL_STATUS_OK) {
         return status;
@@ -1249,7 +1884,7 @@ static ql_status emit_pointer_offset(lower_context *context,
         }
     }
     status = add_uint_constant(context, u64,
-                               pointee_byte_width(pointer.type), &scale,
+                               pointee_byte_width(context, pointer.type), &scale,
                                error);
     if (status != QL_STATUS_OK) {
         return status;
@@ -1262,6 +1897,7 @@ static ql_status emit_pointer_offset(lower_context *context,
         return status;
     }
     *output = pointer;
+    output->has_object = pointer.has_object;
     operands[0] = pointer.value;
     operands[1] = scaled;
     status = combine_defined(context, &pointer, &offset, &output->defined,
@@ -1655,6 +2291,7 @@ static ql_status emit_pointer_of_address(lower_context *context,
     }
     *output = address;
     output->type = target;
+    output->has_object = address.has_object;
     return emit_instruction(context, QL_IR_OPCODE_BV_TO_PTR, &target,
                             &address.value, 1u, NULL, 0u, QL_IR_EFFECT_NONE,
                             &output->value, error);
@@ -2260,13 +2897,28 @@ static ql_status lower_identifier(lower_context *context, size_t node,
         return QL_STATUS_OUT_OF_MEMORY;
     }
     variable = find_variable(context, name, strlen(name));
-    context->allocator->deallocate(context->allocator->user_data, name);
     if (variable == NULL) {
+        const lower_enumerator *enumerator = find_enumerator(context, name);
+        context->allocator->deallocate(context->allocator->user_data, name);
+        if (enumerator != NULL) {
+            lower_type type = make_integer_type(32u, 3u, 1u);
+            ql_status constant_status = ensure_bool_constants(context, error);
+            memset(output, 0, sizeof(*output));
+            output->type = type;
+            output->may_ub = 0u;
+            if (constant_status != QL_STATUS_OK) {
+                return constant_status;
+            }
+            output->defined = context->true_value;
+            return add_uint_constant(context, type, enumerator->value,
+                                     &output->value, error);
+        }
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNDECLARED_IDENTIFIER, node,
-            "identifier does not name a parameter or visible local variable",
+            "identifier does not name a parameter, local, or enumerator",
             error);
     }
+    context->allocator->deallocate(context->allocator->user_data, name);
     if (variable->initialized == 0u) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, node,
@@ -2280,6 +2932,7 @@ static ql_status lower_identifier(lower_context *context, size_t node,
     output->defined = context->true_value;
     output->type = variable->type;
     output->may_ub = 0u;
+    output->has_object = variable->has_object;
     return QL_STATUS_OK;
 }
 
@@ -2840,8 +3493,148 @@ static size_t disguised_cast_type(lower_context *context, size_t node,
 
 /* The address a dereference or a subscript designates. Both a load and a
    store need it, so it is computed once here rather than twice. */
+static const lower_member *find_member(const lower_record *record,
+                                       const char *name) {
+    size_t index;
+    for (index = 0u; index < record->member_count; ++index) {
+        if (strcmp(record->members[index].name, name) == 0) {
+            return &record->members[index];
+        }
+    }
+    return NULL;
+}
+
+/* The address of `base + offset`, typed so that a load there yields the
+   member. A pointer member is loaded as a plain address and reinterpreted by
+   the caller, which keeps one indirection level in the type and still lets
+   `p->next->f` work. */
+static lower_type member_load_type(lower_type member) {
+    if (member.kind == QL_C_SCALAR_POINTER) {
+        return make_integer_type(QL_C_POINTER_WIDTH, 4u, 0u);
+    }
+    return member;
+}
+
 static ql_status lower_designator_address(lower_context *context, size_t node,
                                           lower_value *output,
+                                          lower_type *declared,
+                                          ql_error *error);
+
+static ql_status lower_member_address(lower_context *context, size_t node,
+                                      lower_value *output,
+                                      lower_type *declared,
+                                      ql_error *error) {
+    size_t argument_node = direct_field_child(context, node, "argument");
+    size_t field_node = direct_field_child(context, node, "field");
+    size_t operator_node = direct_field_child(context, node, "operator");
+    lower_value base;
+    lower_type base_declared;
+    lower_value address;
+    lower_type u64 = address_type();
+    const lower_member *member;
+    char *operator_text;
+    char *field_name;
+    ql_ir_value_id offset_constant;
+    ql_ir_value_id operands[2];
+    size_t record;
+    int through_pointer;
+    ql_status status;
+
+    if (argument_node == SIZE_MAX || field_node == SIZE_MAX ||
+        operator_node == SIZE_MAX) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "member access is missing its object, operator, or field",
+            error);
+    }
+    operator_text = copy_node_text(context, operator_node);
+    if (operator_text == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    through_pointer = strcmp(operator_text, "->") == 0;
+    context->allocator->deallocate(context->allocator->user_data,
+                                   operator_text);
+
+    if (through_pointer) {
+        status = lower_expression(context, argument_node, &base, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        if (base.type.kind != QL_C_SCALAR_POINTER ||
+            base.type.pointee.kind != QL_C_SCALAR_RECORD) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                "the left of -> must be a pointer to a struct or union",
+                error);
+        }
+        record = base.type.record;
+    } else {
+        /* `x.f` needs x's address, so x has to be something this slice can
+           designate: a dereference, a subscript, or another member. */
+        status = lower_designator_address(context, argument_node, &base,
+                                          &base_declared, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        if (base_declared.kind != QL_C_SCALAR_RECORD) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                "the left of . must be a struct or union object", error);
+        }
+        record = base_declared.record;
+    }
+    status = ensure_record_layout(context, record, node, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    field_name = copy_node_text(context, field_node);
+    if (field_name == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    member = find_member(&context->records[record], field_name);
+    context->allocator->deallocate(context->allocator->user_data, field_name);
+    if (member == NULL) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNDECLARED_IDENTIFIER, field_node,
+            "the record has no such member", error);
+    }
+    *declared = member->type;
+
+    status = emit_address_of_pointer(context, base, &address, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = add_uint_constant(context, u64, member->offset,
+                               &offset_constant, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    operands[0] = address.value;
+    operands[1] = offset_constant;
+    status = emit_instruction(context, QL_IR_OPCODE_ADD, &u64, operands, 2u,
+                              NULL, 0u, QL_IR_EFFECT_NONE, &address.value,
+                              error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    {
+        lower_type loaded = member_load_type(member->type);
+        lower_type pointer = loaded.kind == QL_C_SCALAR_RECORD
+                                 ? make_record_pointer_type(loaded.record)
+                                 : make_pointer_type(scalar_of(loaded));
+        address.defined = base.defined;
+        address.may_ub = base.may_ub;
+        address.has_object = base.has_object;
+        return emit_pointer_of_address(context, address, pointer, output,
+                                       error);
+    }
+}
+
+static ql_status lower_designator_address(lower_context *context, size_t node,
+                                          lower_value *output,
+                                          lower_type *declared,
                                           ql_error *error) {
     const char *kind = context->nodes[node].view.kind;
     ql_status status;
@@ -2883,7 +3676,23 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
                 context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
                 "dereference applies to a pointer", error);
         }
+        *declared = output->type.pointee.kind == QL_C_SCALAR_RECORD
+                        ? make_record_type(output->type.record)
+                        : type_from_scalar(output->type.pointee);
         return QL_STATUS_OK;
+    }
+    if (strcmp(kind, "field_expression") == 0) {
+        return lower_member_address(context, node, output, declared, error);
+    }
+    if (strcmp(kind, "parenthesized_expression") == 0) {
+        size_t inner = first_named_child(context, node);
+        if (inner == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "parenthesised designator is empty", error);
+        }
+        return lower_designator_address(context, inner, output, declared,
+                                        error);
     }
     if (strcmp(kind, "subscript_expression") == 0) {
         size_t base_node = direct_field_child(context, node, "argument");
@@ -2916,11 +3725,51 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
                 "a subscript needs one pointer operand and one integer",
                 error);
         }
-        return emit_pointer_offset(context, base, index, 0, output, error);
+        status = emit_pointer_offset(context, base, index, 0, output,
+                                     error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        *declared = base.type.pointee.kind == QL_C_SCALAR_RECORD
+                        ? make_record_type(base.type.record)
+                        : type_from_scalar(base.type.pointee);
+        return QL_STATUS_OK;
     }
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
         "expression does not designate an object", error);
+}
+
+/* Reads whatever a designator names. A record-valued designator has no value
+   this slice can produce, and a pointer member arrives as a plain address
+   that has to be reinterpreted at its declared type. */
+static ql_status lower_designator_load(lower_context *context, size_t node,
+                                       lower_value *output,
+                                       ql_error *error) {
+    lower_value address;
+    lower_value loaded;
+    lower_type declared;
+    ql_status status = lower_designator_address(context, node, &address,
+                                                &declared, error);
+
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    if (declared.kind == QL_C_SCALAR_RECORD) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+            "a struct or union value is outside this slice; only its members "
+            "are", error);
+    }
+    status = emit_load(context, address, &loaded, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    if (declared.kind != QL_C_SCALAR_POINTER) {
+        *output = loaded;
+        return QL_STATUS_OK;
+    }
+    return emit_pointer_of_address(context, loaded, declared, output, error);
 }
 
 static ql_status lower_expression(lower_context *context, size_t node,
@@ -2974,14 +3823,9 @@ static ql_status lower_expression(lower_context *context, size_t node,
             error);
     }
     if (strcmp(kind, "pointer_expression") == 0 ||
-        strcmp(kind, "subscript_expression") == 0) {
-        lower_value address;
-        ql_status status = lower_designator_address(context, node, &address,
-                                                    error);
-        if (status != QL_STATUS_OK || context->unknown != 0u) {
-            return status;
-        }
-        return emit_load(context, address, output, error);
+        strcmp(kind, "subscript_expression") == 0 ||
+        strcmp(kind, "field_expression") == 0) {
+        return lower_designator_load(context, node, output, error);
     }
     if (
         strcmp(kind, "field_expression") == 0) {
@@ -3004,6 +3848,7 @@ static ql_status lower_store_assignment(lower_context *context, size_t node,
                                         ql_error *error) {
     lower_value address;
     lower_value value;
+    lower_type declared;
     char *operator_text = copy_node_text(context, operator_node);
     ql_status status;
 
@@ -3027,9 +3872,26 @@ static ql_status lower_store_assignment(lower_context *context, size_t node,
     if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
     }
-    status = lower_designator_address(context, left_node, &address, error);
+    status = lower_designator_address(context, left_node, &address,
+                                      &declared, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
+    }
+    if (declared.kind == QL_C_SCALAR_RECORD) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, left_node,
+            "assigning a whole struct or union is outside this slice", error);
+    }
+    if (declared.kind == QL_C_SCALAR_POINTER) {
+        lower_value converted;
+        status = convert_value(context, value, declared, &converted, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        status = emit_address_of_pointer(context, converted, &value, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
     }
     return emit_store(context, address, value, error);
 }
@@ -3055,7 +3917,9 @@ static ql_status lower_assignment(lower_context *context, size_t node,
     if (strcmp(context->nodes[left_node].view.kind, "pointer_expression") ==
             0 ||
         strcmp(context->nodes[left_node].view.kind,
-               "subscript_expression") == 0) {
+               "subscript_expression") == 0 ||
+        strcmp(context->nodes[left_node].view.kind,
+               "field_expression") == 0) {
         return lower_store_assignment(context, node, left_node, right_node,
                                       operator_node, error);
     }
@@ -3207,7 +4071,15 @@ static ql_status parse_local_type(lower_context *context, size_t declaration,
                                                0u, output, error);
         context->allocator->deallocate(context->allocator->user_data,
                                        spelling);
-        return status;
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        if (output->kind == QL_C_SCALAR_RECORD) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, type_node,
+                "a struct or union local is outside this slice", error);
+        }
+        return QL_STATUS_OK;
     }
 }
 
@@ -3972,6 +4844,10 @@ static ql_status initialize_parameters(lower_context *context,
             context, parameter.name, strlen(parameter.name), type, value, 1u,
             (parameter.type.qualifiers & QL_C_TYPE_QUALIFIER_CONST) != 0u,
             SIZE_MAX, error);
+        if (status == QL_STATUS_OK && context->unknown == 0u &&
+            type.kind == QL_C_SCALAR_POINTER) {
+            context->variables[context->variable_count - 1u].has_object = 1u;
+        }
         if (status != QL_STATUS_OK || context->unknown != 0u) {
             return status;
         }
@@ -4000,6 +4876,8 @@ static ql_status initialize_parameters(lower_context *context,
 static void cleanup_context(lower_context *context) {
     pop_variables(context, 0u);
     release_typedefs(context);
+    release_records(context);
+    release_enumerators(context);
     context->allocator->deallocate(context->allocator->user_data,
                                    context->objects);
     context->objects = NULL;
@@ -4071,6 +4949,7 @@ ql_status QL_CALL ql_c_lower_selected_function(
     context.void_type = QL_IR_INVALID_TYPE_ID;
     context.memory_type = QL_IR_INVALID_TYPE_ID;
     context.bool_pointer_type = QL_IR_INVALID_TYPE_ID;
+    context.record_pointer_type = QL_IR_INVALID_TYPE_ID;
     context.memory_value = QL_IR_INVALID_VALUE_ID;
     context.true_value = QL_IR_INVALID_VALUE_ID;
     context.false_value = QL_IR_INVALID_VALUE_ID;
@@ -4109,6 +4988,12 @@ ql_status QL_CALL ql_c_lower_selected_function(
     }
     if (status == QL_STATUS_OK) {
         status = collect_nodes(&context, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = collect_records(&context, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = collect_enumerators(&context, error);
     }
     if (status == QL_STATUS_OK) {
         status = collect_typedefs(&context, error);

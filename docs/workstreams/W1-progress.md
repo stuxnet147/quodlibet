@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-2단계. 포인터를 닫았고 첫 차단 사유가 struct/union/enum 타입으로 옮겨갔습니다. 다음은 aggregate 타입입니다.
+2단계. struct 멤버 접근까지 닫았습니다. 남은 차단은 값으로 오가는 aggregate, 메모리에서 읽은 포인터, 호출, 전역입니다.
 
 ## 기준선
 
@@ -414,6 +414,64 @@ IR 은 `QL_IR_INTERP_FIRST_OBJECT_ADDRESS` 의 상징적 object 를 보고 참�
 - `p - q`(포인터 차이), 이중 포인터, typedef 가 가리키는 포인터
 - `struct`/`union`/`enum` 과 `->`, `.`
 
+### 7. 집합 타입: struct, union, enum
+
+커밋: (이 커밋)
+
+#### 비트필드는 제외가 맞습니다 (측정으로 확인)
+
+지시가 빈도를 보고 판단하라 했으므로 쟀습니다. **train 29,893 본문과 val 1,050 본문 모두에서 비트필드 구문이 0건입니다.** 익명화기가 정규화해 없앤 것으로 보입니다. `UNKNOWN` 유지가 맞고, 이 단위에서 손대지 않았습니다.
+
+같은 측정에서 struct 는 train 의 74%(22,213), union 은 0.9%(256), enum 은 2.7%(803) 였습니다. val 의 `unsupported_type` 638건 중 **87%가 struct 를 선언**하고 **73%가 본문에서 멤버 접근**을 씁니다. 그래서 이 단위의 무게는 전부 struct 입니다.
+
+#### 들어간 것
+
+- struct 와 union 정의 수집, **x86-64 SysV 레이아웃**(멤버 정렬로 offset 올림, 레코드 정렬은 최대 멤버 정렬, 전체 크기는 정렬로 올림). union 은 전 멤버 offset 0
+- `p->f`, `(*p).f`, `p->a.b` 중첩, 괄호 designator
+- 멤버로의 store
+- enum 타입은 `int`, enumerator 는 이름 붙은 정수 상수. 계산식 enumerator 는 넣지 않아 식별자가 미해결로 남습니다(틀린 값보다 낫습니다)
+- typedef 가 aggregate 를 가리키는 경우 해석
+
+레코드에는 IR 타입이 없습니다. **레코드 포인터는 바이트 주소**(`pointer(bv8)`)이고 멤버 접근이 그 주소에 offset 을 더한 뒤 멤버 타입으로 재해석합니다. 평평한 주소 공간 모델과 그대로 맞물립니다.
+
+#### 포인터에 provenance 를 붙였다
+
+`p->next->head` 를 만들면서 드러난 것입니다. object 표는 **파라미터에서 유도**되므로, 메모리에서 읽은 포인터에는 guard 가 이름 붙일 object 가 없습니다. 그대로 두면 로어링이 성공하지만 **모든 입력에서 UB 인 IR** 이 나옵니다. 그것은 로어링된 것처럼 보이면서 아무것도 증명하지 못하므로 `UNKNOWN` 보다 나쁩니다.
+
+그래서 `lower_value` 에 `has_object` 를 두고 파라미터에서 유래한 포인터에만 세웁니다. 산술과 멤버 주소는 물려받고, load 로 얻은 포인터는 갖지 못합니다. 그런 포인터를 역참조하면 `unsupported_pointer` 로 거부합니다.
+
+#### 결과 (val 1,050 본문)
+
+| 첫 차단 사유 | 포인터 단위 후 | 이번 단위 후 |
+|---|---:|---:|
+| (로어링 성공) | 5 | **11** |
+| `unsupported_type` | 638 | **460** |
+| `unsupported_pointer` | 241 | 300 |
+| `unsupported_call` | 90 | 157 |
+| `undeclared_identifier` | 40 | 61 |
+| `unsupported_control_flow` | 10 | 22 |
+| `unsupported_expression` | 11 | 19 |
+
+status 실패는 **0** 입니다. 중간에 struct 를 값으로 받는 함수가 `ensure_ir_type` 까지 내려가 `INTERNAL_ERROR` 를 내는 버그가 38건 있었고, 계약대로 `UNKNOWN` 으로 고쳤습니다. 의미 한계는 언제나 status 실패가 아니라 `UNKNOWN` 입니다.
+
+`unsupported_type` 460 은 이제 **값으로 오가는 struct**(`TYP_4 ARG_0`)와 struct 지역 변수입니다. 둘 다 aggregate object 가 있어야 열립니다.
+
+#### differential 이 struct 함수를 잰다
+
+`tests/test_c_lower_records.cpp` 가 레코드 함수를 실제 컴파일 실행과 대조합니다. 매크로 하나가 **참조가 쓰는 struct 와 로어링이 읽는 struct 를 같은 텍스트에서** 만들기 때문에 레이아웃 차이가 두 선언 뒤에 숨을 수 없습니다.
+
+레이아웃이 이 단위의 전부이므로 사례를 그쪽으로 골랐습니다. `char/int/long long/short` 혼합(모든 padding 결정이 답에 드러납니다), 중첩 레코드, union 의 겹치는 바이트, 멤버 store 후 최종 이미지 비교입니다. 무작위 바이트로 채운 구조체 128회씩입니다.
+
+참조 함수는 **unsigned 로 누산**합니다. 무작위 필드 값을 부호 있는 덧셈으로 더하면 오버플로가 나서 로어링이 정당하게 UB 를 보고하고, 그러면 레이아웃이 아니라 오버플로를 재게 됩니다.
+
+#### 이 단위에서 하지 못한 것
+
+지시에 있었으나 넣지 못했습니다.
+
+- **`&x` 와 지역 포인터 선언**: 지역 object 가 필요합니다. struct 를 값으로 받는 것과 같은 부품이라 다음 단위에서 함께 여는 것이 맞습니다
+- **포인터 차 `p - q`**, 이중 포인터
+- 구조체 안 배열 멤버(`int FLD_0[4]`)
+
 ## 막힌 것
 
 - 없음
@@ -440,8 +498,10 @@ IR 은 `QL_IR_INTERP_FIRST_OBJECT_ADDRESS` 의 상징적 object 를 보고 참�
 
 ## 다음에 할 것
 
-1. **struct, union, enum.** 첫 차단 사유의 61% (638/1050) 입니다. 포인터를 열자 차단이 여기로 옮겨왔습니다. `->` 와 `.` 가 같이 갑니다
-2. `&x` 와 지역 포인터 선언. 지역 object 를 만들면 둘 다 열립니다 연산, object identity, provenance, 유효 범위, alignment, load 와 store 입니다. **interpreter 에 메모리 모델을 같이 넣어야 합니다.** 지금 interpreter 는 포인터를 만나면 `UNSUPPORTED` 를 냅니다
+1. **지역 object.** `&x`, 지역 포인터 선언, struct 지역 변수, 그리고 값으로 오가는 struct 가 전부 같은 부품(함수가 스스로 만드는 object)에서 열립니다. `unsupported_type` 460 의 대부분입니다
+2. 함수 호출과 외부 효과 (157)
+3. 전역 변수와 정적 저장 기간 (61)
+4. 메모리에서 읽은 포인터의 object. 지금은 정직하게 거부합니다 연산, object identity, provenance, 유효 범위, alignment, load 와 store 입니다. **interpreter 에 메모리 모델을 같이 넣어야 합니다.** 지금 interpreter 는 포인터를 만나면 `UNSUPPORTED` 를 냅니다
 2. 전역 변수와 정적 저장 기간 (`undeclared_identifier` 31건)
 3. struct, union, enum (`unsupported_type` 잔여 103건)
 4. 함수 호출과 외부 효과 (`unsupported_call` 55건)
