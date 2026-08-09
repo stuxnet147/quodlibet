@@ -128,5 +128,30 @@ def main() -> int:
     return 0
 
 
+def serial(count: int, offset: int) -> int:
+    """One process, `count` judgements back to back, wall on stdout.
+
+    Used by bench-processes.sh to run the same work across processes instead
+    of threads. Threads that stop scaling where processes keep going are
+    contending on something this process owns; if both stop at the same
+    place, they are contending on the machine or on Bitwuzla.
+    """
+    info = quodlibet.backend_info()
+    if not info["available"]:
+        print("error: this build has no Bitwuzla backend", file=sys.stderr)
+        return 1
+    quodlibet.check(**spec(offset))          # warm, not counted
+    start = time.perf_counter()
+    for index in range(count):
+        result = quodlibet.check(**spec(offset + index))
+        if result.verdict != "proved-equivalent":
+            print(f"error: got {result.verdict}", file=sys.stderr)
+            return 1
+    print(f"{time.perf_counter() - start:.6f}")
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "serial":
+        raise SystemExit(serial(int(sys.argv[2]), int(sys.argv[3])))
     raise SystemExit(main())
