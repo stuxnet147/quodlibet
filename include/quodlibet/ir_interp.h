@@ -99,6 +99,41 @@ typedef struct ql_ir_interp_object_v1 {
     uint64_t reserved[2];
 } ql_ir_interp_object_v1;
 
+/* One argument handed to a callee specification, encoded exactly as IR
+   constants are: exact width, little-endian, unused high bits zero. */
+typedef struct ql_ir_interp_argument_v1 {
+    size_t struct_size;
+    uint32_t bit_width;
+    uint32_t reserved_alignment;
+    size_t size;
+    const void *data;
+    uint64_t reserved[2];
+} ql_ir_interp_argument_v1;
+
+/* Supplies the meaning of a call the module makes. The interpreter has no
+   way to invent one: an external callee is uninterpreted in the IR, and
+   guessing a result would be guessing the answer.
+
+   Returning zero refuses the call and the run reports UNSUPPORTED, which is
+   the honest outcome for a callee nobody specified. Returning non-zero
+   asserts three things about that callee, because the interpreter models
+   them and cannot check them: it does not write memory, it does not trap,
+   and its result depends only on the arguments given here. A callee that
+   breaks any of those must be refused instead. The IR itself stays
+   conservative and lets the call write memory; this narrower model is a
+   property of the specification the caller supplies, not of the IR. */
+typedef int(QL_CALL *ql_ir_interp_callee_fn)(
+    void *user_data, const char *symbol,
+    const ql_ir_interp_argument_v1 *arguments, size_t argument_count,
+    void *result, size_t result_size);
+
+typedef struct ql_ir_interp_callees_v1 {
+    size_t struct_size;
+    ql_ir_interp_callee_fn invoke;
+    void *user_data;
+    uint64_t reserved[2];
+} ql_ir_interp_callees_v1;
+
 typedef struct ql_ir_interp_options_v1 {
     size_t struct_size;
     uint32_t schema_version;
@@ -109,6 +144,8 @@ typedef struct ql_ir_interp_options_v1 {
        declared can only reach undefined accesses. */
     const ql_ir_interp_object_v1 *objects;
     size_t object_count;
+    /* Null means the module may make no calls. */
+    const ql_ir_interp_callees_v1 *callees;
     uint64_t reserved[3];
 } ql_ir_interp_options_v1;
 
@@ -128,7 +165,10 @@ typedef struct ql_ir_interp_result_v1 {
     size_t value_size;
     uint8_t value[QL_IR_INTERP_VALUE_CAPACITY];
     uint64_t steps;
-    uint64_t reserved[4];
+    /* How many external calls the run made, which is the length of the event
+       trace it observed. */
+    uint64_t events;
+    uint64_t reserved[3];
 } ql_ir_interp_result_v1;
 
 /* The first address any object may occupy. Everything below it, address zero

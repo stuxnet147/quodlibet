@@ -1349,13 +1349,56 @@ static ql_status verify_shape(verify_context *context,
                                                instruction->operands[2]) &&
                          result_type == first_type, "store");
         break;
-    case QL_IR_OPCODE_CALL:
+    case QL_IR_OPCODE_CALL: {
+        /* A call threads the observable states it was handed. Producing a
+           memory or event-trace result it never consumed would be conjuring
+           a state from nothing, and everything downstream would read it as
+           the continuation of a history that never happened. */
+        size_t consumed_memory = 0u;
+        size_t consumed_trace = 0u;
+        size_t produced_memory = 0u;
+        size_t produced_trace = 0u;
+        size_t slot;
+
         if (instruction->symbol_size == 0u) {
             return verify_fail(context, QL_IR_VERIFY_TYPE_RULE, block, id,
                                QL_IR_INVALID_VALUE_ID,
                                "a call must name its callee symbol");
         }
+        for (slot = 0u; slot < instruction->operand_count; ++slot) {
+            ql_ir_type_kind kind =
+                verify_value_kind(context, instruction->operands[slot]);
+            if (kind == QL_IR_TYPE_MEMORY) {
+                ++consumed_memory;
+            } else if (kind == QL_IR_TYPE_EVENT_TRACE) {
+                ++consumed_trace;
+            }
+        }
+        for (slot = 0u; slot < instruction->result_count; ++slot) {
+            ql_ir_type_kind kind =
+                verify_value_kind(context, instruction->results[slot]);
+            if (kind == QL_IR_TYPE_MEMORY) {
+                ++produced_memory;
+            } else if (kind == QL_IR_TYPE_EVENT_TRACE) {
+                ++produced_trace;
+            }
+        }
+        if (produced_memory > consumed_memory ||
+            produced_trace > consumed_trace) {
+            return verify_fail(context, QL_IR_VERIFY_TYPE_RULE, block, id,
+                               QL_IR_INVALID_VALUE_ID,
+                               "a call produces an observable state it never "
+                               "consumed");
+        }
+        if (produced_memory != 0u &&
+            (instruction->effects & QL_IR_EFFECT_MEMORY) == 0u) {
+            return verify_fail(context, QL_IR_VERIFY_EFFECT_RULE, block, id,
+                               QL_IR_INVALID_VALUE_ID,
+                               "a call that hands on a memory state must "
+                               "declare the memory effect");
+        }
         break;
+    }
     case QL_IR_OPCODE_TRACE_APPEND:
         if (instruction->operand_count == 0u ||
             instruction->result_count != 1u) {

@@ -145,6 +145,21 @@ typedef struct lower_object {
     ql_ir_value_id size;
 } lower_object;
 
+/* A function this unit declares but does not define. Its types are resolved
+   the first time it is called, so a declaration mentioning something outside
+   this slice only costs the bodies that actually call it. */
+typedef struct lower_callee {
+    char *name;
+    size_t declaration_node;
+    size_t declarator_node;
+    uint32_t is_variadic;
+    uint32_t resolved;
+    lower_type return_type;
+    lower_type *parameters;
+    size_t parameter_count;
+    size_t parameter_capacity;
+} lower_callee;
+
 /* Storage for one address-taken name. `is_parameter` marks the ones whose
    incoming value has to be written into the slot on entry. */
 typedef struct lower_stack_slot {
@@ -160,6 +175,7 @@ typedef struct lower_state {
     uint8_t *initialized;
     size_t count;
     ql_ir_value_id memory;
+    ql_ir_value_id trace;
 } lower_state;
 
 typedef struct lower_context {
@@ -216,6 +232,14 @@ typedef struct lower_context {
     lower_stack_slot *stack_slots;
     size_t stack_slot_count;
     size_t stack_slot_capacity;
+    lower_callee *callees;
+    size_t callee_count;
+    size_t callee_capacity;
+    /* The observable order of external calls. Threaded like memory, and
+       present only when the body actually calls something. */
+    ql_ir_type_id trace_type;
+    ql_ir_value_id trace_value;
+    uint32_t makes_calls;
     size_t body_node;
     uint32_t uses_memory;
     ql_ir_value_id true_value;
@@ -793,6 +817,46 @@ static ql_status collect_address_taken(lower_context *context,
 }
 
 
+/* A call may write memory and is itself observable, so both the memory and
+   the trace parameter have to exist before the body runs. */
+static lower_callee *find_callee(lower_context *context,
+                                 const char *name);
+
+static void collect_calls(lower_context *context, size_t body_node) {
+    size_t end = subtree_end(context, body_node);
+    size_t index;
+
+    for (index = body_node + 1u; index < end; ++index) {
+        size_t function_node;
+        char *name;
+        int is_call;
+
+        if (strcmp(context->nodes[index].view.kind, "call_expression") != 0) {
+            continue;
+        }
+        function_node = direct_field_child(context, index, "function");
+        if (function_node == SIZE_MAX ||
+            strcmp(context->nodes[function_node].view.kind,
+                   "identifier") != 0) {
+            /* A parenthesised callee is the cast Tree-sitter resolved toward
+               a call, and casts neither touch memory nor are observable. */
+            continue;
+        }
+        name = copy_node_text(context, function_node);
+        if (name == NULL) {
+            continue;
+        }
+        is_call = find_callee(context, name) != NULL;
+        context->allocator->deallocate(context->allocator->user_data, name);
+        if (!is_call) {
+            continue;
+        }
+        context->makes_calls = 1u;
+        context->uses_memory = 1u;
+        return;
+    }
+}
+
 static void release_address_taken(lower_context *context) {
     size_t index;
     for (index = 0u; index < context->address_taken_count; ++index) {
@@ -988,6 +1052,89 @@ static const lower_enumerator *find_enumerator(const lower_context *context,
         }
     }
     return NULL;
+}
+
+/* A prototype is a declaration whose declarator is a function declarator.
+   Only the nodes are recorded here; the types are resolved at the first call,
+   so a prototype naming something outside this slice costs only the bodies
+   that call it. */
+static ql_status collect_callees(lower_context *context, ql_error *error) {
+    size_t index;
+
+    for (index = 0u; index < context->node_count; ++index) {
+        size_t end;
+        size_t child;
+
+        if (strcmp(context->nodes[index].view.kind, "declaration") != 0) {
+            continue;
+        }
+        end = subtree_end(context, index);
+        for (child = index + 1u; child < end; ++child) {
+            size_t declarator = child;
+            size_t name_node;
+            lower_callee *entry;
+            ql_status status;
+
+            if (context->nodes[child].parent != index ||
+                context->nodes[child].view.field_name == NULL ||
+                strcmp(context->nodes[child].view.field_name,
+                       "declarator") != 0 ||
+                strcmp(context->nodes[child].view.kind,
+                       "function_declarator") != 0) {
+                continue;
+            }
+            name_node = direct_field_child(context, declarator, "declarator");
+            if (name_node == SIZE_MAX ||
+                strcmp(context->nodes[name_node].view.kind,
+                       "identifier") != 0) {
+                continue;
+            }
+            status = grow_array(context->allocator,
+                                (void **)&context->callees,
+                                &context->callee_capacity,
+                                sizeof(*context->callees),
+                                context->callee_count + 1u, error);
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+            entry = &context->callees[context->callee_count];
+            memset(entry, 0, sizeof(*entry));
+            entry->name = copy_node_text(context, name_node);
+            if (entry->name == NULL) {
+                ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                return QL_STATUS_OUT_OF_MEMORY;
+            }
+            entry->declaration_node = index;
+            entry->declarator_node = declarator;
+            ++context->callee_count;
+        }
+    }
+    return QL_STATUS_OK;
+}
+
+static lower_callee *find_callee(lower_context *context, const char *name) {
+    size_t index;
+    for (index = 0u; index < context->callee_count; ++index) {
+        if (strcmp(context->callees[index].name, name) == 0) {
+            return &context->callees[index];
+        }
+    }
+    return NULL;
+}
+
+static void release_callees(lower_context *context) {
+    size_t index;
+    for (index = 0u; index < context->callee_count; ++index) {
+        context->allocator->deallocate(context->allocator->user_data,
+                                       context->callees[index].parameters);
+        context->allocator->deallocate(context->allocator->user_data,
+                                       context->callees[index].name);
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   context->callees);
+    context->callees = NULL;
+    context->callee_count = 0u;
+    context->callee_capacity = 0u;
 }
 
 static ql_status collect_records(lower_context *context, ql_error *error) {
@@ -1659,6 +1806,24 @@ static ql_status emit_typed_instruction(lower_context *context,
         result_type != QL_IR_INVALID_TYPE_ID ? output : NULL, error);
 }
 
+static ql_status ensure_trace_type(lower_context *context,
+                                   ql_error *error) {
+    ql_ir_type_definition_v1 definition;
+    ql_ir_type_id id;
+    ql_status status;
+
+    if (context->trace_type != QL_IR_INVALID_TYPE_ID) {
+        return QL_STATUS_OK;
+    }
+    ql_ir_type_definition_init(&definition, QL_IR_TYPE_EVENT_TRACE);
+    status = ql_ir_builder_add_type(context->builder, &definition, &id,
+                                    error);
+    if (status == QL_STATUS_OK) {
+        context->trace_type = id;
+    }
+    return status;
+}
+
 static ql_status ensure_memory_type(lower_context *context, ql_error *error) {
     ql_ir_type_definition_v1 definition;
     ql_ir_type_id id;
@@ -2227,6 +2392,7 @@ static ql_status save_state(lower_context *context, size_t count,
     memset(state, 0, sizeof(*state));
     state->count = count;
     state->memory = context->memory_value;
+    state->trace = context->trace_value;
     if (count == 0u) {
         return QL_STATUS_OK;
     }
@@ -2255,6 +2421,7 @@ static ql_status save_state(lower_context *context, size_t count,
 static void restore_state(lower_context *context, const lower_state *state) {
     size_t index;
     context->memory_value = state->memory;
+    context->trace_value = state->trace;
     for (index = 0u; index < state->count; ++index) {
         if (context->variables[index].is_stack != 0u) {
             continue;
@@ -4064,6 +4231,272 @@ static ql_status lower_designator_load(lower_context *context, size_t node,
     return emit_pointer_of_address(context, loaded, declared, output, error);
 }
 
+/* Resolves a prototype's return and parameter types. Done at the first call
+   rather than at collection so that a prototype naming something this slice
+   cannot carry costs only the bodies that call it. */
+static ql_status resolve_callee(lower_context *context, lower_callee *callee,
+                                size_t node, ql_error *error) {
+    size_t parameters_node;
+    size_t type_node;
+    size_t end;
+    size_t child;
+    uint32_t pointer_depth = 0u;
+    int rejected = 0;
+    size_t named;
+    ql_status status;
+
+    if (callee->resolved != 0u) {
+        return QL_STATUS_OK;
+    }
+    type_node = direct_field_child(context, callee->declaration_node, "type");
+    if (type_node == SIZE_MAX) {
+        return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL,
+                             node, "the callee has no declared return type",
+                             error);
+    }
+    /* Stars between the return type and the function name belong to the
+       return type, not to the function. */
+    named = member_declarator_name(context, callee->declarator_node,
+                                   &pointer_depth, &rejected);
+    (void)named;
+    status = resolve_type_node(context, type_node, pointer_depth,
+                               &callee->return_type, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    if (callee->return_type.kind == QL_C_SCALAR_RECORD) {
+        return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL,
+                             node,
+                             "a callee returning a record by value is outside "
+                             "this slice", error);
+    }
+    parameters_node = direct_field_child(context, callee->declarator_node,
+                                         "parameters");
+    if (parameters_node == SIZE_MAX) {
+        return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL,
+                             node, "the callee has no parameter list", error);
+    }
+    end = subtree_end(context, parameters_node);
+    for (child = parameters_node + 1u; child < end; ++child) {
+        lower_type parameter;
+        size_t parameter_type;
+        size_t declarator_end;
+        size_t inner;
+        uint32_t depth = 0u;
+
+        if (context->nodes[child].parent != parameters_node) {
+            continue;
+        }
+        if (strcmp(context->nodes[child].view.kind,
+                   "variadic_parameter") == 0) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+                "a variadic callee has no fixed signature to check against",
+                error);
+        }
+        if (strcmp(context->nodes[child].view.kind,
+                   "parameter_declaration") != 0) {
+            continue;
+        }
+        parameter_type = direct_field_child(context, child, "type");
+        if (parameter_type == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+                "a callee parameter has no declared type", error);
+        }
+        /* A prototype's parameters are often unnamed, so the stars are
+           counted off the abstract declarator instead of a name. */
+        declarator_end = subtree_end(context, child);
+        for (inner = child + 1u; inner < declarator_end; ++inner) {
+            const char *kind = context->nodes[inner].view.kind;
+            if (context->nodes[inner].parent != child) {
+                continue;
+            }
+            if (strcmp(kind, "abstract_pointer_declarator") == 0 ||
+                strcmp(kind, "pointer_declarator") == 0) {
+                size_t cursor = inner;
+                while (cursor != SIZE_MAX) {
+                    const char *inner_kind =
+                        context->nodes[cursor].view.kind;
+                    if (strcmp(inner_kind, "abstract_pointer_declarator") !=
+                            0 &&
+                        strcmp(inner_kind, "pointer_declarator") != 0) {
+                        break;
+                    }
+                    ++depth;
+                    cursor = direct_field_child(context, cursor,
+                                                "declarator");
+                }
+            }
+        }
+        status = resolve_type_node(context, parameter_type, depth, &parameter,
+                                   error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        if (parameter.kind == QL_C_SCALAR_VOID) {
+            /* `f(void)` declares no parameters at all. */
+            continue;
+        }
+        if (parameter.kind == QL_C_SCALAR_RECORD) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+                "a callee taking a record by value is outside this slice",
+                error);
+        }
+        status = grow_array(context->allocator,
+                            (void **)&callee->parameters,
+                            &callee->parameter_capacity,
+                            sizeof(lower_type),
+                            callee->parameter_count + 1u, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        callee->parameters[callee->parameter_count++] = parameter;
+    }
+    callee->resolved = 1u;
+    return QL_STATUS_OK;
+}
+
+/* An external call is uninterpreted: it may read and write memory and it is
+   itself observable, so it consumes and produces both the memory state and
+   the event trace. Whether the trace is compared is the contract's business,
+   exactly as it already is for the memory a return carries. */
+static ql_status lower_call_expression(lower_context *context, size_t node,
+                                       lower_value *output,
+                                       ql_error *error) {
+    size_t function_node = direct_field_child(context, node, "function");
+    size_t arguments_node = direct_field_child(context, node, "arguments");
+    lower_callee *callee;
+    char *name;
+    ql_ir_value_id operands[32];
+    ql_ir_type_id result_types[3];
+    ql_ir_value_id results[3];
+    ql_ir_instruction_definition_v1 definition;
+    ql_ir_instruction_id instruction;
+    size_t operand_count = 0u;
+    size_t result_count = 0u;
+    size_t argument_index = 0u;
+    size_t end;
+    size_t child;
+    ql_status status;
+
+    if (function_node == SIZE_MAX || arguments_node == SIZE_MAX ||
+        strcmp(context->nodes[function_node].view.kind, "identifier") != 0) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+            "only a call of a declared function by name is in this slice",
+            error);
+    }
+    name = copy_node_text(context, function_node);
+    if (name == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    callee = find_callee(context, name);
+    context->allocator->deallocate(context->allocator->user_data, name);
+    if (callee == NULL) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+            "the callee has no declaration in this unit", error);
+    }
+    status = resolve_callee(context, callee, node, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+
+    operands[operand_count++] = context->trace_value;
+    operands[operand_count++] = context->memory_value;
+    end = subtree_end(context, arguments_node);
+    for (child = arguments_node + 1u; child < end; ++child) {
+        lower_value argument;
+        lower_value converted;
+
+        if (context->nodes[child].parent != arguments_node ||
+            (context->nodes[child].view.flags & QL_C_SYNTAX_NODE_NAMED) ==
+                0u ||
+            strcmp(context->nodes[child].view.kind, "comment") == 0) {
+            continue;
+        }
+        if (argument_index >= callee->parameter_count) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+                "the call passes more arguments than the callee declares",
+                error);
+        }
+        if (operand_count >= sizeof(operands) / sizeof(operands[0])) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+                "the call has more arguments than this slice carries", error);
+        }
+        status = lower_expression(context, child, &argument, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        status = convert_value(context, argument,
+                               callee->parameters[argument_index], &converted,
+                               error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        status = emit_ub_guard(context, &converted, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        operands[operand_count++] = converted.value;
+        ++argument_index;
+    }
+    if (argument_index != callee->parameter_count) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+            "the call passes fewer arguments than the callee declares",
+            error);
+    }
+
+    result_types[result_count++] = context->trace_type;
+    result_types[result_count++] = context->memory_type;
+    if (callee->return_type.kind != QL_C_SCALAR_VOID) {
+        status = ensure_ir_type(context, &callee->return_type, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        result_types[result_count++] = callee->return_type.ir_type;
+    }
+    ql_ir_instruction_definition_init(&definition, QL_IR_OPCODE_CALL);
+    definition.operands = operands;
+    definition.operand_count = operand_count;
+    definition.result_types = result_types;
+    definition.result_count = result_count;
+    definition.symbol = callee->name;
+    definition.symbol_size = strlen(callee->name);
+    definition.effects = QL_IR_EFFECT_CALL | QL_IR_EFFECT_MEMORY |
+                         QL_IR_EFFECT_IO;
+    status = ql_ir_builder_append_instruction(context->builder,
+                                              context->current_block,
+                                              &definition, &instruction,
+                                              results, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    context->trace_value = results[0];
+    context->memory_value = results[1];
+    memset(output, 0, sizeof(*output));
+    status = ensure_bool_constants(context, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    output->defined = context->true_value;
+    output->may_ub = 0u;
+    if (callee->return_type.kind == QL_C_SCALAR_VOID) {
+        output->type = callee->return_type;
+        output->value = QL_IR_INVALID_VALUE_ID;
+        return QL_STATUS_OK;
+    }
+    output->type = callee->return_type;
+    output->value = results[2];
+    return QL_STATUS_OK;
+}
+
 static ql_status lower_expression(lower_context *context, size_t node,
                                   lower_value *output, ql_error *error) {
     const char *kind;
@@ -4109,10 +4542,7 @@ static ql_status lower_expression(lower_context *context, size_t node,
             return lower_named_cast(context, type_node, operand, output,
                                     error);
         }
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
-            "function calls require external-call or callee-summary semantics",
-            error);
+        return lower_call_expression(context, node, output, error);
     }
     if (strcmp(kind, "pointer_expression") == 0) {
         size_t operator_node = direct_field_child(context, node, "operator");
@@ -4657,6 +5087,23 @@ static ql_status merge_branch_states(
     }
     /* Memory is as much a merged value as any variable: a store on one branch
        and not the other leaves the join with two versions to reconcile. */
+    if (context->makes_calls != 0u && left->trace != right->trace) {
+        ql_ir_value_id operands[2];
+        ql_ir_block_id blocks[2];
+        ql_status status;
+        operands[0] = left->trace;
+        operands[1] = right->trace;
+        blocks[0] = left_block;
+        blocks[1] = right_block;
+        status = emit_typed_instruction_phi(context, context->trace_type,
+                                            operands, blocks,
+                                            &context->trace_value, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    } else {
+        context->trace_value = left->trace;
+    }
     if (context->uses_memory != 0u && left->memory != right->memory) {
         ql_ir_value_id operands[2];
         ql_ir_block_id blocks[2];
@@ -4822,6 +5269,9 @@ static ql_status terminate_void_return(lower_context *context,
     ql_ir_terminator_definition_init(&terminator, QL_IR_TERMINATOR_RETURN);
     terminator.memory = context->uses_memory != 0u ? context->memory_value
                                                    : QL_IR_INVALID_VALUE_ID;
+    terminator.event_trace = context->makes_calls != 0u
+                                 ? context->trace_value
+                                 : QL_IR_INVALID_VALUE_ID;
     status = ql_ir_builder_set_terminator(context->builder,
                                           context->current_block,
                                           &terminator, error);
@@ -4871,6 +5321,9 @@ static ql_status lower_return_statement(lower_context *context, size_t node,
        left behind. */
     terminator.memory = context->uses_memory != 0u ? context->memory_value
                                                    : QL_IR_INVALID_VALUE_ID;
+    terminator.event_trace = context->makes_calls != 0u
+                                 ? context->trace_value
+                                 : QL_IR_INVALID_VALUE_ID;
     status = ql_ir_builder_set_terminator(context->builder,
                                           context->current_block,
                                           &terminator, error);
@@ -5206,6 +5659,19 @@ static ql_status add_object_parameters(lower_context *context,
                                          8u, &context->memory_value, error);
     if (status != QL_STATUS_OK) {
         return status;
+    }
+    if (context->makes_calls != 0u) {
+        status = ensure_trace_type(context, error);
+        if (status == QL_STATUS_OK) {
+            status = ql_ir_builder_add_parameter(context->builder,
+                                                 context->trace_type,
+                                                 "__trace", 7u,
+                                                 &context->trace_value,
+                                                 error);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
     }
     status = ensure_ir_type(context, &u64, error);
     if (status != QL_STATUS_OK) {
@@ -5581,6 +6047,7 @@ static void cleanup_context(lower_context *context) {
     pop_variables(context, 0u);
     release_typedefs(context);
     release_address_taken(context);
+    release_callees(context);
     for (index = 0u; index < context->stack_slot_count; ++index) {
         context->allocator->deallocate(context->allocator->user_data,
                                        context->stack_slots[index].name);
@@ -5675,6 +6142,8 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
     context.function = canonical;
     context.result = result;
     context.memory_type = QL_IR_INVALID_TYPE_ID;
+    context.trace_type = QL_IR_INVALID_TYPE_ID;
+    context.trace_value = QL_IR_INVALID_VALUE_ID;
     context.memory_value = QL_IR_INVALID_VALUE_ID;
     context.true_value = QL_IR_INVALID_VALUE_ID;
     context.false_value = QL_IR_INVALID_VALUE_ID;
@@ -5716,6 +6185,9 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
         status = collect_nodes(&context, error);
     }
     if (status == QL_STATUS_OK) {
+        status = collect_callees(&context, error);
+    }
+    if (status == QL_STATUS_OK) {
         status = collect_records(&context, error);
     }
     if (status == QL_STATUS_OK) {
@@ -5749,6 +6221,7 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
     }
 
     context.body_node = body_node;
+    collect_calls(&context, body_node);
     status = collect_address_taken(&context, body_node, error);
     if (status != QL_STATUS_OK) {
         cleanup_context(&context);

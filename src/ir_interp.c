@@ -9,6 +9,10 @@
    advertised maximum width. */
 #define INTERP_WORDS 5u
 
+/* A call with more arguments than this is not run. Nothing this profile
+   lowers comes close, and the bound keeps the target free of allocation. */
+#define QL_IR_INTERP_MAX_ARGUMENTS 16u
+
 typedef struct interp_bits {
     uint64_t words[INTERP_WORDS];
 } interp_bits;
@@ -43,6 +47,8 @@ typedef struct interp_context {
     interp_value *values;
     const ql_ir_interp_object_v1 *objects;
     size_t object_count;
+    const ql_ir_interp_callees_v1 *callees;
+    uint64_t events;
     interp_store *allocations;
     const interp_store *newest_memory;
     const interp_store *final_memory;
@@ -991,6 +997,125 @@ static int interp_execute_instruction(
         result.store = record;
         break;
     }
+    case QL_IR_OPCODE_CALL: {
+        /* The IR leaves an external callee uninterpreted, so the only thing
+           that can say what it returns is the specification the caller
+           supplied. Without one there is nothing honest to do but stop. */
+        ql_ir_interp_argument_v1 arguments[QL_IR_INTERP_MAX_ARGUMENTS];
+        uint8_t argument_bytes[QL_IR_INTERP_MAX_ARGUMENTS]
+                              [QL_IR_INTERP_VALUE_CAPACITY];
+        uint8_t result_bytes[QL_IR_INTERP_VALUE_CAPACITY];
+        size_t argument_count = 0u;
+        size_t state_operands = 0u;
+        size_t value_result = instruction->result_count;
+        size_t operand;
+        size_t slot;
+
+        if (context->callees == NULL || context->callees->invoke == NULL) {
+            return interp_stop(context, QL_IR_INTERP_OUTCOME_UNSUPPORTED,
+                               QL_IR_INTERP_UB_NONE, block, id);
+        }
+        /* Leading memory and event-trace operands are the states the call
+           threads, not arguments. */
+        for (operand = 0u; operand < instruction->operand_count; ++operand) {
+            const interp_value *value =
+                &context->values[instruction->operands[operand]];
+            if (value->kind != QL_IR_TYPE_MEMORY &&
+                value->kind != QL_IR_TYPE_EVENT_TRACE) {
+                break;
+            }
+            ++state_operands;
+        }
+        for (operand = state_operands; operand < instruction->operand_count;
+             ++operand) {
+            const interp_value *value =
+                &context->values[instruction->operands[operand]];
+            size_t width;
+            if (argument_count >= QL_IR_INTERP_MAX_ARGUMENTS) {
+                return interp_stop(context, QL_IR_INTERP_OUTCOME_UNSUPPORTED,
+                                   QL_IR_INTERP_UB_NONE, block, id);
+            }
+            if (value->defined == 0u) {
+                /* Handing an undefined value to something observable is an
+                   observation of it. */
+                return interp_stop(context,
+                                   QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+                                   QL_IR_INTERP_UB_GUARD_INSUFFICIENT, block,
+                                   id);
+            }
+            interp_bits_to_bytes(&value->bits, value->width,
+                                 argument_bytes[argument_count], &width);
+            memset(&arguments[argument_count], 0,
+                   sizeof(arguments[argument_count]));
+            arguments[argument_count].struct_size =
+                sizeof(arguments[argument_count]);
+            arguments[argument_count].bit_width = value->width;
+            arguments[argument_count].size = width;
+            arguments[argument_count].data = argument_bytes[argument_count];
+            ++argument_count;
+        }
+        /* Results mirror the states, then the returned value if there is
+           one. */
+        for (slot = 0u; slot < instruction->result_count; ++slot) {
+            const interp_value *target =
+                &context->values[instruction->results[slot]];
+            if (target->kind != QL_IR_TYPE_MEMORY &&
+                target->kind != QL_IR_TYPE_EVENT_TRACE) {
+                value_result = slot;
+                break;
+            }
+        }
+        memset(result_bytes, 0, sizeof(result_bytes));
+        {
+            size_t result_size =
+                value_result < instruction->result_count
+                    ? interp_byte_width(
+                          context->values[instruction->results[value_result]]
+                              .width)
+                    : 0u;
+            if (!context->callees->invoke(context->callees->user_data,
+                                          instruction->symbol, arguments,
+                                          argument_count, result_bytes,
+                                          result_size)) {
+                return interp_stop(context, QL_IR_INTERP_OUTCOME_UNSUPPORTED,
+                                   QL_IR_INTERP_UB_NONE, block, id);
+            }
+            ++context->events;
+            for (slot = 0u; slot < instruction->result_count; ++slot) {
+                interp_value *target =
+                    &context->values[instruction->results[slot]];
+                if (target->kind == QL_IR_TYPE_MEMORY) {
+                    /* The specification asserted this callee does not write
+                       memory, so the version it hands on is the one it was
+                       given. */
+                    size_t which;
+                    target->store = NULL;
+                    for (which = 0u; which < state_operands; ++which) {
+                        const interp_value *source =
+                            &context->values[instruction->operands[which]];
+                        if (source->kind == QL_IR_TYPE_MEMORY) {
+                            target->store = source->store;
+                            break;
+                        }
+                    }
+                    target->defined = 1u;
+                } else if (target->kind == QL_IR_TYPE_EVENT_TRACE) {
+                    target->defined = 1u;
+                } else {
+                    if (!interp_bits_from_bytes(result_bytes, result_size,
+                                                target->width,
+                                                &target->bits)) {
+                        return interp_stop(context,
+                                           QL_IR_INTERP_OUTCOME_UNSUPPORTED,
+                                           QL_IR_INTERP_UB_NONE, block, id);
+                    }
+                    target->defined = 1u;
+                }
+                target->bound = 1u;
+            }
+        }
+        return 1;
+    }
     case QL_IR_OPCODE_ASSUME:
         if (left->defined == 0u || bits_is_zero(&left->bits)) {
             return interp_stop(context,
@@ -1089,6 +1214,7 @@ static ql_status interp_execute(interp_context *context, ql_error *error) {
             }
         }
         context->result->steps = steps;
+        context->result->events = context->events;
         switch (block.terminator.kind) {
         case QL_IR_TERMINATOR_RETURN:
             if (!interp_observe(context, block.terminator.return_value,
@@ -1195,6 +1321,10 @@ static ql_status interp_prepare(interp_context *context,
                than bits. The initial version is the images themselves. */
             value->width = 0u;
             value->store = NULL;
+        } else if (type.kind == QL_IR_TYPE_EVENT_TRACE) {
+            /* A trace is threaded and observed, never inspected: what the
+               calls were is what the callee specification saw. */
+            value->width = 0u;
         } else {
             *modelled = 0;
             context->result->outcome = QL_IR_INTERP_OUTCOME_UNSUPPORTED;
@@ -1248,13 +1378,15 @@ static ql_status interp_prepare(interp_context *context,
                          index);
             return QL_STATUS_ALREADY_EXISTS;
         }
-        if (value->kind == QL_IR_TYPE_MEMORY) {
+        if (value->kind == QL_IR_TYPE_MEMORY ||
+            value->kind == QL_IR_TYPE_EVENT_TRACE) {
             /* The object table already supplies the initial image, so a
                memory parameter is bound by naming it and nothing else. */
             if (input->size != 0u) {
                 ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
-                             "interpreter input %zu binds a memory parameter "
-                             "and must carry no bytes", index);
+                             "interpreter input %zu binds a memory or "
+                             "event-trace parameter and must carry no bytes",
+                             index);
                 return QL_STATUS_INVALID_ARGUMENT;
             }
         } else if (!interp_bits_from_bytes(input->data, input->size,
@@ -1340,6 +1472,7 @@ ql_status QL_CALL ql_ir_interp_run(const ql_allocator *allocator,
     if (options != NULL) {
         context.objects = options->objects;
         context.object_count = options->object_count;
+        context.callees = options->callees;
     }
     status = interp_validate_objects(&context, error);
     if (status != QL_STATUS_OK) {
@@ -1366,6 +1499,7 @@ ql_status QL_CALL ql_ir_interp_run(const ql_allocator *allocator,
     if (status == QL_STATUS_OK) {
         interp_write_final_images(&context, context.final_memory);
     }
+    result->events = context.events;
     interp_release_stores(&context);
     selected->deallocate(selected->user_data, context.values);
     if (status == QL_STATUS_OK) {
