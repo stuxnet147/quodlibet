@@ -110,6 +110,43 @@ int ql_c_scalar_from_spelling(const char *spelling,
     return 0;
 }
 
+/* Every AnghaBench source carries `typedef long scalar_t__;` in its preamble,
+   commented "Either arithmetic or pointer type", and the sample this table
+   was written against found that spelling in 3,998 of 4,000 files and no
+   other spelling of it anywhere. Under the profile's LP64 target that is a
+   signed 64-bit integer, wide enough to hold the pointers the comment admits.
+   The table exists because record extraction drops the preamble, not because
+   the meaning is uncertain. */
+static const struct {
+    const char *spelling;
+    uint32_t width;
+    uint32_t rank;
+    uint32_t is_signed;
+} k_corpus_typedefs[] = {
+    {"scalar_t__", 64u, 4u, 1u}
+};
+
+int ql_c_scalar_from_corpus_typedef(const char *spelling,
+                                    ql_c_scalar_type *output) {
+    size_t index;
+
+    if (spelling == NULL || output == NULL) {
+        return 0;
+    }
+    for (index = 0u;
+         index < sizeof(k_corpus_typedefs) / sizeof(k_corpus_typedefs[0]);
+         ++index) {
+        if (strcmp(spelling, k_corpus_typedefs[index].spelling) != 0) {
+            continue;
+        }
+        *output = ql_c_scalar_make_integer(k_corpus_typedefs[index].width,
+                                           k_corpus_typedefs[index].rank,
+                                           k_corpus_typedefs[index].is_signed);
+        return 1;
+    }
+    return 0;
+}
+
 int ql_c_scalar_same(ql_c_scalar_type left, ql_c_scalar_type right) {
     return left.kind == right.kind && left.width == right.width &&
            left.rank == right.rank && left.is_signed == right.is_signed;

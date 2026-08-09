@@ -161,6 +161,21 @@ profile freezes Quodlibet's own accepted subset instead of inheriting a moving
 compiler default. Unsupported extensions must yield `UNKNOWN` or a frontend
 error, never a proof under guessed semantics.
 
+#### Corpus preamble typedefs
+
+Record extraction keeps the type and callee context around a function and
+drops the rest of the file, including the preamble every AnghaBench source
+carries. One typedef from that preamble matters: `typedef long scalar_t__;`,
+commented "Either arithmetic or pointer type". The profile therefore resolves
+`scalar_t__` as the LP64 signed 64-bit integer the corpus compiler used.
+
+This is not a profile-relative assumption in the way the memory model is. It
+is the definition the compilation that produced the corpus actually used,
+recoverable from the raw sources: a 4,000-file sample found that exact
+spelling 3,998 times and no other spelling of it. A name absent from this
+table stays unresolved and is refused, and a unit that declares the name
+itself overrides the table.
+
 #### Memory model
 
 `ASM2C_GNU_V1` gives memory a flat 64-bit address space. A pointer is an

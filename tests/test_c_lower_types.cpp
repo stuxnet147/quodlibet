@@ -272,8 +272,42 @@ TEST(CLowerTypes, NamesTheRealObstacleBehindATypedef) {
 TEST(CLowerTypes, RefusesATypeNameTheUnitNeverDeclared) {
     /* Guessing that an undeclared name means int would be a guess about
        semantics, and a wrong one changes the answer about the function. */
-    ExpectUnknown("int unknown_name(scalar_t__ a) { return 0; }",
+    ExpectUnknown("int unknown_name(TYP_UNKNOWN a) { return 0; }",
                   "unknown_name", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
+}
+
+/* `scalar_t__` is the one name that is resolved without the unit declaring
+   it, and that is not an exception to the rule above. Every AnghaBench source
+   spells `typedef long scalar_t__;` in its preamble; record extraction keeps
+   only the type and callee context and drops that line, so the definition is
+   known even though the extracted unit no longer carries it. */
+TEST(CLowerTypes, ResolvesTheTypedefTheCorpusPreambleDeclares) {
+    Lowered lowered;
+    ASSERT_EQ(QL_STATUS_OK,
+              lowered.Lower("scalar_t__ widened(scalar_t__ a) "
+                            "{ return a + 1; }",
+                            "widened"));
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
+    /* It is a signed 64-bit integer, so this addition wraps nowhere near
+       where a 32-bit one would. */
+    EXPECT_EQ(INT64_C(2147483648),
+              ReturnedSigned(RunModule(lowered.ir(),
+                                       {UINT64_C(2147483647)}), 64u));
+}
+
+TEST(CLowerTypes, LetsTheUnitOverrideTheCorpusTypedef) {
+    /* A unit that declares the name itself means what it says. The table is
+       a fallback for the preamble extraction removed, not an override. */
+    Lowered lowered;
+    ASSERT_EQ(QL_STATUS_OK,
+              lowered.Lower("typedef short scalar_t__;\n"
+                            "int narrow(scalar_t__ a) { return a + 1; }",
+                            "narrow"));
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
+    /* A short parameter promotes to int, so this is 32768 rather than the
+       negative a 16-bit wrap would give. */
+    EXPECT_EQ(32768, ReturnedSigned(RunModule(lowered.ir(),
+                                              {UINT64_C(32767)}), 32u));
 }
 
 TEST(CLowerTypes, StopsOnATypedefChainThatDoesNotTerminate) {

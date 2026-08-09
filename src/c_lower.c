@@ -1404,10 +1404,16 @@ static ql_status parse_type_spelling(lower_context *context,
         }
         entry = find_typedef(context, spelling);
         if (entry == NULL) {
+            /* The unit's own declarations win; this is the fallback for the
+               preamble typedefs record extraction leaves behind. */
+            if (ql_c_scalar_from_corpus_typedef(spelling, &scalar)) {
+                *output = type_from_scalar(scalar);
+                return QL_STATUS_OK;
+            }
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
-                "type spelling names no ASM2C_GNU_V1 scalar type and no "
-                "typedef this unit declares", error);
+                "type spelling names no ASM2C_GNU_V1 scalar type, no typedef "
+                "this unit declares, and no corpus preamble typedef", error);
         }
         if (entry->is_array_or_function != 0u) {
             return lower_unknown(

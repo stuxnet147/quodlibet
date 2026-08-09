@@ -51,6 +51,17 @@ ql_c_scalar_type ql_c_scalar_make_integer(uint32_t width, uint32_t rank,
    cannot resolve a spelling must report it, never guess a meaning for it. */
 int ql_c_scalar_from_spelling(const char *spelling, ql_c_scalar_type *output);
 
+/* Typedefs the corpus's own sources spell out but that its extracted records
+   drop, because extraction keeps only the type and callee context around a
+   function and not the file preamble. Resolving a name from this table is not
+   a guess about what it might mean: it is the definition the compiler that
+   produced the corpus actually used. A name absent from the table stays
+   unresolved and is refused, as before.
+
+   Returns zero when the spelling is not one of them. */
+int ql_c_scalar_from_corpus_typedef(const char *spelling,
+                                    ql_c_scalar_type *output);
+
 int ql_c_scalar_same(ql_c_scalar_type left, ql_c_scalar_type right);
 
 /* C11 6.3.1.1: anything of lesser rank than int becomes int, because int
