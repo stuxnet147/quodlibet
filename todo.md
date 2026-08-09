@@ -18,7 +18,7 @@
 
 조율 규칙은 `GOAL.md` 의 "진행 규칙" 절입니다. `CMakeLists.txt`, `GOAL.md`, 이 표는 조율자가 소유합니다.
 
-**닫힌 GOAL: G1, G2, G3, G4, G5(현 슬라이스 기준).** 열린 것: G6(threading 리포트와 추가 튜닝), G7(VM, 이제 바인딩이 있어 진행 가능), G8(확장 절차 문서와 precondition 퍼저 잔여), G9(현 val lowered 11/1050, 남은 관문은 지역 object, calls, globals).
+**닫힌 GOAL: G1, G2, G3, G4, G5(현 슬라이스 기준).** 열린 것: G6, G7(VM 검증 진행 중), G8, G9, 그리고 **W6/W7 백로그 전부**(2026-08-10 사용자 지시로 todo 전 항목이 완료 범위).
 
 ## 완료한 기반 마일스톤
 
@@ -99,9 +99,31 @@
 - [ ] 강화학습기 경로 스모크(장시간 금지)
 - [ ] VM 기록과 비용 `docs/vm/`
 
-## 뒤로 미룬 것
+## W6: 증거와 method 파이프라인 (2026-08-10 범위 복귀)
 
-scheduler 고도화, plugin SDK 확장, AIG/SAT backend, CHC/PDR, persistent cache, 설치 패키지, 원격 CI 재설계는 GOAL 이 닫힌 뒤에 봅니다.
+사용자 지시로 이 문서의 전 항목이 GOAL 닫힘의 조건입니다. 아래는 원래 "뒤로 미룬 것"이었다가 복귀한 것입니다.
+
+- [ ] e-graph merge log 의 독립 replay checker
+- [ ] rewrite rule 별 soundness 조건과 side condition 을 versioned evidence 에 기록
+- [ ] AIG/SAT backend 와 certificate checker
+- [ ] concrete differential refutation method (등록되는 method 로)
+- [ ] 여러 method 의 병렬 실행을 투표가 아니라 증거 우선 규칙으로 결합
+- [ ] persistent artifact/evidence cache 저장소
+- [ ] method/backend version, option, semantic contract 가 cache key 에 빠지지 않는지 통합 검증
+- [ ] CHC/PDR 또는 loop invariant 연결 (루프 판정. W1 의 루프 로어링 뒤)
+
+## W7: 성능, 안정성, 배포 (2026-08-10 범위 복귀)
+
+- [ ] parser/lowering/e-graph/solver 단계별 benchmark 와 전체 latency 기준선 (일부는 docs/perf/baseline.md 에 있음)
+- [ ] 병렬 worker 수, solver 동시성, cancellation overhead 측정
+- [ ] artifact decoder 와 precondition 파서 퍼징 (파서/로어링/IR 디코더는 완료)
+- [ ] solver crash, timeout, pipe 상속, corrupt model fault-injection 확대
+- [ ] Windows 와 Linux 설치 패키지, relocatable Bitwuzla 탐색
+- [ ] public ABI compatibility 시험과 plugin SDK 예제
+- [ ] 지원 compiler/target matrix 를 asm2c dataset manifest 에서 자동 검증
+- [ ] 원격 CI 재설계와 활성화 (**사용자 승인 필요.** 원문이 승인 조건부라 마지막에 여쭙는다)
+
+scheduler 고도화와 plugin SDK "확장" 중 위 목록에 없는 것은 여전히 범위 밖입니다(G5 의 동결 원칙).
 
 ## 완료 판정 원칙
 
