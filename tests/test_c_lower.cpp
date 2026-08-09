@@ -1,4 +1,5 @@
 #include "quodlibet/c_lower.h"
+#include "quodlibet/ir_verify.h"
 
 #include <cstddef>
 #include <cstring>
@@ -40,6 +41,24 @@ private:
     ql_c_lower_result *result_ = nullptr;
 };
 
+/* Every lowering test reads its result through this helper, so gating it on
+   the verifier makes "the lowering never emits IR that fails verification" a
+   property of the whole file rather than of the tests that remember to check
+   it. */
+void ExpectVerifiedIr(const ql_artifact *artifact) {
+    ql_ir *ir = nullptr;
+    ql_ir_verify_report_v1 report{};
+    ql_error error{};
+
+    ASSERT_NE(nullptr, artifact);
+    ASSERT_EQ(QL_STATUS_OK, ql_ir_open(nullptr, artifact, &ir, &error))
+        << error.message;
+    report.struct_size = sizeof(report);
+    EXPECT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
+        << ql_ir_verify_code_string(report.code) << ": " << report.message;
+    ql_ir_release(ir);
+}
+
 ql_c_lower_result_view_v1 ResultView(const ql_c_lower_result *result) {
     ql_c_lower_result_view_v1 view{};
     ql_error error{};
@@ -47,6 +66,9 @@ ql_c_lower_result_view_v1 ResultView(const ql_c_lower_result *result) {
     EXPECT_EQ(QL_STATUS_OK,
               ql_c_lower_result_get_view(result, &view, &error))
         << error.message;
+    if (view.support == QL_C_LOWER_SUPPORTED) {
+        ExpectVerifiedIr(view.ir_artifact);
+    }
     return view;
 }
 
