@@ -6,19 +6,19 @@
 
 ## 워크스트림 현황
 
-갱신일: 2026-08-10 (통합 2회차, `main` 시험 150/150)
+갱신일: 2026-08-10 (통합 4회차, `main` 시험 239/239)
 
 | 코드 | 이름 | GOAL | 상태 | 담당 |
 |---|---|---|---|---|
-| W1 | semantic-c-frontend | G5 전반, G8, G9 | 진행. IR verifier 와 concrete interpreter 통합됨. 다음은 퍼저와 타입/포인터 확장 | 병렬 세션 |
-| W2 | exact-backend | G5 후반 | 진행. source-signature artifact 와 problem schema v2 통합됨. 다음은 product/miter | 병렬 세션 |
-| W3 | runtime-services | G1, G2, G3 | 진행. **G1 닫힘**. 다음은 예산 | 병렬 세션 |
-| W4 | bindings-and-coverage | G4, G9 측정 | 커버리지 측정은 조율자가 완료. 파이썬 바인딩은 슬롯 대기 | 미배정 |
-| W0 | 조율, 프로파일링, VM | G6, G7 | 진행. 커버리지 기준선 완료. 다음은 VTune | 조율자 |
+| W1 | semantic-c-frontend | G5 전반, G8, G9 | 진행. 정확성 장치(verifier/interpreter/differential/fuzz)와 타입 확장 통합됨. 지금은 포인터 로어링(flat memory model 로 확정) | 병렬 세션 |
+| W2 | exact-backend | G5 후반 | **지시서 완료.** WU1..WU6 전부 main 에. 세션 정리됨. IR 이 넓어지면 miter 확장 작업 단위를 새로 연다 | 완료 |
+| W3 | runtime-services | G1, G2, G3 | **지시서 완료.** 세 GOAL 전부 닫힘. 세션 정리됨 | 완료 |
+| W4 | python-bindings | G4 | 지시서 `docs/workstreams/W4.md`. 세션 기동 | 병렬 세션 |
+| W0 | 조율, 프로파일링, VM | G6, G7 | 진행. 다음은 VTune 기준선과 VM 확인 | 조율자 |
 
 조율 규칙은 `GOAL.md` 의 "진행 규칙" 절입니다. `CMakeLists.txt`, `GOAL.md`, 이 표는 조율자가 소유합니다.
 
-**닫힌 GOAL: G1.** 나머지 여덟은 열려 있습니다.
+**닫힌 GOAL: G1, G2, G3, G5(현 슬라이스 기준).** 열린 것: G4(바인딩), G6(VTune), G7(VM), G8(퍼징 캠페인과 처리량 측정 잔여), G9(포인터가 관문).
 
 ## 완료한 기반 마일스톤
 

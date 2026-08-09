@@ -31,25 +31,25 @@
 
 **요구.** 사용자가 실행 예산과 메모리 예산을 **디테일하게** 결정할 수 있어야 한다.
 
-**종료 조건**
+**종료 조건 (2026-08-10 닫힘)**
 
-- [ ] 실행 예산: 전체 wall-clock, 파이프라인 노드별, solver 호출별 상한을 각각 설정할 수 있다
-- [ ] 메모리 예산: 전체 상한과 할당자 계측(현재/최대 사용량)이 있고, 초과 시 할당이 결정적으로 실패한다
-- [ ] 예산 초과는 **논리 판정이 아니라 상태**로 끝난다. 예산을 넘긴 실행이 `PROVED_*` 나 `COUNTEREXAMPLE` 을 내지 않는다
-- [ ] 예산 초과 시 이미 만든 artifact 가 전부 해제된다(누수 없음, ASan/UBSan 통과)
-- [ ] 시험이 각 축의 상한을 개별로 고정한다
+- [x] 실행 예산: 전체 wall-clock, 파이프라인 노드별, solver 호출별 상한을 각각 설정할 수 있다 - `TotalWallClockAxisExpiresOnItsOwn`, `NodeAndSolverAxesAreSetSeparately`
+- [x] 메모리 예산: 전체 상한과 할당자 계측(현재/최대 사용량)이 있고, 초과 시 할당이 결정적으로 실패한다 - `MemoryLimitFailsDeterministicallyAtTheSameAllocation`, 단일 할당 상한은 별도 축
+- [x] 예산 초과는 **논리 판정이 아니라 상태**로 끝난다 - `ql_budget_guard_outcome` 이 `PROVED_*`/`COUNTEREXAMPLE`/`BOUNDED_CLEAN` 을 `UNKNOWN` 으로 회수
+- [x] 예산 초과 시 이미 만든 artifact 가 전부 해제된다(누수 없음, ASan/UBSan 통과) - linux-sanitize 프리셋 검증 (`b640b8a`)
+- [x] 시험이 각 축의 상한을 개별로 고정한다 - `tests/test_budget.cpp` 21개
 
 ## G3. 사용자 정의 검증 결과와 판정 규칙
 
 **요구.** 검증 결과를 사용자가 JSON 으로 정의할 수 있어야 한다. 판정 규칙과도 관련이 있다.
 
-**종료 조건**
+**종료 조건 (2026-08-10 닫힘)**
 
-- [ ] 버전이 있는 JSON 스키마로 **판정 정책**(어떤 증거가 어떤 판정을 정당화하는지)을 사용자가 정의할 수 있다
-- [ ] 정책은 코어의 건전성 규율을 **약화시킬 수 없다**. `BOUNDED_CLEAN` 을 proof 로 올리는 정책, replay 하지 않은 SAT model 을 counterexample 로 올리는 정책은 파서가 거부한다
-- [ ] 결과 직렬화도 사용자가 정의한 스키마를 따르고, 그 출력이 다시 파스된다(왕복 시험)
-- [ ] 잘못된 정책 JSON 은 실행 전에 거부되고 오류 위치를 말한다
-- [ ] 시험이 정책별 판정 차이를 고정한다
+- [x] 버전이 있는 JSON 스키마로 **판정 정책**을 사용자가 정의할 수 있다 - `include/quodlibet/policy.h`, schema v1
+- [x] 정책은 코어의 건전성 규율을 **약화시킬 수 없다** - 세 금지를 파서가 문법 수준에서 거부하고 `ql_policy_evaluate` 가 실제 증거에 대해 재강제
+- [x] 결과 직렬화 왕복 시험 - `PolicySerializationRoundTrips`, `ResultSerializationRoundTrips`, `GatedResultSerializationRoundTrips`
+- [x] 잘못된 정책 JSON 은 실행 전에 거부되고 오류 위치(JSON pointer 또는 byte offset)를 말한다
+- [x] 시험이 정책별 판정 차이를 고정한다 - `tests/test_policy.cpp` 22개
 
 ## G4. FFI 가 아닌 파이썬 바인딩
 
@@ -68,16 +68,16 @@
 
 **요구.** scheduler 와 plugin architecture 고도화를 멈추고 여기에 개발력을 넣는다.
 
-**종료 조건**
+**종료 조건 (2026-08-10 닫힘. 단 현재 loop-free scalar 슬라이스 위에서이고, W1 이 IR 을 넓히면 miter 도 따라간다)**
 
-- [ ] problem schema v2: 좌우 source-signature digest, 인자 대응, typed-precondition digest 결합
-- [ ] 좌우 IR 을 결합하는 product program 또는 SMT miter
-- [ ] relation 방향, UB policy, return/termination/trap 관찰이 SMT query 에 정확히 반영된다
-- [ ] Bitwuzla SAT model 을 typed input 과 observable witness 로 decode
-- [ ] **decode 한 witness 를 별도 concrete replay 로 검증한 뒤에만** `COUNTEREXAMPLE` 을 낸다
-- [ ] UNSAT 을 proof 로 올리는 경계가 checker 이든 명시된 trusted-backend policy 이든 **문서에 적히고 코드가 그것을 강제한다**
-- [ ] `PROVED_*`, `COUNTEREXAMPLE`, `UNKNOWN` 세 결과의 end-to-end 통합 시험이 있다
-- [ ] scheduler/plugin 은 이 기간에 기능을 늘리지 않는다(회귀 수정만)
+- [x] problem schema v2: 좌우 source-signature digest, 인자 전단사, typed-precondition digest 결합. v1 은 `ql_problem_require_proof_binding` 이 막는다
+- [x] 좌우 IR 을 결합하는 relational miter (`src/product.c`)
+- [x] relation 방향, UB policy, return/termination/trap 관찰이 query 에 반영되고 축별 시험이 있다 (`DischargesRefinementDirectionsSeparately` 등)
+- [x] Bitwuzla SAT model 을 typed input 과 observable witness 로 decode (`src/replay.c`)
+- [x] decode 한 witness 를 W1 의 `ir_interp` 로 replay 한 뒤에만 `COUNTEREXAMPLE` (`EmitsAReplayedCounterexample`)
+- [x] UNSAT 승격은 명시적 trusted-backend policy. 여섯 조건을 코드가 강제하고 envelope 이 `checked_proof=false` 를 항상 기록. `METHODS.md` 에 문서화
+- [x] 세 결과의 end-to-end 통합 시험 (`tests/test_proof_smt.cpp` 9개, 파이프라인 이름 선택 포함)
+- [x] scheduler/plugin 기능 동결 유지
 
 ## G6. VTune 프로파일링과 극한 튜닝
 
