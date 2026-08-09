@@ -1,9 +1,12 @@
 #include "quodlibet/problem.h"
 
+#include "w2_fixtures.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -216,6 +219,327 @@ TEST(Problem, RejectsEmbeddedNulAndInvalidUtf8) {
               ql_problem_artifact_create(nullptr, &definition, &artifact,
                                          &error));
     EXPECT_EQ(nullptr, artifact);
+}
+
+/* --- Schema v2: binding what is being proved ------------------------------ */
+
+constexpr char kLeftSource[] = "int add(int x, int y){ return x + y; }";
+constexpr char kRightSource[] = "int sum(int a, int b){ return b + a; }";
+
+class ArtifactRef {
+public:
+    ArtifactRef() = default;
+    ArtifactRef(const ArtifactRef &) = delete;
+    ArtifactRef &operator=(const ArtifactRef &) = delete;
+    ~ArtifactRef() { ql_artifact_release(artifact_); }
+
+    ql_artifact **output() { return &artifact_; }
+    ql_artifact *get() const { return artifact_; }
+
+private:
+    ql_artifact *artifact_ = nullptr;
+};
+
+class ProblemRef {
+public:
+    ProblemRef() = default;
+    ProblemRef(const ProblemRef &) = delete;
+    ProblemRef &operator=(const ProblemRef &) = delete;
+    ~ProblemRef() { ql_problem_release(problem_); }
+
+    ql_problem **output() { return &problem_; }
+    ql_problem *get() const { return problem_; }
+
+private:
+    ql_problem *problem_ = nullptr;
+};
+
+ql_problem_argument_binding_v1 MakeBinding(std::uint32_t left,
+                                           std::uint32_t right) {
+    ql_problem_argument_binding_v1 binding{};
+    binding.struct_size = sizeof(binding);
+    binding.left_index = left;
+    binding.right_index = right;
+    return binding;
+}
+
+ql_problem_definition_v2 MakeDefinitionV2(const w2::CFunction &left,
+                                          const w2::CFunction &right) {
+    ql_problem_definition_v2 definition{};
+    ql_problem_definition_v2_init(&definition);
+    definition.left_source = left.source().c_str();
+    definition.left_source_size = left.source().size();
+    definition.left_function_name = "add";
+    definition.left_function_name_size = 3u;
+    definition.right_source = right.source().c_str();
+    definition.right_source_size = right.source().size();
+    definition.right_function_name = "sum";
+    definition.right_function_name_size = 3u;
+    definition.left_signature = left.signature_artifact();
+    definition.right_signature = right.signature_artifact();
+    return definition;
+}
+
+TEST(ProblemV2, BindsBothSignatureDigestsTheCorrespondenceAndThePrecondition) {
+    constexpr char precondition[] =
+        "{\"schema_version\":1,\"expression\":{\"op\":\"slt\","
+        "\"left\":{\"op\":\"arg\",\"index\":0},"
+        "\"right\":{\"op\":\"int\",\"signed\":true,\"width\":32,"
+        "\"value\":\"100\"}}}";
+    w2::CFunction left;
+    w2::CFunction right;
+    ArtifactRef artifact;
+    ProblemRef problem;
+    ql_problem_view_v2 view{};
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&left, kLeftSource, "add"));
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&right, kRightSource, "sum"));
+
+    ql_problem_definition_v2 definition = MakeDefinitionV2(left, right);
+    const ql_problem_argument_binding_v1 bindings[] = {MakeBinding(0u, 1u),
+                                                       MakeBinding(1u, 0u)};
+    definition.argument_bindings = bindings;
+    definition.argument_binding_count = 2u;
+    definition.contract.precondition_json = precondition;
+    definition.contract.precondition_json_size = sizeof(precondition) - 1u;
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_problem_artifact_create_v2(nullptr, &definition,
+                                            artifact.output(), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, ql_problem_open(nullptr, artifact.get(),
+                                            problem.output(), &error))
+        << error.message;
+
+    view.struct_size = sizeof(view);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_problem_get_view_v2(problem.get(), &view, &error))
+        << error.message;
+    EXPECT_EQ(QL_PROBLEM_SCHEMA_VERSION_2, view.schema_version);
+    EXPECT_EQ(2u, view.argument_binding_count);
+
+    ql_digest zero{};
+    EXPECT_EQ(0u, ql_digest_equal(&view.left_signature_digest, &zero));
+    EXPECT_EQ(0u, ql_digest_equal(&view.right_signature_digest, &zero));
+    EXPECT_EQ(0u, ql_digest_equal(&view.precondition_digest, &zero));
+    EXPECT_EQ(0u, ql_digest_equal(&view.left_signature_digest,
+                                  &view.right_signature_digest));
+
+    ql_problem_argument_binding_v1 read{};
+    ASSERT_EQ(QL_STATUS_OK, ql_problem_argument_binding_at(problem.get(), 0u,
+                                                           &read, &error));
+    EXPECT_EQ(0u, read.left_index);
+    EXPECT_EQ(1u, read.right_index);
+    EXPECT_EQ(QL_STATUS_NOT_FOUND, ql_problem_argument_binding_at(
+                                       problem.get(), 2u, &read, &error));
+    EXPECT_NE(nullptr, ql_problem_left_signature_artifact(problem.get()));
+    EXPECT_NE(nullptr, ql_problem_right_signature_artifact(problem.get()));
+    EXPECT_EQ(QL_STATUS_OK,
+              ql_problem_require_proof_binding(problem.get(), &error));
+}
+
+TEST(ProblemV2, NullPreconditionStillGetsASignatureBoundDigest) {
+    w2::CFunction left;
+    w2::CFunction right;
+    ArtifactRef artifact;
+    ProblemRef problem;
+    ql_problem_view_v2 view{};
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&left, kLeftSource, "add"));
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&right, kRightSource, "sum"));
+
+    ql_problem_definition_v2 definition = MakeDefinitionV2(left, right);
+    const ql_problem_argument_binding_v1 bindings[] = {MakeBinding(0u, 0u),
+                                                       MakeBinding(1u, 1u)};
+    definition.argument_bindings = bindings;
+    definition.argument_binding_count = 2u;
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_problem_artifact_create_v2(nullptr, &definition,
+                                            artifact.output(), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, ql_problem_open(nullptr, artifact.get(),
+                                            problem.output(), &error))
+        << error.message;
+    view.struct_size = sizeof(view);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_problem_get_view_v2(problem.get(), &view, &error));
+    ql_digest zero{};
+    EXPECT_EQ(0u, ql_digest_equal(&view.precondition_digest, &zero));
+    EXPECT_EQ(nullptr, view.contract.precondition_json);
+}
+
+TEST(ProblemV2, RejectsAPartialOrRepeatedArgumentCorrespondence) {
+    w2::CFunction left;
+    w2::CFunction right;
+    ql_artifact *artifact = nullptr;
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&left, kLeftSource, "add"));
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&right, kRightSource, "sum"));
+
+    ql_problem_definition_v2 definition = MakeDefinitionV2(left, right);
+    const ql_problem_argument_binding_v1 partial[] = {MakeBinding(0u, 0u)};
+    definition.argument_bindings = partial;
+    definition.argument_binding_count = 1u;
+    EXPECT_EQ(QL_STATUS_INVALID_ARGUMENT,
+              ql_problem_artifact_create_v2(nullptr, &definition, &artifact,
+                                            &error));
+    EXPECT_EQ(nullptr, artifact);
+
+    const ql_problem_argument_binding_v1 repeated[] = {MakeBinding(0u, 0u),
+                                                       MakeBinding(1u, 0u)};
+    definition.argument_bindings = repeated;
+    definition.argument_binding_count = 2u;
+    EXPECT_EQ(QL_STATUS_INVALID_ARGUMENT,
+              ql_problem_artifact_create_v2(nullptr, &definition, &artifact,
+                                            &error));
+    EXPECT_EQ(nullptr, artifact);
+}
+
+TEST(ProblemV2, RejectsCorrespondingArgumentsWithDifferentSourceTypes) {
+    w2::CFunction left;
+    w2::CFunction right;
+    ql_artifact *artifact = nullptr;
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&left, kLeftSource, "add"));
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(
+        &right, "int sum(unsigned a, int b){ return b + a; }", "sum"));
+
+    ql_problem_definition_v2 definition = MakeDefinitionV2(left, right);
+    const ql_problem_argument_binding_v1 bindings[] = {MakeBinding(0u, 0u),
+                                                       MakeBinding(1u, 1u)};
+    definition.argument_bindings = bindings;
+    definition.argument_binding_count = 2u;
+    EXPECT_EQ(QL_STATUS_TYPE_MISMATCH,
+              ql_problem_artifact_create_v2(nullptr, &definition, &artifact,
+                                            &error));
+    EXPECT_EQ(nullptr, artifact);
+}
+
+TEST(ProblemV2, RejectsDifferentReturnTypes) {
+    w2::CFunction left;
+    w2::CFunction right;
+    ql_artifact *artifact = nullptr;
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&left, kLeftSource, "add"));
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(
+        &right, "long sum(int a, int b){ return b + a; }", "sum"));
+
+    ql_problem_definition_v2 definition = MakeDefinitionV2(left, right);
+    const ql_problem_argument_binding_v1 bindings[] = {MakeBinding(0u, 0u),
+                                                       MakeBinding(1u, 1u)};
+    definition.argument_bindings = bindings;
+    definition.argument_binding_count = 2u;
+    EXPECT_EQ(QL_STATUS_TYPE_MISMATCH,
+              ql_problem_artifact_create_v2(nullptr, &definition, &artifact,
+                                            &error));
+    EXPECT_EQ(nullptr, artifact);
+}
+
+TEST(ProblemV2, RejectsASignatureThatNamesAnotherFunction) {
+    w2::CFunction left;
+    w2::CFunction right;
+    ql_artifact *artifact = nullptr;
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&left, kLeftSource, "add"));
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&right, kRightSource, "sum"));
+
+    ql_problem_definition_v2 definition = MakeDefinitionV2(left, right);
+    const ql_problem_argument_binding_v1 bindings[] = {MakeBinding(0u, 0u),
+                                                       MakeBinding(1u, 1u)};
+    definition.argument_bindings = bindings;
+    definition.argument_binding_count = 2u;
+    definition.left_signature = right.signature_artifact();
+    EXPECT_EQ(QL_STATUS_TYPE_MISMATCH,
+              ql_problem_artifact_create_v2(nullptr, &definition, &artifact,
+                                            &error));
+    EXPECT_EQ(nullptr, artifact);
+}
+
+TEST(ProblemV2, RecomputesTheRecordedDigestsWhenOpeningAnEditedArtifact) {
+    w2::CFunction left;
+    w2::CFunction right;
+    ArtifactRef original;
+    ArtifactRef edited;
+    ql_problem *problem = nullptr;
+    ql_artifact_view view{};
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&left, kLeftSource, "add"));
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&right, kRightSource, "sum"));
+
+    ql_problem_definition_v2 definition = MakeDefinitionV2(left, right);
+    const ql_problem_argument_binding_v1 bindings[] = {MakeBinding(0u, 0u),
+                                                       MakeBinding(1u, 1u)};
+    definition.argument_bindings = bindings;
+    definition.argument_binding_count = 2u;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_problem_artifact_create_v2(nullptr, &definition,
+                                            original.output(), &error))
+        << error.message;
+
+    view.struct_size = sizeof(view);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_artifact_get_view(original.get(), &view, &error));
+    std::string json(static_cast<const char *>(view.data), view.size);
+    const std::string key = "\"precondition_digest\":\"";
+    const std::size_t position = json.find(key);
+    ASSERT_NE(std::string::npos, position);
+    json.replace(position + key.size(), QL_DIGEST_HEX_SIZE - 1u,
+                 std::string(QL_DIGEST_HEX_SIZE - 1u, '0'));
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_artifact_create(nullptr, QL_ARTIFACT_KIND_PROBLEM,
+                                 QL_PROBLEM_SCHEMA_VERSION_2, json.data(),
+                                 json.size(), edited.output(), &error));
+    EXPECT_EQ(QL_STATUS_SCHEMA_MISMATCH,
+              ql_problem_open(nullptr, edited.get(), &problem, &error));
+    EXPECT_EQ(nullptr, problem);
+}
+
+TEST(ProblemV2, SchemaV1NeverJustifiesAProvedVerdict) {
+    constexpr char precondition[] =
+        "{\"schema_version\":1,\"expression\":true}";
+    ql_problem_definition_v1 with_precondition = make_definition();
+    ql_problem_definition_v1 without = make_definition();
+    ArtifactRef bound;
+    ArtifactRef unbound;
+    ProblemRef bound_problem;
+    ProblemRef unbound_problem;
+    ql_problem_view_v2 view{};
+    ql_error error{};
+
+    with_precondition.contract.precondition_json = precondition;
+    with_precondition.contract.precondition_json_size =
+        sizeof(precondition) - 1u;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_problem_artifact_create(nullptr, &with_precondition,
+                                         bound.output(), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, ql_problem_open(nullptr, bound.get(),
+                                            bound_problem.output(), &error));
+    EXPECT_EQ(QL_STATUS_SCHEMA_MISMATCH,
+              ql_problem_require_proof_binding(bound_problem.get(), &error));
+    EXPECT_NE(nullptr, std::strstr(error.message, "configuration"));
+    view.struct_size = sizeof(view);
+    EXPECT_EQ(QL_STATUS_SCHEMA_MISMATCH,
+              ql_problem_get_view_v2(bound_problem.get(), &view, &error));
+
+    ASSERT_EQ(QL_STATUS_OK, ql_problem_artifact_create(
+                                nullptr, &without, unbound.output(), &error));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_problem_open(nullptr, unbound.get(),
+                              unbound_problem.output(), &error));
+    EXPECT_EQ(QL_STATUS_SCHEMA_MISMATCH,
+              ql_problem_require_proof_binding(unbound_problem.get(), &error));
+    EXPECT_EQ(nullptr,
+              ql_problem_left_signature_artifact(unbound_problem.get()));
 }
 
 }  // namespace

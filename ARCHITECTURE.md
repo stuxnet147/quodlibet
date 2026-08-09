@@ -206,12 +206,24 @@ or constant byte extent, read/write permission, alignment, nullability, and an
 alias group. `ql_precondition_parse` type-checks these nodes against a versioned
 signature and binds canonical JSON plus the signature to one digest.
 
-The current `quodlibet.problem` schema predates that resolved signature and
-does not yet bind the typed-precondition digest to both C functions. Therefore
-a non-null precondition in a v1 problem is storage and configuration only; it
-is not sufficient evidence for a `PROVED_*` verdict. The next problem schema
-must record both resolved source-signature digests, their input mapping, and the
-typed-precondition digest before such a verdict is eligible.
+`quodlibet.problem` schema v1 predates that resolved signature and does not
+bind the typed-precondition digest to either C function. A non-null
+precondition in a v1 problem is therefore storage and configuration only; it is
+not sufficient evidence for a `PROVED_*` verdict.
+
+Schema v2 supplies that binding. It embeds both resolved
+`quodlibet.source-signature` payloads with their digests, a total bijective
+argument correspondence between them, and the typed-precondition digest
+computed against the left signature. Opening a v2 problem rebuilds each
+signature artifact from the embedded bytes, re-derives the correspondence and
+the precondition digest, and rejects the artifact when any recorded digest
+disagrees. `ql_problem_require_proof_binding` is the gate a proof method must
+pass before emitting any `PROVED_*` verdict; a v1 problem never passes it,
+whether or not it carries a precondition.
+
+A source signature is a separately versioned artifact because IR bit-vector
+types are signless: argument and return signedness, pointer depth, address
+space, and the ABI profile exist nowhere else.
 
 IR schema v1 defines explicit types for bit vectors, floats, pointers, memory,
 and event traces, plus effect bits for memory, calls, volatile access, atomics,
