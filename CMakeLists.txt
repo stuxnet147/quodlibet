@@ -134,9 +134,10 @@ else()
     )
 endif()
 
-add_executable(quodlibet_cli cli/main.c)
+add_executable(quodlibet_cli cli/main.c cli/coverage.c)
 set_target_properties(quodlibet_cli PROPERTIES OUTPUT_NAME quodlibet)
 target_link_libraries(quodlibet_cli PRIVATE quodlibet::quodlibet)
+target_include_directories(quodlibet_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli)
 
 if(QL_ENABLE_BITWUZLA)
     if(WIN32)

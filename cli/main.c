@@ -1,5 +1,7 @@
 #include "quodlibet/quodlibet.h"
 
+#include "coverage.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,7 +12,8 @@ static void usage(FILE *stream) {
                   "  quodlibet version\n"
                   "  quodlibet methods\n"
                   "  quodlibet parse-c <source.c>\n"
-                  "  quodlibet validate <pipeline.json>\n");
+                  "  quodlibet validate <pipeline.json>\n"
+                  "  quodlibet coverage <units.txt> [detail.tsv]\n");
 }
 
 static char *read_file(const char *path, size_t *size, ql_error *error) {
@@ -171,6 +174,9 @@ int main(int argc, char **argv) {
                      ql_version_string(), QL_ABI_VERSION,
                      QL_PIPELINE_SCHEMA_VERSION);
         return 0;
+    }
+    if (argc >= 3 && strcmp(argv[1], "coverage") == 0 && argc <= 4) {
+        return ql_cli_coverage(argv[2], argc == 4 ? argv[3] : NULL);
     }
     if (argc != 2 && argc != 3) {
         usage(stderr);
