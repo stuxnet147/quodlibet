@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-2단계 완료. miter, replay, 관찰 축이 메모리까지 넓어졌고 포인터와 struct 함수가 실제 판정을 받습니다. 다음은 val 코퍼스 측정입니다.
+3단계 완료. miter, replay, 관찰 축이 메모리까지 넓어졌고 val 코퍼스 판정률을 쟀습니다. 남은 것은 signature 의 typedef 공백이며 조율자 판단 대기입니다.
 
 ## 기준선
 
@@ -143,11 +143,63 @@ replay 는 이제 model 의 배치를 그대로 쓰고, 실체화하기 너무 �
 
 `ctest` 272/272 통과입니다(265 + 7).
 
+### 3. val 코퍼스 판정률 측정
+
+커밋: (이 커밋)
+
+`tools/corpus/verdict_rate.py` 를 넣었습니다. `quodlibet coverage` 가 "C 를 얼마나 받는가" 를 재고, 이것이 다음 질문인 "나온 IR 중 miter 가 실제로 판정할 수 있는 것이 얼마인가" 를 잽니다. 본문을 **자기 자신과 짝지어** 돌리므로 답은 서로 다른 두 프로그램이 우연히 같은지가 아니라 miter 가 그 IR 을 진술할 수 있는지입니다.
+
+재현은 세 줄입니다(진행 기록 맨 아래 명령).
+
+#### 결과 (val 1,050 본문, 2026-08-10)
+
+| 항목 | 수 |
+|---|---:|
+| 로어링 `SUPPORTED` 본문 | 11 |
+| **판정까지 간 본문** | **5 (45.5%)** |
+| 그중 포인터/메모리 함수 | 4 |
+| 판정 못 간 본문 | 6 |
+
+판정은 5건 모두 `PROVED_EQUIVALENT` 였고, **miter 안에서 막힌 것은 0건**입니다.
+
+`struct TYP_0 *ARG_0`, `TYP_3 *FUN_0(TYP_2 *ARG_0)`, `void FUN_0(TYP_0 *ARG_0)` 같은 포인터 서명이 실제로 판정을 받았습니다. **이 작업 단위 이전에는 이것들이 전부 `UNKNOWN` 이었습니다.** 예전 `check_ir_fragment` 가 `QL_IR_TYPE_POINTER` 와 `QL_IR_TYPE_MEMORY` 를 타입 관문에서 거부했기 때문이고, 그래서 11건 중 포인터가 아닌 2건만이 판정 후보였습니다(그중 하나는 아래 사유로 막힙니다). 즉 상한이 1/11 이었습니다. 이 수치는 제거된 코드 경로에서 유도한 것이고 옛 빌드로 다시 재지는 않았습니다.
+
+#### 막은 것은 miter 가 아니라 한 층 앞이다
+
+6건 전부 같은 사유입니다.
+
+```
+parameter type 'TYP_0' is not in the frozen ASM2C_GNU_V1 table   3
+return type type 'TYP_0' ...                                     1
+parameter type 'TYP_2' ...                                       1
+return type type 'TYP_5' ...                                     1
+```
+
+`ql_source_signature_from_c_function` 이 typedef 이름을 해석하지 않습니다. 고정된 철자 표에 `TYP_0` 이 없으니 거부합니다. **로어링은 typedef 를 해석합니다**(W1 의 타입 단위). 그래서 IR 은 나오는데 그 IR 을 설명할 signature 를 만들지 못해 problem v2 를 구성조차 못 합니다.
+
+이것은 W5 의 인코딩 문제가 아니라 signature 유도의 공백입니다. 고치려면 `ql_source_signature_from_c_function` 이 unit 의 typedef 선언을 스스로 훑어야 하는데, 지금 시그니처는 소스 텍스트를 받지 않으므로 `_v2` API 를 추가하고 호출자(`bindings/python/src/ql_check.c`, `tests/w2_fixtures.h`)를 따라 고쳐야 합니다. `ql_check.c` 는 W4 소유입니다. 조율자에게 물었습니다.
+
+`signature.c` 의 철자 표가 로어링과 **일부러 독립**이라는 것이 설계 의도이므로(그래야 `bind_ir` 이 진짜 교차 검증이 됩니다) 고칠 때도 로어링을 부르지 않고 구문 트리를 직접 훑는 방식이어야 합니다.
+
+#### 재현
+
+```sh
+python tools/corpus/extract.py --corpus D:/projects/machine-model/datasets/records-local \
+    --split val --out out/corpus/val
+python -c "import json; m=json.load(open('out/corpus/val/manifest.json')); \
+    open('out/corpus/val/units.txt','w').write('\n'.join('out/corpus/val/'+u['file'] for u in m['units'])+'\n')"
+./out/build/windows-clang/quodlibet.exe coverage out/corpus/val/units.txt out/corpus/val/detail.tsv
+PYTHONPATH=out/build/windows-clang/bindings/python/package \
+    python tools/corpus/verdict_rate.py out/corpus/val/detail.tsv
+```
+
+`PYTHONPATH` 로 쓰는 파이썬은 CMake 가 고른 것과 같아야 합니다(이 기계에서는 3.13). 3.11 로 부르면 확장이 `PY_SSIZE_T_CLEAN` SystemError 를 냅니다. W4 영역의 별개 문제이므로 손대지 않았습니다.
+
 ## 막힌 것
 
-- 없음
+- 없음. 판정률의 남은 55% 는 signature 의 typedef 공백이고, 소유가 걸쳐 있어 조율자에게 물었습니다
 
 ## 다음에 할 것
 
-1. val 코퍼스에서 로어링된 본문 중 판정까지 간 비율 측정
-2. `todo.md` 갱신은 조율자 소유이므로 worker_done 에 수치를 담아 보고
+- 조율자 답에 따라 signature 의 typedef 해석을 이 브랜치에서 열거나 W1 에 넘김
+- `todo.md` 갱신은 조율자 소유이므로 수치는 worker_done 으로 보고
