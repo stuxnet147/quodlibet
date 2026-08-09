@@ -161,6 +161,22 @@ G6 은 "병렬로 돌아야 하는 구간이 실제로 병렬로 도는가" 를 
 
 **그런데 24 코어에서 4.67배에서 포화한다.** 점유율이 100% 인데 speedup 이 안 붙는다는 것은 **스레드가 놀아서가 아니라 스레드마다 같은 일을 더 오래 하고 있다**는 뜻이다. 판정당 시간이 87ms 에서 약 293ms 로 3.4배 늘었다. 점유율과 speedup 을 같이 봐야 이 구분이 보인다.
 
+### 4.67 배가 기계의 한계인가
+
+**아니다.** 4.67 이라는 숫자는 이 기계가 우리 종류의 일에 얼마를 주는지 모르면 뜻이 없다. 대조군을 세웠다: `scripts/perf/bench-scaling.sh` 는 **완전히 독립된 K 개 프로세스**가 각자 split 전체를 파싱하고 로어링하게 한다. 공유 상태도, 락도, 파이프도, 자식도 없다. 우리 코드가 경합할 것이 아무것도 없는 구성이다.
+
+명령: `./scripts/perf/wsl.sh scripts/perf/bench-scaling.sh val`
+
+| workers | 대조군 (독립 프로세스) | `check_batch` |
+|---|---|---|
+| 1 | 1.00x | 1.00x |
+| 2 | 1.95x | 1.82x |
+| 4 | 3.68x | 3.05x |
+| 8 | 7.69x | 4.12x |
+| 16 | **10.97x** | **4.65x** |
+
+같은 기계, 같은 순간, 같은 24 논리 코어다. **대조군은 10.97 배까지 간다.** 배치 경로는 4.65 배에서 멈춘다. 기계는 2.4 배를 더 줄 수 있는데 배치 경로가 그것을 못 쓰고 있다. **이 격차는 기계의 것이 아니라 우리(또는 Bitwuzla)의 것이다.**
+
 **solver 프로세스 spawn 은 원인이 아니다.** 별도 프로브로 격리했다(`bitwuzla --version` 48회).
 
 | | workers=1 | 2 | 4 | 8 | 16 |
@@ -168,7 +184,32 @@ G6 은 "병렬로 돌아야 하는 구간이 실제로 병렬로 도는가" 를 
 | 9p (`/mnt/c`) | 5.45 ms | 2.15 | 2.12 | 0.87 | 0.52 |
 | 네이티브 (`/tmp`) | 0.92 ms | 0.48 | 0.27 | 0.32 | 0.31 |
 
-spawn 은 9p 에서 순차 5.45ms 로 비싸지만 **병렬화가 잘 되고**(16 워커에서 0.52ms) 판정당 87ms 대비 작다. 직렬화 지점이 아니다. solver 는 파이프로 붙고 임시 파일을 쓰지 않는다(`src/solver.c:1660` 부근). 남은 후보는 Bitwuzla 자체의 메모리 대역폭/SMT 경합과 24 논리 코어의 물리 12 코어 뿐이다. **측정 전에는 단정하지 않는다.** 이 구분은 W9 의 VM threading 리포트가 답할 몫이다.
+spawn 은 9p 에서 순차 5.45ms 로 비싸지만 **병렬화가 잘 되고**(16 워커에서 0.52ms) 판정당 87ms 대비 작다. 직렬화 지점이 아니다. solver 는 파이프로 붙고 임시 파일을 쓰지 않는다(`src/solver.c:1660` 부근).
+
+**그래서 남은 후보는 둘이다.** (a) Bitwuzla 프로세스 자체가 메모리 대역폭에 묶여 있다. (b) 우리 판정 경로 안에 워커끼리 다투는 지점이 있다. 이 둘을 가르려면 판정 안에서 시간이 어디로 가는지 봐야 하고, 그것이 이 호스트에서 못 하는 바로 그 측정이다(자식 프로세스 제약, 아래). **측정 전에는 단정하지 않는다. 이 구분은 W9 의 VM 이 답할 몫이다.**
+
+## 건전성 확인
+
+튜닝이 판정을 바꾸지 않았음을 매번 전 구성으로 확인한다. 2026-08-10 `b6ff804` 기준:
+
+| 구성 | 결과 |
+|---|---|
+| windows-clang | 267/267 |
+| linux-clang | 266/266 |
+| ASan + UBSan (`-fno-sanitize-recover=all`) | 266/266 |
+
+**`linux-sanitize` 프리셋 자체는 지금 깨져 있다.** libuv 가 그 프리셋에서 `-fPIC` 없이 빌드되어 파이썬 확장 링크가 `relocation R_X86_64_PC32 against uv_ip6_addr can not be used when making a shared object` 로 실패한다. W8 의 변경과 무관한 선행 문제이고 `CMakePresets.json` 은 조율자 소유라 고치지 않았다. 조율자에게 보고했고, 그때까지 sanitizer 확인은 별도 build directory 로 한다.
+
+```sh
+cmake -S . -B out/build/linux-sanitize-pic -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all" \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all" \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+cmake --build out/build/linux-sanitize-pic --parallel
+(cd out/build/linux-sanitize-pic && ctest --output-on-failure)
+```
 
 ## 아직 없는 것
 
