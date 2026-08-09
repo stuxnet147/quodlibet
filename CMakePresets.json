@@ -45,6 +45,23 @@
         "CMAKE_C_COMPILER": "clang",
         "CMAKE_CXX_COMPILER": "clang++"
       }
+    },
+    {
+      "name": "linux-sanitize",
+      "displayName": "Linux Clang ASan+UBSan",
+      "inherits": "linux-clang",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-sanitize-recover=all",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-sanitize-recover=all"
+      }
+    },
+    {
+      "name": "linux-fuzz",
+      "displayName": "Linux Clang libFuzzer",
+      "inherits": "linux-sanitize",
+      "cacheVariables": {
+        "QL_BUILD_FUZZERS": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -55,6 +72,14 @@
     {
       "name": "linux-clang",
       "configurePreset": "linux-clang"
+    },
+    {
+      "name": "linux-sanitize",
+      "configurePreset": "linux-sanitize"
+    },
+    {
+      "name": "linux-fuzz",
+      "configurePreset": "linux-fuzz"
     }
   ],
   "testPresets": [
@@ -67,6 +92,12 @@
     {
       "name": "linux-clang",
       "configurePreset": "linux-clang",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "linux-sanitize",
+      "configurePreset": "linux-sanitize",
       "output": { "outputOnFailure": true },
       "execution": { "noTestsAction": "error" }
     }

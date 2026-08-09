@@ -13,6 +13,7 @@ option(QL_BUILD_SHARED "Build libquodlibet as a shared library" OFF)
 option(QL_BUILD_TESTS "Build native tests" ON)
 option(QL_ENABLE_BITWUZLA "Enable the canonical Bitwuzla SMT backend" ON)
 option(QL_ENABLE_LOGGING "Compile the logging service" ON)
+option(QL_BUILD_FUZZERS "Build libFuzzer targets (Clang only)" OFF)
 set(QL_BITWUZLA_EXECUTABLE "" CACHE FILEPATH
     "Override path to a Bitwuzla 0.9.1 executable")
 
@@ -161,6 +162,21 @@ endif()
 
 if(BUILD_TESTING AND QL_BUILD_TESTS)
     add_subdirectory(tests)
+endif()
+
+if(QL_BUILD_FUZZERS)
+    # Every tests/fuzz/fuzz_*.c is one libFuzzer entry point. The drivers are
+    # owned by the workstream that owns the fuzzed layer; this rule only turns
+    # them into targets, so adding a fuzzer never edits this file.
+    file(GLOB QL_FUZZ_SOURCES CONFIGURE_DEPENDS LIST_DIRECTORIES false
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/fuzz_*.c")
+    foreach(QL_FUZZ_SOURCE ${QL_FUZZ_SOURCES})
+        get_filename_component(QL_FUZZ_NAME ${QL_FUZZ_SOURCE} NAME_WE)
+        add_executable(${QL_FUZZ_NAME} ${QL_FUZZ_SOURCE})
+        target_link_libraries(${QL_FUZZ_NAME} PRIVATE quodlibet::quodlibet)
+        target_compile_options(${QL_FUZZ_NAME} PRIVATE -fsanitize=fuzzer)
+        target_link_options(${QL_FUZZ_NAME} PRIVATE -fsanitize=fuzzer)
+    endforeach()
 endif()
 
 install(TARGETS quodlibet quodlibet_cli
