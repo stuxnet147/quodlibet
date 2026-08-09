@@ -275,6 +275,47 @@ digest 가 같고 시간은 잡음 범위다. 그 변경들은 coverage 경로�
 
 `third_party/CMakeLists.txt` 는 조율자 소유이므로 이 변경은 합의 사항이다.
 
+## 네이티브 디스크에서 다시 잰 배치 (2026-08-10). 앞 결론을 정정한다
+
+위 스냅샷 측정이 9p 통행료를 드러냈으므로 워크트리 전체를 `/tmp` 로 복사해 다시 빌드하고 같은 사다리를 돌렸다.
+
+| workers | 이 워크트리 (9p) | 네이티브 (`/tmp`) |
+|---|---|---|
+| 1 | 11.4 pairs/s | 20.8 |
+| 2 | 20.8 | 42.4 |
+| 4 | 34.8 | 83.5 |
+| 8 | 47.0 | 135.9 |
+| 16 | **53.1** (4.65x) | **149~180** (7.1~7.7x) |
+
+**앞 절의 "천장은 solver 와 기계의 것이고 배치 API 는 고칠 것이 없다" 는 결론을 정정한다.** 그 결론은 9p 통행료를 solver 몫으로 잘못 넘겼다. 네이티브에서는 처리량이 **2.8~3.4배** 높고 확장도 4.65배에서 7.4배로 올라간다. 판정당 6.7ms 로, 9p 의 18.8ms 와 비교된다.
+
+**이 정정이 남긴 교훈을 적어 둔다.** 스레드와 프로세스 사다리가 같은 대역에서 멈춘 것은 사실이었지만, 그 공통 원인이 "solver 와 기계" 라고 읽은 것이 틀렸다. **둘 다 같은 공유 파일시스템을 통해 같은 5MB 를 복사하고 있었다.** 공유를 끊었다고 생각한 대조군이 실은 가장 비싼 공유를 그대로 두고 있었다. 대조군을 세울 때는 무엇을 끊었는지가 아니라 **무엇이 남았는지**를 세야 한다.
+
+## 동시 판정에서 SIGSEGV (2026-08-10). 성능이 아니라 건전성 문제다
+
+네이티브 빌드로 사다리를 반복하다 **8 워커 구간에서 SIGSEGV 를 만났다.** 12회 중 6회다. 같은 빌드를 9p 에서 돌리면 8회 중 1회다. **빈도가 동시성 압력을 따라가며, 스냅샷이 느릴 때 가려져 있었을 뿐 새로 생긴 것이 아니다.**
+
+ASan 이 위치를 정확히 짚는다.
+
+```
+ERROR: AddressSanitizer: stack-use-after-return
+    #0 uv__signal_compare            third_party/libuv/src/unix/signal.c:509
+    #2 uv__signal_first_handle       third_party/libuv/src/unix/signal.c:173
+    #3 uv__signal_start              third_party/libuv/src/unix/signal.c:412
+    #4 uv_spawn                      third_party/libuv/src/unix/process.c:1019
+    #5 run_process                   src/solver.c:1680
+    #6 bitwuzla_verify_version       src/solver.c:2290
+    #8 ql_solver_create              src/solver.c:772
+   #13 worker_main                   src/scheduler.c:82
+  freed frame: run_process           src/solver.c:1583
+```
+
+**기전.** `ql_process_capture` 는 `uv_loop_t loop` 를 **값으로** 담고 있고(`src/solver.c:1345`), 그 capture 는 `run_process` 의 **스택 지역 변수**다(`src/solver.c:1583`). libuv 는 `uv_spawn` 에서 SIGCHLD 를 받으려고 그 loop 의 child watcher 를 **프로세스 전역 signal 트리**에 넣는다. `uv_loop_close` 가 `UV_EBUSY` 로 실패하면 그 등록이 남는데, 현재 코드는 그것을 오류 status 로 보고할 뿐 프레임은 그대로 반환한다(`src/solver.c:1772`). 남은 항목은 **이미 죽은 스택 주소**를 가리키고, 다른 워커 스레드의 `uv_spawn` 이 같은 전역 트리를 걸으면서 그것을 읽는다. 세 번째 재현에서는 `uv_close` 의 `RB_REMOVE` 쪽에서 같은 것을 잡았다.
+
+**성능 작업이 만든 것이 아니다.** W8 의 변경은 `cli/coverage.c` 와 `scripts/perf/` 뿐이고 이 경로에 없다. 성능 측정이 동시성 압력을 올려 드러낸 선행 결함이다.
+
+**`src/solver.c` 는 조율자 관리 구역이므로 W8 은 보고하고 고치지 않는다.** 조율자에게 escalation 으로 올렸다.
+
 ## 아직 없는 것
 
 - **threading 리포트.** 워크로드는 준비됐다(`scripts/perf/bench-batch.py`). **WSL 에서 VTune 수집은 자식 프로세스를 띄우는 워크로드에서 걸린다.** 2026-08-10 에 두 번째 확인을 얻었다: 인수 시에는 threading 수집만 걸린다고 알려져 있었는데, **hotspots 수집도 같은 배치 워크로드에서 똑같이 매달렸다**(무출력, 결과 디렉터리는 생기지만 리포트가 안 나옴, 손으로 `pkill` 해야 끝남). 반면 자식을 안 띄우는 coverage 워크로드는 hotspots 가 정상이다. **가르는 것은 수집 종류가 아니라 자식 프로세스다.** threading 리포트는 G7 의 실제 Linux VM 에서 뜬다.
