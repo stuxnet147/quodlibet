@@ -1,3 +1,13 @@
+/* O_CLOEXEC is POSIX.1-2008 and the target-wide _POSIX_C_SOURCE is 200112L, so
+   this translation unit asks for the later level before any header sees the
+   old one. Same shape as the _GNU_SOURCE handling in src/log.c. The snapshot
+   descriptors have to be close-on-exec from the moment they exist; see
+   open_binary_read. */
+#if !defined(_WIN32)
+#  undef _POSIX_C_SOURCE
+#  define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "quodlibet/solver.h"
 
 #include <ctype.h>
@@ -10,7 +20,9 @@
 #if defined(_WIN32)
 #  include <share.h>
 #else
+#  include <fcntl.h>
 #  include <sys/stat.h>
+#  include <unistd.h>
 #endif
 
 #include <uv.h>
@@ -1892,24 +1904,62 @@ static int absolute_executable_path(const char *path) {
            (path[2] == '/' || path[2] == '\\');
 }
 
+/* Every descriptor this file opens must be closed on exec.
+   uv_spawn forks and execs from whichever thread is judging, and a fork
+   snapshots the whole descriptor table, so a descriptor another thread happens
+   to have open at that instant is inherited by that child. For a descriptor
+   onto a snapshot still being written that is not untidiness, it is an
+   execution failure: Linux refuses to exec a file that any process holds open
+   for writing, and the sibling judgement dies with ETXTBSY. Measured at one or
+   two failures per forty-eight judgements at sixteen workers.
+
+   Requesting close-on-exec at open time is the only race-free way to do this;
+   setting it afterwards leaves a window in which a fork can still copy the
+   descriptor. Children need nothing from us but their three stdio streams,
+   which libuv installs itself. */
 static FILE *open_binary_read(const char *path) {
 #if defined(_WIN32)
     /* fopen_s opens with exclusive (non-shared) access, so a concurrent
        reader -- an on-access antivirus scan of a freshly written snapshot is
        the measured case -- makes the open fail with a sharing violation.
-       Hashing only reads; deny nothing. */
-    return _fsopen(path, "rb", _SH_DENYNO);
+       Hashing only reads; deny nothing. `N` keeps the handle out of children. */
+    return _fsopen(path, "rbN", _SH_DENYNO);
 #else
-    return fopen(path, "rb");
+    /* glibc and the BSDs read `e` as O_CLOEXEC. Falling back to a plain open
+       would silently restore the race, so ask open(2) directly instead. */
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    FILE *file;
+
+    if (descriptor < 0) {
+        return NULL;
+    }
+    file = fdopen(descriptor, "rb");
+    if (file == NULL) {
+        (void)close(descriptor);
+    }
+    return file;
 #endif
 }
 
 static FILE *open_binary_write(const char *path) {
 #if defined(_WIN32)
     FILE *file = NULL;
-    return fopen_s(&file, path, "wb") == 0 ? file : NULL;
+    return fopen_s(&file, path, "wbN") == 0 ? file : NULL;
 #else
-    return fopen(path, "wb");
+    /* 0700: the snapshot is this process's private copy and is tightened
+       further once it is written and hashed. */
+    int descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                          S_IRWXU);
+    FILE *stream;
+
+    if (descriptor < 0) {
+        return NULL;
+    }
+    stream = fdopen(descriptor, "wb");
+    if (stream == NULL) {
+        (void)close(descriptor);
+    }
+    return stream;
 #endif
 }
 

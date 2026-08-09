@@ -82,6 +82,14 @@ W1 의 `_with_tree` API 와 W9 의 VM threading 리포트를 기다립니다. W8
 - CTest linux-clang 316/316.
 - **별건 발견: `ETXTBSY`.** 크래시가 사라지자 판정 48개 중 한둘이 `text file is busy` 로 실패하는 것이 보입니다. 스냅샷 쓰기 기술자에 `O_CLOEXEC` 이 없어(`src/solver.c:1907`) 다른 스레드의 fork/exec 가 물려받는 고전적 경쟁입니다. 제 수정이 만든 것이 아니라 크래시에 가려져 있던 것이며, BLAKE3 가 빨라져 창이 좁아지면서 겹침이 늘어 드러났습니다. 조율자에게 별도로 올렸습니다.
 
+### WU9. `ETXTBSY` 수정 (조율자 위임)
+
+- `open_binary_read` 와 `open_binary_write` 를 POSIX 에서 `open(..., O_CLOEXEC)` + `fdopen`, Windows 에서 `fopen` 모드 `N` 으로 바꿨습니다. **연 뒤에 플래그를 세우지 않습니다.** 그 사이에 fork 가 끼어들 수 있습니다.
+- 지시대로 **스폰 재시도는 넣지 않았습니다.** 재시도를 먼저 넣으면 상속 차단이 실제로 됐는지가 가려집니다.
+- `O_CLOEXEC` 가 POSIX.1-2008 이라 이 translation unit 만 `_POSIX_C_SOURCE` 를 200809L 로 올렸습니다(`src/log.c` 의 `_GNU_SOURCE` 처리와 같은 모양).
+- **확장 관문 통과: 48쌍 16워커 10회에서 크래시 0, solver 시작 실패 0, 정상 10/10.**
+- 배치 최고 처리량 229.5 pairs/s (8 워커, 판정당 4.36 ms).
+
 ## 설계 결정
 
 ### 짧은 수집은 가지별 비율을 못 준다
