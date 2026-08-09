@@ -2,6 +2,8 @@
 
 #include "c_types.h"
 
+#include "quodlibet/ir_interp.h"
+
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -35,6 +37,9 @@ typedef struct lower_type {
     uint32_t width;
     uint32_t rank;
     uint32_t is_signed;
+    /* Meaningful only when `kind` is QL_C_SCALAR_POINTER. This slice carries
+       pointers to scalars, so one level of indirection is enough. */
+    ql_c_scalar_type pointee;
     ql_ir_type_id ir_type;
 } lower_type;
 
@@ -65,10 +70,19 @@ typedef struct lower_variable {
     size_t scope_depth;
 } lower_variable;
 
+/* One storage region the function may touch. The object table is derived
+   from the pointer parameters in source order, so both sides of a problem
+   agree on it without exchanging anything. */
+typedef struct lower_object {
+    ql_ir_value_id base;
+    ql_ir_value_id size;
+} lower_object;
+
 typedef struct lower_state {
     ql_ir_value_id *values;
     uint8_t *initialized;
     size_t count;
+    ql_ir_value_id memory;
 } lower_state;
 
 typedef struct lower_context {
@@ -95,7 +109,16 @@ typedef struct lower_context {
     uint32_t current_terminated;
     ql_ir_type_id bool_type;
     ql_ir_type_id void_type;
+    ql_ir_type_id memory_type;
     ql_ir_type_id bv_types[129];
+    ql_ir_type_id pointer_types[129];
+    ql_ir_type_id bool_pointer_type;
+    /* The memory state threaded through the function, and the objects the
+       access guards are written against. */
+    ql_ir_value_id memory_value;
+    lower_object *objects;
+    size_t object_count;
+    uint32_t uses_memory;
     ql_ir_value_id true_value;
     ql_ir_value_id false_value;
     uint64_t next_block_label;
@@ -429,7 +452,44 @@ static lower_type make_integer_type(uint32_t width, uint32_t rank,
 }
 
 static int type_same(lower_type left, lower_type right) {
-    return ql_c_scalar_same(scalar_of(left), scalar_of(right));
+    if (!ql_c_scalar_same(scalar_of(left), scalar_of(right))) {
+        return 0;
+    }
+    if (left.kind != QL_C_SCALAR_POINTER) {
+        return 1;
+    }
+    return ql_c_scalar_same(left.pointee, right.pointee);
+}
+
+static lower_type make_pointer_type(ql_c_scalar_type pointee) {
+    lower_type type;
+    memset(&type, 0, sizeof(type));
+    type.kind = QL_C_SCALAR_POINTER;
+    type.width = QL_C_POINTER_WIDTH;
+    type.rank = 6u;
+    type.is_signed = 0u;
+    type.pointee = pointee;
+    type.ir_type = QL_IR_INVALID_TYPE_ID;
+    return type;
+}
+
+/* Storage width of the pointee, which is what a load or store moves. */
+static uint32_t pointee_byte_width(lower_type pointer) {
+    uint32_t bits = pointer.pointee.kind == QL_C_SCALAR_BOOL
+                        ? 8u
+                        : pointer.pointee.width;
+    return (bits + 7u) / 8u;
+}
+
+/* Natural alignment on the target ABI, stated the same way the interpreter
+   states it: a scalar of N bytes is N-aligned when N is a power of two up to
+   sixteen, and nothing else is required. */
+static uint32_t natural_alignment(uint32_t byte_width) {
+    if (byte_width == 0u || byte_width > 16u ||
+        (byte_width & (byte_width - 1u)) != 0u) {
+        return 1u;
+    }
+    return byte_width;
 }
 
 /* `allow_void` is set only where C admits an incomplete type: a function's
@@ -622,14 +682,28 @@ static ql_status type_from_inventory(lower_context *context,
             "restrict-qualified declarations require pointer semantics",
             error);
     }
-    if (inventory->pointer_depth != 0u ||
-        (inventory->shape &
-         (QL_C_TYPE_SHAPE_POINTER | QL_C_TYPE_SHAPE_ARRAY |
-          QL_C_TYPE_SHAPE_FUNCTION)) != 0u) {
+    if ((inventory->shape &
+         (QL_C_TYPE_SHAPE_ARRAY | QL_C_TYPE_SHAPE_FUNCTION)) != 0u) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-            "pointers, arrays, and function-valued declarations are outside this lowering slice",
-            error);
+            "array and function-valued declarations are outside this "
+            "lowering slice", error);
+    }
+    if (inventory->pointer_depth > 1u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+            "this slice carries one level of indirection", error);
+    }
+    if (inventory->pointer_depth == 1u) {
+        lower_type pointee;
+        ql_status status = parse_type_spelling(context,
+                                               inventory->base_spelling, node,
+                                               1u, &pointee, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        *output = make_pointer_type(scalar_of(pointee));
+        return QL_STATUS_OK;
     }
     /* The inventory's base-kind classification is a fast syntactic hint.
        Multi-keyword integer specifiers vary in Tree-sitter shape, so the
@@ -646,6 +720,34 @@ static ql_status ensure_ir_type(lower_context *context, lower_type *type,
 
     if (type->ir_type != QL_IR_INVALID_TYPE_ID) {
         return QL_STATUS_OK;
+    }
+    if (type->kind == QL_C_SCALAR_POINTER) {
+        lower_type pointee = type_from_scalar(type->pointee);
+        ql_ir_type_id *slot;
+        ql_status pointee_status;
+        if (type->pointee.kind == QL_C_SCALAR_BOOL) {
+            slot = &context->bool_pointer_type;
+        } else {
+            slot = &context->pointer_types[type->pointee.width];
+        }
+        if (*slot != QL_IR_INVALID_TYPE_ID) {
+            type->ir_type = *slot;
+            return QL_STATUS_OK;
+        }
+        pointee_status = ensure_ir_type(context, &pointee, error);
+        if (pointee_status != QL_STATUS_OK) {
+            return pointee_status;
+        }
+        ql_ir_type_definition_init(&definition, QL_IR_TYPE_POINTER);
+        definition.bit_width = QL_C_POINTER_WIDTH;
+        definition.element_type = pointee.ir_type;
+        status = ql_ir_builder_add_type(context->builder, &definition, &id,
+                                        error);
+        if (status == QL_STATUS_OK) {
+            *slot = id;
+            type->ir_type = id;
+        }
+        return status;
     }
     if (type->kind == QL_C_SCALAR_VOID) {
         if (context->void_type != QL_IR_INVALID_TYPE_ID) {
@@ -729,6 +831,49 @@ static ql_status emit_instruction(lower_context *context,
     return ql_ir_builder_append_instruction(
         context->builder, context->current_block, &definition, &instruction,
         result_type != NULL ? output : NULL, error);
+}
+
+/* Emits an instruction whose result type is already an IR type, which is
+   what memory-valued instructions need. */
+static ql_status emit_typed_instruction(lower_context *context,
+                                        ql_ir_opcode opcode,
+                                        ql_ir_type_id result_type,
+                                        const ql_ir_value_id *operands,
+                                        size_t operand_count,
+                                        uint64_t effects,
+                                        ql_ir_value_id *output,
+                                        ql_error *error) {
+    ql_ir_instruction_definition_v1 definition;
+    ql_ir_instruction_id instruction;
+
+    ql_ir_instruction_definition_init(&definition, opcode);
+    definition.effects = effects;
+    definition.operands = operands;
+    definition.operand_count = operand_count;
+    if (result_type != QL_IR_INVALID_TYPE_ID) {
+        definition.result_types = &result_type;
+        definition.result_count = 1u;
+    }
+    return ql_ir_builder_append_instruction(
+        context->builder, context->current_block, &definition, &instruction,
+        result_type != QL_IR_INVALID_TYPE_ID ? output : NULL, error);
+}
+
+static ql_status ensure_memory_type(lower_context *context, ql_error *error) {
+    ql_ir_type_definition_v1 definition;
+    ql_ir_type_id id;
+    ql_status status;
+
+    if (context->memory_type != QL_IR_INVALID_TYPE_ID) {
+        return QL_STATUS_OK;
+    }
+    ql_ir_type_definition_init(&definition, QL_IR_TYPE_MEMORY);
+    status = ql_ir_builder_add_type(context->builder, &definition, &id,
+                                    error);
+    if (status == QL_STATUS_OK) {
+        context->memory_type = id;
+    }
+    return status;
 }
 
 static ql_status add_constant_bytes(lower_context *context, lower_type *type,
@@ -843,6 +988,291 @@ static ql_status emit_ub_guard(lower_context *context,
     return emit_instruction(context, QL_IR_OPCODE_UB_GUARD, NULL,
                             &value->defined, 1u, NULL, 0u,
                             QL_IR_EFFECT_UNDEFINED_BEHAVIOR, NULL, error);
+}
+
+static lower_type address_type(void);
+static ql_status convert_value(lower_context *context, lower_value input,
+                               lower_type target, lower_value *output,
+                               ql_error *error);
+static ql_status combine_defined(lower_context *context,
+                                 const lower_value *left,
+                                 const lower_value *right,
+                                 ql_ir_value_id *output, ql_error *error);
+static ql_status emit_address_of_pointer(lower_context *context,
+                                         lower_value pointer,
+                                         lower_value *output,
+                                         ql_error *error);
+
+/* The predicate the profile defines for an access: the whole access lies
+   inside one live object and the address is naturally aligned. It is built
+   out of ordinary bit-vector operations and handed to UB_GUARD, so the
+   interpreter and the SMT encoding both simply run it. There is one copy of
+   this rule in the IR rather than one per backend. */
+static ql_status emit_access_defined(lower_context *context,
+                                     lower_value pointer,
+                                     uint32_t byte_width,
+                                     ql_ir_value_id *output,
+                                     ql_error *error) {
+    lower_type u64 = address_type();
+    lower_type boolean = make_bool_type();
+    lower_value address;
+    ql_ir_value_id width_constant;
+    ql_ir_value_id alignment_mask;
+    ql_ir_value_id zero;
+    uint32_t alignment = natural_alignment(byte_width);
+    size_t index;
+    ql_status status;
+
+    status = ensure_bool_constants(context, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = emit_address_of_pointer(context, pointer, &address, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = add_uint_constant(context, u64, byte_width, &width_constant,
+                               error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    *output = context->false_value;
+    for (index = 0u; index < context->object_count; ++index) {
+        const lower_object *object = &context->objects[index];
+        ql_ir_value_id operands[2];
+        ql_ir_value_id offset;
+        ql_ir_value_id room;
+        ql_ir_value_id at_or_after;
+        ql_ir_value_id within;
+        ql_ir_value_id fits;
+        ql_ir_value_id inside;
+
+        status = emit_compare(context, QL_IR_OPCODE_ULE, object->base,
+                              address.value, &at_or_after, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        operands[0] = address.value;
+        operands[1] = object->base;
+        status = emit_instruction(context, QL_IR_OPCODE_SUB, &u64, operands,
+                                  2u, NULL, 0u, QL_IR_EFFECT_NONE, &offset,
+                                  error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        status = emit_compare(context, QL_IR_OPCODE_ULE, offset, object->size,
+                              &within, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        operands[0] = object->size;
+        operands[1] = offset;
+        status = emit_instruction(context, QL_IR_OPCODE_SUB, &u64, operands,
+                                  2u, NULL, 0u, QL_IR_EFFECT_NONE, &room,
+                                  error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        status = emit_compare(context, QL_IR_OPCODE_ULE, width_constant, room,
+                              &fits, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        status = emit_bool_and(context, at_or_after, within, &inside, error);
+        if (status == QL_STATUS_OK) {
+            status = emit_bool_and(context, inside, fits, &inside, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_bool_or(context, *output, inside, output, error);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+    if (alignment > 1u) {
+        ql_ir_value_id operands[2];
+        ql_ir_value_id masked;
+        ql_ir_value_id aligned;
+        status = add_uint_constant(context, u64, alignment - 1u,
+                                   &alignment_mask, error);
+        if (status == QL_STATUS_OK) {
+            status = add_uint_constant(context, u64, 0u, &zero, error);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        operands[0] = address.value;
+        operands[1] = alignment_mask;
+        status = emit_instruction(context, QL_IR_OPCODE_BV_AND, &u64,
+                                  operands, 2u, NULL, 0u, QL_IR_EFFECT_NONE,
+                                  &masked, error);
+        if (status == QL_STATUS_OK) {
+            status = emit_compare(context, QL_IR_OPCODE_EQ, masked, zero,
+                                  &aligned, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_bool_and(context, *output, aligned, output, error);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+    (void)boolean;
+    return QL_STATUS_OK;
+}
+
+/* Guards the access at the point it happens rather than deferring to the
+   next observation, which is the tightest place the obligation can sit. */
+static ql_status emit_access_guard(lower_context *context,
+                                   lower_value pointer, uint32_t byte_width,
+                                   ql_ir_value_id inherited_defined,
+                                   uint32_t inherited_may_ub,
+                                   ql_error *error) {
+    ql_ir_value_id defined;
+    lower_value guard;
+    ql_status status = emit_access_defined(context, pointer, byte_width,
+                                           &defined, error);
+
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    if (inherited_may_ub != 0u) {
+        status = emit_bool_and(context, inherited_defined, defined, &defined,
+                               error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+    memset(&guard, 0, sizeof(guard));
+    guard.defined = defined;
+    guard.may_ub = 1u;
+    return emit_ub_guard(context, &guard, error);
+}
+
+static ql_status emit_load(lower_context *context, lower_value pointer,
+                           lower_value *output, ql_error *error) {
+    lower_type pointee = type_from_scalar(pointer.type.pointee);
+    ql_ir_value_id operands[2];
+    ql_status status;
+
+    if (pointee.kind == QL_C_SCALAR_VOID) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+            "a pointer to void has no value to load", error);
+    }
+    status = emit_access_guard(context, pointer, pointee_byte_width(
+                                                     pointer.type),
+                               pointer.defined, pointer.may_ub, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = ensure_ir_type(context, &pointee, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    operands[0] = context->memory_value;
+    operands[1] = pointer.value;
+    memset(output, 0, sizeof(*output));
+    output->type = pointee;
+    output->defined = context->true_value;
+    output->may_ub = 0u;
+    return emit_typed_instruction(context, QL_IR_OPCODE_LOAD,
+                                  pointee.ir_type, operands, 2u,
+                                  QL_IR_EFFECT_MEMORY, &output->value, error);
+}
+
+static ql_status emit_store(lower_context *context, lower_value pointer,
+                            lower_value value, ql_error *error) {
+    lower_type pointee = type_from_scalar(pointer.type.pointee);
+    lower_value converted;
+    ql_ir_value_id operands[3];
+    ql_ir_value_id combined;
+    uint32_t may_ub = pointer.may_ub | value.may_ub;
+    ql_status status;
+
+    if (pointee.kind == QL_C_SCALAR_VOID) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+            "a pointer to void has no value to store", error);
+    }
+    status = convert_value(context, value, pointee, &converted, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    status = combine_defined(context, &pointer, &value, &combined, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = emit_access_guard(context, pointer,
+                               pointee_byte_width(pointer.type), combined,
+                               may_ub, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    operands[0] = context->memory_value;
+    operands[1] = pointer.value;
+    operands[2] = converted.value;
+    return emit_typed_instruction(context, QL_IR_OPCODE_STORE,
+                                  context->memory_type, operands, 3u,
+                                  QL_IR_EFFECT_MEMORY,
+                                  &context->memory_value, error);
+}
+
+/* `p + n` moves by n elements, so the offset is scaled by the pointee's
+   storage width before it reaches PTR_ADD. */
+static ql_status emit_pointer_offset(lower_context *context,
+                                     lower_value pointer, lower_value offset,
+                                     int subtract, lower_value *output,
+                                     ql_error *error) {
+    lower_type u64 = address_type();
+    lower_value widened;
+    ql_ir_value_id scale;
+    ql_ir_value_id scaled;
+    ql_ir_value_id operands[2];
+    ql_status status;
+
+    if (pointer.type.pointee.kind == QL_C_SCALAR_VOID) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, SIZE_MAX,
+            "arithmetic on a pointer to void has no element size", error);
+    }
+    status = convert_value(context, offset, u64, &widened, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    if (subtract) {
+        status = emit_instruction(context, QL_IR_OPCODE_BV_NEG, &u64,
+                                  &widened.value, 1u, NULL, 0u,
+                                  QL_IR_EFFECT_NONE, &widened.value, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+    status = add_uint_constant(context, u64,
+                               pointee_byte_width(pointer.type), &scale,
+                               error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    operands[0] = widened.value;
+    operands[1] = scale;
+    status = emit_instruction(context, QL_IR_OPCODE_MUL, &u64, operands, 2u,
+                              NULL, 0u, QL_IR_EFFECT_NONE, &scaled, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    *output = pointer;
+    operands[0] = pointer.value;
+    operands[1] = scaled;
+    status = combine_defined(context, &pointer, &offset, &output->defined,
+                             error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    output->may_ub = pointer.may_ub | offset.may_ub;
+    return emit_instruction(context, QL_IR_OPCODE_PTR_ADD, &pointer.type,
+                            operands, 2u, NULL, 0u, QL_IR_EFFECT_NONE,
+                            &output->value, error);
 }
 
 static ql_status add_block(lower_context *context, const char *prefix,
@@ -960,6 +1390,7 @@ static ql_status save_state(lower_context *context, size_t count,
     size_t index;
     memset(state, 0, sizeof(*state));
     state->count = count;
+    state->memory = context->memory_value;
     if (count == 0u) {
         return QL_STATUS_OK;
     }
@@ -987,6 +1418,7 @@ static ql_status save_state(lower_context *context, size_t count,
 
 static void restore_state(lower_context *context, const lower_state *state) {
     size_t index;
+    context->memory_value = state->memory;
     for (index = 0u; index < state->count; ++index) {
         context->variables[index].value = state->values[index];
         context->variables[index].initialized = state->initialized[index];
@@ -1187,6 +1619,82 @@ static ql_status lower_integer_literal(lower_context *context, size_t node,
 
 static ql_status convert_value(lower_context *context, lower_value input,
                                lower_type target, lower_value *output,
+                               ql_error *error);
+
+static lower_type address_type(void) {
+    return make_integer_type(QL_C_POINTER_WIDTH, 4u, 0u);
+}
+
+/* An address as a bit-vector, which is where pointer arithmetic and every
+   comparison happen. Under this profile that reinterpretation is exact: a
+   pointer is its address. */
+static ql_status emit_address_of_pointer(lower_context *context,
+                                         lower_value pointer,
+                                         lower_value *output,
+                                         ql_error *error) {
+    lower_type u64 = address_type();
+    ql_status status;
+
+    *output = pointer;
+    output->type = u64;
+    status = emit_instruction(context, QL_IR_OPCODE_PTR_TO_BV, &u64,
+                              &pointer.value, 1u, NULL, 0u,
+                              QL_IR_EFFECT_NONE, &output->value, error);
+    return status;
+}
+
+static ql_status emit_pointer_of_address(lower_context *context,
+                                         lower_value address,
+                                         lower_type target,
+                                         lower_value *output,
+                                         ql_error *error) {
+    ql_status status = ensure_ir_type(context, &target, error);
+
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    *output = address;
+    output->type = target;
+    return emit_instruction(context, QL_IR_OPCODE_BV_TO_PTR, &target,
+                            &address.value, 1u, NULL, 0u, QL_IR_EFFECT_NONE,
+                            &output->value, error);
+}
+
+/* Conversions with a pointer on either side all route through the address,
+   which keeps null literals, casts, and truth tests on one path. */
+static ql_status convert_across_pointer(lower_context *context,
+                                        lower_value input, lower_type target,
+                                        lower_value *output,
+                                        ql_error *error) {
+    lower_type u64 = address_type();
+    lower_value address;
+    ql_status status;
+
+    if (input.type.kind == QL_C_SCALAR_POINTER) {
+        status = emit_address_of_pointer(context, input, &address, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        if (target.kind == QL_C_SCALAR_POINTER) {
+            return emit_pointer_of_address(context, address, target, output,
+                                           error);
+        }
+        return convert_value(context, address, target, output, error);
+    }
+    if (input.type.kind == QL_C_SCALAR_VOID) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+            "void does not convert to a pointer", error);
+    }
+    status = convert_value(context, input, u64, &address, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    return emit_pointer_of_address(context, address, target, output, error);
+}
+
+static ql_status convert_value(lower_context *context, lower_value input,
+                               lower_type target, lower_value *output,
                                ql_error *error) {
     ql_ir_opcode opcode;
     ql_ir_value_id zero;
@@ -1196,6 +1704,10 @@ static ql_status convert_value(lower_context *context, lower_value input,
     if (type_same(input.type, target) != 0) {
         output->type = target;
         return QL_STATUS_OK;
+    }
+    if (input.type.kind == QL_C_SCALAR_POINTER ||
+        target.kind == QL_C_SCALAR_POINTER) {
+        return convert_across_pointer(context, input, target, output, error);
     }
     if (target.kind == QL_C_SCALAR_BOOL) {
         if (input.type.kind == QL_C_SCALAR_BOOL) {
@@ -1935,6 +2447,87 @@ static ql_status lower_logical_expression(
     return convert_value(context, bool_result, int_type, output, error);
 }
 
+/* Comparison and arithmetic where at least one side is a pointer. Under this
+   profile the comparison is on addresses, so operands in different objects
+   compare rather than being undefined; ARCHITECTURE.md records that the
+   verdict is relative to the profile for exactly this reason. */
+static ql_status lower_pointer_binary(lower_context *context,
+                                      const char *operator_text, size_t node,
+                                      lower_value left, lower_value right,
+                                      lower_value *output, ql_error *error) {
+    lower_type u64 = address_type();
+    lower_type result_type = make_integer_type(32u, 3u, 1u);
+    lower_value left_address;
+    lower_value right_address;
+    lower_value comparison;
+    ql_ir_opcode opcode;
+    ql_status status;
+
+    if (strcmp(operator_text, "+") == 0 || strcmp(operator_text, "-") == 0) {
+        const int subtract = strcmp(operator_text, "-") == 0;
+        if (left.type.kind == QL_C_SCALAR_POINTER &&
+            right.type.kind == QL_C_SCALAR_POINTER) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+                "the difference of two pointers is not in this slice", error);
+        }
+        if (left.type.kind != QL_C_SCALAR_POINTER) {
+            if (subtract) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                    "an integer minus a pointer is not a C expression",
+                    error);
+            }
+            return emit_pointer_offset(context, right, left, 0, output,
+                                       error);
+        }
+        return emit_pointer_offset(context, left, right, subtract, output,
+                                   error);
+    }
+    if (strcmp(operator_text, "==") == 0) {
+        opcode = QL_IR_OPCODE_EQ;
+    } else if (strcmp(operator_text, "!=") == 0) {
+        opcode = QL_IR_OPCODE_NE;
+    } else if (strcmp(operator_text, "<") == 0) {
+        opcode = QL_IR_OPCODE_ULT;
+    } else if (strcmp(operator_text, "<=") == 0) {
+        opcode = QL_IR_OPCODE_ULE;
+    } else if (strcmp(operator_text, ">") == 0 ||
+               strcmp(operator_text, ">=") == 0) {
+        lower_value swap = left;
+        left = right;
+        right = swap;
+        opcode = strcmp(operator_text, ">") == 0 ? QL_IR_OPCODE_ULT
+                                                 : QL_IR_OPCODE_ULE;
+    } else {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+            "operator does not apply to a pointer", error);
+    }
+    status = convert_value(context, left, u64, &left_address, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    status = convert_value(context, right, u64, &right_address, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    memset(&comparison, 0, sizeof(comparison));
+    comparison.type = make_bool_type();
+    status = combine_defined(context, &left, &right, &comparison.defined,
+                             error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    comparison.may_ub = left.may_ub | right.may_ub;
+    status = emit_compare(context, opcode, left_address.value,
+                          right_address.value, &comparison.value, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    return convert_value(context, comparison, result_type, output, error);
+}
+
 static ql_status lower_binary_expression(lower_context *context, size_t node,
                                          lower_value *output,
                                          ql_error *error) {
@@ -1982,6 +2575,14 @@ static ql_status lower_binary_expression(lower_context *context, size_t node,
         strcmp(operator_text, ">>") == 0) {
         status = emit_shift_result(context, strcmp(operator_text, "<<") == 0,
                                    left, right, output, error);
+        context->allocator->deallocate(context->allocator->user_data,
+                                       operator_text);
+        return status;
+    }
+    if (left.type.kind == QL_C_SCALAR_POINTER ||
+        right.type.kind == QL_C_SCALAR_POINTER) {
+        status = lower_pointer_binary(context, operator_text, node, left,
+                                      right, output, error);
         context->allocator->deallocate(context->allocator->user_data,
                                        operator_text);
         return status;
@@ -2237,6 +2838,91 @@ static size_t disguised_cast_type(lower_context *context, size_t node,
     return name_node;
 }
 
+/* The address a dereference or a subscript designates. Both a load and a
+   store need it, so it is computed once here rather than twice. */
+static ql_status lower_designator_address(lower_context *context, size_t node,
+                                          lower_value *output,
+                                          ql_error *error) {
+    const char *kind = context->nodes[node].view.kind;
+    ql_status status;
+
+    if (strcmp(kind, "pointer_expression") == 0) {
+        size_t operator_node = direct_field_child(context, node, "operator");
+        size_t argument_node = direct_field_child(context, node, "argument");
+        char *operator_text;
+        int is_dereference;
+        if (operator_node == SIZE_MAX || argument_node == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "pointer expression is missing an operator or argument",
+                error);
+        }
+        operator_text = copy_node_text(context, operator_node);
+        if (operator_text == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        is_dereference = strcmp(operator_text, "*") == 0;
+        context->allocator->deallocate(context->allocator->user_data,
+                                       operator_text);
+        if (!is_dereference) {
+            /* Taking an address introduces an object this slice does not
+               create yet, so it stays a pointer obstacle rather than being
+               guessed at. */
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+                "taking an address requires an object for the operand",
+                error);
+        }
+        status = lower_expression(context, argument_node, output, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        if (output->type.kind != QL_C_SCALAR_POINTER) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                "dereference applies to a pointer", error);
+        }
+        return QL_STATUS_OK;
+    }
+    if (strcmp(kind, "subscript_expression") == 0) {
+        size_t base_node = direct_field_child(context, node, "argument");
+        size_t index_node = direct_field_child(context, node, "index");
+        lower_value base;
+        lower_value index;
+        if (base_node == SIZE_MAX || index_node == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "subscript is missing its base or index", error);
+        }
+        status = lower_expression(context, base_node, &base, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        status = lower_expression(context, index_node, &index, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        /* C admits `i[p]` as readily as `p[i]`. */
+        if (base.type.kind != QL_C_SCALAR_POINTER) {
+            lower_value swap = base;
+            base = index;
+            index = swap;
+        }
+        if (base.type.kind != QL_C_SCALAR_POINTER ||
+            index.type.kind == QL_C_SCALAR_POINTER) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                "a subscript needs one pointer operand and one integer",
+                error);
+        }
+        return emit_pointer_offset(context, base, index, 0, output, error);
+    }
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+        "expression does not designate an object", error);
+}
+
 static ql_status lower_expression(lower_context *context, size_t node,
                                   lower_value *output, ql_error *error) {
     const char *kind;
@@ -2288,7 +2974,16 @@ static ql_status lower_expression(lower_context *context, size_t node,
             error);
     }
     if (strcmp(kind, "pointer_expression") == 0 ||
-        strcmp(kind, "subscript_expression") == 0 ||
+        strcmp(kind, "subscript_expression") == 0) {
+        lower_value address;
+        ql_status status = lower_designator_address(context, node, &address,
+                                                    error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        return emit_load(context, address, output, error);
+    }
+    if (
         strcmp(kind, "field_expression") == 0) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
@@ -2303,6 +2998,42 @@ static ql_status lower_expression(lower_context *context, size_t node,
 static ql_status lower_statement(lower_context *context, size_t node,
                                  ql_error *error);
 
+static ql_status lower_store_assignment(lower_context *context, size_t node,
+                                        size_t left_node, size_t right_node,
+                                        size_t operator_node,
+                                        ql_error *error) {
+    lower_value address;
+    lower_value value;
+    char *operator_text = copy_node_text(context, operator_node);
+    ql_status status;
+
+    if (operator_text == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    status = strcmp(operator_text, "=") == 0 ? QL_STATUS_OK
+                                             : QL_STATUS_INVALID_ARGUMENT;
+    context->allocator->deallocate(context->allocator->user_data,
+                                   operator_text);
+    if (status != QL_STATUS_OK) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "compound assignment is not in the first semantic lowering slice",
+            error);
+    }
+    /* The value is evaluated before the store so that a partial operation in
+       it is already guarded when the address is written. */
+    status = lower_expression(context, right_node, &value, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    status = lower_designator_address(context, left_node, &address, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    return emit_store(context, address, value, error);
+}
+
 static ql_status lower_assignment(lower_context *context, size_t node,
                                   ql_error *error) {
     size_t left_node = direct_field_child(context, node, "left");
@@ -2316,12 +3047,23 @@ static ql_status lower_assignment(lower_context *context, size_t node,
     ql_status status;
 
     if (left_node == SIZE_MAX || right_node == SIZE_MAX ||
-        operator_node == SIZE_MAX ||
-        strcmp(context->nodes[left_node].view.kind, "identifier") != 0) {
+        operator_node == SIZE_MAX) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
-            "only assignment to a scalar local or parameter is supported",
-            error);
+            "assignment is missing a target, a value, or an operator", error);
+    }
+    if (strcmp(context->nodes[left_node].view.kind, "pointer_expression") ==
+            0 ||
+        strcmp(context->nodes[left_node].view.kind,
+               "subscript_expression") == 0) {
+        return lower_store_assignment(context, node, left_node, right_node,
+                                      operator_node, error);
+    }
+    if (strcmp(context->nodes[left_node].view.kind, "identifier") != 0) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "only assignment to a scalar local, parameter, or dereference is "
+            "supported", error);
     }
     operator_text = copy_node_text(context, operator_node);
     if (operator_text == NULL) {
@@ -2610,6 +3352,27 @@ static ql_status lower_compound(lower_context *context, size_t node,
     return status;
 }
 
+static ql_status emit_typed_instruction_phi(lower_context *context,
+                                           ql_ir_type_id type,
+                                           const ql_ir_value_id *operands,
+                                           const ql_ir_block_id *blocks,
+                                           ql_ir_value_id *output,
+                                           ql_error *error) {
+    ql_ir_instruction_definition_v1 definition;
+    ql_ir_instruction_id instruction;
+
+    ql_ir_instruction_definition_init(&definition, QL_IR_OPCODE_PHI);
+    definition.operands = operands;
+    definition.operand_count = 2u;
+    definition.block_operands = blocks;
+    definition.block_operand_count = 2u;
+    definition.result_types = &type;
+    definition.result_count = 1u;
+    return ql_ir_builder_append_instruction(
+        context->builder, context->current_block, &definition, &instruction,
+        output, error);
+}
+
 static ql_status merge_branch_states(
     lower_context *context, const lower_state *left, ql_ir_block_id left_block,
     const lower_state *right, ql_ir_block_id right_block, ql_error *error) {
@@ -2642,6 +3405,20 @@ static ql_status merge_branch_states(
             }
         }
     }
+    /* Memory is as much a merged value as any variable: a store on one branch
+       and not the other leaves the join with two versions to reconcile. */
+    if (context->uses_memory != 0u && left->memory != right->memory) {
+        ql_ir_value_id operands[2];
+        ql_ir_block_id blocks[2];
+        operands[0] = left->memory;
+        operands[1] = right->memory;
+        blocks[0] = left_block;
+        blocks[1] = right_block;
+        return emit_typed_instruction_phi(context, context->memory_type,
+                                          operands, blocks,
+                                          &context->memory_value, error);
+    }
+    context->memory_value = left->memory;
     return QL_STATUS_OK;
 }
 
@@ -2793,6 +3570,8 @@ static ql_status terminate_void_return(lower_context *context,
     ql_status status;
 
     ql_ir_terminator_definition_init(&terminator, QL_IR_TERMINATOR_RETURN);
+    terminator.memory = context->uses_memory != 0u ? context->memory_value
+                                                   : QL_IR_INVALID_VALUE_ID;
     status = ql_ir_builder_set_terminator(context->builder,
                                           context->current_block,
                                           &terminator, error);
@@ -2838,6 +3617,10 @@ static ql_status lower_return_statement(lower_context *context, size_t node,
     }
     ql_ir_terminator_definition_init(&terminator, QL_IR_TERMINATOR_RETURN);
     terminator.return_value = converted.value;
+    /* Memory is observable, so a function that writes has to say what it
+       left behind. */
+    terminator.memory = context->uses_memory != 0u ? context->memory_value
+                                                   : QL_IR_INVALID_VALUE_ID;
     status = ql_ir_builder_set_terminator(context->builder,
                                           context->current_block,
                                           &terminator, error);
@@ -2982,6 +3765,176 @@ static ql_status check_function_specifiers(lower_context *context,
     return QL_STATUS_OK;
 }
 
+/* The object table is derived from the pointer parameters in source order,
+   so it needs nothing exchanged between the two sides of a problem: the same
+   signature yields the same table. The IR parameter list is therefore
+      [ the C parameters, in source order ]
+      [ __memory, once, when the function has any pointer parameter ]
+      [ <name>.__base and <name>.__size, per pointer parameter, in source
+        order ]
+   which keeps the first N parameters lined up with the C arguments and puts
+   everything the memory model needs behind them. */
+static ql_status add_object_parameters(lower_context *context,
+                                       ql_error *error) {
+    lower_type u64 = address_type();
+    size_t index;
+    size_t next = 0u;
+    ql_status status;
+
+    if (context->uses_memory == 0u) {
+        return QL_STATUS_OK;
+    }
+    status = ensure_memory_type(context, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = ql_ir_builder_add_parameter(context->builder,
+                                         context->memory_type, "__memory",
+                                         8u, &context->memory_value, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = ensure_ir_type(context, &u64, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    for (index = 0u; index < context->variable_count; ++index) {
+        const lower_variable *variable = &context->variables[index];
+        char name[128];
+        lower_object *object;
+        if (variable->type.kind != QL_C_SCALAR_POINTER) {
+            continue;
+        }
+        object = &context->objects[next++];
+        if (snprintf(name, sizeof(name), "%s.__base", variable->name) < 0) {
+            ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                         "object parameter name does not fit");
+            return QL_STATUS_INTERNAL_ERROR;
+        }
+        status = ql_ir_builder_add_parameter(context->builder, u64.ir_type,
+                                             name, strlen(name),
+                                             &object->base, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        if (snprintf(name, sizeof(name), "%s.__size", variable->name) < 0) {
+            ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                         "object parameter name does not fit");
+            return QL_STATUS_INTERNAL_ERROR;
+        }
+        status = ql_ir_builder_add_parameter(context->builder, u64.ir_type,
+                                             name, strlen(name),
+                                             &object->size, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+    return QL_STATUS_OK;
+}
+
+static ql_status emit_assume(lower_context *context, ql_ir_value_id predicate,
+                             ql_error *error) {
+    return emit_instruction(context, QL_IR_OPCODE_ASSUME, NULL, &predicate,
+                            1u, NULL, 0u, QL_IR_EFFECT_NONE, NULL, error);
+}
+
+/* The model's three standing constraints, stated in the IR so that the SMT
+   encoding inherits them instead of restating them: objects are non-empty and
+   above the first page, they do not wrap, and distinct objects are disjoint.
+   The interpreter checks the same three on its object table, so a run and a
+   query cannot disagree about which layouts are admissible. */
+static ql_status emit_object_assumptions(lower_context *context,
+                                         ql_error *error) {
+    lower_type u64 = address_type();
+    ql_ir_value_id first_address;
+    ql_ir_value_id zero;
+    size_t index;
+    size_t other;
+    ql_status status;
+
+    if (context->object_count == 0u) {
+        return QL_STATUS_OK;
+    }
+    status = add_uint_constant(context, u64,
+                               QL_IR_INTERP_FIRST_OBJECT_ADDRESS,
+                               &first_address, error);
+    if (status == QL_STATUS_OK) {
+        status = add_uint_constant(context, u64, 0u, &zero, error);
+    }
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    for (index = 0u; index < context->object_count; ++index) {
+        const lower_object *object = &context->objects[index];
+        ql_ir_value_id operands[2];
+        ql_ir_value_id limit;
+        ql_ir_value_id predicate;
+
+        status = emit_compare(context, QL_IR_OPCODE_ULE, first_address,
+                              object->base, &predicate, error);
+        if (status == QL_STATUS_OK) {
+            status = emit_assume(context, predicate, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_compare(context, QL_IR_OPCODE_NE, object->size,
+                                  zero, &predicate, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_assume(context, predicate, error);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        operands[0] = object->base;
+        operands[1] = object->size;
+        status = emit_instruction(context, QL_IR_OPCODE_ADD, &u64, operands,
+                                  2u, NULL, 0u, QL_IR_EFFECT_NONE, &limit,
+                                  error);
+        if (status == QL_STATUS_OK) {
+            status = emit_compare(context, QL_IR_OPCODE_ULE, object->base,
+                                  limit, &predicate, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_assume(context, predicate, error);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        for (other = 0u; other < index; ++other) {
+            const lower_object *earlier = &context->objects[other];
+            ql_ir_value_id earlier_limit;
+            ql_ir_value_id before;
+            ql_ir_value_id after;
+            operands[0] = earlier->base;
+            operands[1] = earlier->size;
+            status = emit_instruction(context, QL_IR_OPCODE_ADD, &u64,
+                                      operands, 2u, NULL, 0u,
+                                      QL_IR_EFFECT_NONE, &earlier_limit,
+                                      error);
+            if (status == QL_STATUS_OK) {
+                status = emit_compare(context, QL_IR_OPCODE_ULE,
+                                      earlier_limit, object->base, &before,
+                                      error);
+            }
+            if (status == QL_STATUS_OK) {
+                status = emit_compare(context, QL_IR_OPCODE_ULE, limit,
+                                      earlier->base, &after, error);
+            }
+            if (status == QL_STATUS_OK) {
+                status = emit_bool_or(context, before, after, &predicate,
+                                      error);
+            }
+            if (status == QL_STATUS_OK) {
+                status = emit_assume(context, predicate, error);
+            }
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+        }
+    }
+    return QL_STATUS_OK;
+}
+
 static ql_status initialize_parameters(lower_context *context,
                                        ql_error *error) {
     size_t index;
@@ -3023,12 +3976,33 @@ static ql_status initialize_parameters(lower_context *context,
             return status;
         }
     }
-    return QL_STATUS_OK;
+    for (index = 0u; index < context->variable_count; ++index) {
+        if (context->variables[index].type.kind == QL_C_SCALAR_POINTER) {
+            ++context->object_count;
+        }
+    }
+    if (context->object_count != 0u) {
+        context->uses_memory = 1u;
+        context->objects = context->allocator->allocate(
+            context->allocator->user_data,
+            context->object_count * sizeof(*context->objects));
+        if (context->objects == NULL) {
+            context->object_count = 0u;
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        memset(context->objects, 0,
+               context->object_count * sizeof(*context->objects));
+    }
+    return add_object_parameters(context, error);
 }
 
 static void cleanup_context(lower_context *context) {
     pop_variables(context, 0u);
     release_typedefs(context);
+    context->allocator->deallocate(context->allocator->user_data,
+                                   context->objects);
+    context->objects = NULL;
     context->allocator->deallocate(context->allocator->user_data,
                                    context->variables);
     ql_ir_builder_destroy(context->builder);
@@ -3095,6 +4069,9 @@ ql_status QL_CALL ql_c_lower_selected_function(
     context.result = result;
     context.bool_type = QL_IR_INVALID_TYPE_ID;
     context.void_type = QL_IR_INVALID_TYPE_ID;
+    context.memory_type = QL_IR_INVALID_TYPE_ID;
+    context.bool_pointer_type = QL_IR_INVALID_TYPE_ID;
+    context.memory_value = QL_IR_INVALID_VALUE_ID;
     context.true_value = QL_IR_INVALID_VALUE_ID;
     context.false_value = QL_IR_INVALID_VALUE_ID;
     context.current_block = QL_IR_INVALID_BLOCK_ID;
@@ -3102,6 +4079,7 @@ ql_status QL_CALL ql_c_lower_selected_function(
                                      sizeof(context.bv_types[0]);
          ++index) {
         context.bv_types[index] = QL_IR_INVALID_TYPE_ID;
+        context.pointer_types[index] = QL_IR_INVALID_TYPE_ID;
     }
 
     if (canonical.support != QL_C_FUNCTION_SUPPORTED) {
@@ -3189,6 +4167,9 @@ ql_status QL_CALL ql_c_lower_selected_function(
         if (status == QL_STATUS_OK) {
             context.current_block = entry;
             context.current_terminated = 0u;
+            status = emit_object_assumptions(&context, error);
+        }
+        if (status == QL_STATUS_OK) {
             status = lower_compound(&context, body_node, 0u, error);
         }
     }

@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-2단계 포인터. 인터프리터 메모리 모델을 세웠고 다음은 `c_lower.c` 의 포인터 하강입니다.
+2단계. 포인터를 닫았고 첫 차단 사유가 struct/union/enum 타입으로 옮겨갔습니다. 다음은 aggregate 타입입니다.
 
 ## 기준선
 
@@ -139,9 +139,26 @@ defined(a, W)  :=  (어떤 살아있는 object O 에 대해
 
 **W2 는 base/size 를 따로 만들어 낼 필요가 없습니다.** IR 이 이미 그것을 파라미터로 갖고 있고 guard 도 IR 안에 있으므로, miter 는 위 세 제약(disjoint, 첫 페이지 위, wrap 없음)만 좌우 공통 assumption 으로 걸면 됩니다. 그 형태는 로어링이 붙는 다음 작업 단위에서 확정해 여기 다시 적습니다.
 
-### 아직 확정하지 않은 것
+### object 의 IR 파라미터 배치 (확정)
 
-로어링이 아직 없으므로 **object 를 IR 파라미터로 어떻게 배치할지**(포인터 파라미터마다 base/size 두 개를 뒤에 붙이는 순서 규칙)는 다음 작업 단위에서 정하고 여기 적습니다. W2 는 그때까지 miter 의 메모리 부분을 시작하지 않는 편이 낫습니다.
+IR 파라미터 목록은 이 순서입니다.
+
+```
+[ C 파라미터, source 순서 ]
+[ __memory,  포인터 파라미터가 하나라도 있을 때 한 개 ]
+[ <이름>.__base 와 <이름>.__size, 포인터 파라미터마다, source 순서 ]
+```
+
+근거입니다.
+
+- **앞의 N개가 C 인자와 그대로 대응**합니다. problem v2 의 인자 대응이 좌우 IR 파라미터 인덱스를 그냥 쓰면 됩니다
+- object 표는 **포인터 파라미터에서 유도**되므로 좌우가 아무것도 주고받지 않아도 같은 표를 얻습니다. 같은 signature 면 같은 표입니다
+- 포인터 파라미터가 없는 함수는 예전과 **완전히 같은 IR** 을 냅니다. 쓰지도 않을 memory 파라미터가 붙지 않습니다
+- base/size 는 `bv64` 이고 `__memory` 는 유일한 MEMORY 타입 값이라 이름과 타입 둘 다로 찾을 수 있습니다
+
+entry 블록이 모델의 세 제약을 `ASSUME` 으로 겁니다. object 마다 `FIRST <= base`, `size != 0`, `base <= base + size`(wrap 없음)이고, 서로 다른 object 쌍마다 `base_i + size_i <= base_j 또는 base_j + size_j <= base_i`(disjoint)입니다. **W2 는 이것을 다시 만들 필요가 없습니다. IR 안에 이미 있습니다.**
+
+접근 guard 도 IR 안에 있습니다. 접근마다 `UB_GUARD(OR_i in_object_i(a, W) AND aligned(a, W))` 이고, `in_object_i` 는 `base_i <= a`, `a - base_i <= size_i`, `W <= size_i - (a - base_i)` 입니다. interpreter 의 `interp_access_defined` 와 같은 형태이고, miter 는 그냥 opcode 를 인코딩하면 됩니다.
 
 ## W2 가 볼 인터페이스
 
@@ -345,6 +362,58 @@ undefined 전파 규칙은 로어링과 맞물려 있습니다.
 
 `ctest` 224/224 통과입니다.
 
+### 6. 포인터 로어링
+
+커밋: (이 커밋)
+
+`c_lower.c` 가 포인터를 냅니다. 파라미터 타입(`int *p`), 메모리 스레딩, `*p`, `p[i]`, `*(p + i)`, `*p = v`, `p[i] = v`, 포인터 산술과 비교, null 비교입니다. object 파라미터 배치는 위 절에 확정해 적었습니다.
+
+#### guard 는 접근 *앞*에 선다
+
+verifier 규칙을 하나 나눠야 했습니다. 기존 규칙은 "부분 연산과 그것을 관찰하는 지점 사이를 guard 가 가른다"였는데, 메모리 접근에는 그대로 쓸 수 없습니다. **역참조를 먼저 하고 나중에 검사할 수는 없기 때문입니다.**
+
+그래서 부분 연산을 둘로 나눴습니다.
+
+| 부류 | 정의성이 | guard 위치 |
+|---|---|---|
+| `SDIV` `UDIV` `SREM` `UREM` `SHL` `LSHR` `ASHR` | 피연산자에 대한 사후 사실 | 연산과 관찰 사이 |
+| `LOAD` `STORE` | 주소에 대한 **사전 조건** | 접근 **앞** |
+
+임의 구분이 아닙니다. 술어가 연산의 사전 조건이냐 결과에 대한 사실이냐의 차이이고, 각 경우에 의무가 실제로 해소되는 지점이 다릅니다. 메모리 접근은 앞의 guard 가 의무를 해소하므로 결과가 pending 을 물려주지 않습니다.
+
+interpreter 는 여전히 `LOAD`/`STORE` 의 부분성을 독립으로 알고 있으므로, guard 가 약하면 구체 입력에서 잡힙니다.
+
+#### 결과 (val 1,050 본문)
+
+| 첫 차단 사유 | 타입 작업 후 | 포인터 작업 후 |
+|---|---:|---:|
+| (로어링 성공) | 2 | **5** |
+| `unsupported_pointer` | 832 | **241** |
+| `unsupported_type` | 103 | **638** |
+| `unsupported_call` | 55 | 90 |
+| `undeclared_identifier` | 31 | 40 |
+| `unsupported_expression` | 8 | 11 |
+| `unsupported_control_flow` | 8 | 10 |
+| `unsupported_loop` | 2 | 4 |
+| `frontend_unsupported` | 9 | 9 |
+
+**포인터가 71% 줄었고 차단이 타입으로 되돌아갔습니다.** 되돌아간 것이 아니라 옮겨간 것입니다. `struct TYP_0 *ARG_0` 같은 서명이 이제 포인터 관문을 통과해서 **가리키는 대상의 타입**에서 걸립니다. 코퍼스의 지배적인 모양이 struct 포인터이므로 예상된 이동이고, 다음 순위는 struct/union/enum 입니다.
+
+#### differential 이 포인터 함수를 잰다
+
+`tests/test_c_lower_pointers.cpp` 의 `MatchesCompiledExecutionOnPointerFunctions` 가 6개 포인터 함수를 실제 컴파일 실행과 대조합니다. 사례마다 무작위 배열 내용 256회이고, **반환값뿐 아니라 최종 메모리 이미지도 비교**합니다. 메모리가 관찰 대상이므로 그것을 비교하지 않으면 store 가 맞는지 아무것도 말하지 않습니다.
+
+IR 은 `QL_IR_INTERP_FIRST_OBJECT_ADDRESS` 의 상징적 object 를 보고 참조는 진짜 배열을 봅니다. 이 사례들 중 주소를 반환하는 것이 없으므로 비교를 건너는 것은 데이터뿐이라 건전합니다.
+
+`ctest` 253/253 통과입니다.
+
+#### 아직 아닌 것
+
+- **`&x`**: 지역 변수의 주소를 잡으려면 이 slice 가 아직 만들지 않는 object 가 필요합니다. `unsupported_pointer` 로 남습니다
+- 지역 포인터 변수 선언(`int *p = ...;`)은 declarator 경로가 아직 막습니다
+- `p - q`(포인터 차이), 이중 포인터, typedef 가 가리키는 포인터
+- `struct`/`union`/`enum` 과 `->`, `.`
+
 ## 막힌 것
 
 - 없음
@@ -371,7 +440,8 @@ undefined 전파 규칙은 로어링과 맞물려 있습니다.
 
 ## 다음에 할 것
 
-1. **포인터 하강 (`c_lower.c`).** 인터프리터 쪽은 섰으므로 남은 것은 로어링입니다. 포인터 타입, 메모리 threading, `*p`, `p[i]`, `&x`, 포인터 산술과 비교, object base/size 파라미터와 그 assumption, 접근 지점 guard 입니다. 첫 차단 사유의 79% 입니다. 연산, object identity, provenance, 유효 범위, alignment, load 와 store 입니다. **interpreter 에 메모리 모델을 같이 넣어야 합니다.** 지금 interpreter 는 포인터를 만나면 `UNSUPPORTED` 를 냅니다
+1. **struct, union, enum.** 첫 차단 사유의 61% (638/1050) 입니다. 포인터를 열자 차단이 여기로 옮겨왔습니다. `->` 와 `.` 가 같이 갑니다
+2. `&x` 와 지역 포인터 선언. 지역 object 를 만들면 둘 다 열립니다 연산, object identity, provenance, 유효 범위, alignment, load 와 store 입니다. **interpreter 에 메모리 모델을 같이 넣어야 합니다.** 지금 interpreter 는 포인터를 만나면 `UNSUPPORTED` 를 냅니다
 2. 전역 변수와 정적 저장 기간 (`undeclared_identifier` 31건)
 3. struct, union, enum (`unsupported_type` 잔여 103건)
 4. 함수 호출과 외부 효과 (`unsupported_call` 55건)

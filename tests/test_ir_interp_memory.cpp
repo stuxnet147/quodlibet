@@ -242,12 +242,15 @@ struct LoadModule {
         EXPECT_EQ(QL_STATUS_OK,
                   ql_ir_builder_set_entry_block(builder.get(), entry,
                                                 &error));
-        const ql_ir_value_id loaded =
-            builder.Append(entry, QL_IR_OPCODE_LOAD, {m, p}, bv32,
-                           QL_IR_EFFECT_MEMORY);
+        /* The guard stands before the access, which is the only place a
+           precondition on an address can stand. It is deliberately weak, so
+           the interpreter is what catches an access it does not cover. */
         builder.Append(entry, QL_IR_OPCODE_UB_GUARD, {yes},
                        QL_IR_INVALID_TYPE_ID,
                        QL_IR_EFFECT_UNDEFINED_BEHAVIOR);
+        const ql_ir_value_id loaded =
+            builder.Append(entry, QL_IR_OPCODE_LOAD, {m, p}, bv32,
+                           QL_IR_EFFECT_MEMORY);
         builder.Return(entry, loaded);
         ir = builder.Finish();
     }
@@ -358,6 +361,8 @@ TEST(IrInterpMemory, StoresAreVisibleToLaterLoadsAndToTheFinalImage) {
        next), so the older version has to stay readable after the store. */
     const ql_ir_value_id next =
         builder.Append(entry, QL_IR_OPCODE_PTR_ADD, {p, four}, pointer);
+    builder.Append(entry, QL_IR_OPCODE_UB_GUARD, {yes},
+                   QL_IR_INVALID_TYPE_ID, QL_IR_EFFECT_UNDEFINED_BEHAVIOR);
     const ql_ir_value_id stored =
         builder.Append(entry, QL_IR_OPCODE_STORE, {m, next, one}, memory,
                        QL_IR_EFFECT_MEMORY);
@@ -369,8 +374,6 @@ TEST(IrInterpMemory, StoresAreVisibleToLaterLoadsAndToTheFinalImage) {
                        QL_IR_EFFECT_MEMORY);
     const ql_ir_value_id sum =
         builder.Append(entry, QL_IR_OPCODE_ADD, {fresh, stale}, bv32);
-    builder.Append(entry, QL_IR_OPCODE_UB_GUARD, {yes},
-                   QL_IR_INVALID_TYPE_ID, QL_IR_EFFECT_UNDEFINED_BEHAVIOR);
     builder.Return(entry, sum, stored);
     ql_ir *ir = builder.Finish();
     ASSERT_NE(nullptr, ir);

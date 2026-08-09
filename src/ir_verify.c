@@ -221,6 +221,14 @@ static uint32_t verify_float_width(ql_ir_float_format format) {
 /* Operations whose IR semantics are partial: some operand assignments leave
    the result undefined. Every observation that depends on one of these must be
    separated from it by a dominating UB_GUARD. */
+/* A memory access is partial too, but its definedness is a precondition on
+   the address rather than a fact about the result, so the guard stands before
+   the access instead of between it and the observation. That is the only
+   place it can stand: nothing can dereference first and check afterwards. */
+static int verify_opcode_is_memory_access(ql_ir_opcode opcode) {
+    return opcode == QL_IR_OPCODE_LOAD || opcode == QL_IR_OPCODE_STORE;
+}
+
 static int verify_opcode_is_partial(ql_ir_opcode opcode) {
     switch (opcode) {
     case QL_IR_OPCODE_UDIV:
@@ -1665,6 +1673,14 @@ static ql_status verify_ub_obligations(verify_context *context) {
                         return status;
                     }
                 }
+                if (verify_opcode_is_memory_access(instruction->opcode) &&
+                    verify_guard_before(context, block, index) == 0u) {
+                    return verify_fail(
+                        context, QL_IR_VERIFY_UB_GUARD, block, id,
+                        QL_IR_INVALID_VALUE_ID,
+                        "a memory access has no guard standing before it to "
+                        "establish that it is in bounds and aligned");
+                }
             } else if (instruction->opcode == QL_IR_OPCODE_PHI) {
                 /* Each incoming obligation must already be discharged at the
                    end of the predecessor it arrives from, because no single
@@ -1693,8 +1709,12 @@ static ql_status verify_ub_obligations(verify_context *context) {
                     }
                 }
             }
-            if (verify_opcode_is_partial(instruction->opcode) &&
-                instruction->key > pending) {
+            if (verify_opcode_is_memory_access(instruction->opcode)) {
+                /* The guard checked above discharges the access, so nothing
+                   downstream inherits an obligation from it. */
+                pending = 0u;
+            } else if (verify_opcode_is_partial(instruction->opcode) &&
+                       instruction->key > pending) {
                 pending = instruction->key;
             }
             for (operand = 0u; operand < instruction->result_count;

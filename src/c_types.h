@@ -15,8 +15,15 @@ typedef enum ql_c_scalar_kind {
     QL_C_SCALAR_INVALID = 0,
     QL_C_SCALAR_VOID,
     QL_C_SCALAR_BOOL,
-    QL_C_SCALAR_INTEGER
+    QL_C_SCALAR_INTEGER,
+    /* A pointer under this profile is an address and nothing else, so its
+       width and signedness are the address's. What it points at is carried
+       beside it by the lowering, not here. */
+    QL_C_SCALAR_POINTER
 } ql_c_scalar_kind;
+
+/* The target ABI is LP64, so an address is 64 bits wide. */
+#define QL_C_POINTER_WIDTH 64u
 
 typedef struct ql_c_scalar_type {
     ql_c_scalar_kind kind;
