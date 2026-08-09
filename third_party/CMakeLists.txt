@@ -5,7 +5,14 @@ set(QL_REQUIRED_VENDOR_DIRECTORIES
     blake3
     tree-sitter
     tree-sitter-c
+    zf_log
 )
+
+# zf_log has no vendor target on purpose. src/log.c defines the library's
+# configuration macros and then includes the pinned zf_log.c as part of its own
+# translation unit, so the logging engine inherits Quodlibet's warning set,
+# visibility and sanitizer flags without a second compile step. Listing the
+# directory here keeps a missing checkout a configure-time error.
 
 set(QL_BITWUZLA_BUNDLED FALSE)
 if(QL_ENABLE_BITWUZLA)

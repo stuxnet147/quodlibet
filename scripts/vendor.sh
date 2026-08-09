@@ -145,6 +145,9 @@ fetch yyjson 0.12.0 \
 fetch xxhash v0.8.3 \
     aae608dfe8213dfd05d909a57718ef82f30722c392344583d3f39050c7f29a80 \
     https://codeload.github.com/Cyan4973/xxHash/tar.gz/refs/tags/v0.8.3
+fetch zf_log v0.4.1 \
+    f81db3d4c4a554ba3c865a02b28dfb7485ef942ea81ba56834967d47c8b79533 \
+    https://codeload.github.com/wonder-mice/zf_log/tar.gz/refs/tags/v0.4.1
 fetch googletest v1.17.0 \
     65fab701d9829d38cb77c14acdc431d2108bfdbf8979e40eb8ae567edf10b27c \
     https://codeload.github.com/google/googletest/tar.gz/refs/tags/v1.17.0

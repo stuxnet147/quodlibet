@@ -11,6 +11,7 @@ the corresponding vendored directories.
 | BLAKE3 | 1.8.6 | CC0-1.0 or Apache-2.0 | Reproducible content identities |
 | Tree-sitter | v0.26.12 | MIT | Incremental parsing runtime |
 | tree-sitter-c | v0.24.2 | MIT | Generated C grammar |
+| zf_log | v0.4.1 | MIT | Logging engine behind the public logging API |
 | GoogleTest | v1.17.0 | BSD-3-Clause | Test-only framework |
 | Bitwuzla | 0.9.1 | MIT | Canonical SMT backend on Windows and Linux x86-64 |
 

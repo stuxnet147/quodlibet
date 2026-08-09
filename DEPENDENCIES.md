@@ -40,6 +40,50 @@ be added as a measured build option without changing digest values or the ABI.
 
 Source: <https://github.com/BLAKE3-team/BLAKE3>
 
+### zf_log 0.4.1
+
+Used as the logging engine behind `include/quodlibet/log.h`. Quodlibet does not
+implement its own logger. zf_log owns level gating, the per-call stack buffer,
+message formatting, truncation, and single-callback delivery; Quodlibet owns
+level and verbosity policy, category routing, the caller-supplied sink, and the
+lock that keeps concurrent writers from interleaving inside that sink.
+
+Selection compared the permissively licensed candidates that are usable from a
+C17 static library:
+
+| Candidate | License | Language | Disabled level | Thread safety | Windows | Size |
+| --- | --- | --- | --- | --- | --- | --- |
+| zf_log 0.4.1 | MIT | C99 | One load and compare of an `int`, arguments not evaluated | Stack buffer per call, one callback invocation per line | Yes | 2 files, ~2.3k lines |
+| rxi/log.c | MIT | C99 | Function call, arguments evaluated | Caller must install a lock callback | Yes | 1 file, ~200 lines |
+| yksz/c-logger | MIT | C99 | Function call, arguments evaluated | Internal mutex | Yes | 4 files, ~1k lines |
+| zlog | LGPL-2.1 | C99 | Function call | Internal mutex | Partial | ~10k lines |
+| spdlog | MIT | C++11 | Atomic load | Internal mutex | Yes | Header set, ~20k lines |
+
+zf_log wins on the axes this repository weighs:
+
+- License is MIT, so static distribution carries no relinking obligation. zlog
+  is LGPL-2.1 and was rejected for that reason alone.
+- It is pure C99, so a static consumer of `libquodlibet` never has to link a
+  C++ runtime. spdlog is faster in some benchmarks but would impose that cost
+  on every C consumer, including the planned CPython extension.
+- The disabled-level path is a macro that compares a message level against an
+  `int` before evaluating any argument. Measured cost is recorded in
+  `docs/runtime-services/logging.md`.
+- Every message is composed in a caller-stack buffer and handed to the output
+  callback exactly once, so concurrent writers cannot interleave a partial
+  line inside the buffer. Serializing the sink itself is Quodlibet's job.
+- Windows and Linux are first-class upstream targets.
+- Two source files fit a repository that vendors small, pinned dependencies.
+
+The library has no build target of its own. `src/log.c` sets the configuration
+macros, then includes the pinned `zf_log.c` into its own translation unit. This
+keeps the logging engine under Quodlibet's warning, visibility and sanitizer
+flags, and it lets the message context, tag and source-location layouts be
+rendered by Quodlibet callbacks that honour the caller's runtime verbosity.
+Only symbols declared in `zf_log.h` are used.
+
+Source: <https://github.com/wonder-mice/zf_log>
+
 ### GoogleTest 1.17.0
 
 Used only by C++17 test drivers and omitted when `QL_BUILD_TESTS=OFF`. The
