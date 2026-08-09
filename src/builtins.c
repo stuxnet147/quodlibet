@@ -1,5 +1,7 @@
 #include "quodlibet/registry.h"
 
+#include "quodlibet/proof_smt.h"
+
 static ql_status QL_CALL identity_run(
     void *instance, const ql_run_context_v1 *context,
     ql_artifact *const *inputs, size_t input_count, ql_artifact **output,
@@ -36,5 +38,13 @@ static const ql_method_v1 identity_method = {
 
 ql_status QL_CALL ql_register_builtin_methods(ql_registry *registry,
                                               ql_error *error) {
-    return ql_registry_register(registry, &identity_method, error);
+    ql_status status;
+
+    status = ql_registry_register(registry, &identity_method, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    /* The SMT product-program prover is a built-in method, not a privileged
+       one: it still passes the same capability checks as any plugin. */
+    return ql_register_smt_product_method(registry, error);
 }
