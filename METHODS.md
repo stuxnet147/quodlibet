@@ -161,6 +161,31 @@ extraction cost model, proof reconstruction, and whether conditional rewrites
 may invoke a side-condition solver. The rewrite-set digest belongs in evidence
 and cache keys.
 
+#### The rewrite rule catalogue
+
+A merge record carries only the rule name that fired. The premises that make
+that rule sound live in a versioned catalogue keyed by that name, reachable
+through `ql_egraph_rule_lookup` and enumerable through
+`ql_egraph_rule_catalogue_at`. The catalogue is the rewrite-set identity:
+`ql_egraph_rule_catalogue_digest` is the BLAKE3 digest of its canonical
+serialization, and that digest is what evidence and cache keys carry.
+
+Each descriptor states the shape of the rewrite, the operators the rule name
+may have fired on, which operands must already share a class, which constant
+must witness a side condition, and the width range the rule accepts. Three
+condition bits carry the premises that a source language can invalidate.
+
+- `WIDTH_AGNOSTIC` says the rule holds at every width the sort admits.
+- `SIGN_AGNOSTIC` says the rule holds under both readings of its operands.
+- `TOTAL_ARITHMETIC` says the rule holds only because this engine's bit-vector
+  arithmetic is total modulo `2^width`. A frontend whose source language makes
+  the same operation undefined on overflow still owes an argument for those
+  merges, and the evidence names exactly which ones.
+
+The e-graph itself is a pure term engine with no undefined-behaviour, effect,
+or poison semantics, so these bits are a record of what the engine assumed,
+not a claim that the frontend discharged it.
+
 ### SMT product program
 
 Method name: `prove.smt-product`. This is the first implemented method. The

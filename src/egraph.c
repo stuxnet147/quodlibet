@@ -1,9 +1,13 @@
 #include "quodlibet/egraph.h"
 
 #include <limits.h>
+#include <stdarg.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "blake3.h"
 
 #define QL_EGRAPH_DEFAULT_MAX_TERMS UINT64_C(1048576)
 #define QL_EGRAPH_DEFAULT_MAX_MERGES UINT64_C(4194304)
@@ -1951,4 +1955,466 @@ uint64_t QL_CALL ql_egraph_class_count(const ql_egraph *graph) {
 
 uint64_t QL_CALL ql_egraph_merge_count(const ql_egraph *graph) {
     return graph == NULL ? 0u : (uint64_t)graph->merge_count;
+}
+
+ql_status QL_CALL ql_egraph_term_initial_class(
+    const ql_egraph *graph, ql_egraph_term_id term,
+    ql_egraph_class_id *out_class, ql_error *error) {
+    if (require_graph(graph, error) != QL_STATUS_OK) {
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    if (require_term(graph, term, error) != QL_STATUS_OK) {
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    if (out_class == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "e-graph initial class output is required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    *out_class = graph->nodes[(size_t)term - 1u].initial_class;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+/* --- Rewrite rule catalogue -------------------------------------------- */
+
+/* The premises below are stated for the pure term semantics this engine
+   implements: bit-vector arithmetic is total modulo 2^width and there is no
+   poison, trap, or effect ordering. QL_EGRAPH_RULE_COND_TOTAL_ARITHMETIC
+   marks the rules that rely on that totality, so a frontend whose source
+   language makes the same operation undefined on overflow can see, from the
+   evidence alone, which merges it still owes an argument for. */
+
+#define QL_RULE_ST QL_EGRAPH_RULE_COND_SAME_TYPE
+#define QL_RULE_OS QL_EGRAPH_RULE_COND_OPERAND_SORT
+#define QL_RULE_EQ QL_EGRAPH_RULE_COND_OPERANDS_SAME_CLASS
+#define QL_RULE_WC QL_EGRAPH_RULE_COND_WITNESS_CONSTANT
+#define QL_RULE_NA QL_EGRAPH_RULE_COND_NESTED_APPLICATION
+#define QL_RULE_TA QL_EGRAPH_RULE_COND_TOTAL_ARITHMETIC
+#define QL_RULE_SA QL_EGRAPH_RULE_COND_SIGN_AGNOSTIC
+#define QL_RULE_WA QL_EGRAPH_RULE_COND_WIDTH_AGNOSTIC
+#define QL_RULE_BOOL_BASE (QL_RULE_ST | QL_RULE_OS)
+#define QL_RULE_BV_BASE (QL_RULE_ST | QL_RULE_OS | QL_RULE_SA | QL_RULE_WA)
+#define QL_RULE_NONE QL_EGRAPH_RULE_CONSTANT_NONE
+#define QL_RULE_OP_NONE QL_EGRAPH_RULE_OPERAND_NONE
+#define QL_RULE_OP_ANY QL_EGRAPH_RULE_OPERAND_ANY
+#define QL_RULE_OP_OTHER QL_EGRAPH_RULE_OPERAND_OTHER
+
+typedef struct ql_egraph_rule_entry {
+    const char *name;
+    const char *soundness;
+    ql_egraph_rule_shape shape;
+    uint32_t op_count;
+    ql_egraph_operator ops[QL_EGRAPH_RULE_MAX_SUBJECT_OPS];
+    uint32_t arity;
+    ql_egraph_rule_conditions conditions;
+    ql_egraph_rule_constant witness;
+    ql_egraph_rule_constant result;
+    uint32_t witness_operand;
+    uint32_t result_operand;
+    uint32_t equal_operands[2];
+    uint32_t minimum_bit_width;
+    uint32_t maximum_bit_width;
+} ql_egraph_rule_entry;
+
+static const ql_egraph_rule_entry ql_egraph_rules[] = {
+    {"bool.not.true",
+     "not(true) = false in two-valued propositional logic",
+     QL_EGRAPH_RULE_SHAPE_CONSTANT_FOLD, 1u,
+     {QL_EGRAPH_OP_BOOL_NOT, 0u, 0u, 0u}, 1u,
+     QL_RULE_BOOL_BASE | QL_RULE_WC, QL_EGRAPH_RULE_CONSTANT_BOOL_TRUE,
+     QL_EGRAPH_RULE_CONSTANT_BOOL_FALSE, 0u, QL_RULE_OP_NONE, {0u, 0u}, 1u,
+     1u},
+    {"bool.not.false",
+     "not(false) = true in two-valued propositional logic",
+     QL_EGRAPH_RULE_SHAPE_CONSTANT_FOLD, 1u,
+     {QL_EGRAPH_OP_BOOL_NOT, 0u, 0u, 0u}, 1u,
+     QL_RULE_BOOL_BASE | QL_RULE_WC, QL_EGRAPH_RULE_CONSTANT_BOOL_FALSE,
+     QL_EGRAPH_RULE_CONSTANT_BOOL_TRUE, 0u, QL_RULE_OP_NONE, {0u, 0u}, 1u,
+     1u},
+    {"bool.not.involution", "not(not(a)) = a",
+     QL_EGRAPH_RULE_SHAPE_INVOLUTION, 1u,
+     {QL_EGRAPH_OP_BOOL_NOT, 0u, 0u, 0u}, 1u,
+     QL_RULE_BOOL_BASE | QL_RULE_NA, QL_RULE_NONE, QL_RULE_NONE, 0u,
+     QL_RULE_OP_NONE, {0u, 0u}, 1u, 1u},
+    {"bool.idempotent",
+     "and(a, a) = a and or(a, a) = a; both operands must already be in one "
+     "class",
+     QL_EGRAPH_RULE_SHAPE_IDEMPOTENT, 2u,
+     {QL_EGRAPH_OP_BOOL_AND, QL_EGRAPH_OP_BOOL_OR, 0u, 0u}, 2u,
+     QL_RULE_BOOL_BASE | QL_RULE_EQ, QL_RULE_NONE, QL_RULE_NONE,
+     QL_RULE_OP_NONE, 0u, {0u, 1u}, 1u, 1u},
+    {"bool.xor.self", "xor(a, a) = false",
+     QL_EGRAPH_RULE_SHAPE_SELF_ANNIHILATION, 1u,
+     {QL_EGRAPH_OP_BOOL_XOR, 0u, 0u, 0u}, 2u, QL_RULE_BOOL_BASE | QL_RULE_EQ,
+     QL_RULE_NONE, QL_EGRAPH_RULE_CONSTANT_BOOL_FALSE, QL_RULE_OP_NONE,
+     QL_RULE_OP_NONE, {0u, 1u}, 1u, 1u},
+    {"bool.and.true", "and(a, true) = a; true is the identity of and",
+     QL_EGRAPH_RULE_SHAPE_IDENTITY_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BOOL_AND, 0u, 0u, 0u}, 2u, QL_RULE_BOOL_BASE | QL_RULE_WC,
+     QL_EGRAPH_RULE_CONSTANT_BOOL_TRUE, QL_RULE_NONE, QL_RULE_OP_ANY,
+     QL_RULE_OP_OTHER, {0u, 0u}, 1u, 1u},
+    {"bool.and.false", "and(a, false) = false; false absorbs and",
+     QL_EGRAPH_RULE_SHAPE_ABSORBING_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BOOL_AND, 0u, 0u, 0u}, 2u, QL_RULE_BOOL_BASE | QL_RULE_WC,
+     QL_EGRAPH_RULE_CONSTANT_BOOL_FALSE,
+     QL_EGRAPH_RULE_CONSTANT_BOOL_FALSE, QL_RULE_OP_ANY, QL_RULE_OP_NONE,
+     {0u, 0u}, 1u, 1u},
+    {"bool.and.commutative", "and(a, b) = and(b, a)",
+     QL_EGRAPH_RULE_SHAPE_COMMUTATIVE, 1u,
+     {QL_EGRAPH_OP_BOOL_AND, 0u, 0u, 0u}, 2u, QL_RULE_BOOL_BASE,
+     QL_RULE_NONE, QL_RULE_NONE, QL_RULE_OP_NONE, QL_RULE_OP_NONE, {0u, 0u},
+     1u, 1u},
+    {"bool.or.false", "or(a, false) = a; false is the identity of or",
+     QL_EGRAPH_RULE_SHAPE_IDENTITY_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BOOL_OR, 0u, 0u, 0u}, 2u, QL_RULE_BOOL_BASE | QL_RULE_WC,
+     QL_EGRAPH_RULE_CONSTANT_BOOL_FALSE, QL_RULE_NONE, QL_RULE_OP_ANY,
+     QL_RULE_OP_OTHER, {0u, 0u}, 1u, 1u},
+    {"bool.or.true", "or(a, true) = true; true absorbs or",
+     QL_EGRAPH_RULE_SHAPE_ABSORBING_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BOOL_OR, 0u, 0u, 0u}, 2u, QL_RULE_BOOL_BASE | QL_RULE_WC,
+     QL_EGRAPH_RULE_CONSTANT_BOOL_TRUE, QL_EGRAPH_RULE_CONSTANT_BOOL_TRUE,
+     QL_RULE_OP_ANY, QL_RULE_OP_NONE, {0u, 0u}, 1u, 1u},
+    {"bool.or.commutative", "or(a, b) = or(b, a)",
+     QL_EGRAPH_RULE_SHAPE_COMMUTATIVE, 1u,
+     {QL_EGRAPH_OP_BOOL_OR, 0u, 0u, 0u}, 2u, QL_RULE_BOOL_BASE,
+     QL_RULE_NONE, QL_RULE_NONE, QL_RULE_OP_NONE, QL_RULE_OP_NONE, {0u, 0u},
+     1u, 1u},
+    {"bool.xor.false", "xor(a, false) = a; false is the identity of xor",
+     QL_EGRAPH_RULE_SHAPE_IDENTITY_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BOOL_XOR, 0u, 0u, 0u}, 2u, QL_RULE_BOOL_BASE | QL_RULE_WC,
+     QL_EGRAPH_RULE_CONSTANT_BOOL_FALSE, QL_RULE_NONE, QL_RULE_OP_ANY,
+     QL_RULE_OP_OTHER, {0u, 0u}, 1u, 1u},
+    {"bool.xor.commutative", "xor(a, b) = xor(b, a)",
+     QL_EGRAPH_RULE_SHAPE_COMMUTATIVE, 1u,
+     {QL_EGRAPH_OP_BOOL_XOR, 0u, 0u, 0u}, 2u, QL_RULE_BOOL_BASE,
+     QL_RULE_NONE, QL_RULE_NONE, QL_RULE_OP_NONE, QL_RULE_OP_NONE, {0u, 0u},
+     1u, 1u},
+
+    {"bv.not.involution", "bvnot(bvnot(a)) = a at every width",
+     QL_EGRAPH_RULE_SHAPE_INVOLUTION, 1u, {QL_EGRAPH_OP_BV_NOT, 0u, 0u, 0u},
+     1u, QL_RULE_BV_BASE | QL_RULE_NA, QL_RULE_NONE, QL_RULE_NONE, 0u,
+     QL_RULE_OP_NONE, {0u, 0u}, 1u, 0u},
+    {"bv.idempotent", "bvand(a, a) = a and bvor(a, a) = a, bitwise at "
+     "every width",
+     QL_EGRAPH_RULE_SHAPE_IDEMPOTENT, 2u,
+     {QL_EGRAPH_OP_BV_AND, QL_EGRAPH_OP_BV_OR, 0u, 0u}, 2u,
+     QL_RULE_BV_BASE | QL_RULE_EQ, QL_RULE_NONE, QL_RULE_NONE,
+     QL_RULE_OP_NONE, 0u, {0u, 1u}, 1u, 0u},
+    {"bv.xor.self", "bvxor(a, a) = 0 bitwise at every width",
+     QL_EGRAPH_RULE_SHAPE_SELF_ANNIHILATION, 1u,
+     {QL_EGRAPH_OP_BV_XOR, 0u, 0u, 0u}, 2u, QL_RULE_BV_BASE | QL_RULE_EQ,
+     QL_RULE_NONE, QL_EGRAPH_RULE_CONSTANT_BV_ZERO, QL_RULE_OP_NONE,
+     QL_RULE_OP_NONE, {0u, 1u}, 1u, 0u},
+    {"bv.sub.self",
+     "bvsub(a, a) = 0 under total arithmetic modulo 2^width; a source "
+     "language whose subtraction may trap or be undefined must discharge "
+     "that separately",
+     QL_EGRAPH_RULE_SHAPE_SELF_ANNIHILATION, 1u,
+     {QL_EGRAPH_OP_BV_SUB, 0u, 0u, 0u}, 2u,
+     QL_RULE_BV_BASE | QL_RULE_EQ | QL_RULE_TA, QL_RULE_NONE,
+     QL_EGRAPH_RULE_CONSTANT_BV_ZERO, QL_RULE_OP_NONE, QL_RULE_OP_NONE,
+     {0u, 1u}, 1u, 0u},
+    {"bv.and.zero", "bvand(a, 0) = 0 bitwise at every width",
+     QL_EGRAPH_RULE_SHAPE_ABSORBING_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BV_AND, 0u, 0u, 0u}, 2u, QL_RULE_BV_BASE | QL_RULE_WC,
+     QL_EGRAPH_RULE_CONSTANT_BV_ZERO, QL_EGRAPH_RULE_CONSTANT_BV_ZERO,
+     QL_RULE_OP_ANY, QL_RULE_OP_NONE, {0u, 0u}, 1u, 0u},
+    {"bv.and.ones",
+     "bvand(a, ~0) = a; the all-ones constant is width-dependent and its "
+     "high bits must be exactly the width, not a wider pattern",
+     QL_EGRAPH_RULE_SHAPE_IDENTITY_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BV_AND, 0u, 0u, 0u}, 2u, QL_RULE_BV_BASE | QL_RULE_WC,
+     QL_EGRAPH_RULE_CONSTANT_BV_ONES, QL_RULE_NONE, QL_RULE_OP_ANY,
+     QL_RULE_OP_OTHER, {0u, 0u}, 1u, 0u},
+    {"bv.and.commutative", "bvand(a, b) = bvand(b, a)",
+     QL_EGRAPH_RULE_SHAPE_COMMUTATIVE, 1u, {QL_EGRAPH_OP_BV_AND, 0u, 0u, 0u},
+     2u, QL_RULE_BV_BASE, QL_RULE_NONE, QL_RULE_NONE, QL_RULE_OP_NONE,
+     QL_RULE_OP_NONE, {0u, 0u}, 1u, 0u},
+    {"bv.or.zero", "bvor(a, 0) = a bitwise at every width",
+     QL_EGRAPH_RULE_SHAPE_IDENTITY_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BV_OR, 0u, 0u, 0u}, 2u, QL_RULE_BV_BASE | QL_RULE_WC,
+     QL_EGRAPH_RULE_CONSTANT_BV_ZERO, QL_RULE_NONE, QL_RULE_OP_ANY,
+     QL_RULE_OP_OTHER, {0u, 0u}, 1u, 0u},
+    {"bv.or.ones", "bvor(a, ~0) = ~0 at the subject width",
+     QL_EGRAPH_RULE_SHAPE_ABSORBING_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BV_OR, 0u, 0u, 0u}, 2u, QL_RULE_BV_BASE | QL_RULE_WC,
+     QL_EGRAPH_RULE_CONSTANT_BV_ONES, QL_EGRAPH_RULE_CONSTANT_BV_ONES,
+     QL_RULE_OP_ANY, QL_RULE_OP_NONE, {0u, 0u}, 1u, 0u},
+    {"bv.or.commutative", "bvor(a, b) = bvor(b, a)",
+     QL_EGRAPH_RULE_SHAPE_COMMUTATIVE, 1u, {QL_EGRAPH_OP_BV_OR, 0u, 0u, 0u},
+     2u, QL_RULE_BV_BASE, QL_RULE_NONE, QL_RULE_NONE, QL_RULE_OP_NONE,
+     QL_RULE_OP_NONE, {0u, 0u}, 1u, 0u},
+    {"bv.xor.zero", "bvxor(a, 0) = a bitwise at every width",
+     QL_EGRAPH_RULE_SHAPE_IDENTITY_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BV_XOR, 0u, 0u, 0u}, 2u, QL_RULE_BV_BASE | QL_RULE_WC,
+     QL_EGRAPH_RULE_CONSTANT_BV_ZERO, QL_RULE_NONE, QL_RULE_OP_ANY,
+     QL_RULE_OP_OTHER, {0u, 0u}, 1u, 0u},
+    {"bv.xor.commutative", "bvxor(a, b) = bvxor(b, a)",
+     QL_EGRAPH_RULE_SHAPE_COMMUTATIVE, 1u, {QL_EGRAPH_OP_BV_XOR, 0u, 0u, 0u},
+     2u, QL_RULE_BV_BASE, QL_RULE_NONE, QL_RULE_NONE, QL_RULE_OP_NONE,
+     QL_RULE_OP_NONE, {0u, 0u}, 1u, 0u},
+    {"bv.add.zero",
+     "bvadd(a, 0) = a under total arithmetic modulo 2^width; the identity "
+     "does not depend on the signed or unsigned reading",
+     QL_EGRAPH_RULE_SHAPE_IDENTITY_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BV_ADD, 0u, 0u, 0u}, 2u,
+     QL_RULE_BV_BASE | QL_RULE_WC | QL_RULE_TA,
+     QL_EGRAPH_RULE_CONSTANT_BV_ZERO, QL_RULE_NONE, QL_RULE_OP_ANY,
+     QL_RULE_OP_OTHER, {0u, 0u}, 1u, 0u},
+    {"bv.add.commutative",
+     "bvadd(a, b) = bvadd(b, a) under total arithmetic modulo 2^width",
+     QL_EGRAPH_RULE_SHAPE_COMMUTATIVE, 1u, {QL_EGRAPH_OP_BV_ADD, 0u, 0u, 0u},
+     2u, QL_RULE_BV_BASE | QL_RULE_TA, QL_RULE_NONE, QL_RULE_NONE,
+     QL_RULE_OP_NONE, QL_RULE_OP_NONE, {0u, 0u}, 1u, 0u},
+    {"bv.sub.zero",
+     "bvsub(a, 0) = a under total arithmetic modulo 2^width; the zero must "
+     "be the right operand because subtraction is not commutative",
+     QL_EGRAPH_RULE_SHAPE_IDENTITY_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BV_SUB, 0u, 0u, 0u}, 2u,
+     QL_RULE_BV_BASE | QL_RULE_WC | QL_RULE_TA,
+     QL_EGRAPH_RULE_CONSTANT_BV_ZERO, QL_RULE_NONE, 1u, 0u, {0u, 0u}, 1u,
+     0u},
+    {"bv.mul.zero",
+     "bvmul(a, 0) = 0 under total arithmetic modulo 2^width",
+     QL_EGRAPH_RULE_SHAPE_ABSORBING_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BV_MUL, 0u, 0u, 0u}, 2u,
+     QL_RULE_BV_BASE | QL_RULE_WC | QL_RULE_TA,
+     QL_EGRAPH_RULE_CONSTANT_BV_ZERO, QL_EGRAPH_RULE_CONSTANT_BV_ZERO,
+     QL_RULE_OP_ANY, QL_RULE_OP_NONE, {0u, 0u}, 1u, 0u},
+    {"bv.mul.one",
+     "bvmul(a, 1) = a under total arithmetic modulo 2^width; the one "
+     "constant is the width-correct unit, not a wider literal",
+     QL_EGRAPH_RULE_SHAPE_IDENTITY_ELEMENT, 1u,
+     {QL_EGRAPH_OP_BV_MUL, 0u, 0u, 0u}, 2u,
+     QL_RULE_BV_BASE | QL_RULE_WC | QL_RULE_TA,
+     QL_EGRAPH_RULE_CONSTANT_BV_ONE, QL_RULE_NONE, QL_RULE_OP_ANY,
+     QL_RULE_OP_OTHER, {0u, 0u}, 1u, 0u},
+    {"bv.mul.commutative",
+     "bvmul(a, b) = bvmul(b, a) under total arithmetic modulo 2^width",
+     QL_EGRAPH_RULE_SHAPE_COMMUTATIVE, 1u, {QL_EGRAPH_OP_BV_MUL, 0u, 0u, 0u},
+     2u, QL_RULE_BV_BASE | QL_RULE_TA, QL_RULE_NONE, QL_RULE_NONE,
+     QL_RULE_OP_NONE, QL_RULE_OP_NONE, {0u, 0u}, 1u, 0u},
+
+    {"equal.reflexive",
+     "equal(a, a) = true; the operands must already share a class, and the "
+     "subject sort is bool while the operand sort is not constrained by it",
+     QL_EGRAPH_RULE_SHAPE_REFLEXIVE, 1u, {QL_EGRAPH_OP_EQUAL, 0u, 0u, 0u},
+     2u, QL_RULE_ST | QL_RULE_EQ, QL_RULE_NONE,
+     QL_EGRAPH_RULE_CONSTANT_BOOL_TRUE, QL_RULE_OP_NONE, QL_RULE_OP_NONE,
+     {0u, 1u}, 0u, 0u},
+    {"equal.symmetric", "equal(a, b) = equal(b, a)",
+     QL_EGRAPH_RULE_SHAPE_COMMUTATIVE, 1u, {QL_EGRAPH_OP_EQUAL, 0u, 0u, 0u},
+     2u, QL_RULE_ST, QL_RULE_NONE, QL_RULE_NONE, QL_RULE_OP_NONE,
+     QL_RULE_OP_NONE, {0u, 0u}, 0u, 0u},
+    {"ite.true", "ite(true, t, e) = t",
+     QL_EGRAPH_RULE_SHAPE_SELECT_BRANCH, 1u, {QL_EGRAPH_OP_ITE, 0u, 0u, 0u},
+     3u, QL_RULE_ST | QL_RULE_WC, QL_EGRAPH_RULE_CONSTANT_BOOL_TRUE,
+     QL_RULE_NONE, 0u, 1u, {0u, 0u}, 0u, 0u},
+    {"ite.false", "ite(false, t, e) = e",
+     QL_EGRAPH_RULE_SHAPE_SELECT_BRANCH, 1u, {QL_EGRAPH_OP_ITE, 0u, 0u, 0u},
+     3u, QL_RULE_ST | QL_RULE_WC, QL_EGRAPH_RULE_CONSTANT_BOOL_FALSE,
+     QL_RULE_NONE, 0u, 2u, {0u, 0u}, 0u, 0u},
+    {"ite.same",
+     "ite(c, t, t) = t; both branches must already share a class and the "
+     "condition is then irrelevant because the term engine has no effects",
+     QL_EGRAPH_RULE_SHAPE_SELECT_SAME, 1u, {QL_EGRAPH_OP_ITE, 0u, 0u, 0u},
+     3u, QL_RULE_ST | QL_RULE_EQ, QL_RULE_NONE, QL_RULE_NONE,
+     QL_RULE_OP_NONE, 1u, {1u, 2u}, 0u, 0u}
+};
+
+#define QL_EGRAPH_RULE_COUNT \
+    (sizeof(ql_egraph_rules) / sizeof(ql_egraph_rules[0]))
+
+static void fill_rule_descriptor(const ql_egraph_rule_entry *entry,
+                                 ql_egraph_rule_descriptor_v1 *descriptor) {
+    size_t index;
+    memset(descriptor, 0, sizeof(*descriptor));
+    descriptor->struct_size = sizeof(*descriptor);
+    descriptor->abi_version = QL_ABI_VERSION;
+    descriptor->catalogue_version = QL_EGRAPH_RULE_CATALOGUE_VERSION;
+    descriptor->rule_name = entry->name;
+    descriptor->soundness = entry->soundness;
+    descriptor->shape = entry->shape;
+    descriptor->subject_op_count = entry->op_count;
+    for (index = 0u; index < QL_EGRAPH_RULE_MAX_SUBJECT_OPS; ++index) {
+        descriptor->subject_ops[index] = entry->ops[index];
+    }
+    descriptor->subject_arity = entry->arity;
+    descriptor->conditions = entry->conditions;
+    descriptor->witness_constant = entry->witness;
+    descriptor->result_constant = entry->result;
+    descriptor->witness_operand = entry->witness_operand;
+    descriptor->result_operand = entry->result_operand;
+    descriptor->equal_operands[0] = entry->equal_operands[0];
+    descriptor->equal_operands[1] = entry->equal_operands[1];
+    descriptor->minimum_bit_width = entry->minimum_bit_width;
+    descriptor->maximum_bit_width = entry->maximum_bit_width;
+}
+
+uint32_t QL_CALL ql_egraph_rule_catalogue_size(void) {
+    return (uint32_t)QL_EGRAPH_RULE_COUNT;
+}
+
+ql_status QL_CALL ql_egraph_rule_catalogue_at(
+    uint32_t index, ql_egraph_rule_descriptor_v1 *descriptor,
+    ql_error *error) {
+    if (descriptor == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "e-graph rule descriptor output is required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    if ((size_t)index >= QL_EGRAPH_RULE_COUNT) {
+        ql_error_set(error, QL_STATUS_NOT_FOUND,
+                     "e-graph rule index %u is out of range (%u rules)",
+                     index, (unsigned)QL_EGRAPH_RULE_COUNT);
+        return QL_STATUS_NOT_FOUND;
+    }
+    fill_rule_descriptor(&ql_egraph_rules[index], descriptor);
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+ql_status QL_CALL ql_egraph_rule_lookup(
+    const char *rule_name, ql_egraph_rule_descriptor_v1 *descriptor,
+    ql_error *error) {
+    size_t index;
+    if (rule_name == NULL || descriptor == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "e-graph rule lookup needs a name and an output");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    for (index = 0u; index < QL_EGRAPH_RULE_COUNT; ++index) {
+        if (strcmp(ql_egraph_rules[index].name, rule_name) == 0) {
+            fill_rule_descriptor(&ql_egraph_rules[index], descriptor);
+            ql_error_clear(error);
+            return QL_STATUS_OK;
+        }
+    }
+    ql_error_set(error, QL_STATUS_NOT_FOUND,
+                 "no e-graph rewrite rule is named '%s'", rule_name);
+    return QL_STATUS_NOT_FOUND;
+}
+
+const char *QL_CALL ql_egraph_rule_shape_string(
+    ql_egraph_rule_shape shape) {
+    switch (shape) {
+    case QL_EGRAPH_RULE_SHAPE_COMMUTATIVE:
+        return "commutative";
+    case QL_EGRAPH_RULE_SHAPE_IDEMPOTENT:
+        return "idempotent";
+    case QL_EGRAPH_RULE_SHAPE_INVOLUTION:
+        return "involution";
+    case QL_EGRAPH_RULE_SHAPE_IDENTITY_ELEMENT:
+        return "identity-element";
+    case QL_EGRAPH_RULE_SHAPE_ABSORBING_ELEMENT:
+        return "absorbing-element";
+    case QL_EGRAPH_RULE_SHAPE_SELF_ANNIHILATION:
+        return "self-annihilation";
+    case QL_EGRAPH_RULE_SHAPE_CONSTANT_FOLD:
+        return "constant-fold";
+    case QL_EGRAPH_RULE_SHAPE_SELECT_BRANCH:
+        return "select-branch";
+    case QL_EGRAPH_RULE_SHAPE_SELECT_SAME:
+        return "select-same";
+    case QL_EGRAPH_RULE_SHAPE_REFLEXIVE:
+        return "reflexive";
+    default:
+        return "invalid";
+    }
+}
+
+const char *QL_CALL ql_egraph_rule_constant_string(
+    ql_egraph_rule_constant constant) {
+    switch (constant) {
+    case QL_EGRAPH_RULE_CONSTANT_BOOL_FALSE:
+        return "bool.false";
+    case QL_EGRAPH_RULE_CONSTANT_BOOL_TRUE:
+        return "bool.true";
+    case QL_EGRAPH_RULE_CONSTANT_BV_ZERO:
+        return "bv.zero";
+    case QL_EGRAPH_RULE_CONSTANT_BV_ONE:
+        return "bv.one";
+    case QL_EGRAPH_RULE_CONSTANT_BV_ONES:
+        return "bv.ones";
+    default:
+        return "none";
+    }
+}
+
+/* Canonical serialization: one line per rule in catalogue order, fields in
+   declaration order, ASCII decimal, no locale dependence. It is streamed into
+   the hasher rather than buffered so the function needs no allocator and no
+   shared state. Any change to a premise moves the digest, which is what
+   evidence and cache keys rely on. */
+#define QL_EGRAPH_RULE_LINE_CAPACITY 512u
+
+static ql_status hash_rule_chunk(blake3_hasher *hasher, ql_error *error,
+                                 const char *format, ...) {
+    char line[QL_EGRAPH_RULE_LINE_CAPACITY];
+    va_list arguments;
+    int written;
+
+    va_start(arguments, format);
+    written = vsnprintf(line, sizeof(line), format, arguments);
+    va_end(arguments);
+    if (written < 0 || (size_t)written >= sizeof(line)) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "e-graph rule catalogue serialization overflowed");
+        return QL_STATUS_INTERNAL_ERROR;
+    }
+    blake3_hasher_update(hasher, line, (size_t)written);
+    return QL_STATUS_OK;
+}
+
+ql_status QL_CALL ql_egraph_rule_catalogue_digest(ql_digest *digest,
+                                                  ql_error *error) {
+    blake3_hasher hasher;
+    size_t index;
+
+    if (digest == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "e-graph rule catalogue digest output is required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    blake3_hasher_init(&hasher);
+    if (hash_rule_chunk(&hasher, error,
+                        "quodlibet.egraph.rules\nversion=%u\ncount=%u\n",
+                        (unsigned)QL_EGRAPH_RULE_CATALOGUE_VERSION,
+                        (unsigned)QL_EGRAPH_RULE_COUNT) != QL_STATUS_OK) {
+        return QL_STATUS_INTERNAL_ERROR;
+    }
+    for (index = 0u; index < QL_EGRAPH_RULE_COUNT; ++index) {
+        const ql_egraph_rule_entry *entry = &ql_egraph_rules[index];
+        size_t op;
+        if (hash_rule_chunk(&hasher, error,
+                            "%s|%u|%u|%u|%u|%u|%u|%u|%u|%u|%u|%u",
+                            entry->name, (unsigned)entry->shape,
+                            (unsigned)entry->arity,
+                            (unsigned)entry->conditions,
+                            (unsigned)entry->witness,
+                            (unsigned)entry->result,
+                            (unsigned)entry->witness_operand,
+                            (unsigned)entry->result_operand,
+                            (unsigned)entry->equal_operands[0],
+                            (unsigned)entry->equal_operands[1],
+                            (unsigned)entry->minimum_bit_width,
+                            (unsigned)entry->maximum_bit_width) !=
+            QL_STATUS_OK) {
+            return QL_STATUS_INTERNAL_ERROR;
+        }
+        for (op = 0u; op < (size_t)entry->op_count; ++op) {
+            if (hash_rule_chunk(&hasher, error, "|op%u",
+                                (unsigned)entry->ops[op]) != QL_STATUS_OK) {
+                return QL_STATUS_INTERNAL_ERROR;
+            }
+        }
+        blake3_hasher_update(&hasher, "|", 1u);
+        blake3_hasher_update(&hasher, entry->soundness,
+                             strlen(entry->soundness));
+        blake3_hasher_update(&hasher, "\n", 1u);
+    }
+    blake3_hasher_finalize(&hasher, digest->bytes, QL_DIGEST_SIZE);
+    ql_error_clear(error);
+    return QL_STATUS_OK;
 }

@@ -2,6 +2,7 @@
 #define QUODLIBET_EGRAPH_H
 
 #include "quodlibet/allocator.h"
+#include "quodlibet/hash.h"
 #include "quodlibet/status.h"
 
 QL_EXTERN_C_BEGIN
@@ -228,9 +229,141 @@ QL_API ql_status QL_CALL ql_egraph_evidence(
     const ql_egraph *graph, ql_egraph_evidence_view_v1 *view,
     ql_error *error);
 
+/* The class a term is created in. Every term starts alone in its own class,
+   and that identifier is what the merge records snapshot before any union is
+   applied. An independent replay checker needs this seed mapping because the
+   current_class in a term view is a post-hoc root, not a derivation state. */
+QL_API ql_status QL_CALL ql_egraph_term_initial_class(
+    const ql_egraph *graph, ql_egraph_term_id term,
+    ql_egraph_class_id *out_class, ql_error *error);
+
 QL_API uint64_t QL_CALL ql_egraph_term_count(const ql_egraph *graph);
 QL_API uint64_t QL_CALL ql_egraph_class_count(const ql_egraph *graph);
 QL_API uint64_t QL_CALL ql_egraph_merge_count(const ql_egraph *graph);
+
+/* --- Rewrite rule catalogue -------------------------------------------- */
+
+/* A merge record carries only the rule name. The premises that make that rule
+   sound (bit width range, signedness reading, the arithmetic model it needs)
+   live here, keyed by that name and versioned as a whole. A checker that
+   replays the merge log resolves each REWRITE reason against this catalogue
+   and discharges the side conditions itself. Bump the version whenever a rule
+   is added, removed, or has its premises changed; the digest below then also
+   changes, which is what belongs in evidence and cache keys. */
+#define QL_EGRAPH_RULE_CATALOGUE_VERSION UINT32_C(1)
+#define QL_EGRAPH_RULE_MAX_SUBJECT_OPS 4u
+
+/* The digest of catalogue version 1, pinned so that editing a premise without
+   bumping the version is a test failure rather than a silent change of what
+   past evidence means. */
+#define QL_EGRAPH_RULE_CATALOGUE_DIGEST_HEX \
+    "f2666b08e576261a24705f2fdc77b5b4fc2ae67c3cfa3333a615ceddcf596aec"
+
+/* How the recorded right-hand term must relate to the subject term. */
+typedef uint32_t ql_egraph_rule_shape;
+#define QL_EGRAPH_RULE_SHAPE_INVALID UINT32_C(0)
+/* op(a, b) = op(b, a) */
+#define QL_EGRAPH_RULE_SHAPE_COMMUTATIVE UINT32_C(1)
+/* op(a, a) = a */
+#define QL_EGRAPH_RULE_SHAPE_IDEMPOTENT UINT32_C(2)
+/* op(op(a)) = a */
+#define QL_EGRAPH_RULE_SHAPE_INVOLUTION UINT32_C(3)
+/* op(a, e) = a where e is the witness constant */
+#define QL_EGRAPH_RULE_SHAPE_IDENTITY_ELEMENT UINT32_C(4)
+/* op(a, z) = z where z is the witness constant */
+#define QL_EGRAPH_RULE_SHAPE_ABSORBING_ELEMENT UINT32_C(5)
+/* op(a, a) = c where c is the result constant */
+#define QL_EGRAPH_RULE_SHAPE_SELF_ANNIHILATION UINT32_C(6)
+/* op(k) = c for a unary op over a witness constant k */
+#define QL_EGRAPH_RULE_SHAPE_CONSTANT_FOLD UINT32_C(7)
+/* ite(k, t, e) = t or e for a constant condition k */
+#define QL_EGRAPH_RULE_SHAPE_SELECT_BRANCH UINT32_C(8)
+/* ite(c, t, t) = t */
+#define QL_EGRAPH_RULE_SHAPE_SELECT_SAME UINT32_C(9)
+/* equal(a, a) = true */
+#define QL_EGRAPH_RULE_SHAPE_REFLEXIVE UINT32_C(10)
+
+/* Constant a side condition demands, named by value class rather than by bit
+   pattern so one descriptor covers every width the rule accepts. */
+typedef uint32_t ql_egraph_rule_constant;
+#define QL_EGRAPH_RULE_CONSTANT_NONE UINT32_C(0)
+#define QL_EGRAPH_RULE_CONSTANT_BOOL_FALSE UINT32_C(1)
+#define QL_EGRAPH_RULE_CONSTANT_BOOL_TRUE UINT32_C(2)
+#define QL_EGRAPH_RULE_CONSTANT_BV_ZERO UINT32_C(3)
+#define QL_EGRAPH_RULE_CONSTANT_BV_ONE UINT32_C(4)
+#define QL_EGRAPH_RULE_CONSTANT_BV_ONES UINT32_C(5)
+
+/* Operand selectors. ANY means the checker may find the witness in either
+   operand position; OTHER means the operand that is not the witness. */
+#define QL_EGRAPH_RULE_OPERAND_NONE UINT32_C(0xFFFFFFFF)
+#define QL_EGRAPH_RULE_OPERAND_ANY UINT32_C(0xFFFFFFFE)
+#define QL_EGRAPH_RULE_OPERAND_OTHER UINT32_C(0xFFFFFFFD)
+
+typedef uint32_t ql_egraph_rule_conditions;
+#define QL_EGRAPH_RULE_COND_NONE UINT32_C(0)
+/* Both merged terms must carry the identical sort and bit width. */
+#define QL_EGRAPH_RULE_COND_SAME_TYPE (UINT32_C(1) << 0)
+/* The subject operands must carry the subject's own sort. */
+#define QL_EGRAPH_RULE_COND_OPERAND_SORT (UINT32_C(1) << 1)
+/* The two operands named by equal_operands must already share a class. */
+#define QL_EGRAPH_RULE_COND_OPERANDS_SAME_CLASS (UINT32_C(1) << 2)
+/* Some operand class must contain a term equal to witness_constant. */
+#define QL_EGRAPH_RULE_COND_WITNESS_CONSTANT (UINT32_C(1) << 3)
+/* An operand class must contain a further application of subject_op. */
+#define QL_EGRAPH_RULE_COND_NESTED_APPLICATION (UINT32_C(1) << 4)
+/* Sound only under total arithmetic modulo 2^width. A source language in
+   which the operation may overflow into undefined behaviour must discharge
+   that obligation before the term reaches the e-graph. */
+#define QL_EGRAPH_RULE_COND_TOTAL_ARITHMETIC (UINT32_C(1) << 5)
+/* Sound under both the signed and the unsigned reading of its operands. */
+#define QL_EGRAPH_RULE_COND_SIGN_AGNOSTIC (UINT32_C(1) << 6)
+/* Sound at every bit width the sort admits, subject to the width bounds. */
+#define QL_EGRAPH_RULE_COND_WIDTH_AGNOSTIC (UINT32_C(1) << 7)
+
+/* rule_name and soundness point at static storage owned by the library and
+   stay valid for the process lifetime. maximum_bit_width is 0 when the rule
+   places no upper bound. */
+typedef struct ql_egraph_rule_descriptor_v1 {
+    size_t struct_size;
+    uint32_t abi_version;
+    uint32_t catalogue_version;
+    const char *rule_name;
+    const char *soundness;
+    ql_egraph_rule_shape shape;
+    /* Operators this rule name may have fired on. A few names cover more than
+       one operator because the engine shares one reason string for them. */
+    uint32_t subject_op_count;
+    ql_egraph_operator subject_ops[QL_EGRAPH_RULE_MAX_SUBJECT_OPS];
+    uint32_t subject_arity;
+    ql_egraph_rule_conditions conditions;
+    ql_egraph_rule_constant witness_constant;
+    ql_egraph_rule_constant result_constant;
+    uint32_t witness_operand;
+    uint32_t result_operand;
+    uint32_t equal_operands[2];
+    uint32_t minimum_bit_width;
+    uint32_t maximum_bit_width;
+    uint64_t reserved[4];
+} ql_egraph_rule_descriptor_v1;
+
+QL_API uint32_t QL_CALL ql_egraph_rule_catalogue_size(void);
+QL_API ql_status QL_CALL ql_egraph_rule_catalogue_at(
+    uint32_t index, ql_egraph_rule_descriptor_v1 *descriptor,
+    ql_error *error);
+/* NOT_FOUND for a name the catalogue does not define. A merge record whose
+   reason does not resolve is not justified by any known rule. */
+QL_API ql_status QL_CALL ql_egraph_rule_lookup(
+    const char *rule_name, ql_egraph_rule_descriptor_v1 *descriptor,
+    ql_error *error);
+/* BLAKE3 over the canonical serialization of the whole catalogue. This is the
+   rewrite-set identity that evidence and cache keys carry. */
+QL_API ql_status QL_CALL ql_egraph_rule_catalogue_digest(
+    ql_digest *digest, ql_error *error);
+
+QL_API const char *QL_CALL ql_egraph_rule_shape_string(
+    ql_egraph_rule_shape shape);
+QL_API const char *QL_CALL ql_egraph_rule_constant_string(
+    ql_egraph_rule_constant constant);
 
 QL_EXTERN_C_END
 
