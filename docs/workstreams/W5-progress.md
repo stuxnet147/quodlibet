@@ -197,7 +197,7 @@ PYTHONPATH=out/build/windows-clang/bindings/python/package \
 
 ### 4. signature 의 typedef 해석
 
-커밋: (이 커밋)
+커밋: `02f2ad1`
 
 3단계 측정이 지목한 병목입니다. 조율자가 구체안을 승인했고 `bindings/python/src/ql_check.c` 수정도 이 변경에 한해 위임받았습니다.
 
