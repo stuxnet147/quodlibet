@@ -6,7 +6,7 @@
 
 ## 지금 하는 것
 
-첫 작업 단위(확장 모듈, 빌드, 시험 25개)를 커밋하고 G4 종료 조건을 대조하는 중입니다.
+G4 종료 조건이 전부 닫혔습니다. 남은 것은 Linux 확인뿐이고 그것은 G7 에서 조율자가 합니다.
 
 ## 읽은 것과 확인한 코어 경계
 
@@ -25,11 +25,13 @@
 - **예산은 모든 실패 경로에서 UNKNOWN 입니다.** 메모리 축은 method 실행 전 frontend 할당에서 먼저 걸리므로, `ql_budget_is_exhausted` 가 참이면 어떤 실패든 예외가 아니라 budget UNKNOWN 으로 접습니다. 마지막에 `ql_budget_guard_outcome` 을 한 번 더 통과시킵니다.
 - **해제 순서**는 artifact -> pipeline result -> pipeline -> scheduler -> registry -> problem -> side -> policy -> budget 입니다. budget 이 모든 handle 이 쓴 allocator 의 소유자이므로 마지막입니다. 파이썬으로 넘기는 counterexample 바이트는 budget allocator 가 아니라 CRT `malloc` 으로 복사해서 budget 수명과 무관하게 만듭니다.
 - **Windows 에서 `pip install` 은 Clang + Ninja 를 고릅니다.** 기본 생성기의 MSVC 는 런타임이 쓰는 C11 atomics 를 거부합니다. 저장소의 `windows-clang` 프리셋과 같은 툴체인입니다.
-- **install component 분리.** `install(TARGETS _quodlibet ... COMPONENT quodlibet_python)` 과 `install.components` 로 코어의 install 규칙(CLI, 헤더, solver 실행 파일)이 wheel 에 딸려 들어가지 않게 했습니다.
+- **install component 분리.** `install(TARGETS _quodlibet ... COMPONENT quodlibet_python)` 과 `install.components` 로 코어의 install 규칙(CLI, 헤더, solver 실행 파일)이 wheel 에 딸려 들어가지 않게 했습니다. `COMPONENT` 는 artifact 그룹마다 따로 붙여야 합니다. `LIBRARY DESTINATION ... RUNTIME DESTINATION ... COMPONENT x` 로 쓰면 `COMPONENT` 가 `RUNTIME` 에만 붙어서 정작 `.pyd` 는 `Unspecified` 로 남고 wheel 에서 빠집니다.
+- **재진입 가드.** 루트에 `add_subdirectory(bindings/python)` 훅이 들어간 뒤로는 `bindings/python` 을 최상위로 configure 하면 자기 자신을 두 번 처리하게 됩니다(이 디렉터리 -> 루트 -> 이 디렉터리). `QL_PYTHON_BINDINGS_ENTERED` 로 두 번째 진입에서 `return()` 합니다. cache 가 아니라 보통 변수여야 같은 build tree 를 다시 configure 할 때 첫 진입이 다시 살아납니다.
 
 ## 끝난 작업 단위
 
-1. CPython C 확장, 빌드, pytest 25개, CTest 등록, 문서 - 커밋 `629c8a0`
+1. CPython C 확장, 빌드, pytest 25개, CTest 등록, 문서 - 커밋 `daccf93` (진행 기록 `6fbb893`)
+2. 재진입 가드와 abi3 교차 버전 확인, pytest 27개 - 커밋 `a632381`
 
 ## 조율자에게 올려 처리된 것
 
@@ -48,8 +50,8 @@
 ## G4 종료 조건 대조
 
 - [x] **CPython C 확장 모듈**이다. ctypes, cffi, ABI 를 런타임에 재선언하는 방식이 아니다 - `bindings/python/src/quodlibet_module.c`, `tests/test_extension.py::test_the_module_is_a_compiled_extension`, `::test_no_ffi_layer_is_involved`
-- [x] `Py_LIMITED_API` (abi3) 로 빌드 - `Py_LIMITED_API=0x030B0000`, `python_add_library(... USE_SABI 3.11)`, wheel 태그 `cp311-abi3-win_amd64`, `::test_it_is_built_against_the_stable_abi`
-- [~] Windows 와 Linux 양쪽에서 import 되고 왕복 시험이 통과 - **Windows 25/25 통과. Linux 는 이 기계에 없어 미검증이며 G7 에서 조율자가 확인합니다.**
+- [x] `Py_LIMITED_API` (abi3) 로 빌드 - `Py_LIMITED_API=0x030B0000`, `python_add_library(... USE_SABI 3.11)`, wheel 태그 `cp311-abi3-win_amd64`, `::test_it_is_built_against_the_stable_abi`. **주장에 그치지 않게 실제로 확인했습니다.** 3.11 로 만든 wheel 을 CPython 3.13.12 venv 에 그대로 설치해 시험 27개 전부 통과했습니다.
+- [~] Windows 와 Linux 양쪽에서 import 되고 왕복 시험이 통과 - **Windows 는 3.11 과 3.13 양쪽에서 27/27 통과. Linux 는 이 기계에 없어 미검증이며 G7 에서 조율자가 확인합니다.**
 - [x] GIL 을 solver 대기 동안 놓는다 - `Py_BEGIN_ALLOW_THREADS` 로 판정 전체를 감쌈. `tests/test_concurrency.py::test_python_keeps_running_while_a_check_is_in_flight` 가 판정 도중 파이썬 스레드가 실제로 도는지를, `::test_two_checks_are_in_flight_at_the_same_instant` 가 두 판정의 구간이 실제로 겹치는지를 고정합니다. 둘 다 벽시계 비율이 아니라 구조적 성질을 봅니다. 비율 시험은 기계 부하를 재는 것이라 flaky 해서 버렸습니다 (실측으로는 4-way 에서 6.7s -> 1.6s)
 - [x] 예산, 판정 정책, 결과가 파이썬 쪽에서 전부 노출 - `budget=` 다섯 축, `policy_json=`, `result.verdict/.status/.evidence/.counterexample/.policy`. `tests/test_budget_and_policy.py` 9개
-- [x] 빌드가 CMake 한 경로에 들어 있고 `pip install .` 이 된다 - `bindings/python/CMakeLists.txt` 가 루트를 subproject 로 부르고, `pip install ./bindings/python` 이 abi3 wheel 을 만들어 설치까지 확인
+- [x] 빌드가 CMake 한 경로에 들어 있고 `pip install .` 이 된다 - `bindings/python/CMakeLists.txt` 가 루트를 subproject 로 부르고, `pip install ./bindings/python` 이 abi3 wheel(590KB, `.pyd` 포함)을 만들어 설치까지 확인. 같은 파일이 루트에서 `add_subdirectory` 될 때는 CTest 항목 `quodlibet.python_bindings` 를 등록합니다.

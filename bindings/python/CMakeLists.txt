@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.26)
 
+# Configuring this directory on its own adds the repository root as a
+# subproject, and the root adds this directory back. Without a guard the second
+# entry would try to define the extension target twice. A plain variable is
+# used rather than a cache entry so that it does not survive into a
+# reconfigure of the same build tree, where the first entry must run again.
+if(DEFINED QL_PYTHON_BINDINGS_ENTERED)
+    return()
+endif()
+set(QL_PYTHON_BINDINGS_ENTERED TRUE)
+
 # 3.26 is the floor because Development.SABIModule and python_add_library's
 # USE_SABI are what produce a real abi3 module instead of a version-tagged one.
 project(quodlibet_python LANGUAGES C)

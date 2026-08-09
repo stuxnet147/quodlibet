@@ -21,7 +21,14 @@ subproject and links the core **statically** into one self-contained module.
 There is no companion shared library to place on a loader path.
 
 The module is built against `Py_LIMITED_API` 3.11 (abi3), so a single wheel
-serves 3.11 and every later CPython minor version.
+serves 3.11 and every later CPython minor version. This is checked rather than
+assumed: the `cp311-abi3` wheel built here is installed into a CPython 3.13
+environment and the whole suite is run against it unchanged.
+
+The distribution is named `quodlibet-engine` and the import name is
+`quodlibet`. The import name is the engine's own, and it is not the unrelated
+Quod Libet music player that publishes the `quodlibet` distribution; do not
+install both into one environment.
 
 Requirements: CMake 3.26 or later (for `Development.SABIModule`), a C17
 compiler, and the vendored `third_party/` tree (`./scripts/vendor.sh`).
