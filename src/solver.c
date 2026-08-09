@@ -26,7 +26,13 @@
 #define QL_BITWUZLA_VERSION "0.9.1"
 #define QL_BITWUZLA_VERSION_TIMEOUT_MS UINT64_C(5000)
 #define QL_PROCESS_WATCHDOG_GRACE_MS UINT64_C(50)
-#define QL_PROCESS_DRAIN_GRACE_MS UINT64_C(250)
+/* Time allowed between child exit and pipe EOF callbacks. This is not a
+   liveness bound on the solver: the overall check deadline still applies
+   above it. 250ms was measured too tight on Windows under concurrent load
+   (4-way batch: 6 of 60 checks lost their fully written output because the
+   EOF callback lagged the exit), and a spurious transport error there costs
+   a verdict while a slow EOF costs only latency on an already-failed path. */
+#define QL_PROCESS_DRAIN_GRACE_MS UINT64_C(5000)
 #define QL_SOLVER_PATH_CAPACITY 32768u
 
 typedef struct ql_buffer {

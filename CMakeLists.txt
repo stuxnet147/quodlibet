@@ -160,6 +160,13 @@ if(QL_ENABLE_BITWUZLA)
         VERBATIM)
 endif()
 
+# W4 owns bindings/python. That directory decides for itself whether a CPython
+# 3.11+ interpreter with the abi3 headers exists; without one it builds nothing
+# and says so at configure time instead of registering a skipping test.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bindings/python/CMakeLists.txt")
+    add_subdirectory(bindings/python)
+endif()
+
 if(BUILD_TESTING AND QL_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
