@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "nodes": [
+    {
+      "name": "normalize",
+      "method": "builtin.identity",
+      "options": {}
+    },
+    {
+      "name": "prove",
+      "method": "builtin.identity",
+      "depends_on": ["normalize"]
+    },
+    {
+      "name": "refute",
+      "method": "builtin.identity",
+      "depends_on": ["normalize"]
+    }
+  ]
+}
