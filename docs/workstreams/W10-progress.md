@@ -191,18 +191,19 @@ p cnf 2 4
 
 ## 다음에 할 것
 
-### 1. 범용 프로세스 실행기 (선행 부품)
+### 1. 프로세스 실행기 추출 (선행 부품, 조율자 지시 B)
 
-`prove.aig-sat` 를 막는 유일한 부품입니다. `src/solver.c` 의 프로세스 계층은 Bitwuzla 전용이고(`ql_solver_add_smt2`, `ql_solver_check`) DIMACS 파일을 인자로 받는 실행 파일을 돌릴 수 없습니다. 공개 헤더에도 범용 실행기가 없습니다.
+`prove.aig-sat` 를 막는 유일한 부품입니다. `src/solver.c` 의 프로세스 계층은 Bitwuzla 전용이고(`ql_solver_add_smt2`, `ql_solver_check`) DIMACS 파일을 인자로 받는 실행 파일을 돌릴 수 없습니다.
 
-`src/proof_aigsat.c` 안에 libuv 기반으로 다음을 만듭니다. `src/solver.c` 의 규율을 그대로 따릅니다.
+두 번째 실행기를 새로 쓰는 안(A)은 조율자가 기각했습니다. 근거가 강합니다. `src/solver.c` 의 프로세스 규율에는 loop 수명 완결, 공유 읽기 열기, AV 재시도, CLOEXEC 상속 차단 네 수리가 쌓여 있고, 새 실행기는 그 넷이 전부 빠진 채 시작합니다. 인코더를 두 벌 두지 말자는 논리가 여기에 더 강하게 적용됩니다.
 
-- shell 없이 argument vector 로 실행, 절대 경로
-- snapshot 디렉터리에 CNF 와 LRAT 를 쓰고 끝나면 정리
-- deadline 과 stdout/stderr 상한. 초과는 `UNKNOWN`
-- 실행 파일 내용의 BLAKE3 digest 를 evidence 에 기록
+**`src/process_runner.c` 로 추출합니다**(이름은 조율자가 `78f4e20` 에 예약). 조건은 셋입니다.
 
-`src/solver.c` 는 W2 소유라 거기서 실행기를 꺼내 공유하려면 조율자 조정이 필요합니다. 중복을 피하려면 그쪽이 낫고, 빨리 가려면 `proof_aigsat.c` 안에 두는 쪽입니다. **조율자에게 물을 것.**
+1. **W8 의 ETXTBSY 수정이 `main` 에 앉기 전에는 `src/solver.c` 를 건드리지 않습니다.** 조율자가 앉으면 알려 줍니다
+2. 추출은 동작 보존입니다. 기존 solver 시험이 전부 그대로 통과해야 하고 공개 ABI 는 바뀌지 않습니다
+3. 두 소비자가 같은 실행기를 쓰고, deadline / 출력 상한 / snapshot / digest 규율이 한 곳에만 남는 것을 시험이 고정합니다
+
+**인터페이스는 이미 합의된 형태로 `src/process_runner.h` 에 있습니다**(`bc26127`). 내부 헤더이고 공개 ABI 를 건너지 않습니다. 유일한 의도적 차이는 `ql_solver_check_request_v1` 대신 중립 `ql_process_limits_v1` 을 받는 것입니다. SMT check request 를 아는 실행기는 DIMACS 경로를 받는 checker 를 섬길 수 없습니다.
 
 ### 2. `prove.aig-sat` method 본체 (3, 4단계)
 

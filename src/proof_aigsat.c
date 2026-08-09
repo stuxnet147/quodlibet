@@ -4,6 +4,10 @@
 
 #include "quodlibet/solver.h"
 
+/* Included ahead of use so the runner interface is compiled from the day it is
+   agreed, not from the day the extraction lands. */
+#include "process_runner.h"
+
 /* --- Values --------------------------------------------------------------- */
 
 /* A blasted term. A Boolean is one bit; nothing else distinguishes it from a
