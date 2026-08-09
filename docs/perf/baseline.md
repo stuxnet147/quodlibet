@@ -1,6 +1,13 @@
 # 성능 기준선
 
-시작 2026-08-10. G6 의 기준선 문서입니다. 수치를 갱신할 때는 아래 재현 명령을 그대로 다시 돌리고 이 문서에 날짜와 함께 잇습니다.
+시작 2026-08-10. G6 의 기준선 문서입니다. 수치를 갱신할 때는 아래 재현 명령을 그대로 다시 돌리고 이 문서에 날짜와 함께 잇습니다. 2026-08-10 부터 W8 이 소유합니다(`docs/workstreams/W8.md`).
+
+## 두 가지 도구
+
+- **회귀 관문**: `scripts/perf/bench-coverage.sh`. 프로파일러가 필요 없고 총량만 봅니다. **"총량이 움직였는가"** 에 답합니다.
+- **귀속 분석**: `scripts/perf/vtune-hotspots.sh`. VTune hotspots 를 스택 수집과 함께 겁니다. **"시간이 어디로 가는가"** 에 답합니다.
+
+회귀 관문은 coverage JSON 의 digest 를 같이 찍습니다. digest 가 바뀌면 측정 대상 자체가 바뀐 것이므로 시간 비교는 무효입니다. 빨라진 것이 아니라 덜 한 것입니다.
 
 ## 측정 환경
 
@@ -45,6 +52,42 @@ Top hotspots:
 
 **tree-sitter 파싱이 여전히 지배한다.** 상위 항목이 전부 파서 계열이다. 로어링과 프런트엔드 자체는 아직 hotspot 에 들어오지도 않는다.
 
+## 호출 귀속 (2026-08-10, W8 인수, `7d4dce7`)
+
+평탄한 함수 목록은 **프런트엔드의 파스와 로어링의 파스를 구분하지 못한다.** 이 워크로드에서는 그 구분이 질문 전체이므로 스택 수집을 켜고 다시 걸었다. 짧은 실행(0.38s)은 표본이 90개 남짓이라 가지별 비율이 흔들리므로 유닛 목록을 10회 이어붙여 4.48s CPU 로 늘렸다. 유닛당 비용은 그대로다.
+
+명령: `./scripts/perf/wsl.sh scripts/perf/vtune-hotspots.sh val 10`
+
+| 호출 경로 | CPU 비율 |
+|---|---|
+| `ql_c_frontend_analyze` | **47.6%** |
+| ㄴ `ql_c_parser_parse` | 31.7% |
+| ㄴ `collect_syntax_nodes` | 12.2% |
+| ㄴ `ql_c_syntax_tree_destroy` | 1.9% |
+| ㄴ `analyze_function` (실제 분석) | 1.3% |
+| `ql_c_lower_selected_function` | **47.9%** |
+| ㄴ `ql_c_parser_parse` | 30.0% |
+| ㄴ `collect_nodes` | 11.8% |
+| ㄴ `cleanup_context` (트리 해제) | 2.5% |
+| ㄴ `ql_c_parser_create` + `_destroy` | 1.9% |
+| ㄴ 실제 로어링 (`collect_records`, `initialize_parameters`, ...) | 1.7% |
+| 측정 하네스의 파일 I/O (`fopen`/`fseek`/`fgets`) | 4.4% |
+
+**두 가지를 말한다.**
+
+1. **파싱 61.6% + 구문 노드 수집 24.0% = 85.6%.** 프런트엔드가 하는 실제 분석은 1.3%, 로어링이 하는 실제 로어링은 1.7% 다. 이 도구는 지금 거의 전부 tree-sitter 다.
+2. **두 가지가 대칭이다.** 프런트엔드 47.6%, 로어링 47.9%. 두 경로가 **같은 소스를 각각 파싱하고 각각 같은 방식으로 트리를 걸어 같은 모양의 노드 배열을 만든다.** 앞선 짧은 수집에서 로어링 쪽이 3배 비싸 보였던 것은 표본 부족이었고, 이 수집이 그것을 정정한다.
+
+중복이 트리 하나가 아니라 **파스 + 걷기 + 트리 해제 + 파서 생성 전부**이므로 제거 가능한 몫은 파스 절반(30.8%)이 아니라 **약 46%** 다.
+
+`ql_c_syntax_record` (`src/c_frontend.c:6`) 와 `lower_node` (`src/c_lower.c:28`) 는 필드가 글자 그대로 같다.
+
+```c
+typedef struct { ql_c_syntax_node_view view; size_t parent; uint32_t depth; } ...;
+```
+
+즉 트리뿐 아니라 **수집한 노드 배열까지 그대로 넘길 수 있다.** 두 파일은 W1 소유이므로 이 최적화는 W1 과 합의해야 한다.
+
 ## 적용한 최적화
 
 ### 1. coverage 경로의 중복 구문 파스 제거 (2026-08-10)
@@ -61,9 +104,24 @@ Top hotspots:
 | 후 | 0.380s | 0.362ms |
 | 차 | **-27%** | |
 
-### 남은 알려진 중복: 프런트엔드와 로어링의 이중 파스
+### 남은 알려진 중복: 프런트엔드와 로어링의 이중 파스 + 이중 걷기
 
-유닛당 아직 **두 번** 파싱한다. `ql_c_frontend_analyze` 와 `ql_c_lower_selected_function` 이 각각 자기 파서로 같은 소스를 파싱한다. 파싱이 CPU 의 절반 이상이므로 트리를 한 번 만들어 넘기는 API(append-only 로 `_with_tree` 변형 추가)가 다음으로 큰 단일 최적화다. **이 API 는 W1 소유 파일에 있으므로 W1 의 작업 단위로 넘긴다.** 포인터 로어링이 끝난 뒤가 맞다. 지금 그 파일들은 활발히 바뀌는 중이다.
+유닛당 아직 **두 번** 파싱하고 **두 번** 걷는다. 위 호출 귀속 절이 몫을 확정했다: 제거 가능한 CPU 는 **약 46%** 다. **이 코드는 W1 소유(`src/c_frontend.c`, `src/c_lower.c`)이므로 W1 과 합의한다.** 제안한 API 는 아래와 같다.
+
+```c
+/* c_frontend.h, append-only */
+QL_API ql_status QL_CALL ql_c_frontend_analyze_with_parser(
+    const ql_allocator *allocator, const char *source, size_t source_size,
+    ql_c_parser *parser, ql_c_frontend_unit **output, ql_error *error);
+
+/* c_lower.h, append-only. tree 와 nodes 가 NULL 이면 현재 동작 그대로. */
+QL_API ql_status QL_CALL ql_c_lower_selected_function_with_tree(
+    const ql_allocator *allocator, const char *source, size_t source_size,
+    const ql_c_frontend_unit *unit, const ql_c_function_view *function,
+    ql_c_syntax_tree *tree, ql_c_lower_result **output, ql_error *error);
+```
+
+`ql_c_syntax_tree` 는 이미 원자적 참조 계수를 갖고 있으므로(`src/c_syntax.c:15`) 소유권 계약을 바꾸지 않고 빌려줄 수 있다. 기존 두 함수는 새 함수를 파서/트리 NULL 로 부르는 얇은 껍데기가 되므로 **ABI 는 append-only 로 유지되고 기존 호출자는 그대로다.**
 
 ## 아직 없는 것
 
@@ -72,21 +130,40 @@ Top hotspots:
 
 ## 재현
 
+한 번만 (WSL Ubuntu 24.04, 부팅마다):
+
 ```sh
-# WSL Ubuntu 24.04. 한 번만:
 sudo sysctl -w kernel.yama.ptrace_scope=0
-
-cd /mnt/d/projects/machine-model/python/quodlibet
-cmake --build --preset linux-clang --parallel
-
-# 유닛을 네이티브 디스크로
-rm -rf /tmp/qlunits && cp -r out/corpus/val/units /tmp/qlunits
-ls /tmp/qlunits | sed 's|^|/tmp/qlunits/|' > /tmp/qlunits.txt
-
-VT=/opt/intel/oneapi/vtune/latest/bin64/vtune
-rm -rf /tmp/vt-hs && $VT -collect hotspots -result-dir /tmp/vt-hs \
-    -- ./out/build/linux-clang/quodlibet coverage /tmp/qlunits.txt
-$VT -report summary -r /tmp/vt-hs | grep -E 'Elapsed|CPU Time'
 ```
 
-회귀 판정은 같은 코퍼스에서 CPU Time 비교로 한다. 수집은 항상 볼 것만 좁혀서 백그라운드 + 120초 제한으로 건다.
+코퍼스를 이 워크트리에 추출하고 Linux 바이너리를 만든다.
+
+```sh
+python tools/corpus/extract.py --corpus "$QL_CORPUS" --split val --out out/corpus/val
+cmake --preset linux-clang && cmake --build --preset linux-clang --parallel
+```
+
+**회귀 관문.** 프로파일러 없이 총량만 잰다. 5회 중 최소값과 결과 digest 를 찍는다.
+
+```sh
+# Linux 에서
+./scripts/perf/bench-coverage.sh val 5
+# Windows Git Bash 에서 WSL 을 통해
+./scripts/perf/wsl.sh scripts/perf/bench-coverage.sh val 5
+```
+
+**귀속 분석.** VTune hotspots 를 스택 수집과 함께 건다. 유닛 목록을 10회 이어붙여 표본을 확보한다.
+
+```sh
+./scripts/perf/wsl.sh scripts/perf/vtune-hotspots.sh val 10
+```
+
+`scripts/coordinator/vtune-wsl.sh` 는 뒤쪽으로 넘기는 shim 으로 남겨 두었다.
+
+## 회귀를 재는 방법
+
+1. **관문은 wall-clock 최소값이다.** 평균이 아니라 최소값을 쓴다. 최소값이 스케줄러 잡음에 가장 덜 오염된 추정이다.
+2. **digest 가 같아야 시간 비교가 성립한다.** `bench-coverage.sh` 는 coverage JSON 의 `cksum` 을 같이 찍는다. digest 가 바뀌었으면 빨라진 것이 아니라 **덜 한 것**이므로 그 비교는 무효다.
+3. **회귀 판정 기준은 유닛당 시간 5% 악화**다. 같은 기계, 같은 코퍼스, 같은 프리셋에서 잰다. 관측된 실행 간 산포는 2% 미만이다(위 기준선에서 380..387 ms).
+4. 원인을 알아야 할 때만 VTune 을 건다. 수집은 항상 볼 것만 좁혀서 백그라운드 + 120초 제한으로 건다.
+5. 모든 최적화 커밋은 before/after 를 이 문서에 잇는다. **프로파일 근거 없는 최적화는 넣지 않는다.**
