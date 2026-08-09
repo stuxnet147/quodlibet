@@ -104,6 +104,14 @@ ql_artifact *RawQuery(const std::string &text) {
     return artifact;
 }
 
+std::string ArtifactText(const ql_artifact *artifact) {
+    ql_artifact_view view{};
+    ql_error error{};
+    view.struct_size = sizeof(view);
+    EXPECT_EQ(QL_STATUS_OK, ql_artifact_get_view(artifact, &view, &error));
+    return std::string(static_cast<const char *>(view.data), view.size);
+}
+
 std::uint32_t EvaluateRoot(ql_aig *aig, ql_aig_lit root,
                            const std::vector<std::uint8_t> &values) {
     std::uint32_t bit = 0u;
@@ -527,6 +535,147 @@ TEST(AigBlast, TheMiterAgreesWithTheInterpreterUnderAPrecondition) {
     fixture.Check("int f(int x){ return x; }", "f",
                   "int g(int x){ if (x < 0) return 0; return x; }", "g",
                   contract);
+}
+
+/* --- SAT assignment back to a replayed witness ---------------------------- */
+
+/* The SAT half of prove.aig-sat without a solver in it. A violating input is
+   found by evaluating the circuit, turned into the DIMACS assignment a solver
+   would have printed, mapped back through the model artifact, and then decoded
+   and replayed by the same code that validates a Bitwuzla model. If that round
+   trip loses or reorders a bit, the replay refuses to reproduce the violation
+   and this fails. */
+TEST(AigBlast, ASatisfyingAssignmentBecomesAReplayedCounterexample) {
+    w2::Pair pair;
+    Graph aig;
+    Blast blast;
+    ql_product_query *query = nullptr;
+    ql_product_query_view_v1 query_view{};
+    ql_aig_cnf *cnf = nullptr;
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build("int f(int x){ return x; }", "f",
+                         "int g(int x){ if (x == 7) return 7; return 0; }",
+                         "g",
+                         w2::ContractObserving(QL_OBSERVE_RETURN_VALUE),
+                         &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_product_query_build(nullptr, pair.problem(), pair.left_ir(),
+                                     pair.right_ir(), &query, &error))
+        << error.message;
+    query_view.struct_size = sizeof(query_view);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_product_query_get_view(query, &query_view, &error));
+    ASSERT_EQ(QL_STATUS_OK,
+              blast.Run(aig, {ql_product_query_prefix_artifact(query),
+                              ql_product_query_violation_artifact(query)},
+                        &error))
+        << error.message;
+    const ql_aig_blast_view_v1 blast_view = blast.view();
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_aig_cnf_create(nullptr, aig, blast_view.root, &cnf, &error));
+
+    /* The two agree only at x == 7, so any other input is a violation. */
+    ql_aig_blast_symbol_v1 symbol{};
+    symbol.struct_size = sizeof(symbol);
+    ql_product_input_v1 input{};
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_product_query_input_at(query, 0u, &input, &error));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_aig_blast_symbol_by_name(blast.get(), input.symbol, &symbol,
+                                          &error));
+    ASSERT_EQ(32u, symbol.bit_width);
+
+    std::vector<std::uint8_t> values(symbol.bit_width, 0u);
+    for (std::uint32_t bit = 0u; bit < symbol.bit_width; ++bit) {
+        values[symbol.first_input + bit] =
+            static_cast<std::uint8_t>((1u >> bit) & 1u);
+    }
+    ASSERT_EQ(1u, EvaluateRoot(aig, blast_view.root, values))
+        << "the blasted miter does not call x == 1 a violation";
+
+    /* The DIMACS literals a solver would have printed for that input. */
+    std::vector<std::int32_t> assignment;
+    for (std::uint32_t bit = 0u; bit < symbol.bit_width; ++bit) {
+        const std::uint32_t variable =
+            ql_aig_cnf_input_variable(cnf, symbol.first_input + bit);
+        if (variable == 0u) {
+            continue;
+        }
+        const std::int32_t literal = static_cast<std::int32_t>(variable);
+        assignment.push_back(values[symbol.first_input + bit] != 0u ? literal
+                                                                    : -literal);
+    }
+    ASSERT_FALSE(assignment.empty());
+
+    ql_artifact *model = nullptr;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_aig_blast_model_artifact_create(nullptr, blast.get(), cnf,
+                                                 assignment.data(),
+                                                 assignment.size(), &model,
+                                                 &error))
+        << error.message;
+    ASSERT_NE(nullptr, model);
+
+    ql_replay_witness *witness = nullptr;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_replay_decode_model(nullptr, query, model, &witness, &error))
+        << error.message;
+    ql_replay_result_v1 replay{};
+    replay.struct_size = sizeof(replay);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_replay_execute(nullptr, pair.problem(), query,
+                                pair.left_ir(), pair.right_ir(), witness,
+                                &replay, &error));
+    EXPECT_EQ(1u, replay.conclusive);
+    EXPECT_EQ(1u, replay.violated)
+        << "the mapped assignment did not reproduce the violation";
+
+    ql_replay_witness_destroy(witness);
+    ql_artifact_release(model);
+    ql_aig_cnf_destroy(cnf);
+    ql_product_query_destroy(query);
+}
+
+TEST(AigBlast, AnAssignmentOutsideTheFormulaIsRejected) {
+    Query query;
+    Graph aig;
+    Blast blast;
+    ql_aig_cnf *cnf = nullptr;
+    ql_artifact *model = nullptr;
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_smt2_builder_declare_bv(query.builder(), "x", 4u, &error));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_smt2_builder_declare_bool(query.builder(), "p", &error));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_smt2_builder_assert(query.builder(),
+                                     "(and p (bvult x #b0111))", &error));
+    ASSERT_EQ(QL_STATUS_OK, blast.Run(aig, {query.Build()}, &error));
+    ASSERT_EQ(QL_STATUS_OK, ql_aig_cnf_create(nullptr, aig, blast.view().root,
+                                              &cnf, &error));
+
+    const std::int32_t beyond[] = {999999};
+    EXPECT_EQ(QL_STATUS_PARSE_ERROR,
+              ql_aig_blast_model_artifact_create(nullptr, blast.get(), cnf,
+                                                 beyond, 1u, &model, &error));
+    EXPECT_EQ(nullptr, model);
+
+    /* An empty assignment is not an error. Every bit reads false, and the
+       replay is what decides whether that witness means anything. */
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_aig_blast_model_artifact_create(nullptr, blast.get(), cnf,
+                                                 nullptr, 0u, &model, &error))
+        << error.message;
+    const std::string text = ArtifactText(model);
+    EXPECT_NE(std::string::npos,
+              text.find("(define-fun x () (_ BitVec 4) #b0000)"));
+    EXPECT_NE(std::string::npos, text.find("(define-fun p () Bool false)"));
+    ql_artifact_release(model);
+    ql_aig_cnf_destroy(cnf);
 }
 
 /* --- Fuzzing -------------------------------------------------------------- */

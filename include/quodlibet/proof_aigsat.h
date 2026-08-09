@@ -83,6 +83,28 @@ QL_API ql_status QL_CALL ql_aig_blast_symbol_by_name(
     const ql_aig_blast *blast, const char *name,
     ql_aig_blast_symbol_v1 *output, ql_error *error);
 
+/* Turns a SAT assignment back into a quodlibet.solver-model artifact.
+
+   `assignment` is the DIMACS literal list a solver prints on its `v` lines: a
+   positive entry sets that variable true, a negative one sets it false, and a
+   zero terminator is ignored. Order does not matter and a variable may be
+   absent.
+
+   The point of returning a solver-model artifact rather than typed values is
+   that the AIG path then hands its witness to ql_replay_decode_model and
+   ql_replay_execute, the same decoder and the same relation evaluator that
+   validate a Bitwuzla model. A second decoder could disagree with the first
+   about what a bit pattern means; there is not one.
+
+   A declared bit the root's cone never reached has no CNF variable and no
+   assignment. It is emitted as zero, which is sound precisely because the
+   miter's value does not depend on it, and the replay re-derives the
+   violation concretely anyway. */
+QL_API ql_status QL_CALL ql_aig_blast_model_artifact_create(
+    const ql_allocator *allocator, const ql_aig_blast *blast,
+    const ql_aig_cnf *cnf, const int32_t *assignment, size_t assignment_count,
+    ql_artifact **output, ql_error *error);
+
 QL_EXTERN_C_END
 
 #endif

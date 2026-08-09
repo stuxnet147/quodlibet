@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-CaDiCaL 2.2.1 과 `lrat-check` 벤더링을 끝냈습니다(`302e0de`). 남은 것은 `prove.aig-sat` method 본체와 Bitwuzla 대조 시험입니다. **그 둘을 막는 것은 판단이 아니라 없는 부품 하나입니다: 범용 프로세스 실행기.** 아래 "다음에 할 것" 에 설계를 적었습니다.
+러너 추출은 W7 의 `ql_solver_check` 오류 경로 누수 수정이 `main` 에 앉을 때까지 보류입니다(조율자가 status 로 알려 줍니다). 그동안 method 본체의 러너 비의존부를 만들고 있습니다. SAT 배정을 기존 replay 경로로 되돌리는 매핑을 끝냈습니다.
 
 ## 끝난 작업 단위
 
@@ -65,6 +65,16 @@ cake_lpr(경로 C, HOL4 로 기계어까지 검증)은 첫 절단에 넣지 않�
 2. round-trip 시험과, 같은 query bytes 에 대해 Bitwuzla 와 kissat 의 SAT/UNSAT 일치 시험. 불일치는 다수결하지 않고 상태 오류로 크게 표면화 (round-trip 과 인터프리터 일치는 닫힘, kissat 대조는 벤더링 뒤)
 3. 파서를 `tests/fuzz/` 표면에 추가 (닫힘)
 4. envelope 에 AIG 경로의 query digest 가 SMT 경로의 그것과 같은 값으로 기록 (method 본체에서)
+
+### 8. SAT 배정 -> replay 매핑 (러너 비의존부)
+
+`ql_aig_blast_model_artifact_create`. solver 가 낸 DIMACS 배정을 `quodlibet.solver-model` artifact 로 되돌립니다. **typed value 가 아니라 model artifact 를 내는 것이 핵심입니다.** 그래야 AIG 경로의 witness 가 Bitwuzla model 과 똑같이 `ql_replay_decode_model` 과 `ql_replay_execute` 를 지납니다. 비트 패턴의 뜻을 아는 곳이 둘이면 어긋날 수 있고, 하나면 어긋날 수 없습니다.
+
+cone 이 닿지 않은 비트는 CNF 변수가 없고 배정도 없습니다. 0 으로 냅니다. miter 의 값이 그 비트에 의존하지 않으므로 건전하고, 어차피 replay 가 위반을 구체적으로 다시 도출합니다.
+
+시험은 solver 없이 SAT 경로 전체를 한 바퀴 돌립니다. 회로를 평가해 위반 입력을 찾고, solver 가 찍었을 DIMACS 배정으로 바꾸고, model artifact 로 되돌리고, decode 해서 replay 합니다. 왕복에서 비트 하나라도 잃거나 순서가 바뀌면 replay 가 위반을 재현하지 못해 실패합니다. 형식 밖 변수 거부와 빈 배정 처리도 고정했습니다.
+
+CTest 392/392 통과입니다.
 
 ### 7. CaDiCaL 전환과 벤더링 (`302e0de`)
 
@@ -205,7 +215,7 @@ p cnf 2 4
 
 **인터페이스는 이미 합의된 형태로 `src/process_runner.h` 에 있습니다**(`bc26127`). 내부 헤더이고 공개 ABI 를 건너지 않습니다. 유일한 의도적 차이는 `ql_solver_check_request_v1` 대신 중립 `ql_process_limits_v1` 을 받는 것입니다. SMT check request 를 아는 실행기는 DIMACS 경로를 받는 checker 를 섬길 수 없습니다.
 
-### 2. `prove.aig-sat` method 본체 (3, 4단계)
+### 2. `prove.aig-sat` method 본체 (3, 4단계). SAT 배정 매핑은 위 8번에서 닫혔습니다
 
 흐름은 이렇습니다.
 

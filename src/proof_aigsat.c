@@ -1,5 +1,6 @@
 #include "quodlibet/proof_aigsat.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "quodlibet/solver.h"
@@ -1229,4 +1230,196 @@ ql_status QL_CALL ql_aig_blast_symbol_by_name(const ql_aig_blast *blast,
     fill_symbol_view(symbol, output);
     ql_error_clear(error);
     return QL_STATUS_OK;
+}
+
+/* --- SAT assignment back to a solver model -------------------------------- */
+
+typedef struct model_text {
+    ql_allocator allocator;
+    char *data;
+    size_t size;
+    size_t capacity;
+} model_text;
+
+static int model_text_reserve(model_text *text, size_t extra) {
+    size_t needed = text->size + extra + 1u;
+    size_t capacity;
+    char *grown;
+
+    if (needed <= text->capacity) {
+        return 1;
+    }
+    capacity = text->capacity == 0u ? 256u : text->capacity;
+    while (capacity < needed) {
+        if (capacity > (SIZE_MAX / 2u)) {
+            return 0;
+        }
+        capacity *= 2u;
+    }
+    grown = text->allocator.reallocate(text->allocator.user_data, text->data,
+                                       capacity);
+    if (grown == NULL) {
+        return 0;
+    }
+    text->data = grown;
+    text->capacity = capacity;
+    return 1;
+}
+
+static int model_text_append(model_text *text, const char *bytes,
+                             size_t size) {
+    if (!model_text_reserve(text, size)) {
+        return 0;
+    }
+    memcpy(text->data + text->size, bytes, size);
+    text->size += size;
+    text->data[text->size] = '\0';
+    return 1;
+}
+
+static int model_text_append_cstr(model_text *text, const char *bytes) {
+    return model_text_append(text, bytes, strlen(bytes));
+}
+
+ql_status QL_CALL ql_aig_blast_model_artifact_create(
+    const ql_allocator *allocator, const ql_aig_blast *blast,
+    const ql_aig_cnf *cnf, const int32_t *assignment, size_t assignment_count,
+    ql_artifact **output, ql_error *error) {
+    const ql_allocator *selected = select_allocator(allocator);
+    ql_aig_cnf_view_v1 cnf_view;
+    model_text text;
+    uint8_t *values = NULL;
+    size_t index;
+    size_t symbol_count;
+    ql_status status;
+
+    if (blast == NULL || cnf == NULL || output == NULL ||
+        (assignment_count != 0u && assignment == NULL)) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "blast result, formula, assignment, and output are required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    *output = NULL;
+    memset(&cnf_view, 0, sizeof(cnf_view));
+    cnf_view.struct_size = sizeof(cnf_view);
+    status = ql_aig_cnf_get_view(cnf, &cnf_view, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    memset(&text, 0, sizeof(text));
+    text.allocator = *selected;
+
+    /* One byte per variable: 0 unassigned or false, 1 true. A variable the
+       solver did not mention is left false, which the replay then confirms or
+       refutes concretely. */
+    if (cnf_view.variable_count != 0u) {
+        values = selected->allocate(selected->user_data,
+                                    (size_t)cnf_view.variable_count + 1u);
+        if (values == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        memset(values, 0, (size_t)cnf_view.variable_count + 1u);
+    }
+    for (index = 0u; index < assignment_count; ++index) {
+        const int32_t literal = assignment[index];
+        uint64_t variable;
+        if (literal == 0) {
+            continue;
+        }
+        variable = literal < 0 ? (uint64_t)(-(int64_t)literal)
+                               : (uint64_t)literal;
+        if (variable > cnf_view.variable_count) {
+            ql_error_set(error, QL_STATUS_PARSE_ERROR,
+                         "the assignment mentions variable %llu but the formula has %llu",
+                         (unsigned long long)variable,
+                         (unsigned long long)cnf_view.variable_count);
+            status = QL_STATUS_PARSE_ERROR;
+            goto cleanup;
+        }
+        values[variable] = literal > 0 ? 1u : 0u;
+    }
+
+    if (!model_text_append_cstr(&text, "(")) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        status = QL_STATUS_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+    symbol_count = ql_aig_blast_symbol_count(blast);
+    for (index = 0u; index < symbol_count; ++index) {
+        ql_aig_blast_symbol_v1 symbol;
+        char sort[48];
+        uint32_t bit;
+        int written;
+
+        memset(&symbol, 0, sizeof(symbol));
+        symbol.struct_size = sizeof(symbol);
+        status = ql_aig_blast_symbol_at(blast, index, &symbol, error);
+        if (status != QL_STATUS_OK) {
+            goto cleanup;
+        }
+        if (!model_text_append_cstr(&text, "(define-fun ") ||
+            !model_text_append(&text, symbol.name, symbol.name_size)) {
+            status = QL_STATUS_OUT_OF_MEMORY;
+            ql_error_set(error, status, NULL);
+            goto cleanup;
+        }
+        if (symbol.is_bool != 0u) {
+            const uint32_t variable =
+                ql_aig_cnf_input_variable(cnf, symbol.first_input);
+            const int set = variable != 0u && values != NULL &&
+                            values[variable] != 0u;
+            if (!model_text_append_cstr(&text, " () Bool ") ||
+                !model_text_append_cstr(&text, set ? "true" : "false") ||
+                !model_text_append_cstr(&text, ")")) {
+                status = QL_STATUS_OUT_OF_MEMORY;
+                ql_error_set(error, status, NULL);
+                goto cleanup;
+            }
+            continue;
+        }
+        written = snprintf(sort, sizeof(sort), " () (_ BitVec %u) #b",
+                           (unsigned)symbol.bit_width);
+        if (written < 0 || (size_t)written >= sizeof(sort)) {
+            ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                         "could not format a bit-vector sort");
+            status = QL_STATUS_INTERNAL_ERROR;
+            goto cleanup;
+        }
+        if (!model_text_append(&text, sort, (size_t)written)) {
+            status = QL_STATUS_OUT_OF_MEMORY;
+            ql_error_set(error, status, NULL);
+            goto cleanup;
+        }
+        /* SMT-LIB binary literals run most significant bit first. */
+        for (bit = symbol.bit_width; bit != 0u; --bit) {
+            const uint32_t variable = ql_aig_cnf_input_variable(
+                cnf, symbol.first_input + bit - 1u);
+            const int set = variable != 0u && values != NULL &&
+                            values[variable] != 0u;
+            if (!model_text_append_cstr(&text, set ? "1" : "0")) {
+                status = QL_STATUS_OUT_OF_MEMORY;
+                ql_error_set(error, status, NULL);
+                goto cleanup;
+            }
+        }
+        if (!model_text_append_cstr(&text, ")")) {
+            status = QL_STATUS_OUT_OF_MEMORY;
+            ql_error_set(error, status, NULL);
+            goto cleanup;
+        }
+    }
+    if (!model_text_append_cstr(&text, ")")) {
+        status = QL_STATUS_OUT_OF_MEMORY;
+        ql_error_set(error, status, NULL);
+        goto cleanup;
+    }
+    status = ql_artifact_create(selected, QL_ARTIFACT_KIND_SOLVER_MODEL,
+                                QL_SOLVER_ARTIFACT_SCHEMA_VERSION, text.data,
+                                text.size, output, error);
+
+cleanup:
+    selected->deallocate(selected->user_data, values);
+    selected->deallocate(selected->user_data, text.data);
+    return status;
 }
