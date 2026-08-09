@@ -25,7 +25,8 @@ cmake --preset linux-clang >>"$LOG" 2>&1 \
 grep -E "tests passed|tests failed" "$LOG" | tail -1 >> "$SUM"
 
 note "stage 3: python bindings (venv, pip install, pytest)"
-python3 -m venv /opt/quodlibet/venv >>"$LOG" 2>&1
+# The image ships 3.10; the abi3 floor is 3.11, installed by the coordinator.
+python3.11 -m venv /opt/quodlibet/venv >>"$LOG" 2>&1
 /opt/quodlibet/venv/bin/pip install -q ./bindings/python pytest >>"$LOG" 2>&1 \
   || note "  PIP INSTALL FAILED"
 /opt/quodlibet/venv/bin/python -c "import quodlibet; print('import OK')" >> "$SUM" 2>>"$LOG"
