@@ -22,6 +22,7 @@
 #include "quodlibet/registry.h"
 #include "quodlibet/scheduler.h"
 #include "quodlibet/semantics.h"
+#include "quodlibet/signature.h"
 #include "quodlibet/solver.h"
 #include "quodlibet/status.h"
 #include "quodlibet/version.h"
