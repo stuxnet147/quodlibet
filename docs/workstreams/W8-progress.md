@@ -31,7 +31,24 @@ WU12. (B) solver 세션 객체. 조율자가 W7 대기 조건을 완화해 착�
 3. bindings: 파이썬 세션 객체와 `check_batch` 이전 (조건 5)
 4. 측정: 판정당 before/after 와 `ETXTBSY` 잔존 재측정
 
-**진행: 1단계 시작 전.**
+**진행: 1단계 시작 전. 코드는 한 줄도 안 들어갔습니다.**
+
+이 세션에서 헤더에 선언만 먼저 넣어 봤다가 **되돌렸습니다.** 구현 없는 공개 선언을 브랜치에 남기는 것은 반쪽 ABI 이고, 이 저장소가 가장 싫어하는 상태입니다. 다음 세션이 위 4단계를 1번부터 그대로 시작하면 됩니다.
+
+**다음 세션이 바로 쓸 수 있는 것.**
+
+- 확장 지점: `ql_solver_descriptor_v1` 의 `reserved[8]` 을 typed 필드 세 개 + `reserved[5]` 로 바꾸면 크기와 기존 필드 의미가 그대로입니다. `ql_solver_descriptor_validate` 의 `minimum_size` 는 `offsetof(..., reserved)` 로 계산되므로 **새 필드를 읽기 전에 `struct_size` 로 가려야** 옛 descriptor 가 계속 통과합니다(`src/solver.c:490`).
+- 세션이 옮겨 담을 상태는 `ql_bitwuzla_state` 의 `snapshot_directory`, `executable`, `executable_digest` 세 개입니다(`src/solver.c`).
+- 판정마다 남겨야 하는 것은 `verify_snapshot_digest` 호출 두 번(`bitwuzla_check` 안)과 envelope 의 backend digest 기록입니다.
+
+## 이 디스패치에서 닫지 못한 것 (인계)
+
+| 항목 | 막은 것 | 필요한 것 |
+|---|---|---|
+| coverage 경로 약 30% | W1 API 에 트리를 꺼낼 방법이 없음 | 접근자 또는 `analyze_with_tree` 또는 트리 반환. 조율자가 W1 에 요청해 둠 |
+| 세션 객체 (B) | 착수만 하고 코드 없음 | 위 4단계. 설계와 확장 지점은 위에 있음 |
+| threading 리포트 | 이 호스트에서 원리적으로 불가(자식 프로세스) | W9 의 VM 결과 |
+| ASan/UBSan 재확인 | `src/aig.c:1114` shift UB, `third_party/drat-trim/lrat-check.c` 링크 실패 | 둘 다 escalation 으로 올림 |
 
 ### 이전 상태
 
