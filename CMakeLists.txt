@@ -173,6 +173,12 @@ if(QL_ENABLE_BITWUZLA)
         VERBATIM)
 endif()
 
+# W7 owns examples/. The hook is gated the same way as the bindings hook so
+# the example lands without another root edit.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/CMakeLists.txt")
+    add_subdirectory(examples)
+endif()
+
 # W4 owns bindings/python. That directory decides for itself whether a CPython
 # 3.11+ interpreter with the abi3 headers exists; without one it builds nothing
 # and says so at configure time instead of registering a skipping test.
