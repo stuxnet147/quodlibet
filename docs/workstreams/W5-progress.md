@@ -7,12 +7,12 @@
 
 ## 지금 하는 것
 
-0단계. 코드 조사와 인코딩 설계를 마쳤습니다. 조율자에게 SMT-LIB builder 의 array 확장 허가를 물었습니다.
+1단계. SMT-LIB builder 에 array 를 넣었습니다. 다음은 `src/product.c` 의 메모리 인코딩입니다.
 
 ## 기준선
 
 - 시작 커밋 `4a8bf3c` (`main` 의 W5 지시서 커밋)
-- `cmake --preset windows-clang` + build 통과. CTest 기준선은 첫 작업 단위 커밋에서 기록합니다
+- 시작 시점 `ctest --preset windows-clang`: 262/262 통과
 
 ## 조사 결과: 지금 miter 가 메모리에서 막히는 지점
 
@@ -70,13 +70,27 @@ disjointness, 첫 페이지, wrap 없음 세 제약은 **다시 만들지 않습
 
 replay 는 "이 구체 입력에서 관계가 깨지는가" 를 독립으로 다시 확인하는 것이므로, 넘겨주는 배치가 모델의 세 제약을 만족하는 적법한 배치이기만 하면 판정이 건전합니다. 그래서 model 의 size 가 replay 가 실체화하기에 너무 크면 상한으로 줄여서 실행합니다. 줄인 배치에서 위반이 재현되면 그것은 진짜 반례이고, 재현되지 않으면 `UNKNOWN` 입니다. 어느 쪽도 없는 사실을 만들지 않습니다.
 
+## 완료한 작업 단위
+
+### 1. SMT-LIB builder 의 array 지원
+
+커밋: `4db9068`
+
+`ql_smt2_builder` 에 `(Array ...)` 를 선언하고 정의하는 함수가 없었습니다(`declare_bool`, `declare_bv`, `define_bool`, `define_bv` 뿐). 메모리를 배열로 인코딩하려면 prefix 안에 `(declare-const mem0 (Array (_ BitVec 64) (_ BitVec 8)))` 이 필요하고, 이것은 side 인코딩보다 앞서야 하므로 별도 artifact 로 뗄 수 없습니다.
+
+`src/solver.c` 와 `include/quodlibet/solver.h` 는 W2 소유이므로 조율자에게 물었고, **builder 절에 한해 W5 로 위임**받았습니다. 조건은 다섯이었고 전부 지켰습니다.
+
+1. builder 에 논리를 넣지 않았습니다. `ql_smt2_builder_declare_array` 와 `ql_smt2_builder_define_array` 는 sort 문자열만 씁니다. `select` 와 `store` 는 기존 정의 본문 안에 그대로 들어가고 backend 만 파싱합니다
+2. append-only 입니다. 새 `QL_API` 함수 두 개뿐이고 구조체와 기존 시그니처는 그대로입니다
+3. transport, snapshot, process 코드는 건드리지 않았습니다
+4. `tests/test_solver.cpp` 에 세 시험을 더했습니다. 직렬화 왕복(`SerializesArraySortsDeterministically`), 인자 거부(`RejectsMalformedArrayDeclarations`), **Bitwuzla 0.9.1 실제 QF_ABV solve**(`SolvesRealArrayQueries`, UNSAT 과 SAT 양쪽)
+5. `SOLVERS.md` 의 builder 절에 array 를 적었습니다
+
+`ctest` 265/265 통과입니다(기준선 262 + 3).
+
 ## 막힌 것
 
-### 조율자 판단 대기: SMT-LIB builder 의 array 지원
-
-`ql_smt2_builder` 에 `(Array ...)` 를 선언하고 정의하는 함수가 없습니다(`declare_bool`, `declare_bv`, `define_bool`, `define_bv` 뿐). 메모리를 배열로 인코딩하려면 prefix 안에 `(declare-const mem0 (Array (_ BitVec 64) (_ BitVec 8)))` 이 필요하고, 이것은 side 인코딩보다 앞서야 하므로 별도 artifact 로 뗄 수 없습니다.
-
-`src/solver.c` 는 W2 소유이고 W2 지시서는 완료 상태입니다. 제안은 append-only 함수 두 개(`ql_smt2_builder_declare_array`, `ql_smt2_builder_define_array`)이고 기존 구조체와 ABI 는 건드리지 않습니다.
+- 없음
 
 ## 다음에 할 것
 

@@ -230,6 +230,16 @@ QL_API ql_status QL_CALL ql_smt2_builder_define_bool(
 QL_API ql_status QL_CALL ql_smt2_builder_define_bv(
     ql_smt2_builder *builder, const char *symbol, uint32_t width,
     const char *term, ql_error *error);
+/* A flat byte-addressed memory is an array from an address bit-vector to an
+   element bit-vector. The builder writes the sort and nothing else; select and
+   store terms are ordinary bodies the backend sort-checks. An array symbol
+   requires an array-capable logic such as QF_ABV. */
+QL_API ql_status QL_CALL ql_smt2_builder_declare_array(
+    ql_smt2_builder *builder, const char *symbol, uint32_t index_width,
+    uint32_t element_width, ql_error *error);
+QL_API ql_status QL_CALL ql_smt2_builder_define_array(
+    ql_smt2_builder *builder, const char *symbol, uint32_t index_width,
+    uint32_t element_width, const char *term, ql_error *error);
 QL_API ql_status QL_CALL ql_smt2_builder_assert(
     ql_smt2_builder *builder, const char *boolean_term, ql_error *error);
 QL_API ql_status QL_CALL ql_smt2_builder_build(

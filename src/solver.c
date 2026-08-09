@@ -1127,6 +1127,87 @@ ql_status QL_CALL ql_smt2_builder_define_bv(ql_smt2_builder *builder,
                           (size_t)count, ") ", term, error);
 }
 
+/* The array sort is the only thing this pair adds to the transcript; select
+   and store appear inside ordinary definition bodies, which stay verbatim. */
+static int format_array_sort(char *text, size_t capacity, uint32_t index_width,
+                             uint32_t element_width) {
+    int count = snprintf(text, capacity, "(Array (_ BitVec %u) (_ BitVec %u))",
+                         index_width, element_width);
+    return (count <= 0 || (size_t)count >= capacity) ? -1 : count;
+}
+
+ql_status QL_CALL ql_smt2_builder_declare_array(ql_smt2_builder *builder,
+                                                const char *symbol,
+                                                uint32_t index_width,
+                                                uint32_t element_width,
+                                                ql_error *error) {
+    char sort[64];
+    int count;
+    ql_status status;
+
+    if (builder == NULL || !valid_symbol(symbol) || index_width == 0u ||
+        element_width == 0u) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "array declaration requires a symbol and positive index and element widths");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    count = format_array_sort(sort, sizeof(sort), index_width, element_width);
+    if (count < 0) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "could not format the array sort");
+        return QL_STATUS_INTERNAL_ERROR;
+    }
+    status = builder_require_space(
+        builder, strlen("(declare-const  )\n") + strlen(symbol) +
+                     (size_t)count,
+        error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = buffer_append_cstr(&builder->text, "(declare-const ", error);
+    if (status == QL_STATUS_OK) {
+        status = buffer_append_cstr(&builder->text, symbol, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = buffer_append_cstr(&builder->text, " ", error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = buffer_append(&builder->text, sort, (size_t)count, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = buffer_append_cstr(&builder->text, ")\n", error);
+    }
+    if (status == QL_STATUS_OK) {
+        ql_error_clear(error);
+    }
+    return status;
+}
+
+ql_status QL_CALL ql_smt2_builder_define_array(ql_smt2_builder *builder,
+                                               const char *symbol,
+                                               uint32_t index_width,
+                                               uint32_t element_width,
+                                               const char *term,
+                                               ql_error *error) {
+    char sort[64];
+    int count;
+
+    if (builder == NULL || !valid_symbol(symbol) || index_width == 0u ||
+        element_width == 0u || !valid_single_line_term(term)) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "array definition requires a symbol, positive index and element widths, and a non-empty single-line term");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    count = format_array_sort(sort, sizeof(sort), index_width, element_width);
+    if (count < 0) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "could not format the array sort");
+        return QL_STATUS_INTERNAL_ERROR;
+    }
+    return builder_define(builder, symbol, "", sort, (size_t)count, " ", term,
+                          error);
+}
+
 ql_status QL_CALL ql_smt2_builder_assert(
     ql_smt2_builder *builder, const char *boolean_term, ql_error *error) {
     ql_status status;

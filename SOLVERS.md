@@ -151,7 +151,10 @@ checked certificate path.
 
 The v1 builder emits one command per line in call order. It currently provides
 logic selection, Boolean and bit-vector constants, nullary `define-fun`
-bindings for Boolean and bit-vector terms, and Boolean assertions. The
+bindings for Boolean and bit-vector terms, and Boolean assertions. It also
+declares and defines `(Array (_ BitVec I) (_ BitVec E))` symbols, which is how
+a flat byte-addressed memory enters a query; `select` and `store` appear only
+inside definition bodies, so the builder writes the sort and nothing else. The
 definition forms exist so a relational encoding can name each intermediate
 value once instead of substituting it into a single term that grows with the
 product of two control-flow graphs. A definition body is serialized verbatim;

@@ -414,6 +414,132 @@ TEST(SmtLibBuilder, SerializesDeterministicallyWithoutTerminalCommands) {
     ql_artifact_release(right);
 }
 
+ql_artifact *build_memory_formula(const char *term) {
+    ql_smt2_builder *builder = nullptr;
+    ql_artifact *artifact = nullptr;
+    ql_error error{};
+    EXPECT_EQ(QL_STATUS_OK,
+              ql_smt2_builder_create(nullptr, QL_SOLVER_LOGIC_QF_ABV,
+                                     &builder, &error))
+        << error.message;
+    if (builder == nullptr) {
+        return nullptr;
+    }
+    EXPECT_EQ(QL_STATUS_OK,
+              ql_smt2_builder_declare_array(builder, "mem0", 64u, 8u, &error))
+        << error.message;
+    EXPECT_EQ(QL_STATUS_OK,
+              ql_smt2_builder_declare_bv(builder, "a", 64u, &error))
+        << error.message;
+    EXPECT_EQ(QL_STATUS_OK,
+              ql_smt2_builder_define_array(builder, "mem1", 64u, 8u,
+                                           "(store mem0 a #x2a)", &error))
+        << error.message;
+    EXPECT_EQ(QL_STATUS_OK, ql_smt2_builder_assert(builder, term, &error))
+        << error.message;
+    EXPECT_EQ(QL_STATUS_OK,
+              ql_smt2_builder_build(builder, &artifact, &error))
+        << error.message;
+    ql_smt2_builder_destroy(builder);
+    return artifact;
+}
+
+TEST(SmtLibBuilder, SerializesArraySortsDeterministically) {
+    ql_artifact *left = build_memory_formula("(= (select mem1 a) #x2a)");
+    ql_artifact *right = build_memory_formula("(= (select mem1 a) #x2a)");
+    ql_artifact_view left_view{};
+    ql_artifact_view right_view{};
+    ql_error error{};
+    constexpr char expected[] =
+        "(set-logic QF_ABV)\n"
+        "(declare-const mem0 (Array (_ BitVec 64) (_ BitVec 8)))\n"
+        "(declare-const a (_ BitVec 64))\n"
+        "(define-fun mem1 () (Array (_ BitVec 64) (_ BitVec 8)) "
+        "(store mem0 a #x2a))\n"
+        "(assert (= (select mem1 a) #x2a))\n";
+
+    ASSERT_NE(nullptr, left);
+    ASSERT_NE(nullptr, right);
+    left_view.struct_size = sizeof(left_view);
+    right_view.struct_size = sizeof(right_view);
+    ASSERT_EQ(QL_STATUS_OK, ql_artifact_get_view(left, &left_view, &error));
+    ASSERT_EQ(QL_STATUS_OK, ql_artifact_get_view(right, &right_view, &error));
+    EXPECT_EQ(sizeof(expected) - 1u, left_view.size);
+    EXPECT_EQ(0, std::memcmp(expected, left_view.data, left_view.size));
+    EXPECT_TRUE(ql_digest_equal(&left_view.digest, &right_view.digest));
+    ql_artifact_release(left);
+    ql_artifact_release(right);
+}
+
+TEST(SmtLibBuilder, RejectsMalformedArrayDeclarations) {
+    ql_smt2_builder *builder = nullptr;
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_smt2_builder_create(nullptr, QL_SOLVER_LOGIC_QF_ABV,
+                                     &builder, &error));
+    EXPECT_EQ(QL_STATUS_INVALID_ARGUMENT,
+              ql_smt2_builder_declare_array(builder, "mem", 0u, 8u, &error));
+    EXPECT_EQ(QL_STATUS_INVALID_ARGUMENT,
+              ql_smt2_builder_declare_array(builder, "mem", 64u, 0u, &error));
+    EXPECT_EQ(QL_STATUS_INVALID_ARGUMENT,
+              ql_smt2_builder_declare_array(builder, "0mem", 64u, 8u,
+                                            &error));
+    EXPECT_EQ(QL_STATUS_INVALID_ARGUMENT,
+              ql_smt2_builder_define_array(builder, "mem", 64u, 8u,
+                                           "bad\nterm", &error));
+    ql_smt2_builder_destroy(builder);
+}
+
+TEST(BitwuzlaSolver, SolvesRealArrayQueries) {
+    const ql_solver_descriptor_v1 *descriptor =
+        ql_bitwuzla_solver_descriptor();
+    ql_solver *solver = nullptr;
+    ql_artifact *formula = nullptr;
+    ql_solver_check_request_v1 request{};
+    ql_solver_check_result_v1 result{};
+    ql_error error{};
+    ql_status status =
+        ql_solver_create(nullptr, descriptor, nullptr, &solver, &error);
+
+    if (status == QL_STATUS_NOT_FOUND) {
+        GTEST_SKIP() << error.message;
+    }
+    ASSERT_EQ(QL_STATUS_OK, status) << error.message;
+    /* Reading back the byte just written is valid in the array theory, so the
+       negation is unsatisfiable and the backend must say so. */
+    formula = build_memory_formula("(not (= (select mem1 a) #x2a))");
+    ASSERT_NE(nullptr, formula);
+    ASSERT_EQ(QL_STATUS_OK, ql_solver_add_smt2(solver, formula, &error));
+    ql_solver_check_request_init(&request, QL_SOLVER_LOGIC_QF_ABV);
+    request.maximum_bv_width = 64u;
+    ql_solver_check_result_init(&result);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_solver_check(solver, &request, &result, &error))
+        << error.message;
+    EXPECT_EQ(QL_SOLVER_CHECK_UNSAT, result.kind);
+    ql_solver_check_result_clear(&result);
+    ql_artifact_release(formula);
+    ql_solver_destroy(solver);
+
+    solver = nullptr;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_solver_create(nullptr, descriptor, nullptr, &solver,
+                               &error));
+    formula = build_memory_formula("(= (select mem0 a) #x00)");
+    ASSERT_NE(nullptr, formula);
+    ASSERT_EQ(QL_STATUS_OK, ql_solver_add_smt2(solver, formula, &error));
+    ql_solver_check_request_init(&request, QL_SOLVER_LOGIC_QF_ABV);
+    request.maximum_bv_width = 64u;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_solver_check(solver, &request, &result, &error))
+        << error.message;
+    EXPECT_EQ(QL_SOLVER_CHECK_SAT, result.kind);
+    ql_solver_check_result_clear(&result);
+    ql_artifact_release(formula);
+    ql_solver_destroy(solver);
+}
+
 TEST(SmtLibBuilder, EnforcesHardTranscriptLimitBeforeAllocation) {
     ql_smt2_builder *builder = nullptr;
     ql_error error{};
