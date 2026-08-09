@@ -21,6 +21,12 @@ if(BUILD_TESTING AND QL_BUILD_TESTS)
     enable_language(CXX)
 endif()
 
+# The tree contains a Python shared module that folds in the core and every
+# vendored archive, so all objects must be PIC in every preset. 8ddd5e7 set
+# this only on the standalone pip path and linux-sanitize kept failing at the
+# libuv link (W8's report, 2026-08-10).
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
