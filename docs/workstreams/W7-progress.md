@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-항목 2. solver fault-injection 확대. 기존 시험이 이미 덮는 축을 먼저 조사합니다.
+항목 2 의 두 번째 절반. process transport fault-injection (가짜 solver 실행 파일로 crash, 잘린 출력, corrupt model, 폭주 출력, hang 주입).
 
 ## 착수 시 조사한 것 (2026-08-10)
 
@@ -57,6 +57,28 @@ signature=1248      policy=6025      policy_result=22510
 
 CTest 273/273 통과 (기존 267 + 신규 6). 드라이버 5개는 `clang -std=c17 -Wall -Wextra -Wpedantic -fsyntax-only` 통과. libFuzzer 실행 자체는 `linux-fuzz` 프리셋 전용이라 Windows 에서는 확인하지 못했습니다.
 
+### 2. solver fault-injection, in-process 절반 (`tests/test_fault_injection.cpp`)
+
+기존 solver 시험은 **정직하게 동작하는** backend 를 몹니다. 이 파일은 그렇지 않은 backend 를 몹니다. adapter 의 일이 오작동하거나 거짓말하는 backend 와 코어 사이에 서는 것이기 때문입니다.
+
+먼저 이미 덮인 축을 조사해 빼놓았습니다.
+
+| 이미 있는 것 | 어디 |
+|---|---|
+| cancellation, watchdog timeout 분류 | `SolverUnknownReason`, `Solver.MockSupportsSatModelAndCancellation` |
+| SMT-LIB transcript 하드 상한 | `SmtLibBuilder.EnforcesHardTranscriptLimitBeforeAllocation`, `BitwuzlaSolver.EnforcesHardLimitOnCompleteTerminalQuery` |
+| 상속된 pipe 가 직계 자식보다 오래 사는 경우 | `BitwuzlaTransport.BoundsInheritedPipesAfterDirectChildExit` |
+| snapshot 변조 탐지 | `BitwuzlaSolver.RunsPrivateSnapshotAfterOverrideIsRemovedAndCleansIt` |
+| decode 는 되지만 재현되지 않는 model | `tests/test_replay.cpp` 6개 |
+
+더한 축은 **느린 backend 가 아니라 틀리게 답하는 backend** 입니다. 적대적 descriptor 하나가 16가지 거짓 결과를 냅니다. SAT 이 proof 를 들고 오기, UNSAT 이 model 을 들고 오기, UNKNOWN 이 증거를 들고 오기, 요청하지 않은 artifact, 라벨이 틀린 artifact, 요청한 model 누락, 영 backend digest, 잘못된 kind, kind 와 unknown reason 불일치, 범위 밖 unknown reason, 오류 반환과 동시에 artifact 보유.
+
+**할당 계수기를 붙였습니다.** 오류 경로에서 artifact 를 남기면 sanitizer 빌드에서만 보이는 누수가 아니라 실패하는 시험이 됩니다. Windows 에서도 작동합니다. 거부된 check 를 같은 solver 에서 64회 반복해도 계수가 늘지 않는 것도 고정했습니다.
+
+backend identity 를 descriptor 에서 찍는 것도 고정했습니다. backend 가 남의 이름으로 답하지 못해야 trusted-backend proof policy 의 key 가 뜻을 갖습니다.
+
+CTest 278/278 통과 (직전 273 + 신규 5).
+
 ## 내린 설계 결정
 
 - **새 target 을 `fuzz_targets.h` 가 아니라 별도 `fuzz_contract_targets.h` 에 둡니다.** 근거: `fuzz_targets.h` 와 `tests/test_fuzz.cpp` 는 W1 이 소유하는 표면(파서/로어링/IR)의 기록이고, W7 이 더하는 것은 계약 표면이라 소유가 다릅니다. `QL_FUZZ_REQUIRE`/`QL_FUZZ_REACHED` 규약은 그대로 따라서 두 헤더가 같은 규율 아래 있습니다.
@@ -67,6 +89,17 @@ CTest 273/273 통과 (기존 267 + 신규 6). 드라이버 5개는 `clang -std=c
 - **불변식 위반 시 입력 byte 열을 escape 해서 같이 보고합니다.** 문장만 보고하면 다음 사람이 campaign 전체를 다시 돌려야 어떤 입력이었는지 알 수 있습니다.
 
 ## 조율자에게 보고할 것
+
+### result header 를 덮어쓴 backend 에서의 누수 (`src/solver.c`, W2 소유)
+
+backend 가 `ql_solver_check_result_v1` 의 `abi_version` 이나 `struct_size` 를 덮어쓰면 `ql_solver_check` 는 `QL_STATUS_ABI_MISMATCH` 로 올바르게 거부합니다. 그러나 그 backend 가 할당한 artifact 는 해제되지 않습니다. 측정한 잔여 할당은 model artifact 하나당 3건입니다.
+
+원인은 `src/solver.c:387` 의 `ql_solver_check_result_clear` 가 `abi_version` 과 `struct_size` 가 맞을 때만 해제한다는 것입니다. **바깥에서 들어온 layout 미상의 구조체에 대해서는 옳은 방어입니다.** 문제는 `ql_solver_check` 안에서는 layout 이 미상이 아니라는 점입니다. `local_result` 는 adapter 자신이 `ql_solver_check_result_init` 로 만든 것이고 backend 는 그 안의 필드만 덮어썼습니다. 지우기 전에 header 두 필드를 복원하면 해제됩니다.
+
+`src/solver.c` 는 W2 소유라 고치지 않았습니다. **W7 이 고쳐도 되는지 판단이 필요합니다.**
+
+시험은 이 누수를 정상으로 적지 않습니다. `RewrittenResultHeaderIsRejectedButStillLeaks` 가 잔여를 정확히 3으로 고정하므로 W2 가 고치면 이 시험이 실패하고 0 으로 조여집니다.
+
 
 ### 정규 형태가 고정점이 아닌 경우 (`src/policy.c`, W3 소유)
 
@@ -92,7 +125,7 @@ campaign 은 그동안 두 번째 serialize 부터의 고정점을 검사합니�
 ## 다음에 할 것
 
 1. (완료) 퍼저 확대
-2. (진행 중) solver fault-injection 확대. crash, timeout, corrupt model, 잘린 출력, 폭주 출력. 기존 커버 먼저 조사
+2. (진행 중) solver fault-injection 확대. in-process 절반 완료. 남은 절반은 process transport - 가짜 solver 실행 파일(테스트 바이너리를 env var 로 재실행)로 crash, 빈 출력, 잘린 출력, model 없는 SAT, corrupt model, 폭주 출력, hang 주입
 3. 동시성 측정 -> `docs/perf/`. `bindings` 의 `check_batch` 를 부하 생성기로
 4. ABI 호환 시험과 plugin SDK 예제
 5. 설치 패키지와 relocatable Bitwuzla 탐색
