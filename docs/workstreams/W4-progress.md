@@ -32,7 +32,7 @@ G4 종료 조건이 전부 닫혔습니다. 남은 것은 Linux 확인뿐이고 
 
 1. CPython C 확장, 빌드, pytest 25개, CTest 등록, 문서 - 커밋 `daccf93` (진행 기록 `6fbb893`)
 2. 재진입 가드와 abi3 교차 버전 확인, pytest 27개 - 커밋 `5e8897c`
-3. `solver_executable` 인자 시험 추가, pytest 28개 - 커밋 `4cf3969`
+3. `solver_executable` 인자 시험 추가, pytest 28개 - 커밋 `ad2cd44`
 
 ## 조율자에게 올려 처리된 것
 
