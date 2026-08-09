@@ -1,0 +1,57 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    # The Windows build uses Clang with Ninja, matching the repository's
+    # windows-clang preset. MSVC is not a supported toolchain for the core:
+    # it rejects the C11 atomics the runtime uses.
+    "ninja>=1.11; sys_platform == 'win32'",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "quodlibet-engine"
+version = "0.1.0"
+description = "CPython C extension bindings for the Quodlibet function-equivalence engine"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "See THIRD_PARTY_NOTICES.md in the Quodlibet repository" }
+classifiers = [
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.26"
+build-dir = "build/{wheel_tag}"
+# Only the extension is built and only its install component is staged, so the
+# core's CLI, headers and solver binary never end up inside the wheel.
+build.targets = ["_quodlibet"]
+install.components = ["quodlibet_python"]
+wheel.packages = ["quodlibet"]
+wheel.py-api = "cp311"
+sdist.exclude = ["build", "*.pyd", "*.so"]
+
+[tool.scikit-build.cmake.define]
+QL_BUILD_SHARED = "OFF"
+QL_BUILD_TESTS = "OFF"
+BUILD_TESTING = "OFF"
+
+# The core is a Clang C17 project. On Windows the default generator would pick
+# MSVC, which refuses the C11 atomics in the runtime, so the same toolchain the
+# repository's windows-clang preset uses is selected here. Override either
+# value with CMAKE_ARGS or SKBUILD_CMAKE_ARGS when a different Clang is wanted.
+[[tool.scikit-build.overrides]]
+if.platform-system = "win32"
+if.env.CMAKE_C_COMPILER = false
+cmake.define.CMAKE_C_COMPILER = "clang"
+cmake.args = ["-GNinja"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,11 @@
+# scikit-build-core's default build tree and anything a local build leaves in
+# the package directory. The compiled module belongs in a build tree or a
+# wheel, never in the source package.
+/build/
+/dist/
+*.egg-info/
+quodlibet/*.pyd
+quodlibet/*.so
+quodlibet/*.dylib
+__pycache__/
+.pytest_cache/

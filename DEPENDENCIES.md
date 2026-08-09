@@ -153,6 +153,35 @@ its certificate or trusted result path.
 
 Sources: <https://github.com/arminbiere/kissat>, <https://github.com/cvc5/cvc5>
 
+## Python bindings
+
+`bindings/python/` is a CPython C extension over the same public headers the
+core is built from. It is deliberately not an FFI: `ctypes` and `cffi`
+re-declare the ABI at run time from a Python-side description that nothing
+validates, so a struct that grew a field or an enum whose values moved becomes
+silent memory corruption rather than a diagnostic. A compiled extension
+consumes `include/quodlibet/*.h` through the C compiler, which turns the same
+drift into a build error.
+
+The bindings add **no new vendored dependency**. Their entire runtime is
+CPython itself plus the statically linked core.
+
+| Dependency | Version | Role | License | Why |
+|---|---|---|---|---|
+| CPython stable ABI (abi3) | `Py_LIMITED_API` 0x030B0000, that is 3.11 | The extension's only runtime interface | PSF-2.0 | One built module serves 3.11 and every later minor version, so a Python upgrade in a training environment does not force a rebuild. 3.11 is the floor because it is the oldest release still receiving security fixes when this was written. |
+| scikit-build-core | `>= 0.10`, build-time only | PEP 517 backend that drives the existing CMake build | Apache-2.0 | The core already builds with CMake. Any other backend would need a second description of the same build. It is never installed with the wheel. |
+| ninja | `>= 1.11`, build-time only, Windows | Generator for the Windows `pip install` path | Apache-2.0 | The Windows default generator selects MSVC, which rejects the C11 atomics the runtime uses. This matches the repository's `windows-clang` preset. |
+
+pybind11 was rejected: it is a C++ library, while the core is C17 and every
+public header is C. A pure C extension keeps one language across the boundary
+and adds no header-only C++ dependency to the build.
+
+The core is linked **statically** into the extension, so an installed wheel is
+one self-contained file with no companion shared library on a loader path. The
+pinned Bitwuzla executable is not bundled into the wheel; the core finds it
+through the path compiled into it, and `check(solver_executable=...)` overrides
+that for a deployment where the wheel and the solver are shipped apart.
+
 ## Update policy
 
 A dependency update requires:
