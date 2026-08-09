@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-**막혔습니다.** kissat rel-4.0.4 가 Windows 에서 **틀린 답을 냅니다.** 측정은 아래 "Windows 이식 측정" 절에 있고 조율자에게 escalation 을 보냈습니다. solver 후보가 정해지기 전에는 3, 4단계를 진행할 수 없습니다.
+CaDiCaL 2.2.1 과 `lrat-check` 벤더링을 끝냈습니다(`302e0de`). 남은 것은 `prove.aig-sat` method 본체와 Bitwuzla 대조 시험입니다. **그 둘을 막는 것은 판단이 아니라 없는 부품 하나입니다: 범용 프로세스 실행기.** 아래 "다음에 할 것" 에 설계를 적었습니다.
 
 ## 끝난 작업 단위
 
@@ -66,6 +66,30 @@ cake_lpr(경로 C, HOL4 로 기계어까지 검증)은 첫 절단에 넣지 않�
 3. 파서를 `tests/fuzz/` 표면에 추가 (닫힘)
 4. envelope 에 AIG 경로의 query digest 가 SMT 경로의 그것과 같은 값으로 기록 (method 본체에서)
 
+### 7. CaDiCaL 전환과 벤더링 (`302e0de`)
+
+kissat 실격 뒤 조율자가 CaDiCaL 로 결정했고, 조건 (a) 대로 **벤더링 전에** 양 플랫폼 프로브를 먼저 돌렸습니다.
+
+| 프로브 | Windows (`windows-clang`, MSVC ABI) | Linux (WSL Ubuntu 24.04, gcc) |
+|---|---|---|
+| 사소 SAT | `s SATISFIABLE`, 코드 10 | 같음 |
+| 사소 UNSAT (kissat 이 틀린 그 식) | `s UNSATISFIABLE`, 코드 20 | 같음 |
+| 중간 UNSAT (pigeonhole 9/8) | 코드 20, LRAT 70,701줄, **VERIFIED** | 코드 20, LRAT 69,002줄, **VERIFIED** |
+| 중간 SAT (무작위 3-SAT 250변수) | `s SATISFIABLE`, model 미충족 절 0개 | `s SATISFIABLE` |
+
+전부 통과해서 벤더링했습니다.
+
+- `scripts/vendor.sh` 에 CaDiCaL rel-2.2.1(`16d24cc1...`)과 drat-trim 커밋 `2e3b2dc`(`a75e5a20...`) SHA-256 pin 추가
+- `third_party/CMakeLists.txt` 에 `ql_cadical` 과 `ql_lrat_check` 실행 파일 target. `QL_ENABLE_SAT` 로 끕니다. **`libquodlibet` 은 둘 다 링크하지 않습니다**
+- `third_party/quodlibet-compat/`: Windows 에 없는 헤더 넷과 prelude 하나. **pin 한 소스를 고치지 않습니다.** 고치면 checksum 이 빌드되는 것과 다른 것을 가리킵니다
+- `DEPENDENCIES.md`, `THIRD_PARTY_NOTICES.md`, `docs/notes/sat-backend-and-proof-checker.md` 에 결정 기록 (조건 c)
+
+**drat-trim 이 사슬에서 빠졌습니다.** CaDiCaL 이 LRAT 를 직접 내므로 kissat -> drat-trim -> lrat-check 세 프로세스가 CaDiCaL -> lrat-check 두 프로세스가 됩니다. TCB 는 그대로 `lrat-check.c` 한 파일입니다. `drat-trim.c` 는 벤더에 있지만 빌드하지 않습니다.
+
+루트 `CMakeLists.txt` 는 조율자 소유라 건드리지 않았습니다. 실행 파일 경로 두 개는 `cmake_language(DEFER DIRECTORY ...)` 로 최상위 스코프 끝에 `target_compile_definitions` 를 걸어 전달합니다.
+
+CTest 317/317 통과입니다.
+
 ### 6. QF_BV bit-blaster (2단계 후반)
 
 `include/quodlibet/proof_aigsat.h`, `src/proof_aigsat.c`, `tests/test_proof_aigsat.cpp` 10개 시험, `tests/fuzz/fuzz_blaster_target.h` 와 `tests/fuzz/fuzz_smt2_blaster.c`. `METHODS.md` 에 "Where the miter comes from" 소절을 넣었습니다. CTest 302/302 통과입니다.
@@ -105,7 +129,7 @@ cake_lpr(경로 C, HOL4 로 기계어까지 검증)은 첫 절단에 넣지 않�
 
 ## 막힌 것
 
-**solver 후보.** 위 "Windows 이식 측정" 절 그대로입니다. 조율자 답을 기다립니다. 이것이 닫히기 전에는 3, 4단계와 Bitwuzla-solver 대조 시험을 할 수 없습니다.
+없습니다. 남은 것은 판단이 아니라 분량입니다.
 
 ## Windows 이식 측정 (2026-08-10)
 
@@ -167,6 +191,32 @@ p cnf 2 4
 
 ## 다음에 할 것
 
-1. **조율자 답을 받는다** (solver 후보). 그 뒤 벤더링. `scripts/vendor.sh` 는 symlink 를 건너뛰는 `fetch` 변형이 필요하고, `third_party/CMakeLists.txt` 에 실행 파일 target 과 이식 shim 이 들어갑니다
-2. 3단계와 4단계. `prove.aig-sat` method 본체. product query -> blast -> CNF -> kissat -> drat-trim(신뢰 안 함) -> lrat-check. checker 통과 뒤에만 `PROVED_*` 와 `checked_proof=true`. envelope 에 세 실행 파일 digest 와 SMT 경로와 같은 query digest
-3. Bitwuzla 와 kissat 이 같은 query bytes 에 같은 답을 내는지 고정하는 시험 (조율자 조건 2 의 나머지 절반)
+### 1. 범용 프로세스 실행기 (선행 부품)
+
+`prove.aig-sat` 를 막는 유일한 부품입니다. `src/solver.c` 의 프로세스 계층은 Bitwuzla 전용이고(`ql_solver_add_smt2`, `ql_solver_check`) DIMACS 파일을 인자로 받는 실행 파일을 돌릴 수 없습니다. 공개 헤더에도 범용 실행기가 없습니다.
+
+`src/proof_aigsat.c` 안에 libuv 기반으로 다음을 만듭니다. `src/solver.c` 의 규율을 그대로 따릅니다.
+
+- shell 없이 argument vector 로 실행, 절대 경로
+- snapshot 디렉터리에 CNF 와 LRAT 를 쓰고 끝나면 정리
+- deadline 과 stdout/stderr 상한. 초과는 `UNKNOWN`
+- 실행 파일 내용의 BLAKE3 digest 를 evidence 에 기록
+
+`src/solver.c` 는 W2 소유라 거기서 실행기를 꺼내 공유하려면 조율자 조정이 필요합니다. 중복을 피하려면 그쪽이 낫고, 빨리 가려면 `proof_aigsat.c` 안에 두는 쪽입니다. **조율자에게 물을 것.**
+
+### 2. `prove.aig-sat` method 본체 (3, 4단계)
+
+흐름은 이렇습니다.
+
+1. problem v2 -> 양쪽 lowering -> `ql_product_query_build`
+2. `ql_aig_blast_smt2([prefix, violation])` -> `ql_aig_cnf_create` -> DIMACS
+3. CaDiCaL 을 `--lrat --no-binary` 로 실행
+4. `s SATISFIABLE` 이면 DIMACS 변수를 `ql_aig_blast_symbol_*` 로 되짚어 solver-model 문법 텍스트를 만들고 `ql_replay_decode_model` + `ql_replay_execute`. **replay 가 위반을 재현할 때만** `COUNTEREXAMPLE`
+5. `s UNSATISFIABLE` 이면 (가) `lrat-check` 가 원본 CNF 와 LRAT 에 대해 통과하고 (나) domain query(`[prefix, domain]`)를 같은 방식으로 blast 해서 SAT 여야 vacuous 가 아니며 (다) `ql_problem_require_proof_binding` 이 통과할 때만 `PROVED_*` 와 **`checked_proof=true`**
+6. envelope 에 CaDiCaL 과 `lrat-check` 두 실행 파일의 BLAKE3 digest, 그리고 **SMT 경로와 같은 query digest**(`prefix_digest`/`violation_digest`)를 기록 (조건 d)
+
+`ql_aig_cnf_get_view` 의 `trivially_true` / `trivially_false` 는 solver 를 부르지 않고 처리하되 **checked proof 가 아닙니다.**
+
+### 3. Bitwuzla 대 CaDiCaL 일치 시험 (조건 e)
+
+같은 query bytes 에 대해 두 backend 의 SAT/UNSAT 이 일치하는지 고정합니다. 불일치는 다수결하지 않고 상태 오류로 크게 표면화합니다. 불일치는 어느 한쪽 backend 또는 blaster 의 버그 증거입니다.
