@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-WU3. `src/combine.c` 로 여러 method 의 결과를 증거 우선 규칙으로 결합하는 중입니다.
+WU4. `src/cache.c` 로 BLAKE3 identity 기반 persistent artifact/evidence cache 를 만드는 중입니다.
 
 ## 작업 단위
 
@@ -13,8 +13,8 @@ WU3. `src/combine.c` 로 여러 method 의 결과를 증거 우선 규칙으로 
 |---|---|---|---|
 | WU1 | rewrite rule catalogue (W6.md 2번) | 완료 | (아래) |
 | WU2 | 독립 merge replay checker `src/egraph_check.c` (1번) | 완료 | (아래) |
-| WU3 | 증거 우선 결합 `src/combine.c` (3번) | 진행 중 | |
-| WU4 | persistent artifact/evidence cache `src/cache.c` (4번) | 대기 | |
+| WU3 | 증거 우선 결합 `src/combine.c` (3번) | 완료 | (아래) |
+| WU4 | persistent artifact/evidence cache `src/cache.c` (4번) | 진행 중 | |
 | WU5 | cache key 완전성 통합 검증 (5번) | 대기 | |
 
 ## 설계 결정
@@ -62,10 +62,28 @@ e-graph 는 순수 term engine 이고 UB/poison/effect 를 모르므로(`egraph.
 
 검증: `ctest --preset windows-clang` 345/345 통과.
 
+### WU3 가 실제로 넣은 것
+
+`src/combine.c` 는 `METHODS.md` 의 병렬 결합 규칙 1..8 을 구현합니다(9번 cache key 는 WU5).
+
+핵심 설계 결정은 **건전하지 않은 수단을 API 에서 표현할 수 없게 만든 것**입니다. 동의한 method 수를 세는 필드가 인터페이스에도 구현에도 없고, method 우선순위 표도 없으며, proof 와 counterexample 을 화해시키는 인자도 없습니다.
+
+- 규칙 1: 각 input 이 자기가 답한 contract(problem digest, contract digest, IR semantics version, relation, UB policy, observation projection)를 다시 진술합니다. 하나라도 다르면 결합하지 않고 status 오류로 거부하며 어긋난 축을 메시지에 적습니다.
+- 규칙 2: `ql_policy_evidence_v1` 을 그대로 재사용해 단일 결과 경계의 규율을 결합 시점에 다시 강제합니다. `PROVED_*` 는 checked proof 또는 request 가 명시한 trusted backend 만, `COUNTEREXAMPLE` 은 replay 된 witness 만 살아남고 budget 소진은 무조건 철회입니다. 철회는 항상 `UNKNOWN` 이고 더 약한 긍정 주장으로 내려가지 않습니다.
+- 규칙 3: 요청한 relation 을 정확히 세우는 proof 만 판정합니다. 반대 방향 refinement 두 개의 합성은 호출자가 `allow_refinement_composition` 으로 명시할 때만 일어납니다.
+- 규칙 4: checked proof 와 replayed counterexample 이 만나면 `inconsistent` 이고 verdict 는 `UNKNOWN` 이며 양쪽 input 을 지목합니다. 우선순위, 순서, 다수결 어느 것으로도 해소하지 않습니다.
+- 규칙 6: bound 는 vector 째로 보존하고 서로 다른 차원을 합치지 않습니다.
+- 규칙 7: normalization 위에서 돈 결과는 `depends_on` 으로 그것을 가리키고, normalization proof 가 유효하지 않으면 철회됩니다.
+- 규칙 8: 순서는 declaration order, evidence digest, input 위치 순입니다. `completion_order` 는 구조체에 기록만 하고 읽지 않습니다.
+
+시험 `tests/test_combine.cpp` 24개. 규칙별로 하나 이상이고, 특히 `ThreeAgreeingUncheckedProofsStillDecideNothing` 과 `OneCheckedProofOutweighsAnyNumberOfUncheckedDisagreements` 가 다수결 금지를 양쪽에서 고정합니다.
+
+검증: `ctest --preset windows-clang` 369/369 통과.
+
 ## 막힌 것
 
 없습니다.
 
 ## 다음에 할 것
 
-WU3 결합기. `METHODS.md` 의 "Parallel combination rules" 9개 규칙이 이미 문서에 있으므로 그것을 구현하고 규칙별 시험으로 고정합니다.
+WU4 persistent cache. BLAKE3 identity 로 디스크에 저장하고 재사용하며 위치는 호출자가 정합니다. 이어서 WU5 cache key 완전성 통합 검증입니다.

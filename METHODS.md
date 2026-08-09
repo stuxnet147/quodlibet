@@ -748,3 +748,46 @@ rules:
 This combination model permits fast refuters, bounded searches, normalizers, and
 unbounded provers to cooperate without promoting any single method to a built-in
 source of truth.
+
+### The implemented combiner
+
+`src/combine.c` implements rules 1 through 8. Rule 9 is the cache key, which
+`ql_cache_key_compute` owns.
+
+The shape of the API is chosen so the unsound moves are not expressible. There
+is no count of agreeing methods anywhere in the interface or the
+implementation, no method priority table, and no way to ask for a proof and a
+counterexample to be reconciled.
+
+`ql_combine_evaluate` takes a request naming the contract and a set of inputs.
+Each input restates the contract it answered, so an answer to a different
+question is refused with a status error rather than combined; the message names
+the axis that differs. Each input then carries its `ql_policy_evidence_v1`, the
+same facts the single-result policy boundary consumes, and the combiner
+reapplies that discipline rather than trusting what the method reported. A
+`PROVED_*` verdict survives only with a checked proof or a backend the request
+names as trusted, a `COUNTEREXAMPLE` only with a replayed witness, and an
+exhausted budget withdraws whatever was reported. Everything withdrawn becomes
+`UNKNOWN`, never a weaker positive claim.
+
+Every input gets a finding stating its disposition and, when the verdict was
+withdrawn, which evidence was missing. A caller can always say why a given
+method did or did not count.
+
+Two cases deserve naming. A result produced on top of a normalization declares
+`depends_on`, and if that normalization's own proof is absent or invalid the
+dependent result is withdrawn, because there is nothing to transfer it back
+along. And when a checked proof of the requested relation meets a replayed
+counterexample, the result is `inconsistent` with both inputs named and a
+verdict of `UNKNOWN`. That case is the point of the whole design: it is
+evidence of a defect, and priority, ordering, and counting are all refused as
+ways to make it go away.
+
+Bounded results keep their whole bound vector. Two bounds on different
+dimensions are carried side by side, never joined into a scalar, because the
+covered state sets are not comparable. Any number of bounded results still
+combines to `BOUNDED_CLEAN`.
+
+Ordering among equally valid results is declaration order, then evidence
+digest, then input position. Worker completion time is recorded on the input
+and never consulted.
