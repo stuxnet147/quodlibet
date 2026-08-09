@@ -38,7 +38,7 @@
 
 ## 막힌 것
 
-없습니다.
+- **`src/solver.c` 의 두 번째 동시 실행 결함(조율자에게 보고함).** 8-way 배치에서 `could not open Bitwuzla executable for identity hashing` 가 6/80 로 납니다. 4-way 에서는 0/60 이었지만 `ctest -R python` 을 6회 반복하니 1회 나왔습니다. `create_executable_snapshot` 이 판정마다 Bitwuzla 실행 파일(약 5MB)을 개인 임시 디렉터리로 새로 복사하고 곧바로 `digest_executable` 이 그 파일을 여는데, Windows 에서 갓 쓰인 실행 파일은 실시간 검사가 잠깐 공유 거부로 물고 있어서 `fopen("rb")` 가 실패합니다. 동시에 여러 개를 복사할수록 확률이 오릅니다. `src/solver.c` 는 조율자 소유라 손대지 않았고, 짧은 backoff 재시도를 제안해 두었습니다.
 
 ## 다음에 할 것
 
@@ -50,6 +50,6 @@
 - [x] **CPython C 확장 모듈**이다. ctypes, cffi, ABI 를 런타임에 재선언하는 방식이 아니다 - `bindings/python/src/quodlibet_module.c`, `tests/test_extension.py::test_the_module_is_a_compiled_extension`, `::test_no_ffi_layer_is_involved`
 - [x] `Py_LIMITED_API` (abi3) 로 빌드 - `Py_LIMITED_API=0x030B0000`, `python_add_library(... USE_SABI 3.11)`, wheel 태그 `cp311-abi3-win_amd64`, `::test_it_is_built_against_the_stable_abi`
 - [~] Windows 와 Linux 양쪽에서 import 되고 왕복 시험이 통과 - **Windows 25/25 통과. Linux 는 이 기계에 없어 미검증이며 G7 에서 조율자가 확인합니다.**
-- [x] GIL 을 solver 대기 동안 놓는다 - `Py_BEGIN_ALLOW_THREADS` 로 판정 전체를 감쌈. `tests/test_concurrency.py::test_a_batch_actually_overlaps` 가 직렬 대비 시간을 비교해 겹침을 고정 (실측 4-way 에서 6.7s -> 1.6s)
+- [x] GIL 을 solver 대기 동안 놓는다 - `Py_BEGIN_ALLOW_THREADS` 로 판정 전체를 감쌈. `tests/test_concurrency.py::test_python_keeps_running_while_a_check_is_in_flight` 가 판정 도중 파이썬 스레드가 실제로 도는지를, `::test_two_checks_are_in_flight_at_the_same_instant` 가 두 판정의 구간이 실제로 겹치는지를 고정합니다. 둘 다 벽시계 비율이 아니라 구조적 성질을 봅니다. 비율 시험은 기계 부하를 재는 것이라 flaky 해서 버렸습니다 (실측으로는 4-way 에서 6.7s -> 1.6s)
 - [x] 예산, 판정 정책, 결과가 파이썬 쪽에서 전부 노출 - `budget=` 다섯 축, `policy_json=`, `result.verdict/.status/.evidence/.counterexample/.policy`. `tests/test_budget_and_policy.py` 9개
 - [x] 빌드가 CMake 한 경로에 들어 있고 `pip install .` 이 된다 - `bindings/python/CMakeLists.txt` 가 루트를 subproject 로 부르고, `pip install ./bindings/python` 이 abi3 wheel 을 만들어 설치까지 확인
