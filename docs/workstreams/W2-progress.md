@@ -6,13 +6,13 @@
 
 ## 지금 하는 중
 
-WU5. prove.smt-product proof method 와 UNSAT 승격 경계.
+WU6 마무리. `src/builtins.c` 등록만 조율자 대기.
 
 ## 기준선과 통합
 
 - `6c6a34e` 에서 분기했고 조율자 지시에 따라 `cfbbb20` (origin/main) 위로 rebase 했습니다.
 - 작업 단위마다 `git fetch origin` 후 `git rebase origin/main`, 자기 브랜치는 force push 합니다.
-- 기준선 `ctest` 98/98 통과 확인. WU1 후 105/105, WU2 후 113/113, WU3 후 125/125. `784e719` (W1/W2/W3 통합) 위로 rebase 한 뒤 WU4 후 168/168.
+- 기준선 `ctest` 98/98 통과 확인. WU1 후 105/105, WU2 후 113/113, WU3 후 125/125. `784e719` (W1/W2/W3 통합) 위로 rebase 한 뒤 WU4 후 168/168, WU5+WU6 후 177/177.
 
 ## 계획한 작업 단위
 
@@ -21,9 +21,9 @@ WU5. prove.smt-product proof method 와 UNSAT 승격 경계.
 | WU1 | `quodlibet.source-signature` artifact 와 IR 결합 검사 | 완료 | `530d54b` |
 | WU2 | problem schema v2, v1 non-null precondition gate | 완료 | `7b95ff6` |
 | WU3 | SMT-LIB `define-fun` 직렬화, product/miter (`src/product.c`) | 완료 | `426b81e` |
-| WU4 | SAT model decode 와 concrete replay (`src/replay.c`) | 완료 | 다음 커밋 |
-| WU5 | `prove.smt-product` proof method, UNSAT 승격 경계 | 진행 | |
-| WU6 | 세 결과 end-to-end 통합 시험 | 대기 | |
+| WU4 | SAT model decode 와 concrete replay (`src/replay.c`) | 완료 | `49f786d` |
+| WU5 | `prove.smt-product` proof method, UNSAT 승격 경계 | 완료 | 다음 커밋 |
+| WU6 | 세 결과 end-to-end 통합 시험 | 완료 | 다음 커밋 |
 
 ## 설계 결정
 
@@ -69,6 +69,19 @@ WU5. prove.smt-product proof method 와 UNSAT 승격 경계.
 - `ql_replay_counterexample_artifact_create` 는 `violated && conclusive` 가 아니면 **직렬화를 거부합니다**. replay 안 된 SAT model 이 counterexample artifact 가 되는 경로가 코드에 없습니다.
 - 시험이 고정하는 것: 실제 Bitwuzla model 을 decode 해서 replay 로 확인, 재현되지 않는 model 은 `violated == 0` 이고 artifact 생성 거부, precondition 밖 witness 는 `conclusive == 0`, 잘못된 폭과 누락 입력은 parse error.
 
+### WU5, WU6. proof method 와 UNSAT 승격 경계
+
+- `prove.smt-product` 는 `quodlibet.problem` 하나를 먹고 `quodlibet.outcome` 하나를 냅니다. **problem v2 가 아니면 `validate` 에서 거부합니다.** 실행 중이 아니라 실행 전에 축을 거절하라는 `METHODS.md` 규율을 따른 것입니다.
+- IR 을 **problem 의 소스에서 직접 하강**합니다. 밖에서 받은 IR 을 믿지 않으므로 "이 IR 이 정말 이 problem 의 함수인가" 라는 구멍이 없습니다. 하강이 `UNKNOWN` 이면 outcome 도 `UNKNOWN` 이고 진단이 붙습니다.
+- **UNSAT 승격 경계는 (나) 명시적 trusted-backend policy 를 택했습니다.** Bitwuzla 0.9.1 은 proof object 를 내놓지 않으므로 checker 가 검증할 certificate 자체가 없습니다(`SOLVERS.md`). 근거 없는 (가) 를 흉내 내는 대신 신뢰를 명시하고 기록합니다.
+  - 기본값은 `"none"` 입니다. raw UNSAT 은 solver evidence 로만 남고 판정은 `UNKNOWN` 입니다.
+  - `"trusted-backend"` 는 여섯 조건이 전부 성립할 때만 `PROVED_*` 를 냅니다: proof binding gate 통과, miter 가 관계/UB 정책/관찰 축을 정확히 덮음, domain query 가 SAT, violation query 가 UNSAT, 고정된 Bitwuzla 의 이름/버전/실행 파일 digest/query digest 기록, 그리고 명시적 선택. 코드가 여섯 개를 전부 강제합니다.
+  - envelope 는 항상 `checked_proof: false` 를 적습니다. 이 backend 의 proof 가 무엇에 기대고 있는지 사용자가 봅니다.
+- **capability query 가 옵션에 따라 달라집니다.** `"none"` 이면 `QL_PROOF_RESULT_PROOF` 와 `QL_PROOF_SOUNDNESS_PROOF` 를 광고하지 않습니다. 신뢰 정책을 고르지 않은 파이프라인은 이 method 를 proof producer 로 스케줄할 수 없습니다.
+- `BOUNDED_CLEAN` 은 어떤 경로로도 나오지 않습니다. loop-free product 는 완전하므로 bound 자체가 없습니다. capability 도 `QL_PROOF_RESULT_BOUNDED` 를 광고하지 않습니다.
+- cache key 는 problem digest, method 이름과 버전, 선택된 정책과 한계, query 세 개의 digest, backend 실행 파일 digest 를 전부 묶습니다(`SOLVERS.md` 요구). 정책만 달라도 cache 신원이 달라지는 것을 시험이 고정합니다.
+- end-to-end 시험: `PROVED_EQUIVALENT`(신뢰 정책 켰을 때만), `COUNTEREXAMPLE`(replay 확인됨, artifact 추출 가능), `UNKNOWN`(정책 미선택, 공허한 정의역, 하강 불가), refinement 두 방향이 서로 다른 판정을 내는 것, 그리고 **파이프라인 JSON 에서 이름으로 선택되어 도는 것**까지 포함합니다.
+
 ## 소유 밖 파일을 고친 것
 
 - `ARCHITECTURE.md` 의 "Input precondition schema" 절 마지막 문단이 problem v2 이후 사실과 어긋나서 그 문단만 고쳤습니다(v2 가 무엇을 묶는지, gate 가 무엇인지, source signature 가 왜 별도 artifact 인지). 워크스트림 소유 표에 없는 파일이라 조율자께 보고합니다.
@@ -86,8 +99,25 @@ WU5. prove.smt-product proof method 와 UNSAT 승격 경계.
 
 ## 조율자에게 요청할 것
 
-- (WU5 예정) `src/builtins.c` 에 `prove.smt-product` 등록. `quodlibet methods` 에 나오게 하려면 필요합니다. `src/builtins.c` 는 W2 소유가 아니므로 등록 진입점만 만들고 요청하겠습니다.
+- **`src/builtins.c` 등록 요청.** 준비됐습니다. `src/builtins.c` 에 다음 두 줄이면 됩니다.
+
+  ```c
+  #include "quodlibet/proof_smt.h"
+  ```
+
+  그리고 `ql_register_builtin_methods` 안에서 `identity` 등록 뒤에
+
+  ```c
+      status = ql_registry_register(registry, &identity_method, error);
+      if (status != QL_STATUS_OK) {
+          return status;
+      }
+      return ql_register_smt_product_method(registry, error);
+  ```
+
+  `ql_register_smt_product_method` 는 executable method 와 proof descriptor 를 둘 다 등록합니다. 이것이 들어가면 `quodlibet methods` 에 `prove.smt-product` 가 나옵니다. 그 전까지는 `tests/test_proof_smt.cpp` 가 자기 registry 에 직접 등록해서 시험합니다.
+- `METHODS.md` 의 `prove.smt-product` 절을 구현 내용과 UNSAT 승격 경계로 채웠습니다. 지시서가 준 소유 범위 안입니다.
 
 ## 다음에 할 것
 
-WU5 착수.
+`src/builtins.c` 등록 요청 후 조율자 응답 대기. 그 외 W2 종료 조건은 닫혔습니다.

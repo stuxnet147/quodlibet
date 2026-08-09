@@ -154,7 +154,91 @@ and cache keys.
 
 ### SMT product program
 
-Recommended method name: `prove.smt-product`.
+Method name: `prove.smt-product`. This is the first implemented method. The
+paragraphs below the implementation notes describe the general interface; the
+implementation currently covers the loop-free scalar fragment of that
+interface and refuses the rest.
+
+#### Implementation, schema v1
+
+The method consumes one `quodlibet.problem` artifact and produces one
+`quodlibet.outcome`. It requires problem schema v2 and rejects v1 in
+`validate`, before execution: a v1 problem records no argument correspondence,
+so there is no stated relation between the two input lists to encode.
+
+It lowers both functions from the problem's own sources, so the IR it reasons
+about is derived from the problem rather than supplied alongside it. A
+function the semantic C lowering reports as `UNKNOWN` yields an `UNKNOWN`
+outcome with a diagnostic, never a narrower question.
+
+The relational encoding flattens each acyclic control-flow graph into path
+conditions, shares one symbolic input per corresponding argument, and names
+every intermediate value with a nullary `define-fun`. It emits one shared
+SMT-LIB prefix and two terminal assertions:
+
+- `quodlibet_violation` holds exactly when the declared relation is broken;
+- `quodlibet_domain` holds exactly when the comparison domain is inhabited.
+
+Each observation axis is encoded explicitly. The return-value axis compares
+whether a normal return happened before it compares the value, because a trap
+or a divergence produces no return value at all. The memory, volatile, atomic,
+I/O, and external-call axes are discharged only after establishing that
+neither IR carries the corresponding effect; an effect the encoding cannot
+state is a `QL_STATUS_TYPE_MISMATCH` naming the axis, never a dropped
+obligation. Definedness is governed by the UB policy, as this document
+specifies, so `QL_OBSERVE_UNDEFINED_BEHAVIOR` adds no separate conjunct.
+
+Every UB policy conjoins the observation obligation with both sides being
+defined. SMT-LIB totalizes division, remainder, and shift; that totalization
+therefore never reaches an observation claim on an input whose C semantics are
+undefined.
+
+A `sat` answer is a candidate. The method decodes the model into typed inputs,
+requires an exactly-width literal for every declared input, runs both
+functions through the IR interpreter, re-evaluates the typed precondition
+concretely, and re-derives the relation on the concrete results. Only a replay
+that reproduces the violation becomes `COUNTEREXAMPLE`. A replay that does not
+reproduce is logged as an encoding defect and reported as `UNKNOWN`; the
+counterexample serializer refuses an unconfirmed witness outright.
+
+#### UNSAT promotion boundary
+
+Bitwuzla 0.9.1 exposes no proof object, so no certificate exists for a checker
+to validate. Quodlibet therefore takes the second admissible route: an
+explicit, opt-in, recorded trust policy, selected by the `unsat_promotion`
+option.
+
+`"none"` is the default. A raw `unsat` is retained as solver evidence and the
+verdict stays `UNKNOWN`.
+
+`"trusted-backend"` permits a `PROVED_*` verdict only when all of the
+following hold, and the outcome envelope records every one of them:
+
+1. the problem passes `ql_problem_require_proof_binding`, so both source
+   signature digests, the argument correspondence, and the typed-precondition
+   digest are bound into one artifact identity;
+2. the miter covers exactly the contract's relation direction, UB policy, and
+   observation axes;
+3. the domain query answered `sat`, so the `unsat` is not vacuous;
+4. the violation query answered `unsat`;
+5. the backend is the pinned Bitwuzla, and its name, version, executable
+   content digest, and query digest are recorded;
+6. the caller selected the policy explicitly.
+
+The envelope always records `checked_proof: false` for this backend. A proof
+from this path rests on trusting Bitwuzla, not on a validated certificate, and
+the result says so rather than letting a reader assume otherwise. An empty
+comparison domain is reported and never promoted, for every UB policy and not
+only for `QL_UB_COMPARE_WHERE_BOTH_DEFINED`.
+
+The outcome's cache key binds the problem digest, method name and version, the
+selected policy and limits, all three query digests, and the backend
+executable digest, so no answer is reusable across a different backend,
+policy, or query.
+
+#### Interface
+
+
 
 This method forms a relational product of the two CFGs, shares the same symbolic
 input and initial memory, and asks whether any paired execution violates the
