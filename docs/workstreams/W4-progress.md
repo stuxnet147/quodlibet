@@ -31,7 +31,8 @@ G4 종료 조건이 전부 닫혔습니다. 남은 것은 Linux 확인뿐이고 
 ## 끝난 작업 단위
 
 1. CPython C 확장, 빌드, pytest 25개, CTest 등록, 문서 - 커밋 `daccf93` (진행 기록 `6fbb893`)
-2. 재진입 가드와 abi3 교차 버전 확인, pytest 27개 - 커밋 `a632381`
+2. 재진입 가드와 abi3 교차 버전 확인, pytest 27개 - 커밋 `5e8897c`
+3. `solver_executable` 인자 시험 추가, pytest 28개 - 커밋 `4cf3969`
 
 ## 조율자에게 올려 처리된 것
 
@@ -50,8 +51,8 @@ G4 종료 조건이 전부 닫혔습니다. 남은 것은 Linux 확인뿐이고 
 ## G4 종료 조건 대조
 
 - [x] **CPython C 확장 모듈**이다. ctypes, cffi, ABI 를 런타임에 재선언하는 방식이 아니다 - `bindings/python/src/quodlibet_module.c`, `tests/test_extension.py::test_the_module_is_a_compiled_extension`, `::test_no_ffi_layer_is_involved`
-- [x] `Py_LIMITED_API` (abi3) 로 빌드 - `Py_LIMITED_API=0x030B0000`, `python_add_library(... USE_SABI 3.11)`, wheel 태그 `cp311-abi3-win_amd64`, `::test_it_is_built_against_the_stable_abi`. **주장에 그치지 않게 실제로 확인했습니다.** 3.11 로 만든 wheel 을 CPython 3.13.12 venv 에 그대로 설치해 시험 27개 전부 통과했습니다.
-- [~] Windows 와 Linux 양쪽에서 import 되고 왕복 시험이 통과 - **Windows 는 3.11 과 3.13 양쪽에서 27/27 통과. Linux 는 이 기계에 없어 미검증이며 G7 에서 조율자가 확인합니다.**
+- [x] `Py_LIMITED_API` (abi3) 로 빌드 - `Py_LIMITED_API=0x030B0000`, `python_add_library(... USE_SABI 3.11)`, wheel 태그 `cp311-abi3-win_amd64`, `::test_it_is_built_against_the_stable_abi`. **주장에 그치지 않게 실제로 확인했습니다.** 3.11 로 만든 wheel 을 CPython 3.13.12 venv 에 그대로 설치해 시험 전부 통과했습니다.
+- [~] Windows 와 Linux 양쪽에서 import 되고 왕복 시험이 통과 - **Windows 는 3.11 과 3.13 양쪽에서 통과(현재 28개). Linux 는 이 기계에 없어 미검증이며 G7 에서 조율자가 확인합니다.**
 - [x] GIL 을 solver 대기 동안 놓는다 - `Py_BEGIN_ALLOW_THREADS` 로 판정 전체를 감쌈. `tests/test_concurrency.py::test_python_keeps_running_while_a_check_is_in_flight` 가 판정 도중 파이썬 스레드가 실제로 도는지를, `::test_two_checks_are_in_flight_at_the_same_instant` 가 두 판정의 구간이 실제로 겹치는지를 고정합니다. 둘 다 벽시계 비율이 아니라 구조적 성질을 봅니다. 비율 시험은 기계 부하를 재는 것이라 flaky 해서 버렸습니다 (실측으로는 4-way 에서 6.7s -> 1.6s)
 - [x] 예산, 판정 정책, 결과가 파이썬 쪽에서 전부 노출 - `budget=` 다섯 축, `policy_json=`, `result.verdict/.status/.evidence/.counterexample/.policy`. `tests/test_budget_and_policy.py` 9개
 - [x] 빌드가 CMake 한 경로에 들어 있고 `pip install .` 이 된다 - `bindings/python/CMakeLists.txt` 가 루트를 subproject 로 부르고, `pip install ./bindings/python` 이 abi3 wheel(590KB, `.pyd` 포함)을 만들어 설치까지 확인. 같은 파일이 루트에서 `add_subdirectory` 될 때는 CTest 항목 `quodlibet.python_bindings` 를 등록합니다.

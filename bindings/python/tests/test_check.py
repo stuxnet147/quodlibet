@@ -125,6 +125,27 @@ def test_a_vacuous_domain_never_becomes_a_proof(backend):
     assert "vacuous" in result.diagnostic
 
 
+def test_the_solver_executable_can_be_named_explicitly(backend, tmp_path):
+    """A wheel and the solver can be deployed apart, so the path the core was
+    compiled with must be overridable per call."""
+    result = quodlibet.check(
+        ADD,
+        "add",
+        SUM,
+        "sum",
+        trust_smt_backend=True,
+        solver_executable=backend["executable"],
+    )
+    assert result.verdict == "proved-equivalent"
+
+    # A wrong path is an error, never a quietly weaker verdict.
+    missing = tmp_path / "not-bitwuzla.exe"
+    with pytest.raises(quodlibet.QuodlibetError):
+        quodlibet.check(
+            ADD, "add", SUM, "sum", solver_executable=str(missing)
+        )
+
+
 def test_an_explicit_argument_correspondence_is_accepted(backend):
     result = quodlibet.check(
         ADD,
