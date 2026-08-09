@@ -53,15 +53,31 @@ set(QL_CORE_SOURCES
 # snapshot. CONFIGURE_DEPENDS makes an existing build tree notice when a module
 # appears, while exact path patterns keep unrelated scratch C files out of the
 # production library.
+#
+# Names are reserved here before the module exists so that parallel workstreams
+# never have to edit this list at the same time. A reserved path that has no
+# file is simply absent from the glob result.
 file(GLOB QL_OPTIONAL_CORE_SOURCES CONFIGURE_DEPENDS LIST_DIRECTORIES false
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/budget.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/c_frontend.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/c_lower.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/c_lower_expr.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/c_lower_stmt.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/c_types.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/egraph.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/evidence.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ir.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ir_interp.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ir_verify.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/log.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/policy.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/precondition.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/problem.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/product.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_method.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_smt.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/replay.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/signature.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/solver.c"
 )
 list(APPEND QL_CORE_SOURCES ${QL_OPTIONAL_CORE_SOURCES})
