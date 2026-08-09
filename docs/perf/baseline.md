@@ -67,7 +67,7 @@ Top hotspots:
 
 ## 아직 없는 것
 
-- **threading 리포트.** 병렬 소비자가 아직 없다. 파이프라인 스케줄러는 시험에서만 돌고, 실제 병렬 워크로드는 W4 의 `check_batch` 가 생기면 그것으로 잰다. 그때 worker 점유율로 "병렬로 돌아야 하는 구간이 실제로 병렬로 돈다" 를 확인한다.
+- **threading 리포트.** 워크로드는 준비됐다(`check_batch` 8-way, WSL 에서 96판정이 몇 초에 끝나고 판정 전부 정상). 그러나 **WSL 에서 VTune threading 수집은 걸린다**(2026-08-10 실측: 수집 세션이 무출력으로 매달리고, 그 세션이 살아 있는 동안은 같은 워크로드의 비수집 실행까지 웁다). hotspots(user-mode sampling)는 되고 threading(동기화 가로채기 + 자식 프로세스)은 안 되는 조합이다. threading 리포트는 G7 의 실제 Linux VM 에서 뜬다.
 - **prove 경로 프로파일.** solver 왕복이 지배할 것으로 예상되지만 측정 전에는 적지 않는다.
 
 ## 재현
