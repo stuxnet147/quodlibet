@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-2단계. 타입 폭과 포인터, 그리고 cast expression. 조율자 지시로 1단계를 닫고 넘어왔습니다.
+2단계 포인터 하강. 타입 폭은 닫았고 첫 차단 사유의 79% 가 이제 포인터입니다.
 
 ## 기준선
 
@@ -220,6 +220,63 @@ undefined 전파 규칙은 로어링과 맞물려 있습니다.
 
 `CMakeLists.txt` 와 `CMakePresets.json` 이 조율자 소유라 **libFuzzer 실행 파일과 Linux sanitize 프리셋은 아직 없습니다.** 아래 "조율자에게 요청할 것" 에 적었습니다.
 
+### 4. 타입 폭: void, typedef, cast
+
+커밋: `c6de799`
+
+조율자의 기준선이 `unsupported_type` 53.86% 와 `unsupported_pointer` 43.91% 를 지목했고, val 1,050 본문에서 `unsupported_type` 694건의 서명을 직접 뜯어보니 두 가지가 지배적이었습니다.
+
+- 366건이 `void` 반환입니다. 로어링이 `void` 를 타입 어휘에 아예 갖고 있지 않았습니다
+- 286건이 포인터도 구조체 태그도 없이 **typedef 이름만으로** 막혔습니다. 코퍼스는 익명화된 디컴파일러 C 라 `typedef int TYP_0;` 같은 사슬이 도처에 있습니다
+
+#### `src/c_types.c` 와 `src/c_types.h`
+
+스칼라 C 타입 모델을 로어링에서 떼어냈습니다. 철자 어휘, C11 6.3.1.1 정수 promotion, 6.3.1.8 usual arithmetic conversion, 표현 가능성 판정이 여기 있고 IR 을 전혀 모릅니다. 2,900줄짜리 `c_lower.c` 안에서 트리 순회와 뒤섞여 있던 규칙들을 따로 읽을 수 있게 하는 것이 목적입니다.
+
+폭은 **타겟 ABI(x86_64 Linux LP64)** 기준이라 `long` 은 64비트입니다. 호스트가 아닙니다.
+
+헤더가 `src/` 에 있는 비공개 헤더라 시험이 직접 링크하지 못합니다. 그래서 `tests/test_c_lower_types.cpp` 가 로어링의 관찰 가능한 동작으로 검사합니다. 어차피 계약은 "로어링이 무엇을 받고 무엇을 거부하는가" 쪽입니다.
+
+#### void
+
+반환 타입에서만 `void` 를 받습니다(C 가 불완전 타입을 허용하는 유일한 자리). 매개변수나 지역 변수의 `void` 는 타입 오류입니다. `return;` 과 본문 끝에서 떨어지는 암묵적 반환이 같은 terminator 를 씁니다.
+
+#### typedef 해석
+
+`type_definition` 노드를 훑어 이름 표를 만들고, 철자가 어휘에 없으면 표를 따라 해석합니다. 세 가지를 지켰습니다.
+
+- **이 unit 이 실제로 선언한 이름만 해석합니다.** `scalar_t__` 처럼 선언 없이 쓰인 이름에 뜻을 붙이면 그것은 추측이고, 타입에 대한 틀린 추측은 함수에 대한 틀린 답입니다
+- typedef 가 포인터/배열/함수를 가리키면 **`unsupported_pointer`** 로 보고합니다. `unsupported_type` 으로 뭉뚱그리면 커버리지 표가 진짜 장애물을 가립니다
+- 사슬 길이를 64로 묶습니다. `typedef A B; typedef B A;` 는 tree-sitter 가 받아들이는 번역 단위이므로 순환하면 안 됩니다
+
+#### cast expression 과 tree-sitter 의 모호성
+
+`(T)(e)` 는 T 가 타입 이름이면 cast 이고 호출 가능한 것이면 call 인데, 문법만으로는 구별되지 않습니다. tree-sitter 는 call 쪽으로 해소합니다. 그래서 **callee 가 괄호에 싸인 식별자이고 그 이름을 이 unit 이 typedef 로 선언했으며 같은 이름의 객체가 가리지 않을 때** 로어링이 cast 로 되돌립니다. 이것을 안 하면 코퍼스의 cast 들이 `unsupported_call` 칸에 쌓여서 표가 거짓말을 합니다.
+
+가시적인 객체가 같은 이름을 가리면 진짜 call 입니다. C 의 유효 범위 규칙 그대로이고 시험이 고정합니다.
+
+#### 결과 (val 1,050 본문)
+
+| 첫 차단 사유 | 이전 | 이후 |
+|---|---:|---:|
+| (로어링 성공) | 0 | 2 |
+| `unsupported_type` | 694 | **103** |
+| `unsupported_pointer` | 334 | **832** |
+| `unsupported_call` | 4 | 55 |
+| `undeclared_identifier` | 5 | 31 |
+| `unsupported_control_flow` | 0 | 8 |
+| `unsupported_expression` | 4 | 8 |
+| `unsupported_loop` | 0 | 2 |
+| `frontend_unsupported` | 9 | 9 |
+
+`unsupported_type` 이 85% 줄었고 **첫 차단 사유의 79% 가 포인터**로 드러났습니다. 이것이 조율자가 말한 "둘을 닫고 다시 재라" 의 결과입니다. 타입은 닫혔고 남은 103건은 struct/union/enum 과 미선언 이름입니다.
+
+`undeclared_identifier` 31건은 `GLB_0` 같은 전역 변수입니다. 정적 저장 기간이 다음 순위 후보입니다.
+
+#### 정확성을 같이 끌고 갔다
+
+수용이 늘 때마다 differential 사례도 같이 늘렸습니다. `cast_narrow`, `cast_unsigned`, `cast_byte`, `named`, `named_signed` 5개가 추가되어 25개 함수가 실제 컴파일 실행과 대조됩니다. `ctest` 167/167 통과입니다.
+
 ## 막힌 것
 
 - 없음
@@ -246,6 +303,10 @@ undefined 전파 규칙은 로어링과 맞물려 있습니다.
 
 ## 다음에 할 것
 
-1. 퍼저 (파서, 로어링, IR 디코더). Linux sanitize 구성에서 크래시 0
-2. 2단계 커버리지: **타입 폭 먼저, 그 다음 포인터**. 열 때마다 differential 사례를 같이 늘리고 val 1,050 으로 재측정
-3. `docs/lowering/adding-a-construct.md` 와 그 절차대로 추가한 구문 하나
+1. **포인터 하강.** 첫 차단 사유의 79% 입니다. 연산, object identity, provenance, 유효 범위, alignment, load 와 store 입니다. **interpreter 에 메모리 모델을 같이 넣어야 합니다.** 지금 interpreter 는 포인터를 만나면 `UNSUPPORTED` 를 냅니다
+2. 전역 변수와 정적 저장 기간 (`undeclared_identifier` 31건)
+3. struct, union, enum (`unsupported_type` 잔여 103건)
+4. 함수 호출과 외부 효과 (`unsupported_call` 55건)
+5. `docs/lowering/adding-a-construct.md` 와 그 절차대로 추가한 구문 하나
+
+각 단계마다 differential 사례를 같이 늘리고 val 1,050 으로 재측정합니다.

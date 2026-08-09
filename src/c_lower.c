@@ -1,5 +1,7 @@
 #include "quodlibet/c_lower.h"
 
+#include "c_types.h"
+
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,13 +28,10 @@ typedef struct lower_node {
     uint32_t depth;
 } lower_node;
 
-typedef enum lower_type_kind {
-    LOWER_TYPE_BOOL = 1,
-    LOWER_TYPE_INTEGER
-} lower_type_kind;
-
+/* The C-level meaning lives in c_types.c; this adds only the IR type the
+   lowering has already materialised for it. */
 typedef struct lower_type {
-    lower_type_kind kind;
+    ql_c_scalar_kind kind;
     uint32_t width;
     uint32_t rank;
     uint32_t is_signed;
@@ -45,6 +44,16 @@ typedef struct lower_value {
     lower_type type;
     uint32_t may_ub;
 } lower_value;
+
+/* One `typedef` name and the type it stands for. `underlying` is the
+   spelling of the definition's type node, which may itself be a typedef name,
+   so resolution iterates. */
+typedef struct lower_typedef {
+    char *name;
+    char *underlying;
+    uint32_t is_indirect;
+    uint32_t is_aggregate;
+} lower_typedef;
 
 typedef struct lower_variable {
     char *name;
@@ -77,11 +86,15 @@ typedef struct lower_context {
     lower_variable *variables;
     size_t variable_count;
     size_t variable_capacity;
+    lower_typedef *typedefs;
+    size_t typedef_count;
+    size_t typedef_capacity;
     size_t scope_depth;
     lower_type return_type;
     ql_ir_block_id current_block;
     uint32_t current_terminated;
     ql_ir_type_id bool_type;
+    ql_ir_type_id void_type;
     ql_ir_type_id bv_types[129];
     ql_ir_value_id true_value;
     ql_ir_value_id false_value;
@@ -385,107 +398,215 @@ static char *copy_node_text(const lower_context *context, size_t node) {
                      (size_t)range.end_byte - (size_t)range.start_byte);
 }
 
-static lower_type make_bool_type(void) {
+static ql_c_scalar_type scalar_of(lower_type type) {
+    ql_c_scalar_type scalar;
+    memset(&scalar, 0, sizeof(scalar));
+    scalar.kind = type.kind;
+    scalar.width = type.width;
+    scalar.rank = type.rank;
+    scalar.is_signed = type.is_signed;
+    return scalar;
+}
+
+static lower_type type_from_scalar(ql_c_scalar_type scalar) {
     lower_type type;
     memset(&type, 0, sizeof(type));
-    type.kind = LOWER_TYPE_BOOL;
-    type.width = 1u;
+    type.kind = scalar.kind;
+    type.width = scalar.width;
+    type.rank = scalar.rank;
+    type.is_signed = scalar.is_signed;
     type.ir_type = QL_IR_INVALID_TYPE_ID;
     return type;
+}
+
+static lower_type make_bool_type(void) {
+    return type_from_scalar(ql_c_scalar_make_bool());
 }
 
 static lower_type make_integer_type(uint32_t width, uint32_t rank,
                                     uint32_t is_signed) {
-    lower_type type;
-    memset(&type, 0, sizeof(type));
-    type.kind = LOWER_TYPE_INTEGER;
-    type.width = width;
-    type.rank = rank;
-    type.is_signed = is_signed;
-    type.ir_type = QL_IR_INVALID_TYPE_ID;
-    return type;
+    return type_from_scalar(ql_c_scalar_make_integer(width, rank, is_signed));
 }
 
 static int type_same(lower_type left, lower_type right) {
-    return left.kind == right.kind && left.width == right.width &&
-           left.rank == right.rank && left.is_signed == right.is_signed;
+    return ql_c_scalar_same(scalar_of(left), scalar_of(right));
+}
+
+/* `allow_void` is set only where C admits an incomplete type: a function's
+   return type. Everywhere else void is a type error, not a narrowing. */
+/* A declarator that is not just an identifier introduces indirection, which
+   the scalar slice cannot represent. Recording that here lets resolution
+   report `unsupported_pointer` instead of `unsupported_type`, so the coverage
+   tables name the real obstacle. */
+static size_t typedef_declarator_name(const lower_context *context,
+                                      size_t declarator,
+                                      uint32_t *is_indirect) {
+    size_t guard = 0u;
+
+    *is_indirect = 0u;
+    while (declarator != SIZE_MAX && guard++ < 64u) {
+        const char *kind = context->nodes[declarator].view.kind;
+        if (strcmp(kind, "type_identifier") == 0 ||
+            strcmp(kind, "identifier") == 0) {
+            return declarator;
+        }
+        if (strcmp(kind, "pointer_declarator") == 0 ||
+            strcmp(kind, "array_declarator") == 0 ||
+            strcmp(kind, "function_declarator") == 0) {
+            *is_indirect = 1u;
+            declarator = direct_field_child(context, declarator, "declarator");
+            continue;
+        }
+        if (strcmp(kind, "parenthesized_declarator") == 0) {
+            declarator = direct_field_child(context, declarator, "declarator");
+            continue;
+        }
+        return SIZE_MAX;
+    }
+    return SIZE_MAX;
+}
+
+static ql_status collect_typedefs(lower_context *context, ql_error *error) {
+    size_t index;
+
+    for (index = 0u; index < context->node_count; ++index) {
+        size_t type_node;
+        size_t end;
+        size_t child;
+        const char *type_kind;
+        uint32_t is_aggregate;
+
+        if (strcmp(context->nodes[index].view.kind, "type_definition") != 0) {
+            continue;
+        }
+        type_node = direct_field_child(context, index, "type");
+        if (type_node == SIZE_MAX) {
+            continue;
+        }
+        type_kind = context->nodes[type_node].view.kind;
+        is_aggregate = strcmp(type_kind, "struct_specifier") == 0 ||
+                       strcmp(type_kind, "union_specifier") == 0 ||
+                       strcmp(type_kind, "enum_specifier") == 0;
+        end = subtree_end(context, index);
+        for (child = index + 1u; child < end; ++child) {
+            size_t name_node;
+            uint32_t is_indirect;
+            lower_typedef *entry;
+            ql_status status;
+
+            if (context->nodes[child].parent != index ||
+                context->nodes[child].view.field_name == NULL ||
+                strcmp(context->nodes[child].view.field_name,
+                       "declarator") != 0) {
+                continue;
+            }
+            name_node = typedef_declarator_name(context, child, &is_indirect);
+            if (name_node == SIZE_MAX) {
+                continue;
+            }
+            status = grow_array(context->allocator,
+                                (void **)&context->typedefs,
+                                &context->typedef_capacity,
+                                sizeof(*context->typedefs),
+                                context->typedef_count + 1u, error);
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+            entry = &context->typedefs[context->typedef_count];
+            memset(entry, 0, sizeof(*entry));
+            entry->name = copy_node_text(context, name_node);
+            entry->underlying = copy_node_text(context, type_node);
+            entry->is_indirect = is_indirect;
+            entry->is_aggregate = is_aggregate;
+            if (entry->name == NULL || entry->underlying == NULL) {
+                context->allocator->deallocate(context->allocator->user_data,
+                                               entry->name);
+                context->allocator->deallocate(context->allocator->user_data,
+                                               entry->underlying);
+                ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                return QL_STATUS_OUT_OF_MEMORY;
+            }
+            ++context->typedef_count;
+        }
+    }
+    return QL_STATUS_OK;
+}
+
+static const lower_typedef *find_typedef(const lower_context *context,
+                                         const char *name) {
+    size_t index;
+    for (index = context->typedef_count; index-- > 0u;) {
+        if (strcmp(context->typedefs[index].name, name) == 0) {
+            return &context->typedefs[index];
+        }
+    }
+    return NULL;
+}
+
+static void release_typedefs(lower_context *context) {
+    size_t index;
+    for (index = 0u; index < context->typedef_count; ++index) {
+        context->allocator->deallocate(context->allocator->user_data,
+                                       context->typedefs[index].name);
+        context->allocator->deallocate(context->allocator->user_data,
+                                       context->typedefs[index].underlying);
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   context->typedefs);
+    context->typedefs = NULL;
+    context->typedef_count = 0u;
+    context->typedef_capacity = 0u;
 }
 
 static ql_status parse_type_spelling(lower_context *context,
                                      const char *spelling, size_t node,
-                                     lower_type *output,
+                                     uint32_t allow_void, lower_type *output,
                                      ql_error *error) {
-    char normalized[64];
-    size_t source_index;
-    size_t target_index = 0u;
+    ql_c_scalar_type scalar;
+    size_t hops = 0u;
 
-    for (source_index = 0u; spelling[source_index] != '\0'; ++source_index) {
-        char ch = spelling[source_index];
-        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' ||
-            ch == '\f' || ch == '\v') {
-            continue;
-        }
-        if (target_index + 1u >= sizeof(normalized)) {
+    /* A typedef name means whatever this unit declared it to mean. Only names
+       the unit actually declares are resolved: assuming a meaning for an
+       undeclared name would be a guess, and a wrong guess about a type is a
+       wrong answer about the function. */
+    while (!ql_c_scalar_from_spelling(spelling, &scalar)) {
+        const lower_typedef *entry = find_typedef(context, spelling);
+        if (entry == NULL) {
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
-                "integer type spelling is outside ASM2C_GNU_V1", error);
+                "type spelling names no ASM2C_GNU_V1 scalar type and no "
+                "typedef this unit declares", error);
         }
-        normalized[target_index++] = ch;
+        if (entry->is_indirect != 0u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+                "typedef names a pointer, array, or function type", error);
+        }
+        if (entry->is_aggregate != 0u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                "typedef names a struct, union, or enum type", error);
+        }
+        if (++hops > 64u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                "typedef chain does not terminate", error);
+        }
+        spelling = entry->underlying;
     }
-    normalized[target_index] = '\0';
-
-    if (strcmp(normalized, "_Bool") == 0 ||
-        strcmp(normalized, "bool") == 0) {
-        *output = make_bool_type();
-    } else if (strcmp(normalized, "char") == 0 ||
-               strcmp(normalized, "signedchar") == 0) {
-        *output = make_integer_type(8u, 1u, 1u);
-    } else if (strcmp(normalized, "unsignedchar") == 0) {
-        *output = make_integer_type(8u, 1u, 0u);
-    } else if (strcmp(normalized, "short") == 0 ||
-               strcmp(normalized, "shortint") == 0 ||
-               strcmp(normalized, "signedshort") == 0 ||
-               strcmp(normalized, "signedshortint") == 0) {
-        *output = make_integer_type(16u, 2u, 1u);
-    } else if (strcmp(normalized, "unsignedshort") == 0 ||
-               strcmp(normalized, "unsignedshortint") == 0) {
-        *output = make_integer_type(16u, 2u, 0u);
-    } else if (strcmp(normalized, "int") == 0 ||
-               strcmp(normalized, "signed") == 0 ||
-               strcmp(normalized, "signedint") == 0) {
-        *output = make_integer_type(32u, 3u, 1u);
-    } else if (strcmp(normalized, "unsigned") == 0 ||
-               strcmp(normalized, "unsignedint") == 0) {
-        *output = make_integer_type(32u, 3u, 0u);
-    } else if (strcmp(normalized, "long") == 0 ||
-               strcmp(normalized, "longint") == 0 ||
-               strcmp(normalized, "signedlong") == 0 ||
-               strcmp(normalized, "signedlongint") == 0) {
-        *output = make_integer_type(64u, 4u, 1u);
-    } else if (strcmp(normalized, "unsignedlong") == 0 ||
-               strcmp(normalized, "unsignedlongint") == 0) {
-        *output = make_integer_type(64u, 4u, 0u);
-    } else if (strcmp(normalized, "longlong") == 0 ||
-               strcmp(normalized, "longlongint") == 0 ||
-               strcmp(normalized, "signedlonglong") == 0 ||
-               strcmp(normalized, "signedlonglongint") == 0) {
-        *output = make_integer_type(64u, 5u, 1u);
-    } else if (strcmp(normalized, "unsignedlonglong") == 0 ||
-               strcmp(normalized, "unsignedlonglongint") == 0) {
-        *output = make_integer_type(64u, 5u, 0u);
-    } else {
+    if (scalar.kind == QL_C_SCALAR_VOID && allow_void == 0u) {
         return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
-            "only fixed ASM2C_GNU_V1 integer and _Bool types are supported",
-            error);
+            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+            "void is not an object type here", error);
     }
+    *output = type_from_scalar(scalar);
     return QL_STATUS_OK;
 }
 
 static ql_status type_from_inventory(lower_context *context,
                                      const ql_c_type_inventory_v1 *inventory,
-                                     size_t node, lower_type *output,
-                                     ql_error *error) {
+                                     size_t node, uint32_t allow_void,
+                                     lower_type *output, ql_error *error) {
     if ((inventory->qualifiers &
          (QL_C_TYPE_QUALIFIER_VOLATILE | QL_C_TYPE_QUALIFIER_ATOMIC)) != 0u ||
         inventory->base_kind == QL_C_TYPE_BASE_ATOMIC) {
@@ -513,8 +634,8 @@ static ql_status type_from_inventory(lower_context *context,
     /* The inventory's base-kind classification is a fast syntactic hint.
        Multi-keyword integer specifiers vary in Tree-sitter shape, so the
        versioned spelling parser below is the semantic authority. */
-    return parse_type_spelling(context, inventory->base_spelling, node, output,
-                               error);
+    return parse_type_spelling(context, inventory->base_spelling, node,
+                               allow_void, output, error);
 }
 
 static ql_status ensure_ir_type(lower_context *context, lower_type *type,
@@ -526,7 +647,21 @@ static ql_status ensure_ir_type(lower_context *context, lower_type *type,
     if (type->ir_type != QL_IR_INVALID_TYPE_ID) {
         return QL_STATUS_OK;
     }
-    if (type->kind == LOWER_TYPE_BOOL) {
+    if (type->kind == QL_C_SCALAR_VOID) {
+        if (context->void_type != QL_IR_INVALID_TYPE_ID) {
+            type->ir_type = context->void_type;
+            return QL_STATUS_OK;
+        }
+        ql_ir_type_definition_init(&definition, QL_IR_TYPE_VOID);
+        status = ql_ir_builder_add_type(context->builder, &definition, &id,
+                                        error);
+        if (status == QL_STATUS_OK) {
+            context->void_type = id;
+            type->ir_type = id;
+        }
+        return status;
+    }
+    if (type->kind == QL_C_SCALAR_BOOL) {
         if (context->bool_type != QL_IR_INVALID_TYPE_ID) {
             type->ir_type = context->bool_type;
             return QL_STATUS_OK;
@@ -616,7 +751,7 @@ static ql_status add_uint_constant(lower_context *context, lower_type type,
     size_t index;
 
     memset(bytes, 0, sizeof(bytes));
-    size = type.kind == LOWER_TYPE_BOOL ? 1u : (type.width + 7u) / 8u;
+    size = type.kind == QL_C_SCALAR_BOOL ? 1u : (type.width + 7u) / 8u;
     if (size > sizeof(bytes)) {
         ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
                      "integer constant is wider than the lowering buffer");
@@ -626,7 +761,7 @@ static ql_status add_uint_constant(lower_context *context, lower_type type,
         bytes[index] = (uint8_t)(value & UINT64_C(0xff));
         value >>= 8u;
     }
-    if (type.kind == LOWER_TYPE_BOOL) {
+    if (type.kind == QL_C_SCALAR_BOOL) {
         bytes[0] = bytes[0] != 0u ? 1u : 0u;
     }
     return add_constant_bytes(context, &type, bytes, size, output, error);
@@ -867,17 +1002,7 @@ static void destroy_state(lower_context *context, lower_state *state) {
 }
 
 static int type_can_represent(lower_type type, uint64_t value) {
-    uint64_t maximum;
-    if (type.is_signed == 0u) {
-        maximum = type.width == 64u
-                      ? UINT64_MAX
-                      : (UINT64_C(1) << type.width) - UINT64_C(1);
-    } else {
-        maximum = type.width == 64u
-                      ? (uint64_t)INT64_MAX
-                      : (UINT64_C(1) << (type.width - 1u)) - UINT64_C(1);
-    }
-    return value <= maximum;
+    return ql_c_scalar_can_represent(scalar_of(type), value);
 }
 
 static int literal_digit(char ch, uint32_t base, uint32_t *digit) {
@@ -1072,8 +1197,8 @@ static ql_status convert_value(lower_context *context, lower_value input,
         output->type = target;
         return QL_STATUS_OK;
     }
-    if (target.kind == LOWER_TYPE_BOOL) {
-        if (input.type.kind == LOWER_TYPE_BOOL) {
+    if (target.kind == QL_C_SCALAR_BOOL) {
+        if (input.type.kind == QL_C_SCALAR_BOOL) {
             output->type = target;
             return QL_STATUS_OK;
         }
@@ -1089,7 +1214,7 @@ static ql_status convert_value(lower_context *context, lower_value input,
         output->type = target;
         return QL_STATUS_OK;
     }
-    if (input.type.kind == LOWER_TYPE_BOOL) {
+    if (input.type.kind == QL_C_SCALAR_BOOL) {
         ql_ir_value_id operands[3];
         status = add_uint_constant(context, target, 1u, &operands[1], error);
         if (status != QL_STATUS_OK) {
@@ -1126,32 +1251,18 @@ static ql_status convert_value(lower_context *context, lower_value input,
 
 static ql_status integer_promote(lower_context *context, lower_value input,
                                  lower_value *output, ql_error *error) {
-    if (input.type.kind == LOWER_TYPE_BOOL || input.type.rank < 3u) {
-        return convert_value(context, input,
-                             make_integer_type(32u, 3u, 1u), output, error);
+    const lower_type promoted =
+        type_from_scalar(ql_c_scalar_promote(scalar_of(input.type)));
+    if (!type_same(input.type, promoted)) {
+        return convert_value(context, input, promoted, output, error);
     }
     *output = input;
     return QL_STATUS_OK;
 }
 
 static lower_type usual_common_type(lower_type left, lower_type right) {
-    if (left.is_signed == right.is_signed) {
-        return left.rank >= right.rank ? left : right;
-    }
-    if (left.is_signed == 0u) {
-        lower_type temporary = left;
-        left = right;
-        right = temporary;
-    }
-    /* left is signed and right is unsigned. */
-    if (right.rank >= left.rank) {
-        return right;
-    }
-    if (left.width > right.width) {
-        return left;
-    }
-    left.is_signed = 0u;
-    return left;
+    return type_from_scalar(ql_c_scalar_usual(scalar_of(left),
+                                              scalar_of(right)));
 }
 
 static ql_status usual_arithmetic_conversions(
@@ -1978,6 +2089,154 @@ static ql_status lower_binary_expression(lower_context *context, size_t node,
     return status;
 }
 
+/* A cast names its target with a type descriptor: a base type plus an
+   optional abstract declarator. An abstract declarator here always means
+   indirection, which the scalar slice cannot represent, so it is reported as
+   a pointer obstacle rather than a type one. */
+static ql_status lower_named_cast(lower_context *context, size_t type_node,
+                                  size_t value_node, lower_value *output,
+                                  ql_error *error);
+
+static ql_status lower_cast_expression(lower_context *context, size_t node,
+                                       lower_value *output,
+                                       ql_error *error) {
+    size_t descriptor = direct_field_child(context, node, "type");
+    size_t value_node = direct_field_child(context, node, "value");
+    size_t type_node;
+    size_t end;
+    size_t child;
+
+    if (descriptor == SIZE_MAX || value_node == SIZE_MAX) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "cast expression has no type or no operand", error);
+    }
+    type_node = direct_field_child(context, descriptor, "type");
+    if (type_node == SIZE_MAX) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, descriptor,
+            "cast type descriptor names no type", error);
+    }
+    end = subtree_end(context, descriptor);
+    for (child = descriptor + 1u; child < end; ++child) {
+        if (context->nodes[child].parent != descriptor ||
+            context->nodes[child].view.field_name == NULL ||
+            strcmp(context->nodes[child].view.field_name,
+                   "declarator") != 0) {
+            continue;
+        }
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
+            "cast to a pointer, array, or function type requires memory "
+            "semantics", error);
+    }
+    if (strcmp(context->nodes[type_node].view.kind,
+               "atomic_type_specifier") == 0) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_VOLATILE_OR_ATOMIC,
+            type_node, "cast to an atomic type requires observable-event "
+            "semantics", error);
+    }
+    return lower_named_cast(context, type_node, value_node, output, error);
+}
+
+/* Converts `value_node` to the scalar type `type_node` spells. */
+static ql_status lower_named_cast(lower_context *context, size_t type_node,
+                                  size_t value_node, lower_value *output,
+                                  ql_error *error) {
+    lower_value value;
+    lower_type target;
+    char *spelling = copy_node_text(context, type_node);
+    ql_status status;
+
+    if (spelling == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    status = parse_type_spelling(context, spelling, type_node, 1u, &target,
+                                 error);
+    context->allocator->deallocate(context->allocator->user_data, spelling);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    if (target.kind == QL_C_SCALAR_VOID) {
+        /* `(void)e` discards the value, so there is nothing to hand back as
+           an expression result. Statement-level discarding is a separate
+           construct and is not folded in here. */
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, type_node,
+            "a cast to void produces no value", error);
+    }
+    status = lower_expression(context, value_node, &value, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    return convert_value(context, value, target, output, error);
+}
+
+/* `(T)(e)` is a cast when T names a type and a call when it names a callable,
+   and the grammar alone cannot tell which. Tree-sitter resolves the ambiguity
+   toward a call, so the lowering has to undo that whenever the callee is a
+   parenthesised identifier this unit declared as a typedef and no visible
+   object shadows it. Reading these as calls would put casts in the
+   unsupported_call column and hide what the corpus actually contains.
+
+   Returns the node spelling the type, or SIZE_MAX when this really is a
+   call. */
+static size_t disguised_cast_type(lower_context *context, size_t node,
+                                  size_t *operand) {
+    size_t callee = direct_field_child(context, node, "function");
+    size_t arguments = direct_field_child(context, node, "arguments");
+    size_t name_node;
+    size_t argument_end;
+    size_t index;
+    size_t only_argument = SIZE_MAX;
+    char *name;
+    int is_type_name;
+
+    *operand = SIZE_MAX;
+    if (callee == SIZE_MAX || arguments == SIZE_MAX ||
+        strcmp(context->nodes[callee].view.kind,
+               "parenthesized_expression") != 0) {
+        return SIZE_MAX;
+    }
+    name_node = first_named_child(context, callee);
+    if (name_node == SIZE_MAX ||
+        strcmp(context->nodes[name_node].view.kind, "identifier") != 0) {
+        return SIZE_MAX;
+    }
+    argument_end = subtree_end(context, arguments);
+    for (index = arguments + 1u; index < argument_end; ++index) {
+        if (context->nodes[index].parent != arguments ||
+            (context->nodes[index].view.flags & QL_C_SYNTAX_NODE_NAMED) ==
+                0u ||
+            strcmp(context->nodes[index].view.kind, "comment") == 0) {
+            continue;
+        }
+        if (only_argument != SIZE_MAX) {
+            return SIZE_MAX;
+        }
+        only_argument = index;
+    }
+    if (only_argument == SIZE_MAX) {
+        return SIZE_MAX;
+    }
+    name = copy_node_text(context, name_node);
+    if (name == NULL) {
+        return SIZE_MAX;
+    }
+    /* An object of the same name shadows the typedef, and then this is a
+       call through that object after all. */
+    is_type_name = find_variable(context, name, strlen(name)) == NULL &&
+                   find_typedef(context, name) != NULL;
+    context->allocator->deallocate(context->allocator->user_data, name);
+    if (!is_type_name) {
+        return SIZE_MAX;
+    }
+    *operand = only_argument;
+    return name_node;
+}
+
 static ql_status lower_expression(lower_context *context, size_t node,
                                   lower_value *output, ql_error *error) {
     const char *kind;
@@ -2013,7 +2272,16 @@ static ql_status lower_expression(lower_context *context, size_t node,
     if (strcmp(kind, "binary_expression") == 0) {
         return lower_binary_expression(context, node, output, error);
     }
+    if (strcmp(kind, "cast_expression") == 0) {
+        return lower_cast_expression(context, node, output, error);
+    }
     if (strcmp(kind, "call_expression") == 0) {
+        size_t operand = SIZE_MAX;
+        size_t type_node = disguised_cast_type(context, node, &operand);
+        if (type_node != SIZE_MAX) {
+            return lower_named_cast(context, type_node, operand, output,
+                                    error);
+        }
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
             "function calls require external-call or callee-summary semantics",
@@ -2182,7 +2450,9 @@ static ql_status parse_local_type(lower_context *context, size_t declaration,
     }
     if (strcmp(context->nodes[type_node].view.kind, "primitive_type") != 0 &&
         strcmp(context->nodes[type_node].view.kind,
-               "sized_type_specifier") != 0) {
+               "sized_type_specifier") != 0 &&
+        strcmp(context->nodes[type_node].view.kind,
+               "type_identifier") != 0) {
         context->allocator->deallocate(context->allocator->user_data,
                                        spelling);
         return lower_unknown(
@@ -2191,8 +2461,8 @@ static ql_status parse_local_type(lower_context *context, size_t declaration,
             error);
     }
     {
-        ql_status status = parse_type_spelling(context, spelling, type_node, output,
-                                               error);
+        ql_status status = parse_type_spelling(context, spelling, type_node,
+                                               0u, output, error);
         context->allocator->deallocate(context->allocator->user_data,
                                        spelling);
         return status;
@@ -2515,6 +2785,23 @@ cleanup:
     return status;
 }
 
+/* Falling off the end of a void function returns, so the same terminator
+   serves the explicit `return;` and the implicit one. */
+static ql_status terminate_void_return(lower_context *context,
+                                       ql_error *error) {
+    ql_ir_terminator_definition_v1 terminator;
+    ql_status status;
+
+    ql_ir_terminator_definition_init(&terminator, QL_IR_TERMINATOR_RETURN);
+    status = ql_ir_builder_set_terminator(context->builder,
+                                          context->current_block,
+                                          &terminator, error);
+    if (status == QL_STATUS_OK) {
+        context->current_terminated = 1u;
+    }
+    return status;
+}
+
 static ql_status lower_return_statement(lower_context *context, size_t node,
                                         ql_error *error) {
     size_t value_node = first_named_child(context, node);
@@ -2523,6 +2810,14 @@ static ql_status lower_return_statement(lower_context *context, size_t node,
     ql_ir_terminator_definition_v1 terminator;
     ql_status status;
 
+    if (context->return_type.kind == QL_C_SCALAR_VOID) {
+        if (value_node != SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                "a void function cannot return a value", error);
+        }
+        return terminate_void_return(context, error);
+    }
     if (value_node == SIZE_MAX) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
@@ -2706,7 +3001,7 @@ static ql_status initialize_parameters(lower_context *context,
             return status;
         }
         status = type_from_inventory(context, &parameter.type, SIZE_MAX,
-                                     &type, error);
+                                     0u, &type, error);
         if (status != QL_STATUS_OK || context->unknown != 0u) {
             return status;
         }
@@ -2733,6 +3028,7 @@ static ql_status initialize_parameters(lower_context *context,
 
 static void cleanup_context(lower_context *context) {
     pop_variables(context, 0u);
+    release_typedefs(context);
     context->allocator->deallocate(context->allocator->user_data,
                                    context->variables);
     ql_ir_builder_destroy(context->builder);
@@ -2798,6 +3094,7 @@ ql_status QL_CALL ql_c_lower_selected_function(
     context.function = canonical;
     context.result = result;
     context.bool_type = QL_IR_INVALID_TYPE_ID;
+    context.void_type = QL_IR_INVALID_TYPE_ID;
     context.true_value = QL_IR_INVALID_VALUE_ID;
     context.false_value = QL_IR_INVALID_VALUE_ID;
     context.current_block = QL_IR_INVALID_BLOCK_ID;
@@ -2835,6 +3132,9 @@ ql_status QL_CALL ql_c_lower_selected_function(
     if (status == QL_STATUS_OK) {
         status = collect_nodes(&context, error);
     }
+    if (status == QL_STATUS_OK) {
+        status = collect_typedefs(&context, error);
+    }
     if (status != QL_STATUS_OK) {
         cleanup_context(&context);
         ql_c_lower_result_destroy(result);
@@ -2865,7 +3165,7 @@ ql_status QL_CALL ql_c_lower_selected_function(
     }
     if (status == QL_STATUS_OK && context.unknown == 0u) {
         status = type_from_inventory(&context, &canonical.return_type,
-                                     function_node, &context.return_type,
+                                     function_node, 1u, &context.return_type,
                                      error);
     }
     if (status == QL_STATUS_OK && context.unknown == 0u) {
@@ -2894,10 +3194,14 @@ ql_status QL_CALL ql_c_lower_selected_function(
     }
     if (status == QL_STATUS_OK && context.unknown == 0u &&
         context.current_terminated == 0u) {
-        status = lower_unknown(
-            &context, QL_C_LOWER_DIAGNOSTIC_MISSING_RETURN, body_node,
-            "a reachable path leaves an integer function without returning",
-            error);
+        if (context.return_type.kind == QL_C_SCALAR_VOID) {
+            status = terminate_void_return(&context, error);
+        } else {
+            status = lower_unknown(
+                &context, QL_C_LOWER_DIAGNOSTIC_MISSING_RETURN, body_node,
+                "a reachable path leaves an integer function without "
+                "returning", error);
+        }
     }
     if (status == QL_STATUS_OK && context.unknown == 0u) {
         status = ql_ir_builder_finish(context.builder, &result->ir_artifact,

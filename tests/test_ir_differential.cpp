@@ -98,6 +98,25 @@ QL_DIFF_FUNCTION(wide, long long diff_mul64(long long a, long long b) {
 QL_DIFF_FUNCTION(mixed, long long diff_mixed(int a, unsigned int b) {
     return a + b;
 });
+QL_DIFF_FUNCTION(cast_narrow, int diff_cast_narrow(int a, int b) {
+    return (short) (a + b);
+});
+QL_DIFF_FUNCTION(cast_unsigned, int diff_cast_unsigned(int a, int b) {
+    return (unsigned int) a > (unsigned int) b;
+});
+QL_DIFF_FUNCTION(cast_byte, int diff_cast_byte(int a, int b) {
+    return (char) a + (unsigned char) b;
+});
+QL_DIFF_FUNCTION(named, typedef unsigned int QL_DIFF_U32;
+                 typedef QL_DIFF_U32 QL_DIFF_WORD;
+                 QL_DIFF_WORD diff_named(QL_DIFF_WORD a, QL_DIFF_U32 b) {
+                     return a / b + 7u;
+                 });
+QL_DIFF_FUNCTION(named_signed, typedef int QL_DIFF_INT;
+                 QL_DIFF_INT diff_named_signed(QL_DIFF_INT a,
+                                               QL_DIFF_INT b) {
+                     return (QL_DIFF_INT) (a * b);
+                 });
 
 namespace {
 
@@ -423,6 +442,31 @@ const Case kCases[] = {
     {"mixed", mixed_source, "diff_mixed", 32u, 32u, 64u, AlwaysDefined,
      [](uint64_t a, uint64_t b) {
          return FromI64(diff_mixed(AsI32(a), AsU32(b)));
+     }},
+    {"cast_narrow", cast_narrow_source, "diff_cast_narrow", 32u, 32u, 32u,
+     AddDefined,
+     [](uint64_t a, uint64_t b) {
+         return FromI32(diff_cast_narrow(AsI32(a), AsI32(b)));
+     }},
+    {"cast_unsigned", cast_unsigned_source, "diff_cast_unsigned", 32u, 32u,
+     32u, AlwaysDefined,
+     [](uint64_t a, uint64_t b) {
+         return FromI32(diff_cast_unsigned(AsI32(a), AsI32(b)));
+     }},
+    {"cast_byte", cast_byte_source, "diff_cast_byte", 32u, 32u, 32u,
+     AlwaysDefined,
+     [](uint64_t a, uint64_t b) {
+         return FromI32(diff_cast_byte(AsI32(a), AsI32(b)));
+     }},
+    {"named", named_source, "diff_named", 32u, 32u, 32u,
+     UnsignedDivisionDefined,
+     [](uint64_t a, uint64_t b) {
+         return FromU32(diff_named(AsU32(a), AsU32(b)));
+     }},
+    {"named_signed", named_signed_source, "diff_named_signed", 32u, 32u, 32u,
+     MulDefined,
+     [](uint64_t a, uint64_t b) {
+         return FromI32(diff_named_signed(AsI32(a), AsI32(b)));
      }},
 };
 
