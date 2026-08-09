@@ -940,11 +940,76 @@ static ql_status ir_type_matches(const ql_ir *ir, ql_ir_type_id type_id,
     return QL_STATUS_TYPE_MISMATCH;
 }
 
+static int name_has_suffix(const ql_ir_value_view_v1 *value,
+                           const char *suffix) {
+    const size_t length = strlen(suffix);
+    return value->name != NULL && value->name_size >= length &&
+           memcmp(value->name + value->name_size - length, suffix, length) ==
+               0;
+}
+
+/* Tail parameter `ordinal` counts from the first one past the C arguments:
+   zero is the memory value, then base and size alternate. */
+static ql_status object_parameter_matches(const ql_ir *ir,
+                                          const ql_ir_value_view_v1 *value,
+                                          uint32_t pointer_width,
+                                          size_t ordinal, ql_error *error) {
+    ql_ir_view_v1 view;
+    ql_ir_type_view_v1 type;
+    size_t index;
+    ql_status status;
+
+    memset(&view, 0, sizeof(view));
+    view.struct_size = sizeof(view);
+    status = ql_ir_get_view(ir, &view, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    for (index = 0u; index < view.type_count; ++index) {
+        memset(&type, 0, sizeof(type));
+        type.struct_size = sizeof(type);
+        status = ql_ir_type_at(ir, index, &type, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        if (type.id == value->type) {
+            break;
+        }
+    }
+    if (index == view.type_count) {
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "IR object parameter references an unknown type");
+        return QL_STATUS_TYPE_MISMATCH;
+    }
+    if (ordinal == 0u) {
+        if (type.kind == QL_IR_TYPE_MEMORY &&
+            name_has_suffix(value, "__memory")) {
+            return QL_STATUS_OK;
+        }
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "the parameter after the C arguments is not the memory value the flat memory model requires");
+        return QL_STATUS_TYPE_MISMATCH;
+    }
+    if (type.kind == QL_IR_TYPE_BIT_VECTOR &&
+        type.bit_width == pointer_width &&
+        name_has_suffix(value, ((ordinal - 1u) % 2u) == 0u ? ".__base"
+                                                           : ".__size")) {
+        return QL_STATUS_OK;
+    }
+    ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                 "IR object parameter %zu is not the %s the flat memory model requires",
+                 (ordinal - 1u) / 2u,
+                 ((ordinal - 1u) % 2u) == 0u ? "base" : "size");
+    return QL_STATUS_TYPE_MISMATCH;
+}
+
 ql_status QL_CALL ql_source_signature_bind_ir(
     const ql_source_signature *signature, const ql_ir *ir, ql_error *error) {
     ql_ir_view_v1 view;
     size_t index;
     size_t parameter_index = 0u;
+    size_t pointer_count = 0u;
+    size_t expected;
     ql_status status;
 
     if (signature == NULL || ir == NULL) {
@@ -970,6 +1035,18 @@ ql_status QL_CALL ql_source_signature_bind_ir(
     if (status != QL_STATUS_OK) {
         return status;
     }
+    for (index = 0u; index < signature->view.argument_count; ++index) {
+        if (signature->arguments[index].kind == QL_SOURCE_TYPE_POINTER) {
+            ++pointer_count;
+        }
+    }
+    /* A function with pointer arguments carries the flat memory model's own
+       parameters behind the C ones: one memory value, then a base and a size
+       per pointer argument in source order. The tail is checked rather than
+       skipped, because a lowering that got it wrong would silently hand the
+       miter a different object table than the signature implies. */
+    expected = signature->view.argument_count +
+               (pointer_count == 0u ? 0u : 1u + 2u * pointer_count);
     for (index = 0u; index < view.value_count; ++index) {
         ql_ir_value_view_v1 value;
         memset(&value, 0, sizeof(value));
@@ -981,23 +1058,29 @@ ql_status QL_CALL ql_source_signature_bind_ir(
         if (value.definition_kind != QL_IR_VALUE_PARAMETER) {
             continue;
         }
-        if (parameter_index >= signature->view.argument_count) {
+        if (parameter_index >= expected) {
             ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
                          "IR declares more parameters than the source signature");
             return QL_STATUS_TYPE_MISMATCH;
         }
-        status = ir_type_matches(ir, value.type,
-                                 &signature->arguments[parameter_index],
-                                 "parameter", error);
+        if (parameter_index < signature->view.argument_count) {
+            status = ir_type_matches(ir, value.type,
+                                     &signature->arguments[parameter_index],
+                                     "parameter", error);
+        } else {
+            status = object_parameter_matches(
+                ir, &value, signature->view.pointer_width,
+                parameter_index - signature->view.argument_count, error);
+        }
         if (status != QL_STATUS_OK) {
             return status;
         }
         ++parameter_index;
     }
-    if (parameter_index != signature->view.argument_count) {
+    if (parameter_index != expected) {
         ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                     "IR declares %zu parameters but the source signature declares %zu",
-                     parameter_index, signature->view.argument_count);
+                     "IR declares %zu parameters but the source signature and its object table imply %zu",
+                     parameter_index, expected);
         return QL_STATUS_TYPE_MISMATCH;
     }
     ql_error_clear(error);

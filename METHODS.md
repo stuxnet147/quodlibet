@@ -165,8 +165,8 @@ and cache keys.
 
 Method name: `prove.smt-product`. This is the first implemented method. The
 paragraphs below the implementation notes describe the general interface; the
-implementation currently covers the loop-free scalar fragment of that
-interface and refuses the rest.
+implementation currently covers the loop-free fragment of that interface over
+scalars and the flat memory model, and refuses the rest.
 
 #### Implementation, schema v1
 
@@ -190,12 +190,57 @@ SMT-LIB prefix and two terminal assertions:
 
 Each observation axis is encoded explicitly. The return-value axis compares
 whether a normal return happened before it compares the value, because a trap
-or a divergence produces no return value at all. The memory, volatile, atomic,
-I/O, and external-call axes are discharged only after establishing that
-neither IR carries the corresponding effect; an effect the encoding cannot
-state is a `QL_STATUS_TYPE_MISMATCH` naming the axis, never a dropped
-obligation. Definedness is governed by the UB policy, as this document
-specifies, so `QL_OBSERVE_UNDEFINED_BEHAVIOR` adds no separate conjunct.
+or a divergence produces no return value at all. The volatile, atomic, I/O, and
+external-call axes are discharged only after establishing that neither IR
+carries the corresponding effect; an effect the encoding cannot state is a
+`QL_STATUS_TYPE_MISMATCH` naming the axis, never a dropped obligation.
+Definedness is governed by the UB policy, as this document specifies, so
+`QL_OBSERVE_UNDEFINED_BEHAVIOR` adds no separate conjunct.
+
+#### The flat memory model in the miter
+
+Under the `ASM2C_GNU_V1` profile memory is a flat 64-bit address space of
+bytes, which the query states as one `(Array (_ BitVec 64) (_ BitVec 8))` in
+`QF_ABV`. A pointer takes the bit-vector sort of its width, since a pointer is
+an address and nothing more in this profile. An access of `W` bytes is `W`
+`select`s concatenated, or `W` nested `store`s, in little-endian order, which
+is byte for byte the order `ql_ir_interp_run` uses; an access whose width is
+not a whole number of bytes is refused rather than rounded.
+
+Both sides share the initial memory constant and one base and size constant per
+object, so the two functions run over the same storage without either side
+describing it to the other. The object table follows from the pointer arguments
+in source order on each side and is matched through the problem's argument
+correspondence, so a correspondence that permutes the two argument lists still
+binds the same object to the same pair of constants.
+
+**Neither the model's standing constraints nor the access-definedness predicate
+is restated here.** The lowering already emits them as ordinary IR: `ASSUME`
+instructions for disjointness, the first-page floor, and the no-wrap bound, and
+a `UB_GUARD` over ordinary arithmetic at each access. The miter encodes those
+instructions like any others, so the query and `ql_ir_interp_run` cannot come
+to disagree about which layouts are admissible or which accesses are defined.
+The assumptions are conjoined into both terminal queries, so an `unsat`
+violation is never vacuous through an unsatisfiable layout.
+
+The memory observation is the final reachable state: the memory the reached
+return carries, compared byte by byte inside the objects. It is stated with one
+free address constant rather than a quantifier. In the violation query a free
+constant is existential, which is exactly "some address differs"; in the same
+query answered `unsat` it is universal, which is exactly "every address
+agrees". One constant is therefore precise in both directions and the logic
+stays quantifier-free. The comparison is gated on both sides terminating, since
+a trapping or diverging run leaves no final memory. A contract that asks for
+`QL_MEMORY_ORDERED_WRITES` or `QL_MEMORY_FULL_TRACE` is refused: this encoding
+has no term for a write order.
+
+A model may describe an object far too large to materialize for replay. The
+query therefore also carries a **search-only** terminal assertion: the same
+violation claim with every object size bounded. It is used solely to obtain a
+replayable model after the unbounded query returned one that is too large.
+`sat` on it is still a genuine violation and may be replayed; `unsat` on it
+proves nothing whatsoever and is never promoted. The proof path reads only the
+unbounded violation query.
 
 Every UB policy conjoins the observation obligation with both sides being
 defined. SMT-LIB totalizes division, remainder, and shift; that totalization
@@ -209,6 +254,15 @@ concretely, and re-derives the relation on the concrete results. Only a replay
 that reproduces the violation becomes `COUNTEREXAMPLE`. A replay that does not
 reproduce is logged as an encoding defect and reported as `UNKNOWN`; the
 counterexample serializer refuses an unconfirmed witness outright.
+
+When the query has objects, the replay also rebuilds them from the model: each
+object's base and size, and its initial image from the model's array term. The
+three standing constraints are re-checked on the rebuilt layout instead of
+being assumed, and an object whose image is too large to materialize leaves the
+replay undecided rather than being silently replaced by a smaller one. When the
+contract observes memory, both runs write their final images and the replay
+compares them, so a difference that lives only in memory is confirmed by the
+same concrete path as a difference in a return value.
 
 #### UNSAT promotion boundary
 
@@ -229,7 +283,8 @@ following hold, and the outcome envelope records every one of them:
 2. the miter covers exactly the contract's relation direction, UB policy, and
    observation axes;
 3. the domain query answered `sat`, so the `unsat` is not vacuous;
-4. the violation query answered `unsat`;
+4. the **unbounded** violation query answered `unsat`; the search-only bounded
+   variant carries no proof authority at all;
 5. the backend is the pinned Bitwuzla, and its name, version, executable
    content digest, and query digest are recorded;
 6. the caller selected the policy explicitly.

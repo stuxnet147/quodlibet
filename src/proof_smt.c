@@ -719,6 +719,64 @@ static ql_status QL_CALL smt_product_validate(void *instance,
     return QL_STATUS_OK;
 }
 
+/* Second attempt at a replayable model, over the same violation claim with
+   every object bounded. Only its SAT answer is used; the bounded query has no
+   proof authority and this function never touches the verdict. A failure to
+   find or replay one leaves `replay` inconclusive, which the caller reports as
+   UNKNOWN. */
+static ql_status retry_bounded(const ql_allocator *allocator,
+                               const smt_product_instance *instance,
+                               const ql_run_context_v1 *context,
+                               const ql_product_query *query,
+                               const ql_product_query_view_v1 *query_view,
+                               const ql_problem *problem,
+                               const ql_ir *left_ir, const ql_ir *right_ir,
+                               ql_replay_witness **witness,
+                               ql_replay_result_v1 *replay,
+                               ql_error *error) {
+    ql_solver_check_result_v1 bounded;
+    ql_replay_witness *decoded = NULL;
+    ql_status status;
+
+    ql_solver_check_result_init(&bounded);
+    status = run_check(allocator, instance, context, query_view,
+                       ql_product_query_prefix_artifact(query),
+                       ql_product_query_bounded_violation_artifact(query), 1u,
+                       &bounded, error);
+    if (status != QL_STATUS_OK) {
+        ql_solver_check_result_clear(&bounded);
+        return status;
+    }
+    if (bounded.kind != QL_SOLVER_CHECK_SAT ||
+        bounded.model_artifact == NULL) {
+        ql_solver_check_result_clear(&bounded);
+        return QL_STATUS_OK;
+    }
+    status = ql_replay_decode_model(allocator, query, bounded.model_artifact,
+                                    &decoded, error);
+    if (status != QL_STATUS_OK) {
+        QL_LOGE(QL_SMT_PRODUCT_CATEGORY,
+                "bounded solver model could not be decoded: %s",
+                error->message);
+        ql_solver_check_result_clear(&bounded);
+        ql_error_clear(error);
+        return QL_STATUS_OK;
+    }
+    memset(replay, 0, sizeof(*replay));
+    replay->struct_size = sizeof(*replay);
+    status = ql_replay_execute(allocator, problem, query, left_ir, right_ir,
+                               decoded, replay, error);
+    if (status != QL_STATUS_OK) {
+        ql_replay_witness_destroy(decoded);
+        ql_solver_check_result_clear(&bounded);
+        return status;
+    }
+    ql_replay_witness_destroy(*witness);
+    *witness = decoded;
+    ql_solver_check_result_clear(&bounded);
+    return QL_STATUS_OK;
+}
+
 /* Decides the verdict from the two solver answers and, for SAT, from the
    concrete replay. Every path that does not reach a conclusion writes a
    diagnostic instead of settling for a weaker-looking verdict. */
@@ -776,6 +834,20 @@ static ql_status decide(const ql_allocator *allocator,
                                    right_ir, witness, &replay, error);
         if (status != QL_STATUS_OK) {
             goto finish;
+        }
+        if (replay.conclusive == 0u &&
+            ql_product_query_bounded_violation_artifact(query) != NULL) {
+            /* The first model described objects too large to materialize.
+               Asking again with every object bounded yields a violation the
+               replay can actually run. A bounded SAT is still a real
+               violation; a bounded UNSAT would prove nothing and is never
+               read as one. */
+            status = retry_bounded(allocator, instance, context, query,
+                                   query_view, problem, left_ir, right_ir,
+                                   &witness, &replay, error);
+            if (status != QL_STATUS_OK) {
+                goto finish;
+            }
         }
         if (replay.conclusive == 0u) {
             set_diagnostic(decision,

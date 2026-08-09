@@ -12,11 +12,47 @@
 /* The concrete precondition evaluator works on the scalar slice's argument
    widths. A wider literal makes the replay inconclusive instead of guessed. */
 #define QL_REPLAY_MAX_PRECONDITION_BITS 64u
+/* An object's initial image has to be materialized byte for byte before the
+   interpreter can run over it, and a model is free to pick an object gigabytes
+   long. Past this bound the replay says it could not decide; it does not
+   quietly substitute a smaller object, because that would be answering a
+   different question than the one the model answered. The bounded violation
+   query exists to get a second model that fits. */
+#define QL_REPLAY_MAX_OBJECT_BYTES UINT64_C(4096)
+#define QL_REPLAY_MAX_MEMORY_OVERRIDES 8192u
+
+typedef struct replay_override {
+    uint64_t address;
+    uint8_t byte;
+} replay_override;
+
+/* The initial memory a model describes: one default byte plus the sparse
+   stores layered on top of it. */
+typedef struct replay_image {
+    uint8_t fill;
+    replay_override *overrides;
+    size_t count;
+    size_t capacity;
+} replay_image;
+
+typedef struct replay_object {
+    uint64_t base;
+    uint64_t model_size;
+    uint64_t size;
+    uint32_t left_base_parameter;
+    uint32_t right_base_parameter;
+    uint8_t *initial;
+} replay_object;
 
 struct ql_replay_witness {
     ql_allocator allocator;
     ql_replay_value_v1 *values;
     size_t count;
+    replay_object *objects;
+    size_t object_count;
+    /* Zero when the model's memory could not be turned into a layout this
+       replay can execute. The caller reports UNKNOWN rather than a verdict. */
+    uint32_t layout_usable;
 };
 
 static const ql_allocator *select_allocator(const ql_allocator *allocator) {
@@ -237,6 +273,167 @@ static int decode_model_value(const char *text, size_t size,
     return 0;
 }
 
+/* --- Memory model decoding ------------------------------------------------ */
+
+static int decode_model_word(const char *text, size_t size, uint32_t width,
+                             uint64_t *output) {
+    uint8_t bytes[QL_REPLAY_MAX_INPUT_BYTES];
+    size_t byte_count = 0u;
+    size_t index;
+
+    *output = 0u;
+    if (width > 64u ||
+        !decode_model_value(text, size, QL_SOURCE_TYPE_UNSIGNED_INTEGER,
+                            width, bytes, &byte_count)) {
+        return 0;
+    }
+    for (index = 0u; index < byte_count && index < 8u; ++index) {
+        *output |= (uint64_t)bytes[index] << (index * 8u);
+    }
+    return 1;
+}
+
+static int image_record(replay_image *image, const ql_allocator *allocator,
+                        uint64_t address, uint8_t byte) {
+    size_t index;
+
+    /* Outer stores are visited first and win, so an address already recorded
+       keeps its byte. */
+    for (index = 0u; index < image->count; ++index) {
+        if (image->overrides[index].address == address) {
+            return 1;
+        }
+    }
+    if (image->count == QL_REPLAY_MAX_MEMORY_OVERRIDES) {
+        return 0;
+    }
+    if (image->count == image->capacity) {
+        const size_t capacity = image->capacity == 0u ? 32u
+                                                      : image->capacity * 2u;
+        void *allocation = allocator->reallocate(
+            allocator->user_data, image->overrides,
+            capacity * sizeof(*image->overrides));
+        if (allocation == NULL) {
+            return 0;
+        }
+        image->overrides = (replay_override *)allocation;
+        image->capacity = capacity;
+    }
+    image->overrides[image->count].address = address;
+    image->overrides[image->count].byte = byte;
+    ++image->count;
+    return 1;
+}
+
+/* `(store (store ((as const (Array ...)) <fill>) <index> <byte>) ...)`, which
+   is how Bitwuzla prints an array model. Anything else is refused rather than
+   guessed at. */
+static int decode_memory_term(const char *text, size_t size,
+                              const ql_allocator *allocator,
+                              replay_image *image) {
+    replay_scanner scanner;
+    const char *head;
+    size_t head_size;
+    const char *index_text;
+    size_t index_size;
+    const char *value_text;
+    size_t value_size;
+    uint64_t address;
+    uint64_t byte;
+
+    for (;;) {
+        if (size < 2u || text[0] != '(') {
+            return 0;
+        }
+        scanner.text = text + 1;
+        scanner.size = size - 2u;
+        scanner.cursor = 0u;
+        if (!scanner_next(&scanner, &head, &head_size)) {
+            return 0;
+        }
+        if (token_equals(head, head_size, "store")) {
+            if (!scanner_next(&scanner, &head, &head_size) ||
+                !scanner_next(&scanner, &index_text, &index_size) ||
+                !scanner_next(&scanner, &value_text, &value_size)) {
+                return 0;
+            }
+            if (!decode_model_word(index_text, index_size, 64u, &address) ||
+                !decode_model_word(value_text, value_size, 8u, &byte) ||
+                !image_record(image, allocator, address, (uint8_t)byte)) {
+                return 0;
+            }
+            text = head;
+            size = head_size;
+            continue;
+        }
+        /* `((as const (Array ...)) <fill>)`: the head is the constant-array
+           application and the next datum is the byte it repeats. */
+        if (head_size > 2u && head[0] == '(' &&
+            scanner_next(&scanner, &value_text, &value_size) &&
+            decode_model_word(value_text, value_size, 8u, &byte)) {
+            image->fill = (uint8_t)byte;
+            return 1;
+        }
+        return 0;
+    }
+}
+
+/* Builds the layout the interpreter will run over. It is the model's own
+   layout: the standing constraints are re-checked here rather than assumed,
+   so a model that somehow escaped them leaves the replay undecided. */
+static int build_objects(ql_replay_witness *witness, const replay_image *image,
+                         int memory_seen) {
+    const ql_allocator *allocator = &witness->allocator;
+    size_t index;
+
+    if (witness->object_count == 0u) {
+        witness->layout_usable = 1u;
+        return 1;
+    }
+    if (!memory_seen) {
+        return 1;
+    }
+    for (index = 0u; index < witness->object_count; ++index) {
+        replay_object *object = &witness->objects[index];
+        size_t byte;
+
+        if (object->model_size == 0u ||
+            object->model_size > QL_REPLAY_MAX_OBJECT_BYTES ||
+            object->base < QL_IR_INTERP_FIRST_OBJECT_ADDRESS ||
+            object->model_size > UINT64_MAX - object->base) {
+            return 1;
+        }
+        object->size = object->model_size;
+        object->initial = allocator->allocate(allocator->user_data,
+                                              (size_t)object->size);
+        if (object->initial == NULL) {
+            return 0;
+        }
+        memset(object->initial, image->fill, (size_t)object->size);
+        for (byte = 0u; byte < image->count; ++byte) {
+            const uint64_t address = image->overrides[byte].address;
+            if (address < object->base ||
+                address - object->base >= object->size) {
+                continue;
+            }
+            object->initial[address - object->base] =
+                image->overrides[byte].byte;
+        }
+    }
+    for (index = 1u; index < witness->object_count; ++index) {
+        size_t other;
+        for (other = 0u; other < index; ++other) {
+            const replay_object *a = &witness->objects[other];
+            const replay_object *b = &witness->objects[index];
+            if (b->base < a->base + a->size && a->base < b->base + b->size) {
+                return 1;
+            }
+        }
+    }
+    witness->layout_usable = 1u;
+    return 1;
+}
+
 ql_status QL_CALL ql_replay_decode_model(const ql_allocator *allocator,
                                          const ql_product_query *query,
                                          const ql_artifact *model,
@@ -248,6 +445,9 @@ ql_status QL_CALL ql_replay_decode_model(const ql_allocator *allocator,
     ql_replay_witness *witness;
     uint8_t *seen = NULL;
     replay_scanner scanner;
+    replay_image image;
+    const char *memory_symbol;
+    int memory_seen = 0;
     size_t index;
     ql_status status;
 
@@ -285,8 +485,34 @@ ql_status QL_CALL ql_replay_decode_model(const ql_allocator *allocator,
         return QL_STATUS_OUT_OF_MEMORY;
     }
     memset(witness, 0, sizeof(*witness));
+    memset(&image, 0, sizeof(image));
     witness->allocator = *selected;
     witness->count = query_view.input_count;
+    witness->object_count = ql_product_query_object_count(query);
+    memory_symbol = ql_product_query_memory_symbol(query);
+    if (witness->object_count != 0u) {
+        witness->objects = selected->allocate(
+            selected->user_data,
+            witness->object_count * sizeof(*witness->objects));
+        if (witness->objects == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            status = QL_STATUS_OUT_OF_MEMORY;
+            goto cleanup;
+        }
+        memset(witness->objects, 0,
+               witness->object_count * sizeof(*witness->objects));
+        for (index = 0u; index < witness->object_count; ++index) {
+            ql_product_object_v1 object;
+            status = ql_product_query_object_at(query, index, &object, error);
+            if (status != QL_STATUS_OK) {
+                goto cleanup;
+            }
+            witness->objects[index].left_base_parameter =
+                object.left_base_parameter;
+            witness->objects[index].right_base_parameter =
+                object.right_base_parameter;
+        }
+    }
     if (witness->count != 0u) {
         witness->values = selected->allocate(
             selected->user_data, witness->count * sizeof(*witness->values));
@@ -374,6 +600,43 @@ ql_status QL_CALL ql_replay_decode_model(const ql_allocator *allocator,
             seen[index] = 1u;
             break;
         }
+        if (memory_symbol != NULL &&
+            token_equals(symbol, symbol_size, memory_symbol)) {
+            /* A memory the decoder cannot read is not an error about the two
+               functions; it leaves the replay inconclusive. */
+            memory_seen = decode_memory_term(value, value_size, selected,
+                                             &image);
+            continue;
+        }
+        for (index = 0u; index < witness->object_count; ++index) {
+            ql_product_object_v1 object;
+            uint64_t word = 0u;
+            int is_base;
+            status = ql_product_query_object_at(query, index, &object, error);
+            if (status != QL_STATUS_OK) {
+                goto cleanup;
+            }
+            is_base = token_equals(symbol, symbol_size, object.base_symbol);
+            if (!is_base &&
+                !token_equals(symbol, symbol_size, object.size_symbol)) {
+                continue;
+            }
+            if (!decode_model_word(value, value_size, object.address_width,
+                                   &word)) {
+                ql_error_set(error, QL_STATUS_PARSE_ERROR,
+                             "solver model assigns '%s' a value this decoder does not accept",
+                             is_base ? object.base_symbol
+                                     : object.size_symbol);
+                status = QL_STATUS_PARSE_ERROR;
+                goto cleanup;
+            }
+            if (is_base) {
+                witness->objects[index].base = word;
+            } else {
+                witness->objects[index].model_size = word;
+            }
+            break;
+        }
     }
     for (index = 0u; index < witness->count; ++index) {
         if (seen[index] == 0u) {
@@ -383,24 +646,37 @@ ql_status QL_CALL ql_replay_decode_model(const ql_allocator *allocator,
             goto cleanup;
         }
     }
+    if (!build_objects(witness, &image, memory_seen)) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        status = QL_STATUS_OUT_OF_MEMORY;
+        goto cleanup;
+    }
     selected->deallocate(selected->user_data, seen);
+    selected->deallocate(selected->user_data, image.overrides);
     *output = witness;
     ql_error_clear(error);
     return QL_STATUS_OK;
 
 cleanup:
     selected->deallocate(selected->user_data, seen);
+    selected->deallocate(selected->user_data, image.overrides);
     ql_replay_witness_destroy(witness);
     return status;
 }
 
 void QL_CALL ql_replay_witness_destroy(ql_replay_witness *witness) {
     ql_allocator allocator;
+    size_t index;
 
     if (witness == NULL) {
         return;
     }
     allocator = witness->allocator;
+    for (index = 0u; index < witness->object_count; ++index) {
+        allocator.deallocate(allocator.user_data,
+                             witness->objects[index].initial);
+    }
+    allocator.deallocate(allocator.user_data, witness->objects);
     allocator.deallocate(allocator.user_data, witness->values);
     allocator.deallocate(allocator.user_data, witness);
 }
@@ -720,14 +996,29 @@ static ql_status trap_code_of(const ql_ir *ir, ql_ir_block_id block,
     return QL_STATUS_OK;
 }
 
+static void encode_word(uint8_t *bytes, uint64_t value) {
+    size_t index;
+
+    for (index = 0u; index < 8u; ++index) {
+        bytes[index] = (uint8_t)((value >> (index * 8u)) & 0xffu);
+    }
+}
+
+/* `final_images` receives one buffer per object when the caller observes
+   memory, and is null otherwise. */
 static ql_status run_side(const ql_allocator *allocator, const ql_ir *ir,
                           const ql_replay_witness *witness, int is_left,
+                          uint8_t **final_images,
                           ql_replay_outcome_v1 *outcome, ql_error *error) {
     ql_ir_value_id parameters[QL_REPLAY_MAX_PARAMETERS];
     ql_ir_interp_input_v1 inputs[QL_REPLAY_MAX_PARAMETERS];
+    ql_ir_interp_object_v1 objects[QL_REPLAY_MAX_PARAMETERS];
+    uint8_t object_words[QL_REPLAY_MAX_PARAMETERS][8];
     ql_ir_interp_options_v1 options;
     ql_ir_interp_result_v1 result;
     size_t parameter_count = 0u;
+    size_t expected;
+    size_t bound = 0u;
     size_t index;
     ql_status status;
 
@@ -738,10 +1029,13 @@ static ql_status run_side(const ql_allocator *allocator, const ql_ir *ir,
     if (status != QL_STATUS_OK) {
         return status;
     }
-    if (parameter_count != witness->count) {
+    expected = witness->count +
+               (witness->object_count == 0u ? 0u
+                                            : 1u + 2u * witness->object_count);
+    if (parameter_count != expected || expected > QL_REPLAY_MAX_PARAMETERS) {
         ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                     "IR declares %zu parameters but the witness carries %zu inputs",
-                     parameter_count, witness->count);
+                     "IR declares %zu parameters but the witness and its object table imply %zu",
+                     parameter_count, expected);
         return QL_STATUS_TYPE_MISMATCH;
     }
     for (index = 0u; index < witness->count; ++index) {
@@ -754,16 +1048,56 @@ static ql_status run_side(const ql_allocator *allocator, const ql_ir *ir,
                          ordinal);
             return QL_STATUS_TYPE_MISMATCH;
         }
-        ql_ir_interp_input_init(&inputs[index]);
-        inputs[index].value = parameters[ordinal];
-        inputs[index].data = value->bytes;
-        inputs[index].size = value->size;
+        ql_ir_interp_input_init(&inputs[bound]);
+        inputs[bound].value = parameters[ordinal];
+        inputs[bound].data = value->bytes;
+        inputs[bound].size = value->size;
+        ++bound;
     }
     ql_ir_interp_options_init(&options);
+    if (witness->object_count != 0u) {
+        /* The memory parameter sits immediately after the C arguments and
+           carries no bytes; the object table supplies the initial image. */
+        ql_ir_interp_input_init(&inputs[bound]);
+        inputs[bound].value = parameters[witness->count];
+        ++bound;
+        for (index = 0u; index < witness->object_count; ++index) {
+            const replay_object *object = &witness->objects[index];
+            const uint32_t base_ordinal = is_left != 0
+                                              ? object->left_base_parameter
+                                              : object->right_base_parameter;
+            if ((size_t)base_ordinal + 1u >= parameter_count) {
+                ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                             "the object table names parameter %u outside the IR",
+                             base_ordinal);
+                return QL_STATUS_TYPE_MISMATCH;
+            }
+            encode_word(object_words[index * 2u], object->base);
+            encode_word(object_words[index * 2u + 1u], object->size);
+            ql_ir_interp_input_init(&inputs[bound]);
+            inputs[bound].value = parameters[base_ordinal];
+            inputs[bound].data = object_words[index * 2u];
+            inputs[bound].size = 8u;
+            ++bound;
+            ql_ir_interp_input_init(&inputs[bound]);
+            inputs[bound].value = parameters[base_ordinal + 1u];
+            inputs[bound].data = object_words[index * 2u + 1u];
+            inputs[bound].size = 8u;
+            ++bound;
+            ql_ir_interp_object_init(&objects[index]);
+            objects[index].base = object->base;
+            objects[index].size = object->size;
+            objects[index].initial = object->initial;
+            objects[index].final_image =
+                final_images != NULL ? final_images[index] : NULL;
+        }
+        options.objects = objects;
+        options.object_count = witness->object_count;
+    }
     memset(&result, 0, sizeof(result));
     result.struct_size = sizeof(result);
-    status = ql_ir_interp_run(allocator, ir, inputs, witness->count, &options,
-                              &result, error);
+    status = ql_ir_interp_run(allocator, ir, inputs, bound, &options, &result,
+                              error);
     if (status != QL_STATUS_OK) {
         return status;
     }
@@ -817,7 +1151,13 @@ static ql_status run_side(const ql_allocator *allocator, const ql_ir *ir,
 
 static uint32_t observations_agree(const ql_replay_outcome_v1 *left,
                                    const ql_replay_outcome_v1 *right,
-                                   uint64_t observations) {
+                                   uint64_t observations,
+                                   uint32_t memory_agrees) {
+    if ((observations & QL_OBSERVE_MEMORY) != 0u &&
+        left->terminates != 0u && right->terminates != 0u &&
+        memory_agrees == 0u) {
+        return 0u;
+    }
     if ((observations & QL_OBSERVE_RETURN_VALUE) != 0u) {
         if (left->returns != right->returns) {
             return 0u;
@@ -848,9 +1188,10 @@ static uint32_t observations_agree(const ql_replay_outcome_v1 *left,
    agree; a disagreement is exactly what this replay exists to catch. */
 static uint32_t relation_violated(const ql_product_query_view_v1 *query,
                                   const ql_replay_outcome_v1 *left,
-                                  const ql_replay_outcome_v1 *right) {
-    const uint32_t agree =
-        observations_agree(left, right, query->covered_observations);
+                                  const ql_replay_outcome_v1 *right,
+                                  uint32_t memory_agrees) {
+    const uint32_t agree = observations_agree(
+        left, right, query->covered_observations, memory_agrees);
 
     switch (query->ub_policy) {
     case QL_UB_MUST_MATCH:
@@ -883,6 +1224,45 @@ static uint32_t relation_violated(const ql_product_query_view_v1 *query,
     }
 }
 
+static void release_images(const ql_allocator *allocator,
+                           const ql_replay_witness *witness,
+                           uint8_t **images) {
+    size_t index;
+
+    if (images == NULL) {
+        return;
+    }
+    for (index = 0u; index < witness->object_count; ++index) {
+        allocator->deallocate(allocator->user_data, images[index]);
+    }
+    allocator->deallocate(allocator->user_data, images);
+}
+
+static ql_status allocate_images(const ql_allocator *allocator,
+                                 const ql_replay_witness *witness,
+                                 uint8_t ***output, ql_error *error) {
+    uint8_t **images;
+    size_t index;
+
+    images = allocator->allocate(allocator->user_data,
+                                 witness->object_count * sizeof(*images));
+    if (images == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    memset(images, 0, witness->object_count * sizeof(*images));
+    *output = images;
+    for (index = 0u; index < witness->object_count; ++index) {
+        images[index] = allocator->allocate(
+            allocator->user_data, (size_t)witness->objects[index].size);
+        if (images[index] == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+    }
+    return QL_STATUS_OK;
+}
+
 ql_status QL_CALL ql_replay_execute(const ql_allocator *allocator,
                                     const ql_problem *problem,
                                     const ql_product_query *query,
@@ -893,6 +1273,11 @@ ql_status QL_CALL ql_replay_execute(const ql_allocator *allocator,
                                     ql_error *error) {
     const ql_allocator *selected = select_allocator(allocator);
     ql_product_query_view_v1 query_view;
+    uint8_t **left_images = NULL;
+    uint8_t **right_images = NULL;
+    uint32_t memory_agrees = 1u;
+    int observe_memory;
+    size_t index;
     ql_status status;
 
     if (problem == NULL || query == NULL || left_ir == NULL ||
@@ -910,13 +1295,42 @@ ql_status QL_CALL ql_replay_execute(const ql_allocator *allocator,
     if (status != QL_STATUS_OK) {
         return status;
     }
-    status = run_side(selected, left_ir, witness, 1, &result->left, error);
-    if (status != QL_STATUS_OK) {
-        return status;
+    if (witness->object_count != 0u && witness->layout_usable == 0u) {
+        /* The model's memory did not turn into a layout this replay can run.
+           That is a statement about this decoder, not about the functions. */
+        result->conclusive = 0u;
+        ql_error_clear(error);
+        return QL_STATUS_OK;
     }
-    status = run_side(selected, right_ir, witness, 0, &result->right, error);
+    observe_memory = witness->object_count != 0u &&
+                     (query_view.covered_observations & QL_OBSERVE_MEMORY) !=
+                         0u;
+    if (observe_memory) {
+        status = allocate_images(selected, witness, &left_images, error);
+        if (status == QL_STATUS_OK) {
+            status = allocate_images(selected, witness, &right_images, error);
+        }
+        if (status != QL_STATUS_OK) {
+            goto cleanup;
+        }
+    }
+    status = run_side(selected, left_ir, witness, 1, left_images,
+                      &result->left, error);
     if (status != QL_STATUS_OK) {
-        return status;
+        goto cleanup;
+    }
+    status = run_side(selected, right_ir, witness, 0, right_images,
+                      &result->right, error);
+    if (status != QL_STATUS_OK) {
+        goto cleanup;
+    }
+    for (index = 0u; observe_memory && index < witness->object_count;
+         ++index) {
+        if (memcmp(left_images[index], right_images[index],
+                   (size_t)witness->objects[index].size) != 0) {
+            memory_agrees = 0u;
+            break;
+        }
     }
     result->precondition_evaluated =
         check_precondition(selected, problem, witness,
@@ -927,14 +1341,20 @@ ql_status QL_CALL ql_replay_execute(const ql_allocator *allocator,
         result->left.conclusive == 0u || result->right.conclusive == 0u ||
         result->precondition_holds == 0u) {
         result->conclusive = 0u;
+        status = QL_STATUS_OK;
         ql_error_clear(error);
-        return QL_STATUS_OK;
+        goto cleanup;
     }
     result->conclusive = 1u;
-    result->violated =
-        relation_violated(&query_view, &result->left, &result->right);
+    result->violated = relation_violated(&query_view, &result->left,
+                                         &result->right, memory_agrees);
+    status = QL_STATUS_OK;
     ql_error_clear(error);
-    return QL_STATUS_OK;
+
+cleanup:
+    release_images(selected, witness, left_images);
+    release_images(selected, witness, right_images);
+    return status;
 }
 
 /* --- Counterexample artifact ---------------------------------------------- */

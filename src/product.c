@@ -8,11 +8,28 @@
 
 #define QL_PRODUCT_SYMBOL_CAPACITY 40u
 #define QL_PRODUCT_MAX_BV_WIDTH 1024u
+/* The ASM2C_GNU_V1 profile is a flat 64-bit address space of bytes. */
+#define QL_PRODUCT_ADDRESS_WIDTH 64u
+#define QL_PRODUCT_BYTE_WIDTH 8u
+/* An access wider than this is left to a later slice rather than encoded with
+   a byte count the concrete replay cannot reproduce. */
+#define QL_PRODUCT_MAX_ACCESS_WIDTH 128u
+/* The size bound the search-only violation query imposes so a model can be
+   materialized and replayed. It matches QL_REPLAY_MAX_OBJECT_BYTES. */
+#define QL_PRODUCT_REPLAYABLE_OBJECT_BYTES UINT64_C(4096)
 
 #define QL_PRODUCT_PRECONDITION_SYMBOL "quodlibet_precondition"
 #define QL_PRODUCT_OBSERVATION_SYMBOL "quodlibet_observation_equal"
 #define QL_PRODUCT_DOMAIN_SYMBOL "quodlibet_domain"
 #define QL_PRODUCT_VIOLATION_SYMBOL "quodlibet_violation"
+#define QL_PRODUCT_ASSUMPTION_SYMBOL "quodlibet_assumptions"
+#define QL_PRODUCT_MEMORY_SYMBOL "mem0"
+/* One free address constant states the whole final-memory comparison. In the
+   violation query a free constant is existential, which is exactly "some
+   address differs"; in the same query answered UNSAT it is universal, which is
+   exactly "every address agrees". One constant is precise in both directions,
+   and no quantifier enters the logic. */
+#define QL_PRODUCT_PROBE_SYMBOL "mem_probe"
 
 static const char product_violation_assertion[] =
     "(assert " QL_PRODUCT_VIOLATION_SYMBOL ")\n";
@@ -31,6 +48,8 @@ typedef struct product_buffer {
 typedef struct product_site {
     ql_ir_block_id block;
     ql_ir_value_id value;
+    /* The terminal memory a return carries, or the invalid sentinel. */
+    ql_ir_value_id memory;
     uint64_t code;
 } product_site;
 
@@ -52,6 +71,8 @@ typedef struct product_side {
     char *value_symbols;
     ql_ir_type_kind *value_kinds;
     uint32_t *value_widths;
+    /* Pointee width, in bits, for every pointer-typed value. Zero elsewhere. */
+    uint32_t *value_element_widths;
     product_edge *edges;
     size_t edge_count;
     ql_ir_block_id *order;
@@ -60,9 +81,23 @@ typedef struct product_side {
     product_site_list traps;
     product_site_list undefined;
     product_site_list diverges;
+    product_site_list assumes;
     ql_ir_type_kind return_kind;
     uint32_t return_width;
+    /* One shared object index per pointer parameter of this side, in this
+       side's own parameter order. */
+    const uint32_t *object_map;
+    size_t argument_count;
+    size_t object_count;
 } product_side;
+
+/* One storage region, named once and bound on both sides. */
+typedef struct product_object {
+    char base_symbol[QL_PRODUCT_SYMBOL_CAPACITY];
+    char size_symbol[QL_PRODUCT_SYMBOL_CAPACITY];
+    uint32_t left_base_parameter;
+    uint32_t right_base_parameter;
+} product_object;
 
 typedef struct product_encoder {
     const ql_allocator *allocator;
@@ -70,6 +105,8 @@ typedef struct product_encoder {
     product_buffer term;
     const ql_product_input_v1 *inputs;
     size_t input_count;
+    const product_object *objects;
+    size_t object_count;
     ql_error *error;
 } product_encoder;
 
@@ -78,8 +115,11 @@ struct ql_product_query {
     ql_product_query_view_v1 view;
     ql_product_input_v1 *inputs;
     char *input_symbols;
+    product_object *objects;
+    size_t object_count;
     ql_artifact *prefix;
     ql_artifact *violation;
+    ql_artifact *bounded_violation;
     ql_artifact *domain;
 };
 
@@ -165,7 +205,7 @@ static ql_status term_add_bytes(product_encoder *encoder, const char *bytes,
 }
 
 static ql_status term_addf(product_encoder *encoder, const char *format, ...) {
-    char scratch[QL_PRODUCT_SYMBOL_CAPACITY + 32u];
+    char scratch[256];
     va_list arguments;
     int count;
 
@@ -200,6 +240,7 @@ static ql_status site_list_add(product_site_list *list,
     }
     list->items[list->count].block = block;
     list->items[list->count].value = value;
+    list->items[list->count].memory = QL_IR_INVALID_VALUE_ID;
     list->items[list->count].code = code;
     ++list->count;
     return QL_STATUS_OK;
@@ -244,10 +285,20 @@ static int opcode_is_supported(ql_ir_opcode opcode) {
     case QL_IR_OPCODE_SEXT:
     case QL_IR_OPCODE_TRUNC:
     case QL_IR_OPCODE_UB_GUARD:
+    case QL_IR_OPCODE_PTR_ADD:
+    case QL_IR_OPCODE_PTR_TO_BV:
+    case QL_IR_OPCODE_BV_TO_PTR:
+    case QL_IR_OPCODE_LOAD:
+    case QL_IR_OPCODE_STORE:
+    case QL_IR_OPCODE_ASSUME:
         return 1;
     default:
         return 0;
     }
+}
+
+static int opcode_is_memory_access(ql_ir_opcode opcode) {
+    return opcode == QL_IR_OPCODE_LOAD || opcode == QL_IR_OPCODE_STORE;
 }
 
 /* Refuses everything the scalar miter cannot state, so no observation axis is
@@ -267,10 +318,19 @@ static ql_status check_ir_fragment(const ql_ir *ir,
             return status;
         }
         if (type.kind != QL_IR_TYPE_VOID && type.kind != QL_IR_TYPE_BOOL &&
-            type.kind != QL_IR_TYPE_BIT_VECTOR) {
+            type.kind != QL_IR_TYPE_BIT_VECTOR &&
+            type.kind != QL_IR_TYPE_POINTER &&
+            type.kind != QL_IR_TYPE_MEMORY) {
             ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                         "%s IR uses a non-scalar type; pointers, floats, aggregates, memory, and event traces are outside the loop-free scalar miter",
+                         "%s IR uses a type the miter cannot state; floats, aggregates, and event traces are outside this fragment",
                          side);
+            return QL_STATUS_TYPE_MISMATCH;
+        }
+        if (type.kind == QL_IR_TYPE_POINTER &&
+            type.bit_width != QL_PRODUCT_ADDRESS_WIDTH) {
+            ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                         "%s IR uses a %u-bit pointer; the flat memory model this miter encodes is a %u-bit address space",
+                         side, type.bit_width, QL_PRODUCT_ADDRESS_WIDTH);
             return QL_STATUS_TYPE_MISMATCH;
         }
         if (type.kind == QL_IR_TYPE_BIT_VECTOR &&
@@ -298,9 +358,21 @@ static ql_status check_ir_fragment(const ql_ir *ir,
         if (instruction.opcode == QL_IR_OPCODE_UB_GUARD) {
             continue;
         }
+        /* A load or a store carries exactly the memory effect and nothing
+           else. Every other effect names an axis this encoding has no term
+           for, so it is refused instead of dropped. */
+        if (opcode_is_memory_access(instruction.opcode)) {
+            if (instruction.effects != QL_IR_EFFECT_MEMORY) {
+                ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                             "%s IR access carries a volatile, atomic, or I/O effect that this miter does not model",
+                             side);
+                return QL_STATUS_TYPE_MISMATCH;
+            }
+            continue;
+        }
         if (instruction.effects != QL_IR_EFFECT_NONE) {
             ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                         "%s IR has a memory, call, volatile, atomic, or I/O effect that the scalar miter does not model",
+                         "%s IR has a call, volatile, atomic, or I/O effect that this miter does not model",
                          side);
             return QL_STATUS_TYPE_MISMATCH;
         }
@@ -313,10 +385,9 @@ static ql_status check_ir_fragment(const ql_ir *ir,
         if (status != QL_STATUS_OK) {
             return status;
         }
-        if (block.terminator.memory != QL_IR_INVALID_VALUE_ID ||
-            block.terminator.event_trace != QL_IR_INVALID_VALUE_ID) {
+        if (block.terminator.event_trace != QL_IR_INVALID_VALUE_ID) {
             ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                         "%s IR observes terminal memory or an event trace, which the scalar miter does not model",
+                         "%s IR observes an event trace, which this miter does not model",
                          side);
             return QL_STATUS_TYPE_MISMATCH;
         }
@@ -348,6 +419,7 @@ static void side_dispose(product_side *side, const ql_allocator *allocator) {
     allocator->deallocate(allocator->user_data, side->value_symbols);
     allocator->deallocate(allocator->user_data, side->value_kinds);
     allocator->deallocate(allocator->user_data, side->value_widths);
+    allocator->deallocate(allocator->user_data, side->value_element_widths);
     allocator->deallocate(allocator->user_data, side->edges);
     allocator->deallocate(allocator->user_data, side->order);
     site_list_dispose(&side->guards, allocator);
@@ -355,12 +427,16 @@ static void side_dispose(product_side *side, const ql_allocator *allocator) {
     site_list_dispose(&side->traps, allocator);
     site_list_dispose(&side->undefined, allocator);
     site_list_dispose(&side->diverges, allocator);
+    site_list_dispose(&side->assumes, allocator);
     memset(side, 0, sizeof(*side));
 }
 
+/* `element_width` is the pointee's bit width for a pointer type and zero
+   otherwise; a load or a store needs it to know how many bytes it moves. */
 static ql_status side_type_of(const ql_ir *ir, const ql_ir_view_v1 *view,
                               ql_ir_type_id type_id, ql_ir_type_kind *kind,
-                              uint32_t *width, ql_error *error) {
+                              uint32_t *width, uint32_t *element_width,
+                              ql_error *error) {
     ql_ir_type_view_v1 type;
 
     if (type_id >= view->type_count) {
@@ -375,6 +451,23 @@ static ql_status side_type_of(const ql_ir *ir, const ql_ir_view_v1 *view,
     }
     *kind = type.kind;
     *width = type.bit_width;
+    if (element_width != NULL) {
+        *element_width = 0u;
+    }
+    if (type.kind == QL_IR_TYPE_POINTER && element_width != NULL) {
+        ql_ir_type_view_v1 element;
+        memset(&element, 0, sizeof(element));
+        element.struct_size = sizeof(element);
+        if (type.element_type >= view->type_count ||
+            ql_ir_type_at(ir, type.element_type, &element, error) !=
+                QL_STATUS_OK) {
+            ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                         "IR pointer type %u has no readable pointee", type_id);
+            return QL_STATUS_TYPE_MISMATCH;
+        }
+        *element_width = element.kind == QL_IR_TYPE_BOOL ? 1u
+                                                         : element.bit_width;
+    }
     return QL_STATUS_OK;
 }
 
@@ -465,10 +558,77 @@ static ql_status side_collect_edges(product_side *side,
     return QL_STATUS_OK;
 }
 
+/* Parameters beyond the C arguments are the memory model's own: one memory
+   value, then a base and a size per pointer argument in this side's source
+   order. Every one of them is bound to a symbol both sides share, which is
+   what makes the two functions run over the same objects and the same initial
+   memory without either side describing the table to the other. */
+static ql_status side_parameter_symbol(product_side *side,
+                                       const ql_product_input_v1 *inputs,
+                                       size_t input_count,
+                                       const product_object *objects,
+                                       size_t object_count,
+                                       size_t parameter_index, char *symbol,
+                                       ql_error *error) {
+    size_t input;
+    size_t offset;
+    size_t local;
+    int written;
+
+    if (parameter_index < input_count) {
+        for (input = 0u; input < input_count; ++input) {
+            const uint32_t ordinal = side->prefix == 'l'
+                                         ? inputs[input].left_parameter
+                                         : inputs[input].right_parameter;
+            if ((size_t)ordinal == parameter_index) {
+                break;
+            }
+        }
+        if (input == input_count) {
+            ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                         "IR parameter %zu has no argument correspondence",
+                         parameter_index);
+            return QL_STATUS_TYPE_MISMATCH;
+        }
+        written = snprintf(symbol, QL_PRODUCT_SYMBOL_CAPACITY, "%s",
+                           inputs[input].symbol);
+    } else if (object_count == 0u) {
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "IR parameter %zu is outside the signature and no object table explains it",
+                     parameter_index);
+        return QL_STATUS_TYPE_MISMATCH;
+    } else if (parameter_index == input_count) {
+        written = snprintf(symbol, QL_PRODUCT_SYMBOL_CAPACITY, "%s",
+                           QL_PRODUCT_MEMORY_SYMBOL);
+    } else {
+        offset = parameter_index - input_count - 1u;
+        local = offset / 2u;
+        if (local >= object_count) {
+            ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                         "IR parameter %zu is past the object table this signature implies",
+                         parameter_index);
+            return QL_STATUS_TYPE_MISMATCH;
+        }
+        written = snprintf(symbol, QL_PRODUCT_SYMBOL_CAPACITY, "%s",
+                           (offset % 2u) == 0u
+                               ? objects[side->object_map[local]].base_symbol
+                               : objects[side->object_map[local]].size_symbol);
+    }
+    if (written < 0 || (size_t)written >= QL_PRODUCT_SYMBOL_CAPACITY) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "could not format an IR value symbol");
+        return QL_STATUS_INTERNAL_ERROR;
+    }
+    return QL_STATUS_OK;
+}
+
 static ql_status side_prepare(product_side *side, const ql_ir *ir,
                               char prefix, const ql_allocator *allocator,
                               const ql_product_input_v1 *inputs,
-                              size_t input_count, ql_error *error) {
+                              size_t input_count,
+                              const product_object *objects,
+                              size_t object_count,
+                              const uint32_t *object_map, ql_error *error) {
     size_t index;
     size_t parameter_index = 0u;
     ql_status status;
@@ -476,6 +636,9 @@ static ql_status side_prepare(product_side *side, const ql_ir *ir,
     memset(side, 0, sizeof(*side));
     side->ir = ir;
     side->prefix = prefix;
+    side->argument_count = input_count;
+    side->object_count = object_count;
+    side->object_map = object_map;
     side->view.struct_size = sizeof(side->view);
     status = ql_ir_get_view(ir, &side->view, error);
     if (status != QL_STATUS_OK) {
@@ -490,10 +653,14 @@ static ql_status side_prepare(product_side *side, const ql_ir *ir,
     side->value_widths = allocator->allocate(
         allocator->user_data,
         side->view.value_count * sizeof(*side->value_widths));
+    side->value_element_widths = allocator->allocate(
+        allocator->user_data,
+        side->view.value_count * sizeof(*side->value_element_widths));
     side->order = allocator->allocate(
         allocator->user_data, side->view.block_count * sizeof(*side->order));
     if (side->value_symbols == NULL || side->value_kinds == NULL ||
-        side->value_widths == NULL || side->order == NULL) {
+        side->value_widths == NULL || side->value_element_widths == NULL ||
+        side->order == NULL) {
         ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
         return QL_STATUS_OUT_OF_MEMORY;
     }
@@ -511,42 +678,41 @@ static ql_status side_prepare(product_side *side, const ql_ir *ir,
         }
         status = side_type_of(ir, &side->view, value.type,
                               &side->value_kinds[index],
-                              &side->value_widths[index], error);
+                              &side->value_widths[index],
+                              &side->value_element_widths[index], error);
         if (status != QL_STATUS_OK) {
             return status;
         }
         if (value.definition_kind == QL_IR_VALUE_PARAMETER) {
-            /* Both sides share one symbol per corresponding argument. */
-            size_t input;
-            for (input = 0u; input < input_count; ++input) {
-                const uint32_t ordinal = prefix == 'l'
-                                             ? inputs[input].left_parameter
-                                             : inputs[input].right_parameter;
-                if ((size_t)ordinal == parameter_index) {
-                    break;
-                }
+            status = side_parameter_symbol(side, inputs, input_count, objects,
+                                           object_count, parameter_index,
+                                           symbol, error);
+            if (status != QL_STATUS_OK) {
+                return status;
             }
-            if (input == input_count) {
-                ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                             "IR parameter %zu has no argument correspondence",
-                             parameter_index);
-                return QL_STATUS_TYPE_MISMATCH;
-            }
-            written = snprintf(symbol, QL_PRODUCT_SYMBOL_CAPACITY, "%s",
-                               inputs[input].symbol);
             ++parameter_index;
-        } else {
-            written = snprintf(symbol, QL_PRODUCT_SYMBOL_CAPACITY, "%c_v%u",
-                               prefix, (unsigned)index);
+            continue;
         }
+        written = snprintf(symbol, QL_PRODUCT_SYMBOL_CAPACITY, "%c_v%u",
+                           prefix, (unsigned)index);
         if (written < 0 || (size_t)written >= QL_PRODUCT_SYMBOL_CAPACITY) {
             ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
                          "could not format an IR value symbol");
             return QL_STATUS_INTERNAL_ERROR;
         }
     }
+    if (parameter_index !=
+        input_count + (object_count == 0u ? 0u : 1u + 2u * object_count)) {
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "IR declares %zu parameters but the signature and its object table imply %zu",
+                     parameter_index,
+                     input_count +
+                         (object_count == 0u ? 0u : 1u + 2u * object_count));
+        return QL_STATUS_TYPE_MISMATCH;
+    }
     status = side_type_of(ir, &side->view, side->view.return_type,
-                          &side->return_kind, &side->return_width, error);
+                          &side->return_kind, &side->return_width, NULL,
+                          error);
     if (status != QL_STATUS_OK) {
         return status;
     }
@@ -572,10 +738,21 @@ static ql_status emit_bv(product_encoder *encoder, const char *symbol,
                                      encoder->error);
 }
 
+static ql_status emit_memory(product_encoder *encoder, const char *symbol) {
+    return ql_smt2_builder_define_array(
+        encoder->builder, symbol, QL_PRODUCT_ADDRESS_WIDTH,
+        QL_PRODUCT_BYTE_WIDTH, buffer_text(&encoder->term), encoder->error);
+}
+
+/* A pointer is an address and nothing more under this profile, so it takes the
+   same bit-vector sort as its width. */
 static ql_status emit_sorted(product_encoder *encoder, const char *symbol,
                              ql_ir_type_kind kind, uint32_t width) {
     if (kind == QL_IR_TYPE_BOOL) {
         return emit_bool(encoder, symbol);
+    }
+    if (kind == QL_IR_TYPE_MEMORY) {
+        return emit_memory(encoder, symbol);
     }
     return emit_bv(encoder, symbol, width);
 }
@@ -687,6 +864,134 @@ static ql_status term_block_symbol(product_encoder *encoder,
     return term_addf(encoder, "%c_b%u", side->prefix, (unsigned)block);
 }
 
+/* `<pointer>` for byte zero and `(bvadd <pointer> (_ bvN 64))` beyond it. */
+static ql_status term_byte_address(product_encoder *encoder,
+                                   const product_side *side,
+                                   ql_ir_value_id pointer, size_t byte) {
+    ql_status status;
+
+    if (byte == 0u) {
+        return term_add(encoder, side_value_symbol((product_side *)side,
+                                                   pointer));
+    }
+    status = term_add(encoder, "(bvadd ");
+    if (status == QL_STATUS_OK) {
+        status = term_add(encoder,
+                          side_value_symbol((product_side *)side, pointer));
+    }
+    if (status == QL_STATUS_OK) {
+        status = term_addf(encoder, " (_ bv%zu %u))", byte,
+                           QL_PRODUCT_ADDRESS_WIDTH);
+    }
+    return status;
+}
+
+/* Byte order is little-endian, the same order src/ir_interp.c reads and writes
+   under this profile. The two must agree byte for byte or the replay would
+   contradict the query it is checking. */
+static ql_status check_access_width(product_encoder *encoder, uint32_t width,
+                                    size_t *byte_count) {
+    if (width == 0u || (width % QL_PRODUCT_BYTE_WIDTH) != 0u ||
+        width > QL_PRODUCT_MAX_ACCESS_WIDTH) {
+        ql_error_set(encoder->error, QL_STATUS_TYPE_MISMATCH,
+                     "a %u-bit memory access is not a whole number of bytes this miter encodes",
+                     width);
+        return QL_STATUS_TYPE_MISMATCH;
+    }
+    *byte_count = (size_t)(width / QL_PRODUCT_BYTE_WIDTH);
+    return QL_STATUS_OK;
+}
+
+static ql_status term_selected_byte(product_encoder *encoder,
+                                    product_side *side,
+                                    const ql_ir_instruction_view_v1 *view,
+                                    size_t byte) {
+    ql_status status = term_add(encoder, "(select ");
+
+    if (status == QL_STATUS_OK) {
+        status = term_add(encoder, side_value_symbol(side, view->operands[0]));
+    }
+    if (status == QL_STATUS_OK) {
+        status = term_add(encoder, " ");
+    }
+    if (status == QL_STATUS_OK) {
+        status = term_byte_address(encoder, side, view->operands[1], byte);
+    }
+    if (status == QL_STATUS_OK) {
+        status = term_add(encoder, ")");
+    }
+    return status;
+}
+
+/* concat puts the most significant byte first, and under little-endian that is
+   the byte at the highest address. */
+static ql_status encode_load(product_encoder *encoder, product_side *side,
+                             const ql_ir_instruction_view_v1 *view,
+                             uint32_t width) {
+    size_t byte_count;
+    size_t byte;
+    ql_status status = check_access_width(encoder, width, &byte_count);
+
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    for (byte = 0u; byte + 1u < byte_count && status == QL_STATUS_OK; ++byte) {
+        status = term_add(encoder, "(concat ");
+    }
+    if (status == QL_STATUS_OK) {
+        status = term_selected_byte(encoder, side, view, byte_count - 1u);
+    }
+    for (byte = byte_count - 1u; byte != 0u && status == QL_STATUS_OK;
+         --byte) {
+        status = term_add(encoder, " ");
+        if (status == QL_STATUS_OK) {
+            status = term_selected_byte(encoder, side, view, byte - 1u);
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder, ")");
+        }
+    }
+    return status;
+}
+
+static ql_status encode_store(product_encoder *encoder, product_side *side,
+                              const ql_ir_instruction_view_v1 *view,
+                              uint32_t width) {
+    size_t byte_count;
+    size_t byte;
+    ql_status status = check_access_width(encoder, width, &byte_count);
+
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    for (byte = 0u; byte < byte_count && status == QL_STATUS_OK; ++byte) {
+        status = term_add(encoder, "(store ");
+    }
+    if (status == QL_STATUS_OK) {
+        status = term_add(encoder, side_value_symbol(side, view->operands[0]));
+    }
+    for (byte = 0u; byte < byte_count && status == QL_STATUS_OK; ++byte) {
+        status = term_add(encoder, " ");
+        if (status == QL_STATUS_OK) {
+            status = term_byte_address(encoder, side, view->operands[1], byte);
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_addf(encoder, " ((_ extract %zu %zu) ",
+                               byte * QL_PRODUCT_BYTE_WIDTH +
+                                   QL_PRODUCT_BYTE_WIDTH - 1u,
+                               byte * QL_PRODUCT_BYTE_WIDTH);
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder,
+                              side_value_symbol(side, view->operands[2]));
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder, "))");
+        }
+    }
+    return status;
+}
+
 static ql_status encode_instruction(product_encoder *encoder,
                                     product_side *side,
                                     const ql_ir_instruction_view_v1 *view,
@@ -701,6 +1006,13 @@ static ql_status encode_instruction(product_encoder *encoder,
 
     if (view->opcode == QL_IR_OPCODE_UB_GUARD) {
         return site_list_add(&side->guards, allocator, block,
+                             view->operands[0], 0u, encoder->error);
+    }
+    if (view->opcode == QL_IR_OPCODE_ASSUME) {
+        /* The model's disjointness, first-page, and no-wrap constraints reach
+           the query through this list. They are not restated here; the
+           lowering already put them in the IR. */
+        return site_list_add(&side->assumes, allocator, block,
                              view->operands[0], 0u, encoder->error);
     }
     result = view->results[0];
@@ -790,6 +1102,49 @@ static ql_status encode_instruction(product_encoder *encoder,
         if (status == QL_STATUS_OK) {
             status = term_add(encoder, ")");
         }
+        break;
+    case QL_IR_OPCODE_PTR_TO_BV:
+    case QL_IR_OPCODE_BV_TO_PTR:
+        /* The type rule fixes both sides to the same width, so an address and
+           the integer that spells it are the same term. */
+        status = term_add(encoder,
+                          side_value_symbol(side, view->operands[0]));
+        break;
+    case QL_IR_OPCODE_PTR_ADD:
+        if (side->value_widths[view->operands[1]] !=
+            side->value_widths[view->operands[0]]) {
+            ql_error_set(encoder->error, QL_STATUS_TYPE_MISMATCH,
+                         "IR adds a %u-bit offset to a %u-bit pointer; widening it here would invent a rule the interpreter does not share",
+                         side->value_widths[view->operands[1]],
+                         side->value_widths[view->operands[0]]);
+            return QL_STATUS_TYPE_MISMATCH;
+        }
+        status = term_add(encoder, "(bvadd ");
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder,
+                              side_value_symbol(side, view->operands[0]));
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder, " ");
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder,
+                              side_value_symbol(side, view->operands[1]));
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder, ")");
+        }
+        break;
+    case QL_IR_OPCODE_LOAD:
+        status = encode_load(encoder, side, view,
+                             kind == QL_IR_TYPE_BOOL ? 1u : width);
+        break;
+    case QL_IR_OPCODE_STORE:
+        status = encode_store(
+            encoder, side, view,
+            side->value_kinds[view->operands[2]] == QL_IR_TYPE_BOOL
+                ? 1u
+                : side->value_widths[view->operands[2]]);
         break;
     case QL_IR_OPCODE_PHI:
         status = QL_STATUS_OK;
@@ -1054,6 +1409,34 @@ static ql_status encode_reachability_disjunction(
     return emit_bool(encoder, symbol);
 }
 
+static size_t side_memory_carrier_count(const product_side *side) {
+    size_t index;
+    size_t count = 0u;
+
+    for (index = 0u; index < side->returns.count; ++index) {
+        if (side->returns.items[index].memory != QL_IR_INVALID_VALUE_ID) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+static const product_site *side_memory_carrier_at(const product_side *side,
+                                                  size_t ordinal) {
+    size_t index;
+
+    for (index = 0u; index < side->returns.count; ++index) {
+        if (side->returns.items[index].memory == QL_IR_INVALID_VALUE_ID) {
+            continue;
+        }
+        if (ordinal == 0u) {
+            return &side->returns.items[index];
+        }
+        --ordinal;
+    }
+    return NULL;
+}
+
 static ql_status encode_side_aggregates(product_encoder *encoder,
                                         product_side *side) {
     char symbol[QL_PRODUCT_SYMBOL_CAPACITY];
@@ -1192,6 +1575,63 @@ static ql_status encode_side_aggregates(product_encoder *encoder,
         }
     }
 
+    /* The memory a run leaves behind is the memory of whichever return it
+       reached. A run that traps or diverges leaves none, and the comparison
+       below is gated on both sides terminating for exactly that reason. */
+    if (side->object_count != 0u) {
+        const size_t carriers = side_memory_carrier_count(side);
+        size_t carrier;
+
+        (void)snprintf(symbol, sizeof(symbol), "%c_final_memory",
+                       side->prefix);
+        buffer_reset(&encoder->term);
+        status = QL_STATUS_OK;
+        if (carriers == 0u) {
+            /* Nothing returns, so nothing is left behind. The initial memory
+               stands and the gate below keeps it from being observed. */
+            status = term_add(encoder, QL_PRODUCT_MEMORY_SYMBOL);
+        } else {
+            for (carrier = 0u; carrier + 1u < carriers &&
+                               status == QL_STATUS_OK;
+                 ++carrier) {
+                const product_site *site =
+                    side_memory_carrier_at(side, carrier);
+                status = term_add(encoder, "(ite ");
+                if (status == QL_STATUS_OK) {
+                    status = term_block_symbol(encoder, side, site->block);
+                }
+                if (status == QL_STATUS_OK) {
+                    status = term_add(encoder, " ");
+                }
+                if (status == QL_STATUS_OK) {
+                    status = term_add(encoder,
+                                      side_value_symbol(side, site->memory));
+                }
+                if (status == QL_STATUS_OK) {
+                    status = term_add(encoder, " ");
+                }
+            }
+            if (status == QL_STATUS_OK) {
+                status = term_add(
+                    encoder,
+                    side_value_symbol(
+                        side,
+                        side_memory_carrier_at(side, carriers - 1u)->memory));
+            }
+            for (carrier = 0u; carrier + 1u < carriers &&
+                               status == QL_STATUS_OK;
+                 ++carrier) {
+                status = term_add(encoder, ")");
+            }
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_memory(encoder, symbol);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+
     (void)snprintf(symbol, sizeof(symbol), "%c_trap_code", side->prefix);
     buffer_reset(&encoder->term);
     status = QL_STATUS_OK;
@@ -1270,6 +1710,10 @@ static ql_status encode_side(product_encoder *encoder, product_side *side,
             status = site_list_add(&side->returns, allocator, block_id,
                                    block.terminator.return_value, 0u,
                                    encoder->error);
+            if (status == QL_STATUS_OK) {
+                side->returns.items[side->returns.count - 1u].memory =
+                    block.terminator.memory;
+            }
             break;
         case QL_IR_TERMINATOR_TRAP:
             status = site_list_add(&side->traps, allocator, block_id,
@@ -1469,6 +1913,79 @@ static ql_status encode_precondition(product_encoder *encoder,
 
 /* --- Relation obligations ------------------------------------------------- */
 
+/* Every ASSUME the lowering emitted, conditioned on its block being reached.
+   These carry the memory model's standing constraints into the query, so both
+   the violation and the domain range over admissible object layouts only. */
+static ql_status encode_assumptions(product_encoder *encoder,
+                                    const product_side *left,
+                                    const product_side *right) {
+    const product_side *sides[2];
+    size_t which;
+    size_t index;
+    ql_status status;
+
+    sides[0] = left;
+    sides[1] = right;
+    buffer_reset(&encoder->term);
+    if (left->assumes.count == 0u && right->assumes.count == 0u) {
+        status = term_add(encoder, "true");
+        return status == QL_STATUS_OK
+                   ? emit_bool(encoder, QL_PRODUCT_ASSUMPTION_SYMBOL)
+                   : status;
+    }
+    status = term_add(encoder, "(and true");
+    for (which = 0u; which < 2u && status == QL_STATUS_OK; ++which) {
+        const product_side *side = sides[which];
+        for (index = 0u; index < side->assumes.count && status == QL_STATUS_OK;
+             ++index) {
+            status = term_add(encoder, " (=> ");
+            if (status == QL_STATUS_OK) {
+                status = term_block_symbol(encoder, side,
+                                           side->assumes.items[index].block);
+            }
+            if (status == QL_STATUS_OK) {
+                status = term_add(encoder, " ");
+            }
+            if (status == QL_STATUS_OK) {
+                status = term_add(
+                    encoder,
+                    side_value_symbol((product_side *)side,
+                                      side->assumes.items[index].value));
+            }
+            if (status == QL_STATUS_OK) {
+                status = term_add(encoder, ")");
+            }
+        }
+    }
+    if (status == QL_STATUS_OK) {
+        status = term_add(encoder, ")");
+    }
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    return emit_bool(encoder, QL_PRODUCT_ASSUMPTION_SYMBOL);
+}
+
+/* The probe lies in some object. Everything outside the object table is not
+   externally reachable storage, so nothing is claimed about it. */
+static ql_status term_probe_in_range(product_encoder *encoder) {
+    size_t index;
+    ql_status status = term_add(encoder, "(or false");
+
+    for (index = 0u; index < encoder->object_count && status == QL_STATUS_OK;
+         ++index) {
+        status = term_addf(encoder, " (and (bvule %s %s) (bvult %s (bvadd %s %s)))",
+                           encoder->objects[index].base_symbol,
+                           QL_PRODUCT_PROBE_SYMBOL, QL_PRODUCT_PROBE_SYMBOL,
+                           encoder->objects[index].base_symbol,
+                           encoder->objects[index].size_symbol);
+    }
+    if (status == QL_STATUS_OK) {
+        status = term_add(encoder, ")");
+    }
+    return status;
+}
+
 /* Comparing the return-value projection means comparing whether a normal
    return happened at all, then the value. A trapping or diverging execution
    produces no return value, which is a different observation from any value. */
@@ -1479,6 +1996,25 @@ static ql_status encode_observation_equality(
 
     buffer_reset(&encoder->term);
     status = term_add(encoder, "(and true");
+    if (status == QL_STATUS_OK &&
+        (contract->observations & QL_OBSERVE_MEMORY) != 0u &&
+        encoder->object_count != 0u) {
+        /* Both sides run over the same objects, so the final states agree
+           exactly when they agree byte by byte inside those objects. A
+           diverging or trapping run leaves no final memory, which is why the
+           claim is gated on both sides terminating. */
+        status = term_add(encoder,
+                          " (=> (and l_terminates r_terminates ");
+        if (status == QL_STATUS_OK) {
+            status = term_probe_in_range(encoder);
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_addf(
+                encoder,
+                ") (= (select l_final_memory %s) (select r_final_memory %s)))",
+                QL_PRODUCT_PROBE_SYMBOL, QL_PRODUCT_PROBE_SYMBOL);
+        }
+    }
     if (status == QL_STATUS_OK &&
         (contract->observations & QL_OBSERVE_RETURN_VALUE) != 0u) {
         status = term_add(encoder, " (= l_returns r_returns)");
@@ -1535,7 +2071,8 @@ static ql_status encode_domain(product_encoder *encoder,
         break;
     }
     buffer_reset(&encoder->term);
-    status = term_add(encoder, "(and " QL_PRODUCT_PRECONDITION_SYMBOL " ");
+    status = term_add(encoder, "(and " QL_PRODUCT_PRECONDITION_SYMBOL " "
+                               QL_PRODUCT_ASSUMPTION_SYMBOL " ");
     if (status == QL_STATUS_OK) {
         status = term_add(encoder, definedness);
     }
@@ -1589,7 +2126,8 @@ static ql_status encode_violation(product_encoder *encoder,
         break;
     }
     buffer_reset(&encoder->term);
-    status = term_add(encoder, "(and " QL_PRODUCT_PRECONDITION_SYMBOL " ");
+    status = term_add(encoder, "(and " QL_PRODUCT_PRECONDITION_SYMBOL " "
+                               QL_PRODUCT_ASSUMPTION_SYMBOL " ");
     if (status == QL_STATUS_OK) {
         status = term_add(encoder, body);
     }
@@ -1674,9 +2212,78 @@ static ql_status build_inputs(ql_product_query *query,
     return QL_STATUS_OK;
 }
 
+/* The object table follows from the pointer arguments alone. The left order is
+   canonical; each side's own pointer ordering is mapped onto it so a problem
+   whose argument correspondence permutes the two lists still binds the same
+   object to the same symbol on both sides. */
+static ql_status build_objects(ql_product_query *query,
+                               uint32_t **left_map, uint32_t **right_map,
+                               ql_error *error) {
+    size_t index;
+    size_t count = 0u;
+    size_t next = 0u;
+
+    for (index = 0u; index < query->view.input_count; ++index) {
+        if (query->inputs[index].kind == QL_SOURCE_TYPE_POINTER) {
+            ++count;
+        }
+    }
+    query->object_count = count;
+    if (count == 0u) {
+        return QL_STATUS_OK;
+    }
+    query->objects = query->allocator.allocate(
+        query->allocator.user_data, count * sizeof(*query->objects));
+    *left_map = query->allocator.allocate(query->allocator.user_data,
+                                          count * sizeof(**left_map));
+    *right_map = query->allocator.allocate(query->allocator.user_data,
+                                           count * sizeof(**right_map));
+    if (query->objects == NULL || *left_map == NULL || *right_map == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    memset(query->objects, 0, count * sizeof(*query->objects));
+    for (index = 0u; index < query->view.input_count; ++index) {
+        const ql_product_input_v1 *input = &query->inputs[index];
+        product_object *object;
+        size_t right_rank = 0u;
+        size_t scan;
+
+        if (input->kind != QL_SOURCE_TYPE_POINTER) {
+            continue;
+        }
+        for (scan = 0u; scan < query->view.input_count; ++scan) {
+            if (query->inputs[scan].kind == QL_SOURCE_TYPE_POINTER &&
+                query->inputs[scan].right_parameter <
+                    input->right_parameter) {
+                ++right_rank;
+            }
+        }
+        object = &query->objects[next];
+        if (snprintf(object->base_symbol, sizeof(object->base_symbol),
+                     "obj%zu_base", next) < 0 ||
+            snprintf(object->size_symbol, sizeof(object->size_symbol),
+                     "obj%zu_size", next) < 0) {
+            ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                         "could not format an object symbol");
+            return QL_STATUS_INTERNAL_ERROR;
+        }
+        object->left_base_parameter =
+            (uint32_t)(query->view.input_count + 1u + 2u * next);
+        object->right_base_parameter =
+            (uint32_t)(query->view.input_count + 1u + 2u * right_rank);
+        (*left_map)[next] = (uint32_t)next;
+        (*right_map)[right_rank] = (uint32_t)next;
+        ++next;
+    }
+    return QL_STATUS_OK;
+}
+
 static ql_status declare_inputs(ql_smt2_builder *builder,
                                 const ql_product_input_v1 *inputs,
-                                size_t input_count, uint32_t *maximum_width,
+                                size_t input_count,
+                                const product_object *objects,
+                                size_t object_count, uint32_t *maximum_width,
                                 ql_error *error) {
     size_t index;
     ql_status status;
@@ -1688,7 +2295,8 @@ static ql_status declare_inputs(ql_smt2_builder *builder,
                                                   inputs[index].symbol,
                                                   error);
         } else if (inputs[index].kind == QL_SOURCE_TYPE_SIGNED_INTEGER ||
-                   inputs[index].kind == QL_SOURCE_TYPE_UNSIGNED_INTEGER) {
+                   inputs[index].kind == QL_SOURCE_TYPE_UNSIGNED_INTEGER ||
+                   inputs[index].kind == QL_SOURCE_TYPE_POINTER) {
             if (inputs[index].bit_width > *maximum_width) {
                 *maximum_width = inputs[index].bit_width;
             }
@@ -1697,7 +2305,7 @@ static ql_status declare_inputs(ql_smt2_builder *builder,
                                                 error);
         } else {
             ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                         "argument %zu is a pointer, which the scalar miter does not model",
+                         "argument %zu has a source type this miter does not model",
                          index);
             return QL_STATUS_TYPE_MISMATCH;
         }
@@ -1705,7 +2313,32 @@ static ql_status declare_inputs(ql_smt2_builder *builder,
             return status;
         }
     }
-    return QL_STATUS_OK;
+    if (object_count == 0u) {
+        return QL_STATUS_OK;
+    }
+    if (*maximum_width < QL_PRODUCT_ADDRESS_WIDTH) {
+        *maximum_width = QL_PRODUCT_ADDRESS_WIDTH;
+    }
+    status = ql_smt2_builder_declare_array(builder, QL_PRODUCT_MEMORY_SYMBOL,
+                                           QL_PRODUCT_ADDRESS_WIDTH,
+                                           QL_PRODUCT_BYTE_WIDTH, error);
+    if (status == QL_STATUS_OK) {
+        status = ql_smt2_builder_declare_bv(builder, QL_PRODUCT_PROBE_SYMBOL,
+                                            QL_PRODUCT_ADDRESS_WIDTH, error);
+    }
+    for (index = 0u; index < object_count && status == QL_STATUS_OK;
+         ++index) {
+        status = ql_smt2_builder_declare_bv(builder,
+                                            objects[index].base_symbol,
+                                            QL_PRODUCT_ADDRESS_WIDTH, error);
+        if (status == QL_STATUS_OK) {
+            status = ql_smt2_builder_declare_bv(builder,
+                                                objects[index].size_symbol,
+                                                QL_PRODUCT_ADDRESS_WIDTH,
+                                                error);
+        }
+    }
+    return status;
 }
 
 /* --- Public API ----------------------------------------------------------- */
@@ -1723,9 +2356,11 @@ void QL_CALL ql_product_query_destroy(ql_product_query *query) {
     allocator = query->allocator;
     ql_artifact_release(query->prefix);
     ql_artifact_release(query->violation);
+    ql_artifact_release(query->bounded_violation);
     ql_artifact_release(query->domain);
     allocator.deallocate(allocator.user_data, query->inputs);
     allocator.deallocate(allocator.user_data, query->input_symbols);
+    allocator.deallocate(allocator.user_data, query->objects);
     allocator.deallocate(allocator.user_data, query);
 }
 
@@ -1745,7 +2380,11 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
     product_side left;
     product_side right;
     ql_artifact_view artifact_view;
+    uint32_t *left_object_map = NULL;
+    uint32_t *right_object_map = NULL;
     uint32_t maximum_width = 1u;
+    ql_solver_logic logic = QL_SOLVER_LOGIC_QF_BV;
+    size_t index;
 
     ql_status status;
 
@@ -1810,23 +2449,44 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
         goto cleanup;
     }
     query->view.input_count = left_signature_view.argument_count;
+    status = build_objects(query, &left_object_map, &right_object_map, error);
+    if (status != QL_STATUS_OK) {
+        goto cleanup;
+    }
+    /* A finer memory observation than the final reachable state needs a write
+       order or a trace this encoding has no term for. Refused, not narrowed. */
+    if (query->object_count != 0u &&
+        (problem_view.contract.observations & QL_OBSERVE_MEMORY) != 0u &&
+        problem_view.contract.memory_observation !=
+            QL_MEMORY_FINAL_REACHABLE_STATE) {
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "the contract observes memory as an ordered write sequence or a full trace, and this miter states only the final reachable state");
+        status = QL_STATUS_TYPE_MISMATCH;
+        goto cleanup;
+    }
+    if (query->object_count != 0u) {
+        logic = QL_SOLVER_LOGIC_QF_ABV;
+    }
 
     encoder.allocator = selected;
     encoder.error = error;
     encoder.inputs = query->inputs;
     encoder.input_count = query->view.input_count;
+    encoder.objects = query->objects;
+    encoder.object_count = query->object_count;
     buffer_init(&encoder.term, selected);
-    status = ql_smt2_builder_create(selected, QL_SOLVER_LOGIC_QF_BV,
-                                    &encoder.builder, error);
+    status = ql_smt2_builder_create(selected, logic, &encoder.builder, error);
     if (status != QL_STATUS_OK) {
         goto cleanup;
     }
 
     status = side_prepare(&left, left_ir, 'l', selected, query->inputs,
-                          query->view.input_count, error);
+                          query->view.input_count, query->objects,
+                          query->object_count, left_object_map, error);
     if (status == QL_STATUS_OK) {
         status = side_prepare(&right, right_ir, 'r', selected, query->inputs,
-                              query->view.input_count, error);
+                              query->view.input_count, query->objects,
+                              query->object_count, right_object_map, error);
     }
     if (status != QL_STATUS_OK) {
         goto cleanup;
@@ -1848,7 +2508,8 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
     }
 
     status = declare_inputs(encoder.builder, query->inputs,
-                            query->view.input_count, &maximum_width, error);
+                            query->view.input_count, query->objects,
+                            query->object_count, &maximum_width, error);
     if (status == QL_STATUS_OK) {
         status = encode_precondition(&encoder, left_signature,
                                      &problem_view.contract);
@@ -1858,6 +2519,9 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
     }
     if (status == QL_STATUS_OK) {
         status = encode_side(&encoder, &right, selected);
+    }
+    if (status == QL_STATUS_OK) {
+        status = encode_assumptions(&encoder, &left, &right);
     }
     if (status == QL_STATUS_OK) {
         status = encode_observation_equality(
@@ -1881,6 +2545,28 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
             sizeof(product_violation_assertion) - 1u, &query->violation,
             error);
     }
+    if (status == QL_STATUS_OK && query->object_count != 0u) {
+        buffer_reset(&encoder.term);
+        status = term_add(&encoder,
+                          "(assert (and " QL_PRODUCT_VIOLATION_SYMBOL);
+        for (index = 0u; index < query->object_count && status == QL_STATUS_OK;
+             ++index) {
+            status = term_addf(&encoder, " (bvule %s (_ bv%llu %u))",
+                               query->objects[index].size_symbol,
+                               (unsigned long long)
+                                   QL_PRODUCT_REPLAYABLE_OBJECT_BYTES,
+                               QL_PRODUCT_ADDRESS_WIDTH);
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(&encoder, "))\n");
+        }
+        if (status == QL_STATUS_OK) {
+            status = ql_artifact_create(
+                selected, QL_ARTIFACT_KIND_SMTLIB2, QL_SMTLIB2_SCHEMA_VERSION,
+                buffer_text(&encoder.term), encoder.term.size,
+                &query->bounded_violation, error);
+        }
+    }
     if (status == QL_STATUS_OK) {
         status = ql_artifact_create(
             selected, QL_ARTIFACT_KIND_SMTLIB2, QL_SMTLIB2_SCHEMA_VERSION,
@@ -1896,7 +2582,7 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
     query->view.relation = problem_view.contract.relation;
     query->view.ub_policy = problem_view.contract.ub_policy;
     query->view.covered_observations = problem_view.contract.observations;
-    query->view.logic = QL_SOLVER_LOGIC_QF_BV;
+    query->view.logic = logic;
     query->view.return_type_kind = left.return_kind;
     query->view.return_bit_width = left.return_width;
     query->view.problem_digest = problem_view.artifact_digest;
@@ -1927,6 +2613,8 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
     }
 
 cleanup:
+    selected->deallocate(selected->user_data, left_object_map);
+    selected->deallocate(selected->user_data, right_object_map);
     side_dispose(&left, selected);
     side_dispose(&right, selected);
     buffer_dispose(&encoder.term);
@@ -1982,6 +2670,44 @@ ql_status QL_CALL ql_product_query_input_at(const ql_product_query *query,
     return QL_STATUS_OK;
 }
 
+size_t QL_CALL ql_product_query_object_count(const ql_product_query *query) {
+    return query == NULL ? 0u : query->object_count;
+}
+
+ql_status QL_CALL ql_product_query_object_at(const ql_product_query *query,
+                                             size_t index,
+                                             ql_product_object_v1 *output,
+                                             ql_error *error) {
+    if (query == NULL || output == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "product query and object output are required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    if (index >= query->object_count) {
+        ql_error_set(error, QL_STATUS_NOT_FOUND,
+                     "product query has no object %zu", index);
+        return QL_STATUS_NOT_FOUND;
+    }
+    memset(output, 0, sizeof(*output));
+    output->struct_size = sizeof(*output);
+    output->index = (uint32_t)index;
+    output->address_width = QL_PRODUCT_ADDRESS_WIDTH;
+    output->left_base_parameter = query->objects[index].left_base_parameter;
+    output->right_base_parameter = query->objects[index].right_base_parameter;
+    output->base_symbol = query->objects[index].base_symbol;
+    output->size_symbol = query->objects[index].size_symbol;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+const char *QL_CALL ql_product_query_memory_symbol(
+    const ql_product_query *query) {
+    if (query == NULL || query->object_count == 0u) {
+        return NULL;
+    }
+    return QL_PRODUCT_MEMORY_SYMBOL;
+}
+
 const ql_artifact *QL_CALL ql_product_query_prefix_artifact(
     const ql_product_query *query) {
     return query == NULL ? NULL : query->prefix;
@@ -1990,6 +2716,11 @@ const ql_artifact *QL_CALL ql_product_query_prefix_artifact(
 const ql_artifact *QL_CALL ql_product_query_violation_artifact(
     const ql_product_query *query) {
     return query == NULL ? NULL : query->violation;
+}
+
+const ql_artifact *QL_CALL ql_product_query_bounded_violation_artifact(
+    const ql_product_query *query) {
+    return query == NULL ? NULL : query->bounded_violation;
 }
 
 const ql_artifact *QL_CALL ql_product_query_domain_artifact(
