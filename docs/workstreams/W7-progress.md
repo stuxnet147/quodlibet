@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-항목 2 의 두 번째 절반. process transport fault-injection (가짜 solver 실행 파일로 crash, 잘린 출력, corrupt model, 폭주 출력, hang 주입).
+항목 3. 동시성 측정. 병렬 worker 수와 solver 동시성별 처리량, cancellation overhead 를 재서 `docs/perf/` 에 적습니다.
 
 ## 착수 시 조사한 것 (2026-08-10)
 
@@ -79,6 +79,32 @@ backend identity 를 descriptor 에서 찍는 것도 고정했습니다. backend
 
 CTest 278/278 통과 (직전 273 + 신규 5).
 
+### 3. solver fault-injection, process transport 절반 (`tests/test_fault_injection.cpp`)
+
+Bitwuzla adapter 는 `executable` 옵션을 받아 그것이 가리키는 파일을 snapshot 합니다. 그래서 **이 테스트 바이너리의 복사본을 solver 로 세울 수 있습니다.** 어떤 고장을 낼지는 환경 변수로 정하므로 snapshot 하나로 모든 경우를 씁니다. 고장마다 새로 만들면 매번 테스트 실행 파일 전체를 복사하고 해시하게 됩니다.
+
+자식은 version probe 와 실제 check 를 **stdin 으로** 구별합니다. adapter 는 `--version` 으로 probe 하면서 입력을 전혀 주지 않고, 실제 query 는 항상 `(exit)` 로 끝납니다. static constructor 에서 argv 를 읽는 것은 이식성이 없지만 stdin 을 끝까지 읽는 것은 이식성이 있습니다.
+
+주입한 고장과 고정한 결과:
+
+| 고장 | 결과 |
+|---|---|
+| 비정상 종료 (exit 3) | `QL_STATUS_METHOD_ERROR`, kind 는 `INVALID` |
+| 출력 없음 | `METHOD_ERROR` "does not begin with" |
+| 잘린 답 (`sa`) | `METHOD_ERROR` |
+| 답 아닌 텍스트 | `METHOD_ERROR` |
+| stdout 없이 stderr 만 | `QL_STATUS_PARSE_ERROR`, stderr 내용이 진단에 실림 |
+| model 요청했는데 `sat` 만 | `METHOD_ERROR` "without the requested model" |
+| corrupt model | check 는 OK, model artifact 가 **그 bytes 그대로**. NUL 포함해서 보존 |
+| 폭주 출력 (16 MiB) | `stdout_limit_bytes` 에 걸려 `METHOD_ERROR`, artifact 없음, 시간 유계 |
+| 응답 없음 (20초 sleep) | `UNKNOWN` + `UNKNOWN_TIMEOUT`, 300ms timeout 에서 1초 이내 복귀 |
+
+corrupt model 을 그대로 나르는 것은 의도입니다. adapter 는 transport 이므로 여기서 그럴듯한 model 을 지어내거나 조용히 artifact 를 버리면 판단할 수 있는 층에게 오염을 숨기게 됩니다. 그 bytes 가 진짜 counterexample 인지는 replay 가 정하고 `tests/test_replay.cpp` 가 고정합니다.
+
+측정한 시간은 Windows 에서 4개 합계 6.3초, 최대 4.1초입니다(CTest 케이스당 상한 30초). ASan 빌드는 계측된 실행 파일이 커서 snapshot 복사와 해시가 더 걸리므로 여유가 줄어듭니다. 기존 `BitwuzlaTransport.BoundsInheritedPipesAfterDirectChildExit` 도 같은 성질을 갖고 그 주석에 같은 취지가 적혀 있습니다.
+
+CTest 282/282 통과 (직전 278 + 신규 4).
+
 ## 내린 설계 결정
 
 - **새 target 을 `fuzz_targets.h` 가 아니라 별도 `fuzz_contract_targets.h` 에 둡니다.** 근거: `fuzz_targets.h` 와 `tests/test_fuzz.cpp` 는 W1 이 소유하는 표면(파서/로어링/IR)의 기록이고, W7 이 더하는 것은 계약 표면이라 소유가 다릅니다. `QL_FUZZ_REQUIRE`/`QL_FUZZ_REACHED` 규약은 그대로 따라서 두 헤더가 같은 규율 아래 있습니다.
@@ -125,8 +151,8 @@ campaign 은 그동안 두 번째 serialize 부터의 고정점을 검사합니�
 ## 다음에 할 것
 
 1. (완료) 퍼저 확대
-2. (진행 중) solver fault-injection 확대. in-process 절반 완료. 남은 절반은 process transport - 가짜 solver 실행 파일(테스트 바이너리를 env var 로 재실행)로 crash, 빈 출력, 잘린 출력, model 없는 SAT, corrupt model, 폭주 출력, hang 주입
-3. 동시성 측정 -> `docs/perf/`. `bindings` 의 `check_batch` 를 부하 생성기로
+2. (완료) solver fault-injection 확대. in-process 와 process transport 양쪽
+3. (진행 중) 동시성 측정 -> `docs/perf/`. `bindings` 의 `check_batch` 를 부하 생성기로
 4. ABI 호환 시험과 plugin SDK 예제
 5. 설치 패키지와 relocatable Bitwuzla 탐색
 6. compiler/target matrix 자동 검증 (`D:/projects/machine-model/datasets/records-local/summary.json`)

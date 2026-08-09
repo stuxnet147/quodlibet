@@ -24,14 +24,162 @@
 #include "quodlibet/solver.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <thread>
+#include <vector>
+
+#if defined(_WIN32)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+#endif
 
 #include <gtest/gtest.h>
 
 namespace {
+
+/* ---------------------------------------------------------------------- *
+ * The process transport half: a solver executable that misbehaves.
+ *
+ * The pinned Bitwuzla adapter accepts an `executable` option and snapshots
+ * whatever it points at, so a copy of this test binary can stand in for the
+ * solver. Which fault it performs is read from the environment at spawn, so
+ * one snapshot serves every case; taking a fresh snapshot per fault would
+ * copy and hash the whole test executable each time.
+ *
+ * The child tells a version probe from a check by its stdin: the adapter
+ * probes with `--version` and no input at all, and every real query ends with
+ * `(exit)`. Reading argv from a static constructor is not portable; reading
+ * stdin to end is.
+ * ---------------------------------------------------------------------- */
+
+constexpr char kFaultEnvironment[] = "QL_SOLVER_FAULT_PROCESS_MODE";
+
+std::string fault_process_mode() {
+#if defined(_WIN32)
+    char *value = nullptr;
+    std::size_t size = 0u;
+    std::string result;
+    if (_dupenv_s(&value, &size, kFaultEnvironment) == 0 &&
+        value != nullptr) {
+        result.assign(value);
+    }
+    std::free(value);
+    return result;
+#else
+    const char *value = std::getenv(kFaultEnvironment);
+    return value == nullptr ? std::string() : std::string(value);
+#endif
+}
+
+bool set_fault_process_mode(const char *value) {
+#if defined(_WIN32)
+    return _putenv_s(kFaultEnvironment, value) == 0;
+#else
+    return value[0] == '\0' ? unsetenv(kFaultEnvironment) == 0
+                            : setenv(kFaultEnvironment, value, 1) == 0;
+#endif
+}
+
+struct FaultEnvironmentGuard {
+    ~FaultEnvironmentGuard() { (void)set_fault_process_mode(""); }
+};
+
+void write_stdout(const char *text, std::size_t size) {
+    (void)std::fwrite(text, 1u, size, stdout);
+    (void)std::fflush(stdout);
+}
+
+/* Runs before main in the snapshot copy the adapter spawns. In the ordinary
+   test process the environment variable is unset and this does nothing. */
+struct SolverFaultProcessMode {
+    SolverFaultProcessMode() {
+        const std::string mode = fault_process_mode();
+        std::string input;
+        char chunk[4096];
+        std::size_t read_size;
+
+        if (mode.empty()) {
+            return;
+        }
+#if defined(_WIN32)
+        /* Text mode would rewrite every newline on the way out. The version
+           probe tolerates both spellings, but a model artifact must be the
+           exact bytes the solver wrote. */
+        (void)_setmode(_fileno(stdout), _O_BINARY);
+        (void)_setmode(_fileno(stderr), _O_BINARY);
+#endif
+        while ((read_size = std::fread(chunk, 1u, sizeof(chunk), stdin)) !=
+               0u) {
+            input.append(chunk, read_size);
+        }
+        if (input.empty()) {
+            /* The version probe. It insists on the exact pinned version on
+               stdout, nothing on stderr, and exit zero. */
+            const std::string version =
+                std::string(ql_bitwuzla_solver_descriptor()->version) + "\n";
+            write_stdout(version.data(), version.size());
+            std::_Exit(0);
+        }
+        if (mode == "crash") {
+            std::_Exit(3);
+        }
+        if (mode == "silent") {
+            std::_Exit(0);
+        }
+        if (mode == "truncated") {
+            write_stdout("sa", 2u);
+            std::_Exit(0);
+        }
+        if (mode == "garbage") {
+            static const char body[] = "SAT?\n(model)\n";
+            write_stdout(body, sizeof(body) - 1u);
+            std::_Exit(0);
+        }
+        if (mode == "stderr-only") {
+            static const char message[] = "unexpected token at line 1\n";
+            (void)std::fwrite(message, 1u, sizeof(message) - 1u, stderr);
+            (void)std::fflush(stderr);
+            std::_Exit(0);
+        }
+        if (mode == "sat-without-model") {
+            write_stdout("sat\n", 4u);
+            std::_Exit(0);
+        }
+        if (mode == "corrupt-model") {
+            /* A leading answer line the adapter parses, then bytes no model
+               reader can make sense of, including a NUL. */
+            static const char body[] =
+                "sat\n(\xff\xfe not a model at all \0 )\n";
+            write_stdout(body, sizeof(body) - 1u);
+            std::_Exit(0);
+        }
+        if (mode == "runaway") {
+            const std::string noise(65536u, 'x');
+            write_stdout("sat\n", 4u);
+            for (std::size_t round = 0u; round < 256u; ++round) {
+                write_stdout(noise.data(), noise.size());
+            }
+            std::_Exit(0);
+        }
+        if (mode == "hang") {
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+            std::_Exit(0);
+        }
+        /* An unrecognised mode must not look like a working solver. */
+        std::_Exit(4);
+    }
+};
+
+const SolverFaultProcessMode kSolverFaultProcessMode;
 
 /* Counts live allocations so an error path that leaves an artifact behind is
    a failing test rather than a leak only a sanitizer build would notice. The
@@ -542,6 +690,268 @@ TEST(SolverFaultInjection, RepeatedRejectedChecksDoNotAccumulate) {
     ql_solver_destroy(solver);
     g_fault = Fault::kHonestSat;
     EXPECT_EQ(0u, counter.live.load(std::memory_order_relaxed));
+}
+
+
+/* ---------------------------------------------------------------------- *
+ * Process transport faults.
+ * ---------------------------------------------------------------------- */
+
+std::filesystem::path this_executable() {
+#if defined(_WIN32)
+    std::wstring path(32768u, L'\0');
+    const DWORD size =
+        GetModuleFileNameW(nullptr, path.data(),
+                           static_cast<DWORD>(path.size()));
+    if (size == 0u || size >= path.size()) {
+        return {};
+    }
+    path.resize(size);
+    return std::filesystem::path(path);
+#else
+    std::error_code error;
+    return std::filesystem::read_symlink("/proc/self/exe", error);
+#endif
+}
+
+/* One solver whose executable is a copy of this test binary, plus the
+   scratch directory holding that copy. The snapshot the adapter takes at
+   create time is the expensive step, so every fault in a test reuses it and
+   only the environment changes between checks. */
+class FakeSolver {
+public:
+    FakeSolver() = default;
+    FakeSolver(const FakeSolver &) = delete;
+    FakeSolver &operator=(const FakeSolver &) = delete;
+
+    ~FakeSolver() {
+        ql_artifact_release(formula_);
+        ql_solver_destroy(solver_);
+        if (!directory_.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove_all(directory_, ignored);
+        }
+        (void)set_fault_process_mode("");
+    }
+
+    /* Returns false when Bitwuzla support is off, which is the only reason
+       to skip: the adapter under test is the Bitwuzla one. */
+    bool Start() {
+        namespace fs = std::filesystem;
+        const ql_solver_descriptor_v1 *descriptor =
+            ql_bitwuzla_solver_descriptor();
+        ql_error error{};
+
+        if (descriptor->capability.availability == QL_SOLVER_UNAVAILABLE) {
+            return false;
+        }
+        const fs::path host = this_executable();
+        EXPECT_FALSE(host.empty());
+        if (host.empty()) {
+            return false;
+        }
+        const auto unique = std::chrono::high_resolution_clock::now()
+                                .time_since_epoch()
+                                .count();
+        directory_ = fs::temp_directory_path() /
+                     ("quodlibet-fault-injection-" + std::to_string(unique));
+        EXPECT_TRUE(fs::create_directory(directory_));
+#if defined(_WIN32)
+        const fs::path override_path = directory_ / "override.exe";
+#else
+        const fs::path override_path = directory_ / "override";
+#endif
+        EXPECT_TRUE(fs::copy_file(host, override_path));
+        /* Armed before create so the version probe is answered by the copy
+           rather than by a process that thinks it is a test runner. */
+        EXPECT_TRUE(set_fault_process_mode("silent"));
+        const std::string options = std::string("{\"executable\":\"") +
+                                    override_path.generic_string() + "\"}";
+        const ql_status status = ql_solver_create(
+            nullptr, descriptor, options.c_str(), &solver_, &error);
+        EXPECT_EQ(QL_STATUS_OK, status) << error.message;
+        if (status != QL_STATUS_OK) {
+            return false;
+        }
+        ql_smt2_builder *builder = nullptr;
+        EXPECT_EQ(QL_STATUS_OK,
+                  ql_smt2_builder_create(nullptr, QL_SOLVER_LOGIC_QF_BV,
+                                         &builder, &error))
+            << error.message;
+        EXPECT_EQ(QL_STATUS_OK,
+                  ql_smt2_builder_declare_bv(builder, "x", 8u, &error));
+        EXPECT_EQ(QL_STATUS_OK,
+                  ql_smt2_builder_assert(builder, "(= x #x2a)", &error));
+        EXPECT_EQ(QL_STATUS_OK,
+                  ql_smt2_builder_build(builder, &formula_, &error));
+        ql_smt2_builder_destroy(builder);
+        EXPECT_EQ(QL_STATUS_OK,
+                  ql_solver_add_smt2(solver_, formula_, &error))
+            << error.message;
+        return true;
+    }
+
+    ql_status CheckUnder(const char *mode,
+                         const ql_solver_check_request_v1 &request,
+                         ql_solver_check_result_v1 *result,
+                         ql_error *error) {
+        EXPECT_TRUE(set_fault_process_mode(mode));
+        ql_solver_check_result_init(result);
+        return ql_solver_check(solver_, &request, result, error);
+    }
+
+private:
+    std::filesystem::path directory_;
+    ql_solver *solver_ = nullptr;
+    ql_artifact *formula_ = nullptr;
+};
+
+ql_solver_check_request_v1 BaseRequest() {
+    ql_solver_check_request_v1 request{};
+    ql_solver_check_request_init(&request, QL_SOLVER_LOGIC_QF_BV);
+    request.maximum_bv_width = 8u;
+    request.artifact_requests = 0u;
+    return request;
+}
+
+/* Every way the solver process can answer badly short of answering slowly.
+   None of them may produce a check kind: a caller that read `kind` after one
+   of these would be reading a verdict out of a broken process. */
+TEST(SolverProcessFaultInjection, RefusesEveryMalformedProcessAnswer) {
+    FakeSolver fake;
+    FaultEnvironmentGuard guard;
+
+    if (!fake.Start()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    struct Case {
+        const char *mode;
+        std::uint32_t artifact_requests;
+        ql_status expected;
+        const char *phrase;
+    };
+    const Case cases[] = {
+        {"crash", 0u, QL_STATUS_METHOD_ERROR, "exited with status"},
+        {"silent", 0u, QL_STATUS_METHOD_ERROR, "does not begin with"},
+        {"truncated", 0u, QL_STATUS_METHOD_ERROR, "does not begin with"},
+        {"garbage", 0u, QL_STATUS_METHOD_ERROR, "does not begin with"},
+        {"stderr-only", 0u, QL_STATUS_PARSE_ERROR, "unexpected token"},
+        {"sat-without-model", QL_SOLVER_REQUEST_MODEL,
+         QL_STATUS_METHOD_ERROR, "without the requested model"},
+    };
+
+    for (std::size_t index = 0u; index < sizeof(cases) / sizeof(cases[0]);
+         ++index) {
+        const Case &item = cases[index];
+        ql_solver_check_request_v1 request = BaseRequest();
+        ql_solver_check_result_v1 result{};
+        ql_error error{};
+        SCOPED_TRACE(::testing::Message() << "mode " << item.mode);
+
+        request.artifact_requests = item.artifact_requests;
+        EXPECT_EQ(item.expected,
+                  fake.CheckUnder(item.mode, request, &result, &error));
+        EXPECT_NE(nullptr, std::strstr(error.message, item.phrase))
+            << "message: " << error.message;
+        EXPECT_EQ(QL_SOLVER_CHECK_INVALID, result.kind);
+        EXPECT_EQ(nullptr, result.model_artifact);
+        EXPECT_EQ(nullptr, result.proof_artifact);
+        EXPECT_EQ(nullptr, result.unsat_metadata_artifact);
+        ql_solver_check_result_clear(&result);
+    }
+}
+
+/* A solver that answers SAT and then writes an unparseable model still gets
+   its bytes recorded verbatim. The adapter is a transport: inventing a
+   plausible model here, or silently dropping the artifact, would both hide
+   the corruption from the layer that can actually judge it. Whether those
+   bytes name a real counterexample is decided by replay, which
+   tests/test_replay.cpp fixes. */
+TEST(SolverProcessFaultInjection, ACorruptModelIsCarriedVerbatimNotRepaired) {
+    FakeSolver fake;
+    FaultEnvironmentGuard guard;
+    ql_solver_check_request_v1 request = BaseRequest();
+    ql_solver_check_result_v1 result{};
+    ql_artifact_view view{};
+    ql_error error{};
+
+    if (!fake.Start()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    request.artifact_requests = QL_SOLVER_REQUEST_MODEL;
+    ASSERT_EQ(QL_STATUS_OK,
+              fake.CheckUnder("corrupt-model", request, &result, &error))
+        << error.message;
+    EXPECT_EQ(QL_SOLVER_CHECK_SAT, result.kind);
+    ASSERT_NE(nullptr, result.model_artifact);
+    view.struct_size = sizeof(view);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_artifact_get_view(result.model_artifact, &view, &error));
+    EXPECT_STREQ(QL_ARTIFACT_KIND_SOLVER_MODEL, view.kind);
+    const std::string bytes(static_cast<const char *>(view.data), view.size);
+    EXPECT_NE(std::string::npos, bytes.find("not a model at all"));
+    /* The embedded NUL survives, so nothing treated the payload as a C
+       string on the way through. */
+    EXPECT_NE(std::string::npos, bytes.find('\0'));
+    ql_solver_check_result_clear(&result);
+}
+
+/* Output is bounded by the request, not by the solver's willingness to stop.
+   A backend that streams forever must fail against the limit rather than
+   grow the host's memory until something else does. */
+TEST(SolverProcessFaultInjection, RunawayOutputIsBoundedByTheRequestLimit) {
+    FakeSolver fake;
+    FaultEnvironmentGuard guard;
+    ql_solver_check_request_v1 request = BaseRequest();
+    ql_solver_check_result_v1 result{};
+    ql_error error{};
+
+    if (!fake.Start()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    request.artifact_requests = QL_SOLVER_REQUEST_MODEL;
+    request.stdout_limit_bytes = 4096u;
+    const auto started = std::chrono::steady_clock::now();
+    const ql_status status =
+        fake.CheckUnder("runaway", request, &result, &error);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    EXPECT_EQ(QL_STATUS_METHOD_ERROR, status) << error.message;
+    EXPECT_NE(nullptr, std::strstr(error.message, "solver stdout"))
+        << "message: " << error.message;
+    EXPECT_EQ(QL_SOLVER_CHECK_INVALID, result.kind);
+    EXPECT_EQ(nullptr, result.model_artifact);
+    EXPECT_LT(elapsed, std::chrono::seconds(15));
+    ql_solver_check_result_clear(&result);
+}
+
+/* A solver that never answers becomes UNKNOWN with a timeout reason, never a
+   kind. The watchdog is what makes the wall-clock budget in G2 mean
+   something at the process boundary. */
+TEST(SolverProcessFaultInjection, AHangingSolverTimesOutIntoUnknown) {
+    FakeSolver fake;
+    FaultEnvironmentGuard guard;
+    ql_solver_check_request_v1 request = BaseRequest();
+    ql_solver_check_result_v1 result{};
+    ql_error error{};
+
+    if (!fake.Start()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    request.timeout_ms = 300u;
+    const auto started = std::chrono::steady_clock::now();
+    const ql_status status =
+        fake.CheckUnder("hang", request, &result, &error);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    ASSERT_EQ(QL_STATUS_OK, status) << error.message;
+    EXPECT_EQ(QL_SOLVER_CHECK_UNKNOWN, result.kind);
+    EXPECT_EQ(QL_SOLVER_UNKNOWN_TIMEOUT, result.unknown_reason);
+    EXPECT_EQ(nullptr, result.model_artifact);
+    /* The child sleeps for twenty seconds; returning well inside that is the
+       property. The grace the watchdog adds is a few seconds. */
+    EXPECT_LT(elapsed, std::chrono::seconds(15));
+    ql_solver_check_result_clear(&result);
 }
 
 }  // namespace
