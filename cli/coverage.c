@@ -140,14 +140,13 @@ static void coverage_count_lower(ql_coverage_totals *totals,
 }
 
 static void coverage_measure_unit(ql_coverage_totals *totals,
-                                  ql_c_parser *parser, const char *path,
-                                  FILE *detail) {
+                                  const char *path, FILE *detail) {
     char *source = NULL;
     size_t source_size = 0u;
-    ql_c_syntax_tree *tree = NULL;
     ql_c_frontend_unit *unit = NULL;
     ql_c_frontend_unit_view unit_view = { 0 };
     ql_error error;
+    ql_status status;
     size_t index;
 
     totals->units += 1u;
@@ -157,19 +156,17 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
         return;
     }
 
+    /* The frontend parses internally and reports a recovered-error tree as
+       QL_STATUS_PARSE_ERROR, so a separate syntax-check parse here would just
+       parse every unit twice. VTune showed parsing dominating this tool. */
     ql_error_clear(&error);
-    if (ql_c_parser_parse(parser, source, source_size, &tree, &error) !=
-            QL_STATUS_OK ||
-        ql_c_syntax_tree_has_errors(tree) != 0u) {
+    status = ql_c_frontend_analyze(NULL, source, source_size, &unit, &error);
+    if (status == QL_STATUS_PARSE_ERROR) {
         totals->units_syntax_error += 1u;
-        ql_c_syntax_tree_destroy(tree);
         free(source);
         return;
     }
-    ql_c_syntax_tree_destroy(tree);
-
-    if (ql_c_frontend_analyze(NULL, source, source_size, &unit, &error) !=
-        QL_STATUS_OK) {
+    if (status != QL_STATUS_OK) {
         totals->units_unreadable += 1u;
         free(source);
         return;
@@ -298,7 +295,6 @@ static void coverage_print_json(const ql_coverage_totals *totals) {
 
 int ql_cli_coverage(const char *list_path, const char *detail_path) {
     ql_coverage_totals totals;
-    ql_c_parser *parser = NULL;
     ql_error error;
     FILE *list = NULL;
     FILE *detail = NULL;
@@ -333,15 +329,6 @@ int ql_cli_coverage(const char *list_path, const char *detail_path) {
             return 1;
         }
     }
-    if (ql_c_parser_create(NULL, &parser, &error) != QL_STATUS_OK) {
-        (void)fclose(list);
-        if (detail != NULL) {
-            (void)fclose(detail);
-        }
-        (void)fprintf(stderr, "error: cannot create parser\n");
-        return 1;
-    }
-
     while (fgets(line, (int)sizeof(line), list) != NULL) {
         size_t length = strlen(line);
         while (length > 0u &&
@@ -351,10 +338,9 @@ int ql_cli_coverage(const char *list_path, const char *detail_path) {
         if (length == 0u) {
             continue;
         }
-        coverage_measure_unit(&totals, parser, line, detail);
+        coverage_measure_unit(&totals, line, detail);
     }
 
-    ql_c_parser_destroy(parser);
     (void)fclose(list);
     if (detail != NULL) {
         (void)fclose(detail);
