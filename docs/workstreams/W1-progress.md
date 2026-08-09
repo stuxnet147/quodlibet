@@ -154,7 +154,7 @@ undefined 전파 규칙은 로어링과 맞물려 있습니다.
 
 ### 2. IR concrete interpreter 와 differential 시험
 
-커밋: (이 커밋)
+커밋: `82424ba`
 
 - `src/ir_interp.c`, `include/quodlibet/ir_interp.h`. 320비트 내부 표현의 고정 용량 bit-vector 산술(add, sub, mul, udiv/sdiv/urem/srem, shl/lshr/ashr, 비교, zext/sext/trunc)을 직접 구현했습니다. `__int128` 같은 컴파일러 확장에 기대지 않습니다
 - 나눗셈은 restoring shift-subtract 이고 곱셈은 32비트 limb schoolbook 이라 64비트 중간 타입만 씁니다
