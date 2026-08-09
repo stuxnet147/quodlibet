@@ -67,7 +67,8 @@ zf_log wins on the axes this repository weighs:
   C++ runtime. spdlog is faster in some benchmarks but would impose that cost
   on every C consumer, including the planned CPython extension.
 - The disabled-level path is a macro that compares a message level against an
-  `int` before evaluating any argument. Measured cost is recorded in
+  `int` before evaluating any argument. Measured cost is 0.071 ns per call on
+  the reference machine; the method and the machine are recorded in
   `docs/runtime-services/logging.md`.
 - Every message is composed in a caller-stack buffer and handed to the output
   callback exactly once, so concurrent writers cannot interleave a partial

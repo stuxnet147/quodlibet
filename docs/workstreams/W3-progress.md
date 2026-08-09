@@ -6,16 +6,16 @@
 
 ## 지금 하는 중
 
-G1 측정. 비활성 레벨 호출 오버헤드.
+G1 완료. 다음은 G2 예산.
 
 ## 작업 단위
 
 | # | 내용 | 상태 | 커밋 |
 |---|---|---|---|
 | 1 | 로깅 라이브러리 선정, 벤더링, SHA-256 고정, `DEPENDENCIES.md` 근거 | 완료 | 34c7ea5 |
-| 2 | `include/quodlibet/log.h`, `src/log.c`, `tests/test_log.cpp` | 완료 | |
-| 3 | 비활성 레벨 오버헤드 측정과 기록 | 진행 | |
-| 4 | `include/quodlibet/budget.h`, `src/budget.c`, 할당자 계측 | 대기 | |
+| 2 | `include/quodlibet/log.h`, `src/log.c`, `tests/test_log.cpp` | 완료 | bf4c013 |
+| 3 | 비활성 레벨 오버헤드 측정과 기록 | 완료 | |
+| 4 | `include/quodlibet/budget.h`, `src/budget.c`, 할당자 계측 | 진행 | |
 | 5 | 예산 훅과 판정 누출 방지 gate, ASan/UBSan | 대기 | |
 | 6 | `include/quodlibet/policy.h`, `src/policy.c`, JSON 스키마와 왕복 | 대기 | |
 
@@ -104,7 +104,10 @@ plugin ABI 는 바뀌지 않습니다.** append-only 확장입니다.
 - 작업 단위 2 시점: `windows-clang` 113/113 통과, `QL_ENABLE_LOGGING=0` 별도
   build directory 에서도 113/113 통과. 두 구성의 `log.c.obj` 에서 zf_log
   심볼이 각각 19 개와 0 개로 확인됩니다.
+- 작업 단위 3 시점: 두 구성 모두 114/114 통과. 비활성 레벨 호출 오버헤드는
+  **0.071 ns/call** 로 측정되었고 연속 3 회 편차가 0.0005 ns 입니다. 측정
+  방법과 기계 정보는 `docs/runtime-services/logging.md` 에 있습니다.
 
 ## 다음에 할 것
 
-작업 단위 3.
+작업 단위 4. G2 예산.
