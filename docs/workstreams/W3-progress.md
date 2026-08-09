@@ -6,15 +6,15 @@
 
 ## 지금 하는 중
 
-G1 착수. 외부 로깅 라이브러리 선정과 벤더링.
+G1 측정. 비활성 레벨 호출 오버헤드.
 
 ## 작업 단위
 
 | # | 내용 | 상태 | 커밋 |
 |---|---|---|---|
-| 1 | 로깅 라이브러리 선정, 벤더링, SHA-256 고정, `DEPENDENCIES.md` 근거 | 진행 | |
-| 2 | `include/quodlibet/log.h`, `src/log.c`, `tests/test_log.cpp` | 대기 | |
-| 3 | 비활성 레벨 오버헤드 측정과 기록 | 대기 | |
+| 1 | 로깅 라이브러리 선정, 벤더링, SHA-256 고정, `DEPENDENCIES.md` 근거 | 완료 | 34c7ea5 |
+| 2 | `include/quodlibet/log.h`, `src/log.c`, `tests/test_log.cpp` | 완료 | |
+| 3 | 비활성 레벨 오버헤드 측정과 기록 | 진행 | |
 | 4 | `include/quodlibet/budget.h`, `src/budget.c`, 할당자 계측 | 대기 | |
 | 5 | 예산 훅과 판정 누출 방지 gate, ASan/UBSan | 대기 | |
 | 6 | `include/quodlibet/policy.h`, `src/policy.c`, JSON 스키마와 왕복 | 대기 | |
@@ -63,14 +63,48 @@ directory 에서 `-DCMAKE_C_FLAGS=-DQL_ENABLE_LOGGING=0` 으로 만듭니다.
   W3 는 그 함수와 `ql_solver_is_cancelled_v1` 호환 콜백을 제공하고, 실제 배선은
   W2 쪽 코드가 준비되면 연결합니다.
 
+### D4. `ql_log_level` 이름 충돌을 log.h 로 통합해서 해결
+
+`include/quodlibet/method.h` 가 이미 plugin host log 콜백용으로 같은 이름의
+열거형을 가지고 있었습니다. 값은 `QL_LOG_TRACE=0`, `DEBUG=1`, `INFO=2`,
+`WARNING=3`, `ERROR=4` 였습니다.
+
+`log.h` 의 새 열거형이 같은 자리에 같은 값을 두고(`TRACE=0` .. `ERROR=4`,
+뒤에 `FATAL=5`, `OFF=6` 추가) `method.h` 는 정의를 지우고 `log.h` 를
+include 한 다음 옛 철자를 매크로 별칭으로 남겼습니다. **수치가 동일하므로
+plugin ABI 는 바뀌지 않습니다.** append-only 확장입니다.
+
+같은 이유로 공개 로깅 매크로 이름은 `QL_LOG_TRACE(...)` 가 아니라
+`QL_LOGT/QL_LOGD/QL_LOGI/QL_LOGW/QL_LOGE/QL_LOGF` 입니다.
+
+### D5. plugin host 의 기본 log 콜백을 로깅 서비스로 돌립니다
+
+`src/method.c` 의 `default_log` 가 무조건 `stderr` 로 찍고 있었습니다. G1 의
+"라이브러리가 남의 stdout 을 마음대로 쓰지 않는다" 와 "기본값은 조용한 것" 을
+정면으로 어기므로 `ql_log_write` 로 넘깁니다. 싱크를 안 걸면 조용합니다.
+
 ## 소유하지 않은 파일 중 손댄 것
 
-작업하면서 여기에 계속 적습니다.
+조율자 확인이 필요한 항목입니다.
+
+- `scripts/vendor.sh`: zf_log fetch 한 줄 추가. 벤더링에 필수.
+- `THIRD_PARTY_NOTICES.md`: zf_log 행 추가.
+- `include/quodlibet/quodlibet.h`: `log.h` include 한 줄 추가.
+- `include/quodlibet/method.h`: D4. 열거형 정의를 `log.h` 로 옮기고 옛 철자를
+  매크로 별칭으로 유지. 수치 불변.
+- `src/method.c`: D5. `default_log` 를 `ql_log_write` 로 전환. `<stdio.h>`
+  include 제거.
 
 ## 막힌 것
 
 없음.
 
+## 검증 기록
+
+- 작업 단위 2 시점: `windows-clang` 113/113 통과, `QL_ENABLE_LOGGING=0` 별도
+  build directory 에서도 113/113 통과. 두 구성의 `log.c.obj` 에서 zf_log
+  심볼이 각각 19 개와 0 개로 확인됩니다.
+
 ## 다음에 할 것
 
-작업 단위 1.
+작업 단위 3.

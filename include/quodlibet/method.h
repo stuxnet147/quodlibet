@@ -2,16 +2,18 @@
 #define QUODLIBET_METHOD_H
 
 #include "quodlibet/artifact.h"
+#include "quodlibet/log.h"
 
 QL_EXTERN_C_BEGIN
 
-typedef enum ql_log_level {
-    QL_LOG_TRACE = 0,
-    QL_LOG_DEBUG,
-    QL_LOG_INFO,
-    QL_LOG_WARNING,
-    QL_LOG_ERROR
-} ql_log_level;
+/* ql_log_level now lives in quodlibet/log.h so that the plugin host callback
+   and the public logging service share one scale. The numeric values of these
+   original spellings are unchanged. */
+#define QL_LOG_TRACE QL_LOG_LEVEL_TRACE
+#define QL_LOG_DEBUG QL_LOG_LEVEL_DEBUG
+#define QL_LOG_INFO QL_LOG_LEVEL_INFO
+#define QL_LOG_WARNING QL_LOG_LEVEL_WARN
+#define QL_LOG_ERROR QL_LOG_LEVEL_ERROR
 
 typedef struct ql_host_v1 {
     size_t struct_size;

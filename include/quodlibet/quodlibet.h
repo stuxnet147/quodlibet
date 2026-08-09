@@ -13,6 +13,7 @@
 #include "quodlibet/ir.h"
 #include "quodlibet/ir_interp.h"
 #include "quodlibet/ir_verify.h"
+#include "quodlibet/log.h"
 #include "quodlibet/method.h"
 #include "quodlibet/pipeline.h"
 #include "quodlibet/plugin.h"

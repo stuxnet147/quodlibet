@@ -1,6 +1,5 @@
 #include "quodlibet/method.h"
 
-#include <stdio.h>
 #include <string.h>
 
 #include "uv.h"
@@ -8,19 +7,12 @@
 static uv_once_t host_once = UV_ONCE_INIT;
 static ql_host_v1 default_host;
 
+/* Plugin diagnostics go through the public logging service instead of the
+   caller's stderr, so a host that installed no sink stays silent. */
 static void QL_CALL default_log(ql_log_level level, const char *component,
                                 const char *message) {
-    static const char *levels[] = {
-        "trace", "debug", "info", "warning", "error"
-    };
-    const char *level_name = "unknown";
-
-    if ((unsigned)level < sizeof(levels) / sizeof(levels[0])) {
-        level_name = levels[level];
-    }
-    (void)fprintf(stderr, "[quodlibet:%s:%s] %s\n", level_name,
-                  component != NULL ? component : "plugin",
-                  message != NULL ? message : "");
+    ql_log_write(level, component != NULL ? component : "plugin", NULL, NULL,
+                 0u, "%s", message != NULL ? message : "");
 }
 
 static void initialize_host(void) {
