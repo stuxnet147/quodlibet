@@ -1341,7 +1341,7 @@ typedef struct ql_process_read_stream {
 
 struct ql_process_capture {
     ql_allocator allocator;
-    uv_loop_t loop;
+    uv_loop_t *loop;
     uv_process_t process;
     uv_pipe_t child_stdin;
     ql_process_read_stream child_stdout;
@@ -1386,6 +1386,41 @@ static void close_uv_handle(uv_handle_t *handle) {
     }
 }
 
+static void close_walk_cb(uv_handle_t *handle, void *unused) {
+    (void)unused;
+    close_uv_handle(handle);
+}
+
+/* uv_loop_close refuses with UV_EBUSY while any non-internal handle or request
+   is still attached, and on that path it skips uv__loop_close, which is what
+   removes this loop's SIGCHLD watcher from libuv's process-wide signal tree
+   (third_party/libuv/src/uv-common.c:878). The loop lives inside a
+   ql_process_capture on run_process's stack, so a refused close leaves that
+   global tree pointing into a frame that is about to die, and the next
+   uv_spawn on any thread walks the tree and reads it. Measured: SIGSEGV in 5
+   of 10 sixteen-worker batches, ASan naming stack-use-after-return in
+   uv__signal_compare. docs/perf/baseline.md carries the diagnosis.
+
+   So closing is not best-effort here. Close every handle still standing, run
+   the loop until their close callbacks have fired, and only then close the
+   loop. The bound exists because an unbounded loop in a teardown path is its
+   own failure mode; each pass makes progress, so reaching the bound means
+   something is wrong that retrying will not fix. */
+#define QL_PROCESS_LOOP_DRAIN_PASSES 64u
+
+static int drain_and_close_loop(uv_loop_t *loop) {
+    unsigned pass;
+    int status = uv_loop_close(loop);
+
+    for (pass = 0u; status == UV_EBUSY && pass < QL_PROCESS_LOOP_DRAIN_PASSES;
+         ++pass) {
+        uv_walk(loop, close_walk_cb, NULL);
+        (void)uv_run(loop, UV_RUN_DEFAULT);
+        status = uv_loop_close(loop);
+    }
+    return status;
+}
+
 static int process_outputs_drained(const ql_process_capture *capture) {
     return capture->child_stdout.eof_observed &&
            capture->child_stderr.eof_observed;
@@ -1412,7 +1447,7 @@ static void process_request_termination(ql_process_capture *capture) {
         return;
     }
     capture->killed = 1;
-    capture->force_kill_deadline_ms = uv_now(&capture->loop) + 50u;
+    capture->force_kill_deadline_ms = uv_now(capture->loop) + 50u;
     uv_status = uv_process_kill(&capture->process, SIGTERM);
     if (uv_status != 0 && uv_status != UV_ESRCH &&
         capture->callback_status == QL_STATUS_OK) {
@@ -1491,7 +1526,7 @@ static void process_exit_cb(uv_process_t *process, int64_t exit_status,
                             int term_signal) {
     ql_process_capture *capture =
         (ql_process_capture *)process->data;
-    const uint64_t now = uv_now(&capture->loop);
+    const uint64_t now = uv_now(capture->loop);
 
     capture->exit_status = exit_status;
     capture->term_signal = term_signal;
@@ -1512,7 +1547,7 @@ static void process_timer_cb(uv_timer_t *timer) {
     if (!capture->process_spawned) {
         return;
     }
-    now = uv_now(&capture->loop);
+    now = uv_now(capture->loop);
     if (capture->process_exited) {
         if (process_outputs_drained(capture)) {
             process_close_timer(capture);
@@ -1597,16 +1632,33 @@ static ql_status run_process(
     buffer_init(&capture.stdout_text, allocator);
     buffer_init(&capture.stderr_text, allocator);
 
-    uv_status = uv_loop_init(&capture.loop);
+    /* The loop is allocated rather than held in this frame because libuv
+       registers it in a process-wide structure that outlives a refused close.
+       See drain_and_close_loop: on the path where the loop cannot be closed
+       the allocation is deliberately not freed, which costs a bounded leak and
+       buys the guarantee that nothing global ever points at dead memory. */
+    capture.loop = allocator->allocate(allocator->user_data,
+                                       sizeof(*capture.loop));
+    if (capture.loop == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY,
+                     "could not allocate solver process loop");
+        status = QL_STATUS_OUT_OF_MEMORY;
+        goto fail_without_loop;
+    }
+    memset(capture.loop, 0, sizeof(*capture.loop));
+
+    uv_status = uv_loop_init(capture.loop);
     if (uv_status != 0) {
+        allocator->deallocate(allocator->user_data, capture.loop);
+        capture.loop = NULL;
         ql_error_set(error, QL_STATUS_IO_ERROR,
                      "could not initialize solver process loop: %s",
                      uv_strerror(uv_status));
         status = QL_STATUS_IO_ERROR;
         goto fail_without_loop;
     }
-    uv_update_time(&capture.loop);
-    capture.started_ms = uv_now(&capture.loop);
+    uv_update_time(capture.loop);
+    capture.started_ms = uv_now(capture.loop);
     if (request != NULL && request->timeout_ms != 0u) {
         uint64_t deadline = capture.started_ms;
         if (request->timeout_ms >
@@ -1619,7 +1671,7 @@ static ql_status run_process(
         capture.watchdog_deadline_ms = deadline;
     }
 
-    uv_status = uv_pipe_init(&capture.loop, &capture.child_stdin, 0);
+    uv_status = uv_pipe_init(capture.loop, &capture.child_stdin, 0);
     if (uv_status != 0) {
         ql_error_set(error, QL_STATUS_IO_ERROR,
                      "could not initialize solver stdin pipe: %s",
@@ -1627,7 +1679,7 @@ static ql_status run_process(
         status = QL_STATUS_IO_ERROR;
         goto close_loop;
     }
-    uv_status = uv_pipe_init(&capture.loop, &capture.child_stdout.pipe, 0);
+    uv_status = uv_pipe_init(capture.loop, &capture.child_stdout.pipe, 0);
     if (uv_status != 0) {
         ql_error_set(error, QL_STATUS_IO_ERROR,
                      "could not initialize solver stdout pipe: %s",
@@ -1636,7 +1688,7 @@ static ql_status run_process(
         close_uv_handle((uv_handle_t *)&capture.child_stdin);
         goto drain_loop;
     }
-    uv_status = uv_pipe_init(&capture.loop, &capture.child_stderr.pipe, 0);
+    uv_status = uv_pipe_init(capture.loop, &capture.child_stderr.pipe, 0);
     if (uv_status != 0) {
         ql_error_set(error, QL_STATUS_IO_ERROR,
                      "could not initialize solver stderr pipe: %s",
@@ -1677,7 +1729,7 @@ static ql_status run_process(
     options.flags = UV_PROCESS_WINDOWS_HIDE;
 #endif
     capture.process.data = &capture;
-    uv_status = uv_spawn(&capture.loop, &capture.process, &options);
+    uv_status = uv_spawn(capture.loop, &capture.process, &options);
     if (uv_status != 0) {
         ql_error_set(error, QL_STATUS_NOT_FOUND,
                      "could not start solver executable '%s': %s", path,
@@ -1705,7 +1757,7 @@ static ql_status run_process(
         close_uv_handle((uv_handle_t *)&capture.child_stderr.pipe);
     }
 
-    uv_status = uv_timer_init(&capture.loop, &capture.timer);
+    uv_status = uv_timer_init(capture.loop, &capture.timer);
     if (uv_status == 0) {
         capture.timer_initialized = 1;
         capture.timer.data = &capture;
@@ -1750,7 +1802,7 @@ static ql_status run_process(
         }
     }
 
-    (void)uv_run(&capture.loop, UV_RUN_DEFAULT);
+    (void)uv_run(capture.loop, UV_RUN_DEFAULT);
     if (capture.callback_status != QL_STATUS_OK) {
         ql_error_set(error, capture.callback_status, "%s",
                      capture.callback_message);
@@ -1770,13 +1822,22 @@ static ql_status run_process(
     ql_error_clear(error);
 
 close_loop:
-    uv_status = uv_loop_close(&capture.loop);
-    if (status == QL_STATUS_OK && uv_status != 0) {
+    uv_status = drain_and_close_loop(capture.loop);
+    if (uv_status == 0) {
+        allocator->deallocate(allocator->user_data, capture.loop);
+    } else {
+        /* Leak it on purpose. libuv still has this loop in its process-wide
+           signal tree, so freeing here would leave that tree pointing at
+           reusable memory and the next uv_spawn on any thread would read it.
+           One leaked loop per occurrence is a price worth paying to keep that
+           impossible, and the caller still learns it happened. Not reachable
+           in practice: every drain pass closes handles that cannot reopen. */
         ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
                      "solver process loop retained active handles: %s",
                      uv_strerror(uv_status));
         status = QL_STATUS_INTERNAL_ERROR;
     }
+    capture.loop = NULL;
     buffer_dispose(&capture.stdout_text);
     buffer_dispose(&capture.stderr_text);
     if (status != QL_STATUS_OK) {
@@ -1785,7 +1846,7 @@ close_loop:
     return status;
 
 drain_loop:
-    (void)uv_run(&capture.loop, UV_RUN_DEFAULT);
+    (void)uv_run(capture.loop, UV_RUN_DEFAULT);
     goto close_loop;
 
 fail_without_loop:

@@ -74,6 +74,14 @@ W1 의 `_with_tree` API 와 W9 의 VM threading 리포트를 기다립니다. W8
 - CTest: windows-clang 304/304(바인딩 시험 포함), linux-clang 303/303.
 - 조율자 조건(B 는 SIGSEGV 수정 이후)을 지켜 B 는 착수하지 않았습니다.
 
+### WU8. 동시성 SIGSEGV 수정 (조율자 승인 후 위임받아 구현)
+
+- `src/solver.c` 의 `run_process` 가 loop 를 닫지 못한 채 반환하던 것을 고쳤습니다. 남은 handle 을 전부 닫고 close 콜백이 돌도록 loop 를 다시 돌린 뒤 닫습니다(`drain_and_close_loop`).
+- **loop 를 스택에서 힙으로 옮겼습니다.** 그래도 못 닫는 경로에서는 일부러 free 하지 않습니다. libuv 전역 트리가 가리키는 메모리를 살려 두는 유한한 누수가, 전역 구조에서의 use-after-free 보다 낫습니다.
+- **검증(조율자 승인 관문, 48쌍 16워커 10회, 다른 조건 동일한 두 트리): 수정 전 크래시 10/10, 수정 후 0/10.**
+- CTest linux-clang 316/316.
+- **별건 발견: `ETXTBSY`.** 크래시가 사라지자 판정 48개 중 한둘이 `text file is busy` 로 실패하는 것이 보입니다. 스냅샷 쓰기 기술자에 `O_CLOEXEC` 이 없어(`src/solver.c:1907`) 다른 스레드의 fork/exec 가 물려받는 고전적 경쟁입니다. 제 수정이 만든 것이 아니라 크래시에 가려져 있던 것이며, BLAKE3 가 빨라져 창이 좁아지면서 겹침이 늘어 드러났습니다. 조율자에게 별도로 올렸습니다.
+
 ## 설계 결정
 
 ### 짧은 수집은 가지별 비율을 못 준다
