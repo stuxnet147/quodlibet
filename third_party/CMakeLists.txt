@@ -111,22 +111,54 @@ add_library(ql_vendor_xxhash STATIC xxhash/xxhash.c)
 target_include_directories(ql_vendor_xxhash PUBLIC xxhash)
 set_target_properties(ql_vendor_xxhash PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Artifact identities are not on the solver hot path. Start with the portable
-# implementation on every architecture, then enable audited SIMD variants as a
-# separate build option later.
-add_library(ql_vendor_blake3 STATIC
+# Artifact identity turned out to be on the solver hot path after all. Every
+# judgement copies the private Bitwuzla snapshot and hashes its 4.49 MB four
+# times, at creation, at the version probe, and before and during the check
+# (src/solver.c). Portable-only spent 16.1 ms per judgement there; the vendored
+# x86-64 assembly spends 3.5 ms. docs/perf/baseline.md holds the measurement.
+#
+# This does not weaken the identity it computes. BLAKE3 is defined by the
+# algorithm, not by which kernel evaluates it, and the two builds were measured
+# producing the same digest for the same input rather than assumed to:
+# 0a989102d9dc2892826c4ae4d6148814b123a2dabe4e723bb1bd68dac57f94a9.
+#
+# blake3_dispatch.c selects a kernel from CPUID at run time, so a machine
+# without AVX-512 simply does not take that path. Architectures and drivers
+# that cannot assemble the vendored .S files keep the portable build.
+set(ql_blake3_sources
     blake3/c/blake3.c
     blake3/c/blake3_dispatch.c
     blake3/c/blake3_portable.c
 )
+set(ql_blake3_definitions BLAKE3_USE_NEON=0)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^([Xx]86_64|AMD64|amd64)$"
+        AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU"
+        AND NOT CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    enable_language(ASM)
+    if(WIN32)
+        set(ql_blake3_asm_abi "windows_gnu")
+    else()
+        set(ql_blake3_asm_abi "unix")
+    endif()
+    list(APPEND ql_blake3_sources
+        blake3/c/blake3_sse2_x86-64_${ql_blake3_asm_abi}.S
+        blake3/c/blake3_sse41_x86-64_${ql_blake3_asm_abi}.S
+        blake3/c/blake3_avx2_x86-64_${ql_blake3_asm_abi}.S
+        blake3/c/blake3_avx512_x86-64_${ql_blake3_asm_abi}.S
+    )
+else()
+    list(APPEND ql_blake3_definitions
+        BLAKE3_NO_SSE2
+        BLAKE3_NO_SSE41
+        BLAKE3_NO_AVX2
+        BLAKE3_NO_AVX512
+    )
+endif()
+
+add_library(ql_vendor_blake3 STATIC ${ql_blake3_sources})
 target_include_directories(ql_vendor_blake3 PUBLIC blake3/c)
-target_compile_definitions(ql_vendor_blake3 PRIVATE
-    BLAKE3_USE_NEON=0
-    BLAKE3_NO_SSE2
-    BLAKE3_NO_SSE41
-    BLAKE3_NO_AVX2
-    BLAKE3_NO_AVX512
-)
+target_compile_definitions(ql_vendor_blake3 PRIVATE ${ql_blake3_definitions})
 set_target_properties(ql_vendor_blake3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(ql_vendor_tree_sitter STATIC tree-sitter/lib/src/lib.c)

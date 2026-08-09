@@ -30,16 +30,27 @@ fi
 
 probe=/tmp/quodlibet-snapshot-probe
 cc="${CC:-clang}"
-# The same flags the library builds BLAKE3 with (third_party/CMakeLists.txt).
-# Portable, no SIMD. Matching this matters: an AVX2 build would hash several
-# times faster and the share would be wrong.
-"$cc" -O2 -o "$probe" "$root/scripts/perf/snapshot_probe.c" \
-    "$root/third_party/blake3/c/blake3.c" \
-    "$root/third_party/blake3/c/blake3_dispatch.c" \
-    "$root/third_party/blake3/c/blake3_portable.c" \
-    -DBLAKE3_USE_NEON=0 \
-    -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 \
-    -I "$root/third_party/blake3/c"
+# Build BLAKE3 the way the library builds it (third_party/CMakeLists.txt), or
+# the probe measures a different program than the one being profiled. Set
+# QL_PROBE_PORTABLE=1 to force the pre-SIMD build for a before/after pair; the
+# digest is printed either way so the two can be shown to agree.
+b3="$root/third_party/blake3/c"
+b3_sources="$b3/blake3.c $b3/blake3_dispatch.c $b3/blake3_portable.c"
+b3_flags="-DBLAKE3_USE_NEON=0"
+if [ -n "${QL_PROBE_PORTABLE:-}" ]; then
+    b3_flags="$b3_flags -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41"
+    b3_flags="$b3_flags -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512"
+    printf 'blake3     portable (QL_PROBE_PORTABLE set)\n'
+else
+    b3_sources="$b3_sources $b3/blake3_sse2_x86-64_unix.S"
+    b3_sources="$b3_sources $b3/blake3_sse41_x86-64_unix.S"
+    b3_sources="$b3_sources $b3/blake3_avx2_x86-64_unix.S"
+    b3_sources="$b3_sources $b3/blake3_avx512_x86-64_unix.S"
+    printf 'blake3     x86-64 assembly, as the library builds it\n'
+fi
+# shellcheck disable=SC2086
+"$cc" -O2 -o "$probe" "$root/scripts/perf/snapshot_probe.c" $b3_sources \
+    $b3_flags -I "$b3"
 
 # A worktree on /mnt is reached over 9p, so a snapshot read from there also
 # measures the share protocol. Stage a native-disk copy and report both, or
