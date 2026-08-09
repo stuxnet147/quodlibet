@@ -189,7 +189,7 @@ undefined 전파 규칙은 로어링과 맞물려 있습니다.
 
 ### 3. 퍼저
 
-커밋: (이 커밋)
+커밋: `948e7c3`
 
 `tests/test_fuzz.cpp` 하나가 두 역할을 합니다. `QL_FUZZ_LIBFUZZER` 를 정의하고 컴파일하면 `LLVMFuzzerTestOneInput` 만 남고, 정의하지 않으면 같은 타깃을 결정적으로 도는 GoogleTest 캠페인이 됩니다. 그래서 지금 당장 매 `ctest` 마다 돌면서, 나중에 libFuzzer 실행 파일을 붙일 때 타깃을 다시 쓸 필요가 없습니다.
 
