@@ -122,6 +122,15 @@ An exhaustive finite analysis may return `PROVED` only when evidence establishes
 that its finite model covers the complete contract domain. Merely reaching a
 user-supplied bound returns `BOUNDED_CLEAN`.
 
+A caller-supplied verdict policy decides which of these verdicts it counts as
+a pass and what it calls them. It never produces a verdict, and it cannot
+weaken this discipline: the policy parser rejects any policy that would call
+`BOUNDED_CLEAN` a proof, treat an unreplayed SAT model as a `COUNTEREXAMPLE`,
+or promote a raw solver `unsat` without a checker or a stated trusted backend.
+An execution that exhausted its budget is withdrawn to `UNKNOWN` before any
+policy sees it. See `docs/runtime-services/policy.md` and
+`docs/runtime-services/budget.md`.
+
 ## Method catalogue
 
 ### E-graph normalization

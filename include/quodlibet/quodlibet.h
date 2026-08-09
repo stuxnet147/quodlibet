@@ -18,6 +18,7 @@
 #include "quodlibet/method.h"
 #include "quodlibet/pipeline.h"
 #include "quodlibet/plugin.h"
+#include "quodlibet/policy.h"
 #include "quodlibet/precondition.h"
 #include "quodlibet/problem.h"
 #include "quodlibet/product.h"

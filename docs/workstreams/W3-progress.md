@@ -6,7 +6,7 @@
 
 ## 지금 하는 중
 
-G2 완료. 다음은 G3 판정 정책.
+G1, G2, G3 세 목표의 작업 단위를 전부 마쳤습니다.
 
 ## 작업 단위
 
@@ -15,9 +15,9 @@ G2 완료. 다음은 G3 판정 정책.
 | 1 | 로깅 라이브러리 선정, 벤더링, SHA-256 고정, `DEPENDENCIES.md` 근거 | 완료 | 34c7ea5 |
 | 2 | `include/quodlibet/log.h`, `src/log.c`, `tests/test_log.cpp` | 완료 | bf4c013 |
 | 3 | 비활성 레벨 오버헤드 측정과 기록 | 완료 | 8f39116 |
-| 4 | `include/quodlibet/budget.h`, `src/budget.c`, 할당자 계측 | 완료 | |
-| 5 | 예산 훅과 판정 누출 방지 gate, ASan/UBSan | 완료 | |
-| 6 | `include/quodlibet/policy.h`, `src/policy.c`, JSON 스키마와 왕복 | 진행 | |
+| 4 | `include/quodlibet/budget.h`, `src/budget.c`, 할당자 계측 | 완료 | a0896a0 |
+| 5 | 예산 훅과 판정 누출 방지 gate, ASan/UBSan | 완료 | a0896a0 |
+| 6 | `include/quodlibet/policy.h`, `src/policy.c`, JSON 스키마와 왕복 | 완료 | |
 
 ## 설계 결정
 
@@ -97,6 +97,37 @@ scheduler, pipeline, input 을 전부 계측 할당자 위에 올리고 노드 �
 뒤 이것을 확인합니다. 진짜 LeakSanitizer 는 WSL Ubuntu-24.04 Linux ASan 실행이
 담당합니다.
 
+### D10. 정책은 분류만 하고 판정을 만들지 않습니다
+
+정책이 할 수 있는 것은 이미 정당한 판정을 이름 붙인 class 로 묶고 그 class 에
+disposition, claims, score 를 주는 것입니다. 판정을 `unknown` 으로 약화시키는
+것까지는 허용하고 강화는 어떤 형태로도 금지합니다.
+
+파서가 거부하는 네 가지가 요구된 세 가지 금지선을 그대로 문법으로 만듭니다.
+
+- `claims: "proof"` class 가 proved 가 아닌 판정을 나열 -> `BOUNDED_CLEAN` 을
+  proof 로 부르려는 시도
+- `weaken` 의 `to` 가 `unknown` 도 `from` 도 아님 -> 판정 승격 시도
+- `counterexample` 을 받는 class 에 `require_replayed_witness: true` 없음 ->
+  replay 하지 않은 SAT model
+- proved 를 pass 로 세거나 proof 를 주장하는 class 에 `proof_trust` 없음, 또는
+  `trusted_backend` 인데 `trust.trusted_backends` 가 빔 -> checker 도
+  trusted-backend policy 도 없는 raw UNSAT 승격
+
+같은 규율을 `ql_policy_evaluate` 가 실행 시점에 실제 evidence 로 한 번 더
+강제합니다. 형식이 맞는 정책이라도 증거가 없으면 분류하지 못합니다.
+
+**abstain 하는 class 는 `proof_trust` 가 필요 없습니다.** 그 class 는 판정에
+아무것도 걸지 않으므로 승격이 일어나지 않습니다. 처음에는 proved 를 나열하기만
+해도 거부했는데 정상적인 정책까지 막아서 pass 이거나 `claims: "proof"` 인 경우로
+좁혔습니다.
+
+### D11. 정책 result 구조체는 포인터를 갖지 않습니다
+
+`ql_policy_result_v1` 이 고정 길이 이름 배열을 씁니다. 정책 수명에 묶이지 않고
+복사, 직렬화, 파이썬 노출이 전부 단순해집니다. W4 가 이 구조체를 그대로
+넘깁니다.
+
 ### D4. `ql_log_level` 이름 충돌을 log.h 로 통합해서 해결
 
 `include/quodlibet/method.h` 가 이미 plugin host log 콜백용으로 같은 이름의
@@ -128,6 +159,8 @@ plugin ABI 는 바뀌지 않습니다.** append-only 확장입니다.
   매크로 별칭으로 유지. 수치 불변.
 - `src/method.c`: D5. `default_log` 를 `ql_log_write` 로 전환. `<stdio.h>`
   include 제거.
+- `METHODS.md`: "Verdict discipline" 절 끝에 정책이 이 규율을 약화시킬 수
+  없다는 문단과 `docs/runtime-services/` 문서 링크 추가.
 - `include/quodlibet/pipeline.h`, `src/pipeline.c`: 예산 훅. `budget.h`
   include, `ql_pipeline_run_with_budget` 추가, `ql_pipeline_run` 은 budget NULL
   로 위임. 노드마다 `QL_BUDGET_SCOPE_NODE` scope 를 열고 닫으며 cancel 판정을
@@ -158,4 +191,13 @@ plugin ABI 는 바뀌지 않습니다.** append-only 확장입니다.
 
 ## 다음에 할 것
 
-작업 단위 6. G3 판정 정책.
+W3 지시서의 작업 단위는 전부 닫혔습니다. GOAL 의 G1, G2, G3 종료 조건 판정은
+조율자가 합니다. 남은 연결 지점은 두 개입니다.
+
+- W2 의 solver 경로가 `ql_budget_scope_remaining_ms` 로 유효 deadline 을 받아
+  `ql_solver_check_request_v1.timeout_ms` 에 넣고, `cancel_state` 에 scope 를
+  `is_cancelled` 에 `ql_budget_scope_is_cancelled` 를 넣는 배선. W3 쪽 함수는
+  준비되어 있고 W2 의 product-program 경로가 생기면 연결하면 됩니다.
+- W4 의 파이썬 바인딩이 `ql_budget_limits_v1`, `ql_policy`,
+  `ql_policy_result_v1` 을 노출. 세 구조체 다 포인터 없이 값으로 다닐 수 있게
+  설계했습니다.
