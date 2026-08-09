@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-QF_BV bit-blaster 를 끝냈습니다. 다음은 kissat / drat-trim 벤더링과 `prove.aig-sat` method 본체입니다.
+**막혔습니다.** kissat rel-4.0.4 가 Windows 에서 **틀린 답을 냅니다.** 측정은 아래 "Windows 이식 측정" 절에 있고 조율자에게 escalation 을 보냈습니다. solver 후보가 정해지기 전에는 3, 4단계를 진행할 수 없습니다.
 
 ## 끝난 작업 단위
 
@@ -105,14 +105,68 @@ cake_lpr(경로 C, HOL4 로 기계어까지 검증)은 첫 절단에 넣지 않�
 
 ## 막힌 것
 
-없습니다.
+**solver 후보.** 위 "Windows 이식 측정" 절 그대로입니다. 조율자 답을 기다립니다. 이것이 닫히기 전에는 3, 4단계와 Bitwuzla-solver 대조 시험을 할 수 없습니다.
 
-## Windows 이식 위험
+## Windows 이식 측정 (2026-08-10)
 
-Kissat 과 drat-trim 은 둘 다 `unistd.h`, `sys/resource.h`, `sys/time.h` 를 씁니다. `windows-clang` 프리셋은 MSVC ABI 이므로 그대로는 빌드되지 않습니다. tree-sitter 처럼 자체 CMake target 으로 컴파일하면서 얇은 이식 shim 을 넣는 방향으로 봅니다. 실제 규모는 벤더링해 본 뒤 여기에 적습니다.
+조율자 조건 3("Kissat 의 POSIX 의존이 Windows clang 에서 마찰을 내면 후보를 바꾸기 전에 측정과 함께 다시 물어보세요")에 대한 측정입니다. **저장소에는 아무것도 벤더링하지 않았습니다.** 전부 scratch 에서 쟀습니다.
+
+고정한 것부터.
+
+- kissat rel-4.0.4 tarball SHA-256 `bfe93eaa6323b48011e4b1fcf74b3f2e20f9de544767e728009e5b2018296193` (<https://codeload.github.com/arminbiere/kissat/tar.gz/refs/tags/rel-4.0.4>)
+- drat-trim 커밋 `2e3b2dc0ecf938addbd779d42877b6ed69d9a985` (2024-11-25) tarball SHA-256 `a75e5a2072fa5a5493ee8504067661c6b452d45a32f889ac5b2c9470c227b58c`. MIT. `drat-trim.c` 1501줄, `lrat-check.c` 509줄
+
+### 마찰 1. tarball 에 symlink 가 있다
+
+`test/cnf/hard.cnf` 가 symlink 라 Windows 에서 `tar -xzf --strip-components=1` 이 실패합니다. `scripts/vendor.sh` 의 `fetch` 는 그대로 쓸 수 없고 `--exclude='test/*'` 를 주는 변형이 필요합니다. 작은 문제입니다.
+
+### 마찰 2. POSIX shim (해결됨)
+
+`windows-clang`(MSVC ABI)에서 93개 소스 중 92개가 약 60줄짜리 shim 으로 컴파일됩니다. shim 이 채우는 것은 `unistd.h`(isatty, access, popen, sysconf, alarm, R_OK), `strings.h`(strcasecmp), `sys/time.h`(gettimeofday), `sys/resource.h`(getrusage), 그리고 prelude 의 `SIGBUS`/`SIGALRM`/`SIGQUIT`/`S_ISDIR`/`S_ISREG` 입니다. 링크에는 16MB 이상 스택이 필요합니다(`-Wl,/stack:...`). 여기까지는 감당할 수 있는 크기입니다.
+
+### 마찰 3. **MSVC ABI 에서 kissat 의 자료구조가 깨진다** (막힘)
+
+`-O0` 빌드가 kissat 자신의 assertion 에서 멈춥니다.
+
+```
+Assertion failed: sizeof (watch) == sizeof (unsigned), file inline.h, line 79
+```
+
+`watch` union 의 bitfield 가 GNU 배치를 전제합니다. MSVC ABI 는 bitfield 의 기반 타입이 바뀔 때 새 저장 단위를 잡으므로 4바이트를 넘깁니다. `-DNDEBUG` 빌드는 assertion 이 없으니 그대로 풀이에 들어가 SIGSEGV 로 죽습니다.
+
+`-mno-ms-bitfields` 는 길이 막혀 있습니다. Windows SDK 헤더가 `error: Itanium-compatible layout for the Microsoft C++ ABI is not yet supported` 로 거부합니다.
+
+### 마찰 4. **MinGW 빌드는 서고 돌지만 답이 틀리다** (막힘, 더 나쁨)
+
+`x86_64-w64-mingw32-gcc 13`(GNU bitfield 배치)으로는 93개 중 91개가 그대로 컴파일되고, 나머지 둘은 `sys/resource.h` 와 `SIGALRM`/`_SC_PAGESIZE` 만 채우면 됩니다. `-static` 링크도 됩니다.
+
+그런데 **명백히 UNSAT 인 식에 SATISFIABLE 을 냅니다.**
+
+```
+p cnf 2 4
+1 2 0
+-1 2 0
+1 -2 0
+-1 -2 0
+```
+
+네 절이 두 변수의 네 배정을 전부 막으므로 UNSAT 입니다. MinGW 빌드는 `s SATISFIABLE` 과 `v 1 2 0` 을 냅니다. `v 1 2 0` 은 네 번째 절을 만족시키지 않습니다.
+
+**이것은 shim 문제가 아니라 정답 문제입니다.** 원인은 아직 특정하지 않았습니다.
+
+### 판단
+
+**두 Windows 빌드 모두 신뢰할 수 없습니다.** 하나는 죽고 하나는 틀립니다. 틀린 SAT 답을 내는 solver 위에 `checked_proof=true` 를 올리는 것은 이 워크스트림이 존재하는 이유와 정반대입니다. checker 가 UNSAT proof 는 잡아주지만 **틀린 SAT 답은 checker 가 잡지 않습니다.** replay 가 잡지만, 그 전에 이미 UNSAT 였어야 할 질문을 SAT 로 답한 solver 를 우리가 신뢰 사슬에 넣었다는 뜻입니다.
+
+그래서 벤더링을 멈추고 조율자에게 물었습니다. 선택지는 이렇게 봅니다.
+
+1. 원인 규명을 계속한다. MinGW 오답이 내 shim(특히 `getrusage`/`sysconf` 대체) 탓인지 kissat 자체의 Windows 이식성 문제인지 좁힌다. 가장 정직하지만 시간이 얼마나 들지 모릅니다
+2. **CaDiCaL 로 바꾼다.** C++11 이고 native LRAT(`--lrat`)라 drat-trim 이 사슬에서 빠집니다. TCB 는 여전히 `lrat-check` 한 파일입니다. Windows 이식성은 다시 재야 합니다
+3. Bitwuzla 처럼 **공식 Windows 바이너리를 pin 한다.** kissat 에는 공식 Windows 릴리스가 없어 이 경로는 kissat 에 대해 닫혀 있습니다
+4. Linux 에서만 `prove.aig-sat` 를 제공하고 Windows 에서는 method 를 등록하지 않는다. 조율자 조건 3("Windows 빌드가 필수")과 어긋나므로 조율자 결정이 필요합니다
 
 ## 다음에 할 것
 
-1. 벤더링. kissat rel-4.0.4 와 drat-trim 을 SHA-256 pin 으로 `scripts/vendor.sh` 에 넣고 `third_party/CMakeLists.txt` 에 실행 파일 target 을 만든다. Windows 이식 마찰을 여기에 기록한다
+1. **조율자 답을 받는다** (solver 후보). 그 뒤 벤더링. `scripts/vendor.sh` 는 symlink 를 건너뛰는 `fetch` 변형이 필요하고, `third_party/CMakeLists.txt` 에 실행 파일 target 과 이식 shim 이 들어갑니다
 2. 3단계와 4단계. `prove.aig-sat` method 본체. product query -> blast -> CNF -> kissat -> drat-trim(신뢰 안 함) -> lrat-check. checker 통과 뒤에만 `PROVED_*` 와 `checked_proof=true`. envelope 에 세 실행 파일 digest 와 SMT 경로와 같은 query digest
 3. Bitwuzla 와 kissat 이 같은 query bytes 에 같은 답을 내는지 고정하는 시험 (조율자 조건 2 의 나머지 절반)
