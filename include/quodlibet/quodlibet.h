@@ -23,6 +23,7 @@
 #include "quodlibet/precondition.h"
 #include "quodlibet/problem.h"
 #include "quodlibet/product.h"
+#include "quodlibet/proof_aigsat.h"
 #include "quodlibet/proof_diff.h"
 #include "quodlibet/proof_method.h"
 #include "quodlibet/proof_smt.h"

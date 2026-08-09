@@ -384,6 +384,40 @@ program was allowed to perform the operation is the UB guard's question. A
 circuit that answered it would be answering it twice, in two places that could
 disagree.
 
+#### Where the miter comes from
+
+The AIG path does **not** walk the IR. `src/product.c` already encodes the
+whole contract once: block reachability, PHI, the observation axes, the UB
+policy and its totalization, the typed precondition, the relation direction,
+and the refusal of memory, effects, and non-scalar types. Rebuilding that at
+bit level would put the C semantics in two independent encoders, and a
+`checked_proof` that rests on the second one is only worth anything if the two
+never drift. A verified proof of the wrong question is worse than an unverified
+proof of the right one, because it carries authority.
+
+So `src/proof_aigsat.c` bit-blasts the SMT-LIB bytes `ql_smt2_builder` already
+produced for Bitwuzla. The two backends answer the same question by
+construction, and the outcome records the same query digest for both, so the
+evidence itself states that they did.
+
+The accepted grammar is closed: `set-logic`, `declare-const`, nullary
+`define-fun`, and `assert`; the `Bool` and `(_ BitVec N)` sorts; the operators
+the encoder emits and no others. An Array sort is refused, because the first
+cut is scalar. Anything outside the grammar is `QL_STATUS_TYPE_MISMATCH` and
+becomes `UNKNOWN`; nothing is guessed at. This is a front end for one producer,
+not a general SMT-LIB parser, and it is the only place in the AIG path that
+reads bytes it did not write, so it carries a fuzz target
+(`tests/fuzz/fuzz_smt2_blaster.c`) whose deterministic corpus also runs on
+every CTest.
+
+Two tests hold the architecture up. A round-trip test blasts what the builder
+writes and checks the circuit against the operators' ordinary meanings. An
+agreement test blasts the real product query and requires that the miter call
+an input a violation exactly when concretely running both functions through the
+IR interpreter does, over boundary and pseudo-random inputs, including
+division, remainder, shifts, and a typed precondition. A disagreement is a bug
+in the blaster or in the encoder and fails loudly; it is never averaged away.
+
 CNF export is Tseitin over the cone of influence of one root, so a part of the
 graph the root does not reach costs the solver nothing. The DIMACS bytes are
 deterministic, which is what lets a query digest identify the question. A root
