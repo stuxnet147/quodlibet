@@ -190,26 +190,30 @@ spawn 은 9p 에서 순차 5.45ms 로 비싸지만 **병렬화가 잘 되고**(1
 
 ## 건전성 확인
 
-튜닝이 판정을 바꾸지 않았음을 매번 전 구성으로 확인한다. 2026-08-10 `b6ff804` 기준:
+튜닝이 판정을 바꾸지 않았음을 매번 전 구성으로 확인한다. `main` (`fbfac09`) 을 병합한 2026-08-10 기준:
 
 | 구성 | 결과 |
 |---|---|
-| windows-clang | 267/267 |
-| linux-clang | 266/266 |
-| ASan + UBSan (`-fno-sanitize-recover=all`) | 266/266 |
+| windows-clang | 292/292 |
+| linux-clang | 291/291 |
+| linux-sanitize (ASan + UBSan, `-fno-sanitize-recover=all`) | 291/291 |
 
-**`linux-sanitize` 프리셋 자체는 지금 깨져 있다.** libuv 가 그 프리셋에서 `-fPIC` 없이 빌드되어 파이썬 확장 링크가 `relocation R_X86_64_PC32 against uv_ip6_addr can not be used when making a shared object` 로 실패한다. W8 의 변경과 무관한 선행 문제이고 `CMakePresets.json` 은 조율자 소유라 고치지 않았다. 조율자에게 보고했고, 그때까지 sanitizer 확인은 별도 build directory 로 한다.
+`linux-sanitize` 프리셋은 한동안 libuv 의 `-fPIC` 누락으로 파이썬 확장 링크가 실패했다(`relocation R_X86_64_PC32 against uv_ip6_addr can not be used when making a shared object`). W8 이 보고하고 조율자가 `d04cb80` 에서 전역 `POSITION_INDEPENDENT_CODE` 로 고쳤다. 지금은 프리셋 그대로 쓰면 된다.
 
-```sh
-cmake -S . -B out/build/linux-sanitize-pic -G Ninja \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all" \
-  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all" \
-  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-cmake --build out/build/linux-sanitize-pic --parallel
-(cd out/build/linux-sanitize-pic && ctest --output-on-failure)
-```
+## 병합 후 회귀 확인 (2026-08-10, `main` `fbfac09` 병합)
+
+`main` 이 `src/product.c`, `src/replay.c`, `src/signature.c` 에 큰 변경을 들여왔으므로 관문을 다시 돌렸다.
+
+| | 최소 wall (1,050 유닛) | 유닛당 | digest |
+|---|---|---|---|
+| 병합 전 | 380 ms | 0.3619 ms | 50775242 |
+| 병합 후 | 378 ms | 0.3600 ms | 50775242 |
+
+digest 가 같고 시간은 잡음 범위다. 그 변경들은 coverage 경로를 지나지 않는다.
+
+### 유닛당 정의는 하나다
+
+로어링이 **정의마다** 다시 파싱하므로 한 유닛에 정의가 여럿이면 중복 배수가 커진다. 이 코퍼스에서는 안 커진다. `tools/corpus/extract.py:63` 의 `build_unit` 이 유닛 하나를 **context 선언(원형만) + target 본문 하나**로 만들기 때문에 정의 수와 유닛 수가 구조적으로 같다(val 에서 1,050 = 1,050 확인). **따라서 val 의 호출 귀속은 train 에도 그대로 적용되고, 유닛당 파스는 정확히 두 번이다.** 쫓을 배수가 따로 없다.
 
 ## 아직 없는 것
 
