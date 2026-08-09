@@ -60,7 +60,9 @@
       "displayName": "Linux Clang libFuzzer",
       "inherits": "linux-sanitize",
       "cacheVariables": {
-        "QL_BUILD_FUZZERS": "ON"
+        "QL_BUILD_FUZZERS": "ON",
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined,fuzzer-no-link -fno-sanitize-recover=all",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined,fuzzer-no-link -fno-sanitize-recover=all"
       }
     }
   ],
