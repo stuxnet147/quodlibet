@@ -30,6 +30,11 @@ if(NOT QL_PYTHON_IN_TREE)
     set(QL_BUILD_SHARED OFF CACHE BOOL "" FORCE)
     set(QL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    # Everything below folds into one shared module, so every vendored object
+    # must be PIC. The core target already asks for it; the vendored archives
+    # (libuv was the one that failed the Linux link) only inherit it from this
+    # global default.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
     add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../.."
                      "${CMAKE_CURRENT_BINARY_DIR}/quodlibet_core"
                      EXCLUDE_FROM_ALL)
