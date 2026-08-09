@@ -19,7 +19,8 @@ Planned optional adapters:
 
 | Project | Pinned version | License | Intended use |
 | --- | --- | --- | --- |
-| Kissat | rel-4.0.4 | MIT | SAT and AIG-miter backend |
+| CaDiCaL | 2.2.1 | MIT | SAT backend for the AIG miter, with native LRAT proofs |
+| drat-trim (`lrat-check.c` only) | commit 2e3b2dc | MIT | The LRAT proof checker a checked proof rests on |
 
 Adding or updating a dependency requires an explicit version, an upstream
 archive checksum, a license review, and successful Windows and Linux CI.

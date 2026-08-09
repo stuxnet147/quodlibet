@@ -112,11 +112,56 @@ CaDiCaL 은 Freiburg 그룹이 "native LRAT" 를 명시적으로 홍보하는 �
 - solver 가 `s SATISFIABLE` 을 내면 배정을 typed input 으로 디코드해 `ir_interp` 로 replay 한 뒤에만 `COUNTEREXAMPLE` 입니다
 - 메모리를 쓰는 IR, 루프, 재귀, 외부 호출은 첫 절단에서 인코딩하지 않고 `UNKNOWN` 입니다. 유한 절단을 썼으면 `BOUNDED_CLEAN` 이며 `PROVED_*` 로 올리지 않습니다
 
-## 조율자에게 필요한 결정
+## 결정 기록: 경로 A 는 측정으로 기각되었고 CaDiCaL 로 갔다 (2026-08-10)
 
-1. 경로 A / B / C 중 무엇인가
-2. `scripts/vendor.sh` 와 `third_party/CMakeLists.txt` 에 새 벤더를 W10 이 직접 넣어도 되는가
-3. `CMakeLists.txt` 의 `QL_OPTIONAL_CORE_SOURCES` 에 `src/aig.c`, `src/proof_aigsat.c`, `src/proof_diff.c` 를 추가해 줄 것
+위의 권고는 **틀렸습니다.** 조율자가 경로 A 를 승인했고 Windows 이식을 재는 단계에서 Kissat 이 실격했습니다. 이 절은 그 근거를 남깁니다.
+
+### Kissat rel-4.0.4 실격 근거
+
+pin 은 tarball SHA-256 `bfe93eaa6323b48011e4b1fcf74b3f2e20f9de544767e728009e5b2018296193` 입니다.
+
+**1. MSVC ABI 에서 자료구조가 깨진다.** `windows-clang` 프리셋으로 93개 소스 중 92개가 약 60줄 shim 으로 컴파일되지만, `-O0` 빌드가 kissat 자신의 assertion 에서 멈춥니다.
+
+```
+Assertion failed: sizeof (watch) == sizeof (unsigned), file inline.h, line 79
+```
+
+`watch` union 의 bitfield 가 GNU 배치를 전제합니다. MSVC ABI 는 bitfield 의 기반 타입이 바뀌면 새 저장 단위를 잡으므로 4바이트를 넘깁니다. `-DNDEBUG` 빌드는 그 검사가 없어 그대로 풀이에 들어가 SIGSEGV 로 죽습니다. `-mno-ms-bitfields` 는 Windows SDK 헤더가 `error: Itanium-compatible layout for the Microsoft C++ ABI is not yet supported` 로 거부합니다.
+
+**2. MinGW 빌드는 틀린 답을 낸다.** `x86_64-w64-mingw32-gcc 13`(GNU bitfield 배치)으로는 서고 돌지만, 다음 식에 `s SATISFIABLE` 과 `v 1 2 0` 을 냅니다.
+
+```
+p cnf 2 4
+1 2 0
+-1 2 0
+1 -2 0
+-1 -2 0
+```
+
+네 절이 두 변수의 네 배정을 전부 막으므로 UNSAT 이고, 내놓은 model 은 네 번째 절을 만족시키지 않습니다. 원인은 특정하지 않았습니다.
+
+**3. 왜 이것이 단순한 빌드 실패보다 무거운가.** checker 는 틀린 UNSAT proof 를 잡습니다. **틀린 SAT 답은 아무것도 잡지 않습니다.** replay 가 마지막에 걸러내기는 하지만, 그때는 이미 UNSAT 였어야 할 질문에 SAT 를 답한 solver 를 신뢰 사슬 안에 들인 뒤입니다. 신뢰를 줄이려고 만든 경로가 오답 solver 를 들이는 것은 자기모순입니다.
+
+### CaDiCaL 2.2.1 채택
+
+pin 은 tarball SHA-256 `16d24cc143632b9990a3fbe062e2858d5dd9599a0f369dc02a40c2a76036f931` 입니다. **벤더링 전에 같은 프로브를 양 플랫폼에서 돌렸습니다.**
+
+| 프로브 | Windows (`windows-clang`, MSVC ABI) | Linux (WSL Ubuntu 24.04, gcc) |
+|---|---|---|
+| 사소 SAT (2변수 2절) | `s SATISFIABLE`, 코드 10 | 같음 |
+| 사소 UNSAT (Kissat 이 틀린 그 식) | `s UNSATISFIABLE`, 코드 20 | 같음 |
+| 중간 UNSAT (pigeonhole 9/8, 297절) | 코드 20, LRAT 70,701줄, `lrat-check` **VERIFIED** | 코드 20, LRAT 69,002줄, **VERIFIED** |
+| 중간 SAT (무작위 3-SAT, 250변수 875절) | `s SATISFIABLE`, model 을 따로 검증해 미충족 절 0개 | `s SATISFIABLE` |
+
+CaDiCaL 3.0.1(`0a8ea563b5a25f5aa064634814edab45cc0e45111ea0f5d412a565f806fd7e11`)도 같은 프로브를 전부 통과했습니다. 조율자가 2.x 를 지정했고 2.2.1 이 더 오래 검증된 계열이라 그쪽을 pin 했습니다.
+
+### 사슬이 짧아졌다
+
+CaDiCaL 이 LRAT 를 직접 내므로 **drat-trim 이 사슬에서 빠졌습니다.** 원래 경로 A 는 kissat(DRAT) -> drat-trim(elaborate) -> lrat-check 세 프로세스였고, 지금은 CaDiCaL(LRAT) -> lrat-check 두 프로세스입니다. TCB 는 그대로 `lrat-check.c` 한 파일입니다.
+
+### Windows 이식 형태
+
+pin 한 소스는 **고치지 않습니다.** `third_party/quodlibet-compat/` 이 Windows 에 없는 헤더 넷(`unistd.h`, `strings.h`, `sys/time.h`, `sys/resource.h`)과 prelude 하나를 대신 줍니다. pin 을 고치면 checksum 이 빌드되는 것과 다른 것을 가리키게 되므로, 없는 것을 채우는 쪽을 택했습니다. shim 이 채우는 시간과 메모리 값은 통계 출력에만 쓰이고 판정에 닿지 않습니다. 링크에는 32MB 스택이 필요합니다.
 
 ## 출처
 

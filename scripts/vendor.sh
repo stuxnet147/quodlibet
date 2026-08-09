@@ -160,6 +160,11 @@ fetch tree-sitter v0.26.12 \
 fetch tree-sitter-c v0.24.2 \
     2eeb4db31f8fa0865e45488503d13403923bcb485a1bdb637abff8c42dd97364 \
     https://codeload.github.com/tree-sitter/tree-sitter-c/tar.gz/refs/tags/v0.24.2
+fetch cadical rel-2.2.1     16d24cc143632b9990a3fbe062e2858d5dd9599a0f369dc02a40c2a76036f931     https://codeload.github.com/arminbiere/cadical/tar.gz/refs/tags/rel-2.2.1
+# Only lrat-check.c is compiled from this checkout. The rest of the repository
+# is fetched so that the checker's source arrives with its licence and its
+# siblings under one pinned identity instead of as a loose file.
+fetch drat-trim 2e3b2dc0ecf938addbd779d42877b6ed69d9a985     a75e5a2072fa5a5493ee8504067661c6b452d45a32f889ac5b2c9470c227b58c     https://codeload.github.com/marijnheule/drat-trim/tar.gz/2e3b2dc0ecf938addbd779d42877b6ed69d9a985
 fetch_zip bitwuzla-linux-x86_64 0.9.1 \
     057f1546ae2068df57beb178f3eeab1678f0e5f0c378787a05b7bb294617c9c6 \
     bin/bitwuzla \

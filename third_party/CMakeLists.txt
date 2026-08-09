@@ -195,3 +195,102 @@ if(BUILD_TESTING AND QL_BUILD_TESTS)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     add_subdirectory(googletest EXCLUDE_FROM_ALL)
 endif()
+
+# --- SAT backend and proof checker -------------------------------------------
+#
+# The AIG/SAT path exists to shrink what a PROVED verdict trusts, so its two
+# programs are built here as ordinary executables and invoked as isolated
+# processes. Neither is linked into libquodlibet: CaDiCaL is C++ and the core
+# is C17, and a checker that shared an address space with the thing it checks
+# would be checking itself.
+#
+# Kissat was the recorded candidate and was disqualified by measurement, not by
+# preference. docs/notes/sat-backend-and-proof-checker.md records why.
+option(QL_ENABLE_SAT "Build the pinned CaDiCaL backend and LRAT checker" ON)
+
+if(QL_ENABLE_SAT)
+    foreach(sat_directory IN ITEMS cadical drat-trim)
+        if(NOT EXISTS
+           "${CMAKE_CURRENT_SOURCE_DIR}/${sat_directory}/.quodlibet-vendor")
+            message(FATAL_ERROR
+                "Missing pinned dependency '${sat_directory}'. "
+                "Run ./scripts/vendor.sh from ${PROJECT_SOURCE_DIR}")
+        endif()
+    endforeach()
+
+    # CaDiCaL's build normally generates this from git metadata. A vendored
+    # checkout has none, and a build identity that varied per machine would
+    # make the recorded backend identity useless anyway.
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/cadical-build/build.hpp"
+        "#define VERSION \"2.2.1\"\n"
+        "#define IDENTIFIER \"quodlibet-vendored\"\n"
+        "#define COMPILER \"${CMAKE_CXX_COMPILER_ID}\"\n"
+        "#define FLAGS \"\"\n"
+        "#define DATE \"pinned\"\n")
+
+    # mobical is CaDiCaL's own model-based tester, not part of the solver.
+    file(GLOB ql_cadical_sources CONFIGURE_DEPENDS LIST_DIRECTORIES false
+        "${CMAKE_CURRENT_SOURCE_DIR}/cadical/src/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cadical/src/*.c")
+    list(FILTER ql_cadical_sources EXCLUDE REGEX "mobical\.cpp$")
+    list(SORT ql_cadical_sources)
+
+    add_executable(ql_cadical ${ql_cadical_sources})
+    target_include_directories(ql_cadical SYSTEM PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/cadical-build"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cadical/src")
+    set_target_properties(ql_cadical PROPERTIES
+        OUTPUT_NAME cadical
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON)
+
+    add_executable(ql_lrat_check
+        "${CMAKE_CURRENT_SOURCE_DIR}/drat-trim/lrat-check.c")
+    set_target_properties(ql_lrat_check PROPERTIES
+        OUTPUT_NAME lrat-check
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON)
+
+    foreach(sat_target IN ITEMS ql_cadical ql_lrat_check)
+        if(MSVC)
+            target_compile_options(${sat_target} PRIVATE /w)
+        else()
+            target_compile_options(${sat_target} PRIVATE -w)
+        endif()
+        if(WIN32)
+            # The pinned sources are unmodified. Windows lacks four POSIX
+            # headers and a handful of names they use, so those are supplied
+            # rather than patched in; see quodlibet-compat/README.md.
+            target_include_directories(${sat_target} SYSTEM BEFORE PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/quodlibet-compat")
+            target_compile_options(${sat_target} PRIVATE
+                -include "${CMAKE_CURRENT_SOURCE_DIR}/quodlibet-compat/ql_sat_prelude.h")
+            # Windows defaults to a 1 MB stack; the solver's recursion on a
+            # large instance needs more, and running out of it looks like a
+            # wrong answer rather than a crash at the wrong moment.
+            target_link_options(${sat_target} PRIVATE "LINKER:/STACK:33554432")
+        endif()
+    endforeach()
+    if(WIN32)
+        # CaDiCaL reads its own resident set size through the Win32 API.
+        target_compile_definitions(ql_cadical PRIVATE NUNLOCKED)
+        target_link_libraries(ql_cadical PRIVATE psapi)
+    endif()
+
+    set(QL_CADICAL_EXECUTABLE "$<TARGET_FILE:ql_cadical>"
+        CACHE STRING "Path to the CaDiCaL 2.2.1 executable" FORCE)
+    set(QL_LRAT_CHECK_EXECUTABLE "$<TARGET_FILE:ql_lrat_check>"
+        CACHE STRING "Path to the LRAT checker executable" FORCE)
+
+    # The core library is created after this directory is processed, and the
+    # root CMakeLists.txt is owned by the integrator. Deferring the call to the
+    # end of the top-level scope adds the two paths without editing that file.
+    cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}"
+        CALL target_compile_definitions quodlibet PRIVATE
+            "QL_CADICAL_EXECUTABLE=\"$<TARGET_FILE:ql_cadical>\""
+            "QL_LRAT_CHECK_EXECUTABLE=\"$<TARGET_FILE:ql_lrat_check>\"")
+    cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}"
+        CALL add_dependencies quodlibet ql_cadical ql_lrat_check)
+endif()

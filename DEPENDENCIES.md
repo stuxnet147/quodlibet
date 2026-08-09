@@ -138,12 +138,60 @@ evaluate those terms itself.
 
 Source: <https://github.com/bitwuzla/bitwuzla>
 
+### CaDiCaL 2.2.1
+
+The SAT backend for the AIG miter. It is invoked as an isolated process, like
+Bitwuzla, and is never linked into `libquodlibet`: CaDiCaL is C++ and the core
+is C17.
+
+It is used specifically for its **native LRAT proof output** (`--lrat`). LRAT
+records the antecedent clauses of every learned clause, so checking it is
+replay rather than search, and the checker is small enough to audit. That is
+what lets the AIG path report `checked_proof = true` where the SMT path cannot.
+Enabling LRAT disables some of CaDiCaL's inprocessing, so the same instance can
+be slower than an unproved run; a proof that no one can check is not the
+cheaper option, it is a different result.
+
+Kissat rel-4.0.4 was the recorded candidate and was **disqualified by
+measurement**. Under the MSVC ABI its `watch` union assumes GNU bitfield
+packing, its own assertion `sizeof (watch) == sizeof (unsigned)` fires, and an
+`NDEBUG` build segfaults during solving; `-mno-ms-bitfields` is refused by the
+Windows SDK headers. A MinGW build compiles and runs but **answers a trivially
+unsatisfiable formula with `s SATISFIABLE`**. A checker catches a bad UNSAT
+proof and nothing in the chain catches a wrong SAT answer, so a solver that
+answers wrongly cannot enter a trust chain whose purpose is to shrink what is
+trusted. The measurements and the reproducing formula are in
+`docs/notes/sat-backend-and-proof-checker.md`.
+
+CaDiCaL was probed the same way before it was pinned: trivial SAT, the trivial
+UNSAT formula Kissat got wrong, and a mid-size pigeonhole instance with LRAT
+emission and checking, on Windows and Linux. All passed.
+
+Source: <https://github.com/arminbiere/cadical>
+
+### drat-trim (`lrat-check` only), commit `2e3b2dc`
+
+Only `lrat-check.c`, roughly 500 lines of C, is compiled. **This one file is
+the entire trusted base of a `checked_proof = true` verdict.** It reads the
+original CNF and the LRAT proof and replays the propagations the proof names;
+it searches for nothing and it is small enough to read.
+
+`drat-trim.c` is present because the checker's source arrives with its licence
+and its siblings under one pinned identity, and it is deliberately **not
+built**. The earlier plan used it to elaborate Kissat's DRAT into LRAT; CaDiCaL
+emits LRAT directly, so that step and its process left the chain.
+
+The checker is a replaceable boundary. The method takes its executable as an
+option and the outcome envelope records which checker validated what, so
+`cake_lpr`, whose machine code is verified in HOL4, can be adopted later
+without rewriting the method.
+
+Source: <https://github.com/marijnheule/drat-trim>
+
 ## Planned optional proof backends
 
 Other solver libraries remain adapters, not dependencies of `libquodlibet`.
 
-- Kissat rel-4.0.4 is the initial SAT candidate for bit-blasted and AIG-miter
-  obligations.
 - cvc5 remains a later candidate for quantified obligations, CHC-adjacent
   workflows, and proof production where its feature set is needed.
 
@@ -151,7 +199,7 @@ Backend versions belong to each plugin's evidence metadata and cache key. A
 backend may only return a proved verdict when the selected trust policy accepts
 its certificate or trusted result path.
 
-Sources: <https://github.com/arminbiere/kissat>, <https://github.com/cvc5/cvc5>
+Source: <https://github.com/cvc5/cvc5>
 
 ## Python bindings
 
