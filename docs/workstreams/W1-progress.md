@@ -628,7 +628,7 @@ ql_status ql_c_lower_selected_function_with_tree(
 
 ### 12. 함수 호출
 
-커밋: (이 커밋)
+커밋: `6796143`
 
 측정 1순위였습니다. 선언된 콜리 호출을 내립니다.
 
