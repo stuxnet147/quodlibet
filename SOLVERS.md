@@ -150,7 +150,12 @@ checked certificate path.
 ## Deterministic SMT-LIB subset
 
 The v1 builder emits one command per line in call order. It currently provides
-logic selection, Boolean and bit-vector constants, and Boolean assertions. Raw
+logic selection, Boolean and bit-vector constants, nullary `define-fun`
+bindings for Boolean and bit-vector terms, and Boolean assertions. The
+definition forms exist so a relational encoding can name each intermediate
+value once instead of substituting it into a single term that grows with the
+product of two control-flow graphs. A definition body is serialized verbatim;
+Bitwuzla remains the only component that parses or sort-checks it. Raw
 assertion artifacts pass a top-level command whitelist before reaching the
 backend. Solver-driving commands such as `check-sat`, `get-model`, `reset`,
 `push`, `pop`, and `exit` cannot be injected through that artifact boundary.

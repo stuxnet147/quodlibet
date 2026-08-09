@@ -219,6 +219,17 @@ QL_API ql_status QL_CALL ql_smt2_builder_declare_bool(
 QL_API ql_status QL_CALL ql_smt2_builder_declare_bv(
     ql_smt2_builder *builder, const char *symbol, uint32_t width,
     ql_error *error);
+/* Nullary define-fun bindings. A relational encoding names every intermediate
+   value once instead of substituting it into a single term whose size grows
+   with the product of both control-flow graphs. The body is serialized
+   verbatim; the backend remains the only component that parses or sort-checks
+   it. */
+QL_API ql_status QL_CALL ql_smt2_builder_define_bool(
+    ql_smt2_builder *builder, const char *symbol, const char *boolean_term,
+    ql_error *error);
+QL_API ql_status QL_CALL ql_smt2_builder_define_bv(
+    ql_smt2_builder *builder, const char *symbol, uint32_t width,
+    const char *term, ql_error *error);
 QL_API ql_status QL_CALL ql_smt2_builder_assert(
     ql_smt2_builder *builder, const char *boolean_term, ql_error *error);
 QL_API ql_status QL_CALL ql_smt2_builder_build(

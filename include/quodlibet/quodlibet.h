@@ -19,6 +19,7 @@
 #include "quodlibet/plugin.h"
 #include "quodlibet/precondition.h"
 #include "quodlibet/problem.h"
+#include "quodlibet/product.h"
 #include "quodlibet/proof_method.h"
 #include "quodlibet/registry.h"
 #include "quodlibet/scheduler.h"

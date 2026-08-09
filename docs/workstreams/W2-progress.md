@@ -6,22 +6,22 @@
 
 ## 지금 하는 중
 
-WU3. SMT-LIB 직렬화 확장과 product/miter.
+WU4. SAT model decode 와 concrete replay.
 
 ## 기준선과 통합
 
 - `6c6a34e` 에서 분기했고 조율자 지시에 따라 `cfbbb20` (origin/main) 위로 rebase 했습니다.
 - 작업 단위마다 `git fetch origin` 후 `git rebase origin/main`, 자기 브랜치는 force push 합니다.
-- 기준선 `ctest` 98/98 통과 확인. WU1 후 105/105, WU2 후 113/113.
+- 기준선 `ctest` 98/98 통과 확인. WU1 후 105/105, WU2 후 113/113, WU3 후 125/125.
 
 ## 계획한 작업 단위
 
 | 단위 | 내용 | 상태 | 커밋 |
 |---|---|---|---|
 | WU1 | `quodlibet.source-signature` artifact 와 IR 결합 검사 | 완료 | `530d54b` |
-| WU2 | problem schema v2, v1 non-null precondition gate | 완료 | 다음 항목 참고 |
-| WU3 | SMT-LIB `define-fun` 직렬화, product/miter (`src/product.c`) | 진행 | |
-| WU4 | SAT model decode 와 concrete replay (`src/replay.c`) | 대기 | |
+| WU2 | problem schema v2, v1 non-null precondition gate | 완료 | `7b95ff6` |
+| WU3 | SMT-LIB `define-fun` 직렬화, product/miter (`src/product.c`) | 완료 | 다음 커밋 |
+| WU4 | SAT model decode 와 concrete replay (`src/replay.c`) | 진행 | |
 | WU5 | `prove.smt-product` proof method, UNSAT 승격 경계 | 대기 | |
 | WU6 | 세 결과 end-to-end 통합 시험 | 대기 | |
 
@@ -43,10 +43,27 @@ WU3. SMT-LIB 직렬화 확장과 product/miter.
 - open 은 기록된 세 digest 를 전부 **다시 계산해서** 대조합니다. 편집된 artifact 는 `QL_STATUS_SCHEMA_MISMATCH` 입니다.
 - gate 는 `ql_problem_require_proof_binding` 하나입니다. **schema v1 은 precondition 유무와 무관하게 통과하지 못합니다.** v1 은 인자 대응도 signature digest 도 없으므로 non-null precondition 만 막는 것보다 이쪽이 맞습니다. 지시서가 요구한 "v1 non-null precondition 으로 `PROVED_*` 불가" 는 이 규칙에 포함되고, 그 경우만 별도 메시지로 구분해 시험이 정확히 고정합니다.
 
+### WU3. product/miter
+
+- `ql_smt2_builder` 에 nullary `define-fun` 두 개(`define_bool`, `define_bv`)를 더했습니다. 관계형 인코딩이 중간값을 한 번씩 이름 붙이지 않으면 항 크기가 좌우 CFG 곱으로 커집니다. body 는 그대로 직렬화하고 파싱과 sort check 는 Bitwuzla 만 합니다.
+- 인코딩은 acyclic CFG 를 **경로 조건으로 평탄화**합니다. 블록마다 `X_bN` 도달 조건, 간선마다 `X_eF_T`, 값마다 `X_vN` 을 define 합니다. topological order 로 내보내므로 모든 피연산자가 먼저 정의됩니다. PHI 는 들어오는 간선 기호 위의 `ite` 사슬입니다.
+- 값 정의는 **전역 함수**입니다. SMT 의 `bvudiv`/`bvsdiv`/`bvshl` 은 전역화되어 있는데, C 의 UB 는 IR 의 `UB_GUARD` 가 담고 있고 모든 정책의 위반식이 관찰 동치를 **양쪽 defined 와 반드시 함께** 묶으므로 전역화된 값이 관찰 주장에 새지 않습니다.
+- 관찰 동치(`quodlibet_observation_equal`):
+  - 반환값 축은 `(= l_returns r_returns)` 와 `(=> l_returns (= l_return_value r_return_value))` 입니다. trap 이나 발산은 "반환값 없음" 이라는 다른 관찰이므로 반환 여부부터 비교합니다.
+  - 종료 축은 `(= l_terminates r_terminates)`, trap 축은 발생과 code 를 함께 비교합니다.
+  - memory, volatile, atomics, IO, external call 축은 두 IR 에 해당 effect 와 타입이 **하나도 없음을 먼저 검사**하고 나서 공허하게 성립하는 것으로 처리합니다. effect 가 있으면 인코딩하지 않고 `QL_STATUS_TYPE_MISMATCH` 입니다. 축을 조용히 떨어뜨리지 않습니다.
+  - `QL_OBSERVE_UNDEFINED_BEHAVIOR` 는 별도 conjunct 를 만들지 않습니다. `METHODS.md` 가 definedness 를 "selected UB policy 에 따라" 관찰한다고 정의하므로 UB 축은 정책 항이 담당합니다. 별도로 더 강하게 걸면 LANGUAGE_REFINEMENT 에서 replay 로 확인되지 않는 가짜 counterexample 이 납니다.
+- UB 정책별 위반식은 `src/product.c` 의 `encode_violation` 에 있습니다. MUST_MATCH 는 정의역 불일치 또는 양쪽 defined 에서의 관찰 불일치, LANGUAGE_REFINEMENT 는 방향에 따라 refined 쪽 defined 를 전제로 한 불일치, COMPARE_WHERE_BOTH_DEFINED 는 교집합 위 불일치입니다.
+- **domain query 를 따로 냅니다.** `quodlibet_domain` 은 precondition 과 정책별 비교 정의역이 실제로 비어 있지 않은지 묻습니다. 이것이 UNSAT 이면 miter 의 UNSAT 은 공허하므로 proof 가 아닙니다. `METHODS.md` 는 COMPARE_WHERE_BOTH_DEFINED 에만 이 보고를 요구하지만 모든 정책에 대해 계산합니다.
+- prefix 와 두 terminal assertion 을 **분리된 artifact 세 개**로 냅니다. 하나의 prefix 를 두 질의가 공유하고, `push`/`pop` 의미론에 기대지 않습니다.
+- 축별 고정 시험: 반환값, trap code, 종료는 각각 축을 끄면 UNSAT, 켜면 SAT 인 쌍으로 고정했습니다. trap 과 발산은 현재 C 슬라이스가 만들 수 없으므로 **IR 을 직접 지어서** 시험합니다. UB 정책과 관계 방향은 `x / y` 와 `if (b == 0) return 0; return a / b;` 쌍으로 세 정책이 서로 다른 답을 내는 것을 고정했습니다.
+- 시험 중 발견: `int g(int x){ return x + 1; }` 는 signed overflow UB 때문에 `int f(int x){ return x; }` 와 **정의역이 다릅니다**. MUST_MATCH 에서 반환값 축을 꺼도 위반이 납니다. 인코딩이 맞고 처음 세운 시험 전제가 틀렸습니다.
+
 ## 소유 밖 파일을 고친 것
 
 - `ARCHITECTURE.md` 의 "Input precondition schema" 절 마지막 문단이 problem v2 이후 사실과 어긋나서 그 문단만 고쳤습니다(v2 가 무엇을 묶는지, gate 가 무엇인지, source signature 가 왜 별도 artifact 인지). 워크스트림 소유 표에 없는 파일이라 조율자께 보고합니다.
-- `include/quodlibet/quodlibet.h` 우산 헤더에 `signature.h` 한 줄을 알파벳 순서로 넣었습니다.
+- `include/quodlibet/quodlibet.h` 우산 헤더에 `signature.h` 와 `product.h` 를 알파벳 순서로 넣었습니다.
+- `SOLVERS.md` 의 "Deterministic SMT-LIB subset" 절에 `define-fun` 두 형태를 더한 사실과 그 이유를 적었습니다.
 
 ## 관찰한 W1 인터페이스 제약
 
@@ -63,4 +80,4 @@ WU3. SMT-LIB 직렬화 확장과 product/miter.
 
 ## 다음에 할 것
 
-WU3 착수.
+WU4 착수.

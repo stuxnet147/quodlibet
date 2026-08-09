@@ -1042,6 +1042,83 @@ ql_status QL_CALL ql_smt2_builder_declare_bv(
     return status;
 }
 
+static ql_status builder_define(ql_smt2_builder *builder, const char *symbol,
+                                const char *sort_prefix, const char *width,
+                                size_t width_size, const char *sort_suffix,
+                                const char *term, ql_error *error) {
+    ql_status status = builder_require_space(
+        builder,
+        strlen("(define-fun  () ") + strlen(symbol) + strlen(sort_prefix) +
+            width_size + strlen(sort_suffix) + strlen(term) + strlen(")\n"),
+        error);
+
+    if (status == QL_STATUS_OK) {
+        status = buffer_append_cstr(&builder->text, "(define-fun ", error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = buffer_append_cstr(&builder->text, symbol, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = buffer_append_cstr(&builder->text, " () ", error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = buffer_append_cstr(&builder->text, sort_prefix, error);
+    }
+    if (status == QL_STATUS_OK && width_size != 0u) {
+        status = buffer_append(&builder->text, width, width_size, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = buffer_append_cstr(&builder->text, sort_suffix, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = buffer_append_cstr(&builder->text, term, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = buffer_append_cstr(&builder->text, ")\n", error);
+    }
+    if (status == QL_STATUS_OK) {
+        ql_error_clear(error);
+    }
+    return status;
+}
+
+ql_status QL_CALL ql_smt2_builder_define_bool(ql_smt2_builder *builder,
+                                              const char *symbol,
+                                              const char *boolean_term,
+                                              ql_error *error) {
+    if (builder == NULL || !valid_symbol(symbol) ||
+        !valid_single_line_term(boolean_term)) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "Boolean definition requires a simple symbol and a non-empty single-line term");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    return builder_define(builder, symbol, "Bool ", NULL, 0u, "",
+                          boolean_term, error);
+}
+
+ql_status QL_CALL ql_smt2_builder_define_bv(ql_smt2_builder *builder,
+                                            const char *symbol,
+                                            uint32_t width, const char *term,
+                                            ql_error *error) {
+    char width_text[16];
+    int count;
+
+    if (builder == NULL || !valid_symbol(symbol) || width == 0u ||
+        !valid_single_line_term(term)) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "bit-vector definition requires a symbol, positive width, and a non-empty single-line term");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    count = snprintf(width_text, sizeof(width_text), "%u", width);
+    if (count <= 0 || (size_t)count >= sizeof(width_text)) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "could not format bit-vector width");
+        return QL_STATUS_INTERNAL_ERROR;
+    }
+    return builder_define(builder, symbol, "(_ BitVec ", width_text,
+                          (size_t)count, ") ", term, error);
+}
+
 ql_status QL_CALL ql_smt2_builder_assert(
     ql_smt2_builder *builder, const char *boolean_term, ql_error *error) {
     ql_status status;
