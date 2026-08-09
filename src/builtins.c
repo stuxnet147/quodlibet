@@ -1,5 +1,6 @@
 #include "quodlibet/registry.h"
 
+#include "quodlibet/proof_diff.h"
 #include "quodlibet/proof_smt.h"
 
 static ql_status QL_CALL identity_run(
@@ -46,5 +47,12 @@ ql_status QL_CALL ql_register_builtin_methods(ql_registry *registry,
     }
     /* The SMT product-program prover is a built-in method, not a privileged
        one: it still passes the same capability checks as any plugin. */
-    return ql_register_smt_product_method(registry, error);
+    status = ql_register_smt_product_method(registry, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    /* The differential refuter is registered beside it rather than under it.
+       It proves nothing and needs no solver, so a pipeline can run both
+       against one problem and take whichever answers first. */
+    return ql_register_diff_method(registry, error);
 }

@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-1단계(조사) 결과를 `docs/notes/sat-backend-and-proof-checker.md` 에 남기고 조율자 확인을 기다립니다.
+5단계(concrete differential)를 끝냈습니다. 다음은 2단계(AIG 하강)입니다.
 
 ## 끝난 작업 단위
 
@@ -23,6 +23,23 @@
 
 cake_lpr(경로 C, HOL4 로 기계어까지 검증)은 첫 절단에 넣지 않고, **checker 를 method option 으로 교체 가능한 경계로 설계**해서 나중에 붙일 수 있게 둡니다.
 
+### 2. 조율자 답 (닫힘)
+
+경로 A 승인. 조건 넷을 받았습니다.
+
+1. `checked_proof=true` 는 `lrat-check` 가 원본 CNF 와 LRAT 에 대해 통과했을 때만이고, envelope 에 kissat / drat-trim / lrat-check 세 실행 파일의 BLAKE3 digest 를 전부 기록합니다
+2. 세 프로세스 모두 기존 Bitwuzla adapter 의 규율(절대 경로, deadline, 출력 상한, shell 없음)을 따릅니다
+3. **Windows 빌드가 필수입니다.** Kissat 의 POSIX 의존이 마찰을 내면 후보를 바꾸기 전에 측정과 함께 다시 물어봅니다
+4. 벤더는 SHA-256 pin, configure 중 네트워크 금지
+
+`scripts/vendor.sh` 와 `third_party/CMakeLists.txt` 편집은 이 벤더 추가에 한해 위임받았습니다. 기존 pin 은 건드리지 않습니다.
+
+`CMakeLists.txt` 는 조율자가 `main` `bc65956` 에서 `src/aig.c`, `src/proof_aigsat.c`, `src/proof_diff.c` 를 예약했습니다. 그 위로 rebase 했습니다.
+
+### 3. `refute.concrete-differential` (5단계)
+
+`include/quodlibet/proof_diff.h`, `src/proof_diff.c`, `tests/test_proof_diff.cpp` 13개 시험. `src/builtins.c` 에 등록을 한 줄 추가하고 `include/quodlibet/quodlibet.h` 에 헤더를 넣었습니다. `METHODS.md` 의 concrete differential 절에 구현 결정을 적었습니다. CTest 280/280 통과입니다.
+
 ## 내린 설계 결정
 
 - **신뢰는 checker 한 곳으로 모읍니다.** solver 도 elaborator 도 신뢰하지 않습니다. 이것이 이 워크스트림이 `prove.smt-product` 와 다른 유일한 이유입니다
@@ -30,15 +47,18 @@ cake_lpr(경로 C, HOL4 로 기계어까지 검증)은 첫 절단에 넣지 않�
 - **solver 와 checker 는 실행 파일입니다.** `libquodlibet` 은 둘 다 링크하지 않습니다. 기존 Bitwuzla adapter(`src/solver.c`)의 snapshot / deadline / 출력 상한 패턴을 그대로 따릅니다
 - **checker 는 교체 가능합니다.** method option 이 실행 파일과 형식을 받고, envelope 이 어떤 checker 가 무엇을 검사했는지 기록합니다
 
+### `refute.concrete-differential` 쪽
+
+- **native sandbox 를 쓰지 않고 `ir_interp` 로 좌우를 돌립니다.** `METHODS.md` 원문은 instrumented native runner 를 말하지만, native 실행은 C UB 를 조용히 통과시키고 ABI 와 CPU feature 가정을 새로 만들어야 합니다. 인터프리터는 definedness 를 명시적으로 모델하므로 그 두 문제가 없습니다
+- **생성한 입력을 solver-model 문법으로 직렬화해서 `ql_replay_decode_model` 에 넣습니다.** 두 번째 decoder 를 만들지 않기 위해서입니다. SMT 가 낸 witness 와 differential 이 만든 witness 가 같은 decoder 와 같은 relation 평가기를 지납니다. 디코더가 둘이면 서로 어긋날 수 있고, 하나면 어긋날 수 없습니다
+- **아무것도 못 찾으면 `UNKNOWN` 입니다. `BOUNDED_CLEAN` 이 아닙니다.** `METHODS.md` 원문은 유한 시험 통과에 `BOUNDED_CLEAN` 을 허용하지만 이 구현은 쓰지 않습니다. `BOUNDED_CLEAN` 은 어떤 bound 를 소진했다는 뜻인데 64비트 공간의 무작위/경계 표본은 어떤 bound 도 소진하지 않습니다. capability 가 `QL_PROOF_RESULT_BOUNDED` 를 어떤 option 으로도 켜지 않습니다. 지시서(`W10.md` 5항)와 같은 판단이고 `METHODS.md` 에 근거를 적었습니다
+- **찾은 반례는 replay 단계가 따로 없습니다.** 좌우를 concrete 하게 돌려서 나온 것이므로 정의상 replay 된 것입니다. `replay_confirmed` 를 기록하고 SMT 경로와 같은 `quodlibet.counterexample` artifact 를 냅니다
+- **생성기는 결정적입니다.** splitmix64 에 seed 를 물리고, 첫 12개 tuple 은 모든 입력에 같은 경계 패턴(0, 1, all ones, sign bit, signed 극값, 교대 패턴, 바이트 경계, half-width bit)을 넣은 뒤 무작위 단계로 갑니다. seed 와 시험 수와 query digest 가 cache key 에 들어가므로 다른 표본은 다른 검색입니다
+- **`src/builtins.c` 를 한 줄 고쳤습니다.** W10 소유 파일이 아닙니다. 새 method 를 built-in registry 에 넣는 등록 호출뿐이고 기존 동작을 바꾸지 않습니다
+
 ## 막힌 것
 
-**조율자 확인 대기 3건.** `docs/notes/sat-backend-and-proof-checker.md` 마지막 절과 같습니다.
-
-1. 경로 A / B / C 중 무엇인가
-2. `scripts/vendor.sh` 와 `third_party/CMakeLists.txt` 에 새 벤더를 W10 이 직접 넣어도 되는가. 둘 다 W10 소유가 아닙니다
-3. **`CMakeLists.txt` 의 `QL_OPTIONAL_CORE_SOURCES` 에 `src/aig.c`, `src/proof_aigsat.c`, `src/proof_diff.c` 가 없습니다.** `docs/workstreams/README.md` 는 지시서에 적힌 파일 이름이 이미 등록되어 있다고 하지만 실제로는 세 개 다 빠져 있습니다. 조율자가 `CMakeLists.txt` 를 소유하므로 추가를 요청합니다
-
-3번이 닫히기 전에는 코드가 빌드에 들어가지 않습니다. 다만 **2단계(AIG 하강)와 5단계(concrete differential)는 벤더가 필요 없으므로** 1번과 2번 답을 기다리는 동안 그쪽부터 씁니다.
+없습니다.
 
 ## Windows 이식 위험
 
@@ -46,7 +66,6 @@ Kissat 과 drat-trim 은 둘 다 `unistd.h`, `sys/resource.h`, `sys/time.h` 를 
 
 ## 다음에 할 것
 
-1. 조율자 답을 받는다
-2. 2단계. loop-free scalar IR 의 AIG 하강(`src/aig.c`). 메모리를 쓰는 IR 은 인코딩하지 않고 `UNKNOWN`
-3. 5단계. `refute.concrete-differential`(`src/proof_diff.c`). `ir_interp` 로 좌우를 돌려 반례를 찾음. 반례는 정의상 replay 된 것이므로 바로 `COUNTEREXAMPLE`, 못 찾으면 증거가 아닌 `UNKNOWN`
-4. 3단계와 4단계. miter -> CNF, solver 와 checker 실행, checker 통과 뒤에만 `checked_proof=true`
+1. 2단계. loop-free scalar IR 의 AIG 하강(`src/aig.c`). 메모리를 쓰는 IR 은 인코딩하지 않고 `UNKNOWN`
+2. 벤더링. kissat rel-4.0.4 와 drat-trim 을 SHA-256 pin 으로 `scripts/vendor.sh` 에 넣고 `third_party/CMakeLists.txt` 에 실행 파일 target 을 만든다. Windows 이식 마찰을 여기에 기록한다
+3. 3단계와 4단계. miter -> CNF, solver 와 checker 실행, checker 통과 뒤에만 `checked_proof=true` (`src/proof_aigsat.c`)

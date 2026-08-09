@@ -397,15 +397,58 @@ reliably identify all C UB, so a witness is accepted only when replay under the
 semantic IR or a validated instrumentation path establishes its definedness and
 the contract-visible mismatch.
 
-This is a refutation method. A validated witness yields `COUNTEREXAMPLE`.
-Any finite number of matching tests yields `BOUNDED_CLEAN` with seed, generator,
-test count, size ranges, timeout, and coverage metrics. It never yields
-`PROVED`, even with complete observed branch coverage. Nondeterministic external
-state must be modeled, recorded, or excluded by the precondition.
+This is a refutation method. A validated witness yields `COUNTEREXAMPLE`. A
+finite number of matching tests may yield `BOUNDED_CLEAN` only when the tests
+actually exhaust a stated bound, with seed, generator, test count, size ranges,
+timeout, and coverage metrics recorded. It never yields `PROVED`, even with
+complete observed branch coverage. Nondeterministic external state must be
+modeled, recorded, or excluded by the precondition.
 
 Important options include generator, seed, test and size budgets, runner backend,
 sanitizers, timeout, coverage guidance, CPU profile, deterministic external-call
 stubs, and witness minimization.
+
+#### The implemented runner
+
+`src/proof_diff.c` implements this method over the loop-free scalar slice.
+There is no instrumented native sandbox: both sides are executed by the IR
+interpreter, which is the same semantic path a solver model must survive in
+`prove.smt-product`. That removes the ABI and CPU-feature assumptions a native
+runner would have to state, and it removes the question of whether native
+execution silently accepted C undefined behaviour, because the interpreter
+models definedness explicitly.
+
+The runner builds the same relational product query the SMT method builds. It
+solves nothing with it. The query is what states the shared input list, the
+argument correspondence, and the exact observation axes, and what refuses
+memory, effects, and non-scalar types instead of narrowing them. A generated
+input tuple is serialised in solver-model syntax and handed to
+`ql_replay_decode_model` and `ql_replay_execute`, so the generated witness and a
+Bitwuzla witness travel through one decoder and one relation evaluator. A second
+decoder could disagree with the first; there is not one.
+
+The generator is deterministic: splitmix64 seeded by the recorded seed, with the
+first twelve tuples assigning every input the same boundary pattern (zero, one,
+all ones, the sign bit, the signed extremes, the alternating patterns, the byte
+boundary, the half-width bit) before the random phase begins. The seed, the test
+count, and the query digests are part of the outcome's cache key, so a different
+sample is a different search and never reuses another sample's answer.
+
+**Finding nothing is `UNKNOWN`, not `BOUNDED_CLEAN`.** `BOUNDED_CLEAN` states
+that a bound was exhausted. Boundary-and-random sampling over a 64-bit input
+space exhausts no bound; it covers an unmeasured fraction of one. Reporting a
+passing test count as a clean bounded result would name a guarantee the search
+does not provide, so the outcome records the generator, the seed, the executed
+and conclusive test counts, and how many inputs the precondition rejected, all
+on an `UNKNOWN` verdict. The advertised capability does not include
+`QL_PROOF_RESULT_BOUNDED` under any option.
+
+A mismatch found this way needs no separate replay stage. It was produced by
+running both functions concretely and re-evaluating the typed precondition and
+the relation on the concrete results, which is exactly what replay confirmation
+means, so the outcome records `replay_confirmed` and emits the same
+`quodlibet.counterexample` artifact the SMT path emits. `checked_proof` is
+always false because this method never claims a proof.
 
 ### CHC/PDR
 
