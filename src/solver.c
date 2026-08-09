@@ -2105,11 +2105,31 @@ static ql_status bitwuzla_select_executable(
     return QL_STATUS_OK;
 }
 
+/* A snapshot is hashed immediately after it is written, and on Windows a
+   freshly written executable is briefly held by on-access antivirus scans, so
+   the first open can fail with a sharing violation. Measured on an 8-way
+   concurrent batch: 6 of 80 checks lost their solver to exactly this window.
+   The retry is bounded and short; a path that stays unopenable still fails. */
+#define QL_DIGEST_OPEN_RETRIES 20u
+#define QL_DIGEST_OPEN_BACKOFF_MS 10u
+
+static FILE *open_binary_read_retry(const char *path) {
+    unsigned attempt;
+    FILE *file = open_binary_read(path);
+
+    for (attempt = 0u; file == NULL && attempt < QL_DIGEST_OPEN_RETRIES;
+         ++attempt) {
+        uv_sleep(QL_DIGEST_OPEN_BACKOFF_MS);
+        file = open_binary_read(path);
+    }
+    return file;
+}
+
 static ql_status digest_executable(const char *path, ql_digest *digest,
                                    ql_error *error) {
     unsigned char bytes[65536];
     blake3_hasher hasher;
-    FILE *file = open_binary_read(path);
+    FILE *file = open_binary_read_retry(path);
     size_t count;
 
     if (file == NULL) {
