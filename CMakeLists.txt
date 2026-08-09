@@ -60,13 +60,17 @@ set(QL_CORE_SOURCES
 # never have to edit this list at the same time. A reserved path that has no
 # file is simply absent from the glob result.
 file(GLOB QL_OPTIONAL_CORE_SOURCES CONFIGURE_DEPENDS LIST_DIRECTORIES false
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/aig.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/budget.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cache.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/c_frontend.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/c_lower.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/c_lower_expr.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/c_lower_stmt.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/c_types.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/combine.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/egraph.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/egraph_check.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/evidence.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ir.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ir_interp.c"
@@ -76,6 +80,8 @@ file(GLOB QL_OPTIONAL_CORE_SOURCES CONFIGURE_DEPENDS LIST_DIRECTORIES false
     "${CMAKE_CURRENT_SOURCE_DIR}/src/precondition.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/problem.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/product.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_aigsat.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_diff.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_method.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_smt.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/replay.c"
