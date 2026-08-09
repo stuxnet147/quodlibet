@@ -17,6 +17,14 @@ preset="${PRESET:-windows-clang}"
 
 git fetch origin --prune
 
+# A failed integration leaves its merge on local main; the next run must not
+# quietly stack on top of it and push both. Align to origin first, loudly.
+git checkout -q main
+if [ -n "$(git log --oneline origin/main..main)" ]; then
+    echo "!! local main was ahead of origin (previous failed integration); resetting"
+    git reset --hard origin/main
+fi
+
 ahead="$(git log --oneline "origin/main..origin/$branch" | wc -l)"
 if [ "$ahead" -eq 0 ]; then
     echo "origin/$branch has nothing beyond origin/main; nothing to do"
