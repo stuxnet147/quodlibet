@@ -5,7 +5,18 @@
 
 ## 지금 하는 것
 
-W6.md 의 다섯 항목을 모두 닫았습니다. 마지막 커밋 후 전 구성 검증을 정리하는 중입니다.
+W6.md 의 다섯 항목을 모두 닫았고 전 구성 검증까지 끝냈습니다.
+
+## 검증 결과
+
+| 구성 | 결과 |
+|---|---|
+| `ctest --preset windows-clang` (Bitwuzla ON) | 397/397 통과 |
+| Windows, `-DQL_ENABLE_BITWUZLA=OFF` | 397/397 통과 (Bitwuzla 시험은 skip) |
+| Linux(WSL Ubuntu 24.04) clang, Bitwuzla OFF | 396/396 통과 (pytest 부재로 바인딩 시험 미등록) |
+| `ctest --preset linux-sanitize` (ASan/UBSan) | 395/396. 실패 1건은 W6 밖 (아래) |
+
+공개 헤더를 넓혔으므로 `AGENTS.MD` 가 요구하는 Windows/Linux 양쪽 전 시험을 돌렸습니다.
 
 ## 작업 단위
 
@@ -100,6 +111,16 @@ WU5 는 `tests/test_cache_key.cpp` 16개로 축을 하나씩 바꿔 key 가 움�
 ## 막힌 것
 
 없습니다.
+
+## 다른 워크스트림에 넘기는 것
+
+`ctest --preset linux-sanitize` 에서 `quodlibet.AigBlast.TheMiterAgreesWithTheInterpreterAcrossPartialOperations` 가 UBSan 으로 실패합니다.
+
+```
+src/aig.c:1114:33: runtime error: shift exponent 32 is too large for 32-bit type 'uint32_t'
+```
+
+`width_constant()` 가 `uint32_t width` 를 `width >> index` 로 훑는데 `index` 가 `width` 까지 올라갑니다. width 가 33 이상인 bit-vector 에서 shift 폭이 타입 폭을 넘습니다. `src/aig.c` 는 W6 소유가 아니고(AIG/SAT backend, 커밋 `425089c`) W10 소관이라 고치지 않았습니다. 조율자께 보고했습니다. W6 가 추가한 시험은 이 구성에서 전부 통과합니다.
 
 ## 다음에 할 것
 
