@@ -71,12 +71,44 @@ typedef struct ql_ir_interp_input_v1 {
     uint64_t reserved[2];
 } ql_ir_interp_input_v1;
 
+/* The memory model is a flat 64-bit address space under the ASM2C_GNU_V1
+   profile, where a pointer is an address and nothing more. One object is
+   described per storage region the run can touch, and the caller is
+   responsible for the model's three standing constraints:
+
+     - distinct objects occupy disjoint byte ranges;
+     - every object lies strictly above the first page, so address zero is in
+       no object and dereferencing null is always undefined;
+     - an object's range does not wrap the address space.
+
+   ql_ir_interp_run checks all three and refuses the run rather than
+   interpreting under a layout the model does not admit.
+
+   This model admits more programs than ISO C provenance does: comparing and
+   subtracting pointers into different objects is defined here. Verdicts are
+   therefore relative to the profile, which ARCHITECTURE.md states. */
+typedef struct ql_ir_interp_object_v1 {
+    size_t struct_size;
+    uint64_t base;
+    uint64_t size;
+    /* Bytes at `base`, or null for an object that starts zeroed. */
+    const void *initial;
+    /* Optional: receives `size` bytes of the final image when the run
+       finishes. Null when the caller does not observe memory. */
+    void *final_image;
+    uint64_t reserved[2];
+} ql_ir_interp_object_v1;
+
 typedef struct ql_ir_interp_options_v1 {
     size_t struct_size;
     uint32_t schema_version;
     uint32_t reserved_alignment;
     /* Zero selects QL_IR_INTERP_DEFAULT_STEP_LIMIT. */
     uint64_t step_limit;
+    /* The object table. A module that loads or stores with no objects
+       declared can only reach undefined accesses. */
+    const ql_ir_interp_object_v1 *objects;
+    size_t object_count;
     uint64_t reserved[3];
 } ql_ir_interp_options_v1;
 
@@ -99,6 +131,13 @@ typedef struct ql_ir_interp_result_v1 {
     uint64_t reserved[4];
 } ql_ir_interp_result_v1;
 
+/* The first address any object may occupy. Everything below it, address zero
+   included, belongs to no object, which is what makes a null dereference
+   undefined rather than merely out of range. */
+#define QL_IR_INTERP_FIRST_OBJECT_ADDRESS UINT64_C(0x1000)
+
+QL_API void QL_CALL ql_ir_interp_object_init(
+    ql_ir_interp_object_v1 *object);
 QL_API void QL_CALL ql_ir_interp_options_init(
     ql_ir_interp_options_v1 *options);
 QL_API void QL_CALL ql_ir_interp_input_init(ql_ir_interp_input_v1 *input);

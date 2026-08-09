@@ -13,19 +13,39 @@ typedef struct interp_bits {
     uint64_t words[INTERP_WORDS];
 } interp_bits;
 
+/* A memory version is the writes that led to it, newest first, over the
+   objects' initial images. Storing versions this way keeps every older
+   version readable, which the IR allows: a load may name a memory value that
+   a later store has already superseded. */
+typedef struct interp_store {
+    const struct interp_store *previous;
+    struct interp_store *allocation_next;
+    uint64_t address;
+    uint32_t width;
+    uint8_t bytes[QL_IR_INTERP_VALUE_CAPACITY];
+} interp_store;
+
 typedef struct interp_value {
     interp_bits bits;
+    const interp_store *store;
     uint32_t width;
     ql_ir_type_id type;
+    ql_ir_type_kind kind;
     uint8_t defined;
     uint8_t bound;
 } interp_value;
 
 typedef struct interp_context {
+    ql_allocator allocator;
     const ql_ir *ir;
     ql_ir_view_v1 view;
     ql_ir_interp_result_v1 *result;
     interp_value *values;
+    const ql_ir_interp_object_v1 *objects;
+    size_t object_count;
+    interp_store *allocations;
+    const interp_store *newest_memory;
+    const interp_store *final_memory;
     uint64_t step_limit;
 } interp_context;
 
@@ -330,8 +350,212 @@ static void interp_bits_to_bytes(const interp_bits *value, uint32_t width,
 }
 
 /* ------------------------------------------------------------------ */
+/* memory                                                              */
+/* ------------------------------------------------------------------ */
+
+static size_t interp_byte_width(uint32_t bit_width) {
+    return (size_t)(bit_width / 8u) + (bit_width % 8u == 0u ? 0u : 1u);
+}
+
+/* Natural alignment on the target ABI: a scalar of N bytes is N-aligned when
+   N is a power of two up to sixteen. A width with no such alignment is not a
+   C scalar layout, so nothing is required of it. */
+static uint32_t interp_natural_alignment(size_t byte_width) {
+    if (byte_width == 0u || byte_width > 16u ||
+        (byte_width & (byte_width - 1u)) != 0u) {
+        return 1u;
+    }
+    return (uint32_t)byte_width;
+}
+
+/* The whole access must lie inside one live object and be naturally aligned.
+   Nothing below the first object address belongs to any object, so a null
+   dereference fails here rather than reading a zero page. */
+static int interp_access_defined(const interp_context *context,
+                                 uint64_t address, size_t byte_width) {
+    uint32_t alignment = interp_natural_alignment(byte_width);
+    size_t index;
+
+    if (alignment > 1u && (address % (uint64_t)alignment) != 0u) {
+        return 0;
+    }
+    for (index = 0u; index < context->object_count; ++index) {
+        const ql_ir_interp_object_v1 *object = &context->objects[index];
+        uint64_t offset;
+        if (address < object->base) {
+            continue;
+        }
+        offset = address - object->base;
+        if (offset <= object->size &&
+            object->size - offset >= (uint64_t)byte_width) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int interp_initial_byte(const interp_context *context,
+                               uint64_t address, uint8_t *output) {
+    size_t index;
+
+    for (index = 0u; index < context->object_count; ++index) {
+        const ql_ir_interp_object_v1 *object = &context->objects[index];
+        uint64_t offset;
+        if (address < object->base) {
+            continue;
+        }
+        offset = address - object->base;
+        if (offset >= object->size) {
+            continue;
+        }
+        *output = object->initial != NULL
+                      ? ((const uint8_t *)object->initial)[offset]
+                      : 0u;
+        return 1;
+    }
+    return 0;
+}
+
+static int interp_read_byte(const interp_context *context,
+                            const interp_store *version, uint64_t address,
+                            uint8_t *output) {
+    const interp_store *cursor;
+
+    for (cursor = version; cursor != NULL; cursor = cursor->previous) {
+        uint64_t offset;
+        if (address < cursor->address) {
+            continue;
+        }
+        offset = address - cursor->address;
+        if (offset < (uint64_t)cursor->width) {
+            *output = cursor->bytes[offset];
+            return 1;
+        }
+    }
+    return interp_initial_byte(context, address, output);
+}
+
+static interp_store *interp_push_store(interp_context *context,
+                                       const interp_store *previous,
+                                       uint64_t address, size_t byte_width,
+                                       const interp_bits *value) {
+    interp_store *record = (interp_store *)context->allocator.allocate(
+        context->allocator.user_data, sizeof(*record));
+    size_t index;
+
+    if (record == NULL) {
+        return NULL;
+    }
+    memset(record, 0, sizeof(*record));
+    record->previous = previous;
+    record->address = address;
+    record->width = (uint32_t)byte_width;
+    for (index = 0u; index < byte_width && index < sizeof(record->bytes);
+         ++index) {
+        record->bytes[index] =
+            (uint8_t)((value->words[index / 8u] >> ((index % 8u) * 8u)) &
+                      0xffu);
+    }
+    record->allocation_next = context->allocations;
+    context->allocations = record;
+    context->newest_memory = record;
+    return record;
+}
+
+static void interp_release_stores(interp_context *context) {
+    interp_store *cursor = context->allocations;
+    while (cursor != NULL) {
+        interp_store *next = cursor->allocation_next;
+        context->allocator.deallocate(context->allocator.user_data, cursor);
+        cursor = next;
+    }
+    context->allocations = NULL;
+}
+
+static void interp_write_final_images(interp_context *context,
+                                      const interp_store *version) {
+    size_t index;
+
+    for (index = 0u; index < context->object_count; ++index) {
+        const ql_ir_interp_object_v1 *object = &context->objects[index];
+        uint8_t *destination = (uint8_t *)object->final_image;
+        uint64_t offset;
+        if (destination == NULL) {
+            continue;
+        }
+        for (offset = 0u; offset < object->size; ++offset) {
+            uint8_t byte = 0u;
+            (void)interp_read_byte(context, version, object->base + offset,
+                                   &byte);
+            destination[offset] = byte;
+        }
+    }
+}
+
+/* The model's three standing constraints. Refusing a layout that breaks them
+   is not pedantry: every access-definedness answer below assumes them, and so
+   does the SMT side that has to agree with this one. */
+static ql_status interp_validate_objects(const interp_context *context,
+                                         ql_error *error) {
+    size_t index;
+    size_t other;
+
+    if (context->object_count != 0u && context->objects == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "interpreter object count is non-zero with no table");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    for (index = 0u; index < context->object_count; ++index) {
+        const ql_ir_interp_object_v1 *object = &context->objects[index];
+        if (object->struct_size != 0u &&
+            object->struct_size < sizeof(*object)) {
+            ql_error_set(error, QL_STATUS_ABI_MISMATCH,
+                         "interpreter object structure is too small");
+            return QL_STATUS_ABI_MISMATCH;
+        }
+        if (object->size == 0u) {
+            ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                         "interpreter object %zu is empty", index);
+            return QL_STATUS_INVALID_ARGUMENT;
+        }
+        if (object->base < QL_IR_INTERP_FIRST_OBJECT_ADDRESS) {
+            ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                         "interpreter object %zu starts below the first "
+                         "object address, which would put a valid access at "
+                         "a null pointer", index);
+            return QL_STATUS_INVALID_ARGUMENT;
+        }
+        if (object->size > UINT64_MAX - object->base) {
+            ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                         "interpreter object %zu wraps the address space",
+                         index);
+            return QL_STATUS_INVALID_ARGUMENT;
+        }
+        for (other = 0u; other < index; ++other) {
+            const ql_ir_interp_object_v1 *previous = &context->objects[other];
+            if (object->base < previous->base + previous->size &&
+                previous->base < object->base + object->size) {
+                ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                             "interpreter objects %zu and %zu overlap", other,
+                             index);
+                return QL_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    return QL_STATUS_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* small accessors                                                     */
 /* ------------------------------------------------------------------ */
+
+void QL_CALL ql_ir_interp_object_init(ql_ir_interp_object_v1 *object) {
+    if (object == NULL) {
+        return;
+    }
+    memset(object, 0, sizeof(*object));
+    object->struct_size = sizeof(*object);
+}
 
 void QL_CALL ql_ir_interp_options_init(ql_ir_interp_options_v1 *options) {
     if (options == NULL) {
@@ -427,11 +651,13 @@ static int interp_execute_instruction(
         result_width = slot->width;
         result.width = slot->width;
         result.type = slot->type;
+        result.kind = slot->kind;
     }
 
     switch (instruction->opcode) {
     case QL_IR_OPCODE_IDENTITY:
         result.bits = left->bits;
+        result.store = left->store;
         result.defined = left->defined;
         break;
     case QL_IR_OPCODE_PHI: {
@@ -449,6 +675,7 @@ static int interp_execute_instruction(
         }
         incoming = &context->values[instruction->operands[chosen]];
         result.bits = incoming->bits;
+        result.store = incoming->store;
         result.defined = incoming->defined;
         break;
     }
@@ -466,6 +693,7 @@ static int interp_execute_instruction(
                      ? &context->values[instruction->operands[2]]
                      : &context->values[instruction->operands[1]];
         result.bits = chosen->bits;
+        result.store = chosen->store;
         result.defined = chosen->defined;
         break;
     }
@@ -679,6 +907,90 @@ static int interp_execute_instruction(
         result.bits = left->bits;
         bits_mask(&result.bits, result_width);
         break;
+    case QL_IR_OPCODE_PTR_ADD:
+        if (any_undefined) {
+            result.defined = 0u;
+            break;
+        }
+        if (right->width != result_width) {
+            /* Schema v1 only says the offset is a bit-vector. Rather than
+               invent a widening rule the SMT side would have to match, this
+               refuses an offset that is not already pointer-width. */
+            return interp_stop(context, QL_IR_INTERP_OUTCOME_UNSUPPORTED,
+                               QL_IR_INTERP_UB_NONE, block, id);
+        }
+        bits_add(&left->bits, &right->bits, &result.bits);
+        bits_mask(&result.bits, result_width);
+        break;
+    case QL_IR_OPCODE_PTR_TO_BV:
+    case QL_IR_OPCODE_BV_TO_PTR:
+        /* The type rule already fixes both sides to the same width, so this
+           is a reinterpretation and nothing else. */
+        if (any_undefined) {
+            result.defined = 0u;
+            break;
+        }
+        result.bits = left->bits;
+        break;
+    case QL_IR_OPCODE_LOAD: {
+        size_t byte_width = interp_byte_width(result_width);
+        uint64_t address;
+        size_t byte;
+        if (left->defined == 0u ||
+            context->values[instruction->operands[1]].defined == 0u) {
+            result.defined = 0u;
+            break;
+        }
+        address = context->values[instruction->operands[1]].bits.words[0];
+        if (bits_exceeds_word(
+                &context->values[instruction->operands[1]].bits) ||
+            !interp_access_defined(context, address, byte_width)) {
+            result.defined = 0u;
+            break;
+        }
+        bits_zero(&result.bits);
+        for (byte = 0u; byte < byte_width; ++byte) {
+            uint8_t value = 0u;
+            (void)interp_read_byte(context, left->store,
+                                   address + (uint64_t)byte, &value);
+            result.bits.words[byte / 8u] |= (uint64_t)value
+                                            << ((byte % 8u) * 8u);
+        }
+        bits_mask(&result.bits, result_width);
+        break;
+    }
+    case QL_IR_OPCODE_STORE: {
+        const interp_value *pointer =
+            &context->values[instruction->operands[1]];
+        const interp_value *stored =
+            &context->values[instruction->operands[2]];
+        size_t byte_width = interp_byte_width(stored->width);
+        uint64_t address;
+        interp_store *record;
+        /* A store of a value a partial operation left undefined makes the
+           whole memory version undefined. Tracking undefinedness per byte
+           would be more precise; this is the conservative direction, and the
+           observation that reads it still reports the guard as too weak. */
+        if (left->defined == 0u || pointer->defined == 0u ||
+            stored->defined == 0u) {
+            result.defined = 0u;
+            break;
+        }
+        address = pointer->bits.words[0];
+        if (bits_exceeds_word(&pointer->bits) ||
+            !interp_access_defined(context, address, byte_width)) {
+            result.defined = 0u;
+            break;
+        }
+        record = interp_push_store(context, left->store, address, byte_width,
+                                   &stored->bits);
+        if (record == NULL) {
+            return interp_stop(context, QL_IR_INTERP_OUTCOME_UNSUPPORTED,
+                               QL_IR_INTERP_UB_NONE, block, id);
+        }
+        result.store = record;
+        break;
+    }
     case QL_IR_OPCODE_ASSUME:
         if (left->defined == 0u || bits_is_zero(&left->bits)) {
             return interp_stop(context,
@@ -710,6 +1022,7 @@ static int interp_execute_instruction(
         interp_value *slot = &context->values[instruction->results[0]];
         result.width = slot->width;
         result.type = slot->type;
+        result.kind = slot->kind;
         *slot = result;
     }
     return 1;
@@ -787,6 +1100,10 @@ static ql_status interp_execute(interp_context *context, ql_error *error) {
             }
             context->result->outcome = QL_IR_INTERP_OUTCOME_RETURN;
             context->result->block = current;
+            context->final_memory =
+                block.terminator.memory != QL_IR_INVALID_VALUE_ID
+                    ? context->values[block.terminator.memory].store
+                    : context->newest_memory;
             if (block.terminator.return_value != QL_IR_INVALID_VALUE_ID) {
                 interp_record_value(context, block.terminator.return_value);
             }
@@ -866,11 +1183,18 @@ static ql_status interp_prepare(interp_context *context,
             return QL_STATUS_INVALID_ARGUMENT;
         }
         value->type = view.type;
+        value->kind = type.kind;
         if (type.kind == QL_IR_TYPE_BOOL) {
             value->width = 1u;
-        } else if (type.kind == QL_IR_TYPE_BIT_VECTOR &&
+        } else if ((type.kind == QL_IR_TYPE_BIT_VECTOR ||
+                    type.kind == QL_IR_TYPE_POINTER) &&
                    type.bit_width <= QL_IR_INTERP_MAX_BIT_WIDTH) {
             value->width = type.bit_width;
+        } else if (type.kind == QL_IR_TYPE_MEMORY) {
+            /* A memory value carries a version of the object images rather
+               than bits. The initial version is the images themselves. */
+            value->width = 0u;
+            value->store = NULL;
         } else {
             *modelled = 0;
             context->result->outcome = QL_IR_INTERP_OUTCOME_UNSUPPORTED;
@@ -924,8 +1248,17 @@ static ql_status interp_prepare(interp_context *context,
                          index);
             return QL_STATUS_ALREADY_EXISTS;
         }
-        if (!interp_bits_from_bytes(input->data, input->size, value->width,
-                                    &value->bits)) {
+        if (value->kind == QL_IR_TYPE_MEMORY) {
+            /* The object table already supplies the initial image, so a
+               memory parameter is bound by naming it and nothing else. */
+            if (input->size != 0u) {
+                ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                             "interpreter input %zu binds a memory parameter "
+                             "and must carry no bytes", index);
+                return QL_STATUS_INVALID_ARGUMENT;
+            }
+        } else if (!interp_bits_from_bytes(input->data, input->size,
+                                           value->width, &value->bits)) {
             ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
                          "interpreter input %zu does not match its "
                          "parameter's type", index);
@@ -998,11 +1331,20 @@ ql_status QL_CALL ql_ir_interp_run(const ql_allocator *allocator,
     }
 
     memset(&context, 0, sizeof(context));
+    context.allocator = *selected;
     context.ir = ir;
     context.result = result;
     context.step_limit = options != NULL && options->step_limit != 0u
                              ? options->step_limit
                              : QL_IR_INTERP_DEFAULT_STEP_LIMIT;
+    if (options != NULL) {
+        context.objects = options->objects;
+        context.object_count = options->object_count;
+    }
+    status = interp_validate_objects(&context, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
     context.view.struct_size = sizeof(context.view);
     status = ql_ir_get_view(ir, &context.view, error);
     if (status != QL_STATUS_OK) {
@@ -1021,6 +1363,10 @@ ql_status QL_CALL ql_ir_interp_run(const ql_allocator *allocator,
     if (status == QL_STATUS_OK && modelled) {
         status = interp_execute(&context, error);
     }
+    if (status == QL_STATUS_OK) {
+        interp_write_final_images(&context, context.final_memory);
+    }
+    interp_release_stores(&context);
     selected->deallocate(selected->user_data, context.values);
     if (status == QL_STATUS_OK) {
         ql_error_clear(error);

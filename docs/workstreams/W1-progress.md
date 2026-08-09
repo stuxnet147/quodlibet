@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-2단계 포인터 하강. 타입 폭은 닫았고 첫 차단 사유의 79% 가 이제 포인터입니다.
+2단계 포인터. 인터프리터 메모리 모델을 세웠고 다음은 `c_lower.c` 의 포인터 하강입니다.
 
 ## 기준선
 
@@ -101,6 +101,48 @@ W2 가 `include/quodlibet/ir.h` 를 읽고 있으므로 append-only 확장만 �
 
 - `include/quodlibet/quodlibet.h` 에 `#include "quodlibet/ir_verify.h"` 한 줄 추가. 이 umbrella 헤더는 누구의 소유도 아니고 W2/W3 도 새 헤더를 넣을 것이므로 충돌 가능성을 여기 적어 둡니다.
 
+## 메모리 모델 계약 (W2 가 miter 에서 그대로 써야 하는 것)
+
+조율자가 flat address space 로 확정했습니다(2026-08-10). `ARCHITECTURE.md` 의 profile 절에 전문이 있습니다. 여기에는 W2 가 바로 쓸 형태로 적습니다.
+
+### 모델
+
+`ASM2C_GNU_V1` 의 메모리는 **평평한 64비트 주소 공간**입니다. 포인터는 주소일 뿐이고 그 이상의 provenance 를 담지 않습니다. 이 프로파일의 원재료가 x86-64 SysV 목적 코드에서 복원한 C 라서 `(char *)p + n` 과 정수 왕복이 일상적이기 때문입니다.
+
+저장 영역은 **object** 로 기술합니다. 각 object 는 base 주소와 크기를 갖고, 세 가지 제약이 항상 겁니다.
+
+1. 서로 다른 살아있는 object 의 바이트 범위는 **disjoint** 합니다
+2. 모든 object 는 **첫 페이지보다 위**에 있습니다 (`QL_IR_INTERP_FIRST_OBJECT_ADDRESS` = 0x1000). 주소 0 은 어떤 object 에도 속하지 않으므로 null 역참조가 항상 undefined 입니다
+3. object 의 범위는 주소 공간을 **wrap 하지 않습니다**
+
+`ql_ir_interp_run` 이 이 셋을 검사하고, 어기면 실행을 거부합니다. 모델이 인정하지 않는 배치에서 답을 내지 않습니다.
+
+### 접근 정의 조건
+
+주소 `a` 에서 `W` 바이트 접근이 정의되는 조건입니다.
+
+```
+defined(a, W)  :=  (어떤 살아있는 object O 에 대해
+                      O.base <=u a  and  a - O.base <=u O.size
+                      and  O.size - (a - O.base) >=u W)
+                   and  a mod natural_alignment(W) == 0
+```
+
+`natural_alignment(W)` 는 W 가 16 이하의 2의 거듭제곱이면 W, 아니면 1 입니다. C 스칼라 배치가 아닌 폭에는 정렬을 요구하지 않습니다.
+
+### 이 술어를 두 번 구현하지 않는 방법
+
+조율자가 "ir_interp 와 miter 가 한 글자까지 같은 술어를 써야 한다"고 했습니다. 답은 **구현을 둘로 두지 않는 것**입니다.
+
+- **증명에 쓰이는 술어는 IR 안에 있습니다.** 로어링이 object 의 base 와 size 를 IR 파라미터로 받아, 접근 지점마다 위 조건을 평범한 bit-vector 연산으로 계산하고 `UB_GUARD` 로 감쌉니다. interpreter 는 그냥 평범한 opcode 를 실행하고, W2 의 miter 도 그냥 평범한 opcode 를 인코딩합니다. **술어는 한 곳에만 있습니다.**
+- interpreter 가 `LOAD`/`STORE` 의 부분성을 **독립으로** 한 번 더 압니다. 이것은 중복이 아니라 교차 검증입니다. guard 가 빠지거나 약하면 구체 입력에서 `GUARD_INSUFFICIENT` 로 잡힙니다. verifier 와 builder 를 분리한 것과 같은 이유입니다.
+
+**W2 는 base/size 를 따로 만들어 낼 필요가 없습니다.** IR 이 이미 그것을 파라미터로 갖고 있고 guard 도 IR 안에 있으므로, miter 는 위 세 제약(disjoint, 첫 페이지 위, wrap 없음)만 좌우 공통 assumption 으로 걸면 됩니다. 그 형태는 로어링이 붙는 다음 작업 단위에서 확정해 여기 다시 적습니다.
+
+### 아직 확정하지 않은 것
+
+로어링이 아직 없으므로 **object 를 IR 파라미터로 어떻게 배치할지**(포인터 파라미터마다 base/size 두 개를 뒤에 붙이는 순서 규칙)는 다음 작업 단위에서 정하고 여기 적습니다. W2 는 그때까지 miter 의 메모리 부분을 시작하지 않는 편이 낫습니다.
+
 ## W2 가 볼 인터페이스
 
 ### `ql_ir_verify` (`include/quodlibet/ir_verify.h`)
@@ -134,6 +176,9 @@ ql_status ql_ir_interp_run(const ql_allocator *allocator, const ql_ir *ir,
 - `UNDEFINED_BEHAVIOR` 일 때 `ub_reason` 이 `GUARD_FAILED` `GUARD_UNDEFINED` `GUARD_INSUFFICIENT` `TERMINATOR` 중 하나를 줍니다
 - 반환값은 `has_value`, `value_type`, `value[value_size]` 로 옵니다. 부호는 IR 이 갖고 있지 않으므로 호출자가 source signature 로 해석합니다
 - bit-vector 폭 상한은 256 비트입니다. 64비트 signed 곱셈이 128비트 중간값을 쓰므로 여유를 둔 값입니다
+- **메모리를 쓰는 모듈은 `options.objects` 로 object 표를 줍니다.** MEMORY 타입 파라미터는 바이트를 받지 않고 이름만으로 묶입니다(초기 이미지는 object 표가 줍니다). `object.final_image` 를 주면 실행이 끝난 메모리 이미지를 거기에 씁니다. differential 시험이 메모리 관찰을 비교할 때 쓰는 통로입니다
+- 메모리 값은 SSA 라 **오래된 버전도 계속 읽힙니다.** store 뒤에 이전 memory 값을 대상으로 load 하는 IR 이 적법하므로, 버전을 write 사슬로 들고 있습니다
+- undefined 값을 store 하면 결과 메모리 전체가 undefined 가 됩니다. 바이트 단위 추적보다 보수적인 쪽이고, 그것을 읽는 관찰이 여전히 guard 부족을 보고합니다
 
 undefined 전파 규칙은 로어링과 맞물려 있습니다.
 
@@ -277,6 +322,29 @@ undefined 전파 규칙은 로어링과 맞물려 있습니다.
 
 수용이 늘 때마다 differential 사례도 같이 늘렸습니다. `cast_narrow`, `cast_unsigned`, `cast_byte`, `named`, `named_signed` 5개가 추가되어 25개 함수가 실제 컴파일 실행과 대조됩니다. `ctest` 167/167 통과입니다.
 
+### 5. 인터프리터 메모리 모델과 퍼저 이전
+
+커밋: (이 커밋)
+
+#### 퍼저를 `tests/fuzz/` 로
+
+조율자가 `tests/fuzz/fuzz_*.c` 자동 타깃 규칙과 `linux-sanitize`, `linux-fuzz` 프리셋을 넣어 주었습니다. 드라이버 셋(`fuzz_c_frontend.c`, `fuzz_c_lower.c`, `fuzz_ir_decoder.c`)을 만들되 **타깃 본체는 `tests/fuzz/fuzz_targets.h`** 에 두어 libFuzzer 실행 파일과 매 `ctest` 마다 도는 결정적 캠페인이 같은 코드를 씁니다. 둘이 갈라지면 무엇이 시험되었는지에 대해 서로 다른 말을 하게 됩니다.
+
+층마다 드라이버를 나눈 것은 libFuzzer 가 타깃별 코퍼스를 갖게 하려는 것입니다. dispatch 바이트 하나를 다시 발견하게 만들 이유가 없습니다.
+
+#### 메모리 모델
+
+위 "메모리 모델 계약" 절이 전문입니다. 구현은 이렇습니다.
+
+- object 표는 `ql_ir_interp_options_v1` 이 받습니다. 세 제약을 `ql_ir_interp_run` 이 검사하고 어기면 실행을 거부합니다
+- 메모리 버전은 **write 사슬**입니다. object 초기 이미지 위에 (주소, 폭, 바이트) 기록이 쌓이고, load 는 바이트마다 가장 최근 기록을 찾습니다. 스냅샷 복사가 없고 오래된 버전이 그대로 읽힙니다
+- `LOAD`, `STORE`, `PTR_ADD`, `PTR_TO_BV`, `BV_TO_PTR` 를 실행합니다
+- `PTR_ADD` 의 offset 이 포인터 폭과 다르면 **`UNSUPPORTED`** 입니다. schema v1 은 offset 이 bit-vector 라고만 하므로, 여기서 확장 규칙을 지어내면 SMT 쪽과 의미가 갈라집니다
+
+`tests/test_ir_interp_memory.cpp` 7개 시험이 초기 이미지 읽기, null 역참조, object 밖 접근과 걸치는 접근, 정렬, store 가시성과 오래된 버전 보존, 거부되는 배치, 모델 밖 구문을 고정합니다. guard 를 일부러 `UB_GUARD(true)` 로 약하게 두어서, null 역참조가 `GUARD_INSUFFICIENT` 로 잡히는 것을 시험이 보입니다.
+
+`ctest` 224/224 통과입니다.
+
 ## 막힌 것
 
 - 없음
@@ -303,7 +371,7 @@ undefined 전파 규칙은 로어링과 맞물려 있습니다.
 
 ## 다음에 할 것
 
-1. **포인터 하강.** 첫 차단 사유의 79% 입니다. 연산, object identity, provenance, 유효 범위, alignment, load 와 store 입니다. **interpreter 에 메모리 모델을 같이 넣어야 합니다.** 지금 interpreter 는 포인터를 만나면 `UNSUPPORTED` 를 냅니다
+1. **포인터 하강 (`c_lower.c`).** 인터프리터 쪽은 섰으므로 남은 것은 로어링입니다. 포인터 타입, 메모리 threading, `*p`, `p[i]`, `&x`, 포인터 산술과 비교, object base/size 파라미터와 그 assumption, 접근 지점 guard 입니다. 첫 차단 사유의 79% 입니다. 연산, object identity, provenance, 유효 범위, alignment, load 와 store 입니다. **interpreter 에 메모리 모델을 같이 넣어야 합니다.** 지금 interpreter 는 포인터를 만나면 `UNSUPPORTED` 를 냅니다
 2. 전역 변수와 정적 저장 기간 (`undeclared_identifier` 31건)
 3. struct, union, enum (`unsupported_type` 잔여 103건)
 4. 함수 호출과 외부 효과 (`unsupported_call` 55건)

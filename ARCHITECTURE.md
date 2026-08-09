@@ -161,6 +161,35 @@ profile freezes Quodlibet's own accepted subset instead of inheriting a moving
 compiler default. Unsupported extensions must yield `UNKNOWN` or a frontend
 error, never a proof under guessed semantics.
 
+#### Memory model
+
+`ASM2C_GNU_V1` gives memory a flat 64-bit address space. A pointer is an
+address and carries no provenance beyond it, which is what the profile's
+source material actually is: C recovered from x86-64 SysV object code, where
+casting a pointer to an integer and back, and computing `(char *)p + n`, are
+ordinary. Storage is described by objects, each a base address and a size,
+and the model holds three standing constraints:
+
+- distinct live objects occupy disjoint byte ranges;
+- every object lies strictly above the first page, so address zero belongs to
+  no object and dereferencing null is always undefined;
+- an object's range does not wrap the address space.
+
+An access of `W` bytes at address `a` is defined exactly when `[a, a + W)`
+lies inside one live object and `a` is naturally aligned for `W`. Both the
+concrete interpreter and the SMT encoding answer that question the same way,
+because the predicate is emitted into the IR as ordinary bit-vector arithmetic
+guarded by `UB_GUARD` rather than restated in each backend. The interpreter
+additionally knows the partiality of `LOAD` and `STORE` on its own, so a guard
+too weak to cover an access is reported instead of silently passing.
+
+**This model admits programs ISO C leaves undefined.** Comparing or
+subtracting pointers into different objects is defined here, and object
+identity does not constrain arithmetic. Verdicts are therefore relative to
+this profile, not to ISO C provenance. A stricter provenance model belongs in
+a separate profile rather than as a change to this one, and results carry the
+profile precisely so that the distinction survives.
+
 ### Input precondition schema
 
 A null precondition means `true`. Otherwise the contract carries UTF-8 JSON
