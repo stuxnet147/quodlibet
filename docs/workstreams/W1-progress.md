@@ -416,7 +416,7 @@ IR 은 `QL_IR_INTERP_FIRST_OBJECT_ADDRESS` 의 상징적 object 를 보고 참�
 
 ### 7. 집합 타입: struct, union, enum
 
-커밋: (이 커밋)
+커밋: `0f98c10`
 
 #### 비트필드는 제외가 맞습니다 (측정으로 확인)
 
