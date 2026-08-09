@@ -160,11 +160,11 @@ artifact produced so far and hands back no partial result.
 
 | Configuration | Result |
 | --- | --- |
-| `windows-clang` | 193/193 |
-| `windows-clang` with `-DQL_ENABLE_LOGGING=OFF` | 193/193 |
-| `linux-clang` | 193/193 |
-| Linux clang 18 with `-fsanitize=address,undefined` (LeakSanitizer on, Bitwuzla on) | 193/193 |
-| Windows clang 22 with `-fsanitize=address,undefined` (Bitwuzla off) | 190/193, the three Bitwuzla cases skipped by that configuration |
+| `windows-clang` | 224/224 |
+| `windows-clang` with `-DQL_ENABLE_LOGGING=OFF` | 224/224 |
+| `linux-clang` | 224/224 |
+| Linux clang 18 with `-fsanitize=address,undefined` (LeakSanitizer on, Bitwuzla on) | 224/224 |
+| Windows clang 22 with `-fsanitize=address,undefined` (Bitwuzla off) | 217/224, the seven Bitwuzla-dependent cases skipped by that configuration |
 
 The Linux sanitizer run is the one that carries leak coverage: LeakSanitizer is
 not available in the Windows ASan runtime.
