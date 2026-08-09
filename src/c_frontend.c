@@ -969,8 +969,17 @@ static ql_status classify_duplicate_definitions(ql_c_frontend_unit *unit,
 ql_status QL_CALL ql_c_frontend_analyze(
     const ql_allocator *allocator, const char *source, size_t source_size,
     ql_c_frontend_unit **output, ql_error *error) {
+    return ql_c_frontend_analyze_with_parser(allocator, NULL, source,
+                                             source_size, output, error);
+}
+
+ql_status QL_CALL ql_c_frontend_analyze_with_parser(
+    const ql_allocator *allocator, ql_c_parser *borrowed_parser,
+    const char *source, size_t source_size, ql_c_frontend_unit **output,
+    ql_error *error) {
     const ql_allocator *selected = select_allocator(allocator);
-    ql_c_parser *parser = NULL;
+    ql_c_parser *owned_parser = NULL;
+    ql_c_parser *parser = borrowed_parser;
     ql_c_syntax_tree *tree = NULL;
     ql_c_syntax_record *nodes = NULL;
     size_t node_count = 0u;
@@ -995,9 +1004,12 @@ ql_status QL_CALL ql_c_frontend_analyze(
                      "C source contains an embedded NUL byte");
         return QL_STATUS_PARSE_ERROR;
     }
-    status = ql_c_parser_create(selected, &parser, error);
-    if (status != QL_STATUS_OK) {
-        return status;
+    if (parser == NULL) {
+        status = ql_c_parser_create(selected, &owned_parser, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        parser = owned_parser;
     }
     status = ql_c_parser_parse(parser, source, source_size, &tree, error);
     if (status != QL_STATUS_OK) {
@@ -1064,7 +1076,8 @@ cleanup:
     ql_c_frontend_unit_destroy(unit);
     selected->deallocate(selected->user_data, nodes);
     ql_c_syntax_tree_destroy(tree);
-    ql_c_parser_destroy(parser);
+    /* A borrowed parser outlives the call; only one made here is freed. */
+    ql_c_parser_destroy(owned_parser);
     return status;
 }
 

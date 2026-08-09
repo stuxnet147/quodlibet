@@ -126,6 +126,18 @@ typedef struct ql_c_frontend_diagnostic_view {
 QL_API ql_status QL_CALL ql_c_frontend_analyze(
     const ql_allocator *allocator, const char *source, size_t source_size,
     ql_c_frontend_unit **output, ql_error *error);
+
+/* The same analysis against a parser the caller owns and keeps. Creating a
+   Tree-sitter parser costs more than parsing a short function, so a caller
+   working through a corpus reuses one instead of paying for it per unit. A
+   null parser makes this identical to ql_c_frontend_analyze.
+
+   The parser is borrowed for the call and is neither reset nor destroyed. It
+   must not be used from another thread while this runs. */
+QL_API ql_status QL_CALL ql_c_frontend_analyze_with_parser(
+    const ql_allocator *allocator, ql_c_parser *parser, const char *source,
+    size_t source_size, ql_c_frontend_unit **output, ql_error *error);
+
 QL_API void QL_CALL ql_c_frontend_unit_destroy(ql_c_frontend_unit *unit);
 
 QL_API ql_status QL_CALL ql_c_frontend_unit_get_view(

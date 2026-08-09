@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-`scalar_t__` 를 코퍼스 사실로 닫았습니다. 남은 차단은 호출(303), 값으로 오가는 aggregate 와 배열(282), 전역(228)입니다.
+다음 지시 대기. 측정된 다음 순위는 호출(303), 값으로 오가는 aggregate 와 배열(282), 전역(228)입니다.
 
 ## 기준선
 
@@ -596,6 +596,35 @@ unit 이 스스로 선언하면 그쪽이 이깁니다. 표는 추출이 지운 
 `scalar_t__` 로 막혀 있던 457건이 이렇게 흩어졌습니다. 274건이 타입 관문을 통과했고(호출 106, 전역 98, 포인터 33, 그 외), 183건은 여전히 타입에서 걸리지만 **이유가 바뀌었습니다.** 남은 282건의 구성은 값으로 오가는 aggregate 43.6%, 배열 declarator 35.5%, 부동소수점 1.4% 입니다.
 
 status 실패 0, `ctest` 319/319 입니다.
+
+### 11. W8 을 위한 재사용 API 두 개
+
+커밋: (이 커밋)
+
+둘 다 append-only 추가입니다. 기존 함수의 서명도 구조체도 건드리지 않았고, 기존 함수는 새 함수에 NULL 을 넘기는 한 줄이 되었습니다. **구현이 하나뿐이므로 빠른 경로가 자기만의 버그를 갖는 일이 없습니다.**
+
+```c
+ql_status ql_c_frontend_analyze_with_parser(
+    const ql_allocator *allocator, ql_c_parser *parser,
+    const char *source, size_t source_size,
+    ql_c_frontend_unit **output, ql_error *error);
+
+ql_status ql_c_lower_selected_function_with_tree(
+    const ql_allocator *allocator, const char *source, size_t source_size,
+    const ql_c_frontend_unit *unit, const ql_c_function_view *function,
+    ql_c_syntax_tree *tree, ql_c_lower_result **output, ql_error *error);
+```
+
+계약입니다.
+
+- `parser` 와 `tree` 는 **빌려 쓸 뿐** 파괴하지 않습니다. 호출 뒤에도 호출자의 것이고 계속 쓸 수 있습니다. 시험이 그것을 고정합니다
+- 둘 다 NULL 을 주면 기존 함수와 **완전히 같습니다**
+- `tree` 는 **바로 그 source 의 파스**여야 합니다. 직접 대조하지는 않지만, 로어링이 이미 선택된 함수의 range 와 body range 가 정확히 일치할 것을 요구하므로 다른 텍스트의 트리는 거기서 걸립니다. 틀린 프로그램을 내리는 대신 거부합니다. 시험이 이 경우를 고정합니다
+- parser 는 호출 중에 다른 스레드에서 쓰면 안 됩니다
+
+무엇을 아끼는가입니다. tree-sitter parser 생성은 짧은 함수 하나를 파싱하는 것보다 비쌉니다. 그리고 지금까지는 frontend 가 한 번, lowering 이 또 한 번, 같은 소스를 **두 번** 파싱했습니다. unit 하나에 함수가 여럿이면 그만큼 곱해집니다.
+
+`ctest` 323/323 이고 val 판정 수는 그대로입니다(17, status 실패 0). 동작을 바꾸지 않는 변경이라는 것이 그것으로 확인됩니다.
 
 ## 막힌 것
 

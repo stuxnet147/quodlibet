@@ -173,6 +173,7 @@ typedef struct lower_context {
     size_t node_count;
     ql_c_parser *parser;
     ql_c_syntax_tree *tree;
+    uint32_t owns_tree;
     ql_ir_builder *builder;
     lower_variable *variables;
     size_t variable_count;
@@ -5601,7 +5602,11 @@ static void cleanup_context(lower_context *context) {
     ql_ir_builder_destroy(context->builder);
     context->allocator->deallocate(context->allocator->user_data,
                                    context->nodes);
-    ql_c_syntax_tree_destroy(context->tree);
+    /* A tree the caller lent us outlives the call, and then no parser was
+       created either. */
+    if (context->owns_tree != 0u) {
+        ql_c_syntax_tree_destroy(context->tree);
+    }
     ql_c_parser_destroy(context->parser);
 }
 
@@ -5609,6 +5614,16 @@ ql_status QL_CALL ql_c_lower_selected_function(
     const ql_allocator *allocator, const char *source, size_t source_size,
     const ql_c_frontend_unit *unit, const ql_c_function_view *function,
     ql_c_lower_result **output, ql_error *error) {
+    return ql_c_lower_selected_function_with_tree(allocator, source,
+                                                  source_size, unit, function,
+                                                  NULL, output, error);
+}
+
+ql_status QL_CALL ql_c_lower_selected_function_with_tree(
+    const ql_allocator *allocator, const char *source, size_t source_size,
+    const ql_c_frontend_unit *unit, const ql_c_function_view *function,
+    ql_c_syntax_tree *borrowed_tree, ql_c_lower_result **output,
+    ql_error *error) {
     const ql_allocator *selected = select_allocator(allocator);
     ql_c_lower_result *result = NULL;
     lower_context context;
@@ -5679,10 +5694,17 @@ ql_status QL_CALL ql_c_lower_selected_function(
         return status;
     }
 
-    status = ql_c_parser_create(selected, &context.parser, error);
-    if (status == QL_STATUS_OK) {
-        status = ql_c_parser_parse(context.parser, source, source_size,
-                                   &context.tree, error);
+    if (borrowed_tree != NULL) {
+        context.tree = borrowed_tree;
+        context.owns_tree = 0u;
+        status = QL_STATUS_OK;
+    } else {
+        context.owns_tree = 1u;
+        status = ql_c_parser_create(selected, &context.parser, error);
+        if (status == QL_STATUS_OK) {
+            status = ql_c_parser_parse(context.parser, source, source_size,
+                                       &context.tree, error);
+        }
     }
     if (status == QL_STATUS_OK &&
         ql_c_syntax_tree_has_errors(context.tree) != 0u) {

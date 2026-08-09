@@ -64,6 +64,20 @@ QL_API ql_status QL_CALL ql_c_lower_selected_function(
     const ql_allocator *allocator, const char *source, size_t source_size,
     const ql_c_frontend_unit *unit, const ql_c_function_view *function,
     ql_c_lower_result **output, ql_error *error);
+
+/* The same lowering against a syntax tree the caller already has. Lowering
+   otherwise reparses the source it was just handed, which doubles the parse
+   for one function and multiplies it for a unit with several.
+
+   `tree` must be the parse of exactly this source; the range checks the
+   lowering already performs against the selected function reject a tree of
+   anything else rather than lowering the wrong text. The tree is borrowed
+   for the call and is not destroyed. A null tree makes this identical to
+   ql_c_lower_selected_function. */
+QL_API ql_status QL_CALL ql_c_lower_selected_function_with_tree(
+    const ql_allocator *allocator, const char *source, size_t source_size,
+    const ql_c_frontend_unit *unit, const ql_c_function_view *function,
+    ql_c_syntax_tree *tree, ql_c_lower_result **output, ql_error *error);
 QL_API void QL_CALL ql_c_lower_result_destroy(ql_c_lower_result *result);
 QL_API ql_status QL_CALL ql_c_lower_result_get_view(
     const ql_c_lower_result *result, ql_c_lower_result_view_v1 *view,
