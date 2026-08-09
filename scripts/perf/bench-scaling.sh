@@ -35,12 +35,22 @@ printf '%8s %10s %12s %9s\n' workers 'wall s' 'units/s' speedup
 base=""
 for workers in $ladder; do
     start=$(date +%s%N)
+    pids=""
     i=1
     while [ "$i" -le "$workers" ]; do
         "$exe" coverage "$list" > /dev/null &
+        pids="$pids $!"
         i=$((i + 1))
     done
-    wait
+    # Wait per pid rather than bare `wait`, so a worker that died still fails
+    # the run. A harness that prints throughput for work that did not happen
+    # is worse than no harness.
+    for pid in $pids; do
+        if ! wait "$pid"; then
+            echo "error: a coverage worker failed at workers=$workers" >&2
+            exit 1
+        fi
+    done
     end=$(date +%s%N)
     wall=$(( (end - start) / 1000000 ))
     total=$((units * workers))

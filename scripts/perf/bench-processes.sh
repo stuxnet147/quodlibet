@@ -34,14 +34,24 @@ printf '%8s %10s %12s %9s\n' workers 'wall s' 'pairs/s' speedup
 base=""
 for workers in $ladder; do
     start=$(date +%s%N)
+    pids=""
     i=0
     while [ "$i" -lt "$workers" ]; do
         # Distinct offsets so no two workers judge the same pair.
         python3 "$root/scripts/perf/bench-batch.py" serial "$per" \
             $((i * per + 1000)) > /dev/null &
+        pids="$pids $!"
         i=$((i + 1))
     done
-    wait
+    # Wait per pid, not bare `wait`. The serial worker exits non-zero on any
+    # verdict other than proved-equivalent, and a run that lost a worker must
+    # not report throughput as if the work had happened.
+    for pid in $pids; do
+        if ! wait "$pid"; then
+            echo "error: a judgement worker failed at workers=$workers" >&2
+            exit 1
+        fi
+    done
     end=$(date +%s%N)
     wall=$(( (end - start) / 1000000 ))
     total=$((per * workers))
