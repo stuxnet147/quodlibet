@@ -55,14 +55,14 @@
 
 **요구.** ctypes/cffi 같은 FFI 가 아닌 방식으로, 크로스플랫폼 파이썬 바인딩. 나중에 강화학습기에서 부른다.
 
-**종료 조건**
+**종료 조건 (2026-08-10 닫힘)**
 
-- [ ] **CPython C 확장 모듈**이다. ctypes, cffi, ABI 를 런타임에 재선언하는 방식이 아니다
-- [ ] `Py_LIMITED_API` (abi3) 로 빌드해서 파이썬 마이너 버전마다 다시 빌드하지 않는다
-- [ ] Windows 와 Linux 양쪽에서 import 되고 왕복 시험이 통과한다
-- [ ] GIL 을 solver 대기 동안 놓는다(RL 루프에서 다른 스레드가 굶지 않는다)
-- [ ] 예산, 판정 정책, 결과가 파이썬 쪽에서 전부 노출된다
-- [ ] 빌드가 CMake 한 경로에 들어 있고 `pip install .` 이 된다
+- [x] **CPython C 확장 모듈**이다 - `bindings/python/src/quodlibet_module.c`. 판정 본체는 CPython 심볼 0개
+- [x] `Py_LIMITED_API` (abi3) - 3.11 로 만든 wheel 을 CPython 3.13.12 에 그대로 설치해 전부 통과 (실측)
+- [x] Windows 와 Linux 양쪽 - Windows 3.11/3.13, Linux(WSL) 27/27. Linux 링크의 PIC 는 `8ddd5e7`
+- [x] GIL 을 solver 대기 동안 놓는다 - 판정 전체가 `Py_BEGIN_ALLOW_THREADS` 안. 두 판정 구간이 실제로 겹치는지를 시험이 고정
+- [x] 예산 다섯 축, 판정 정책 JSON, verdict/status/evidence/counterexample 전부 노출. 코어 건전성 경계를 완화하지 않음
+- [x] `pip install ./bindings/python` 이 wheel 을 만들고, 루트 CTest 가 바인딩 시험을 포함 (262/262)
 
 ## G5. semantic C frontend + IR semantics + 첫 exact backend
 

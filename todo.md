@@ -13,12 +13,12 @@
 | W1 | semantic-c-frontend | G5 전반, G8, G9 | 진행. 정확성 장치(verifier/interpreter/differential/fuzz)와 타입 확장 통합됨. 지금은 포인터 로어링(flat memory model 로 확정) | 병렬 세션 |
 | W2 | exact-backend | G5 후반 | **지시서 완료.** WU1..WU6 전부 main 에. 세션 정리됨. IR 이 넓어지면 miter 확장 작업 단위를 새로 연다 | 완료 |
 | W3 | runtime-services | G1, G2, G3 | **지시서 완료.** 세 GOAL 전부 닫힘. 세션 정리됨 | 완료 |
-| W4 | python-bindings | G4 | 지시서 `docs/workstreams/W4.md`. 세션 기동 | 병렬 세션 |
+| W4 | python-bindings | G4 | **지시서 완료.** G4 닫힘. 세션 정리됨 | 완료 |
 | W0 | 조율, 프로파일링, VM | G6, G7 | 진행. 다음은 VTune 기준선과 VM 확인 | 조율자 |
 
 조율 규칙은 `GOAL.md` 의 "진행 규칙" 절입니다. `CMakeLists.txt`, `GOAL.md`, 이 표는 조율자가 소유합니다.
 
-**닫힌 GOAL: G1, G2, G3, G5(현 슬라이스 기준).** 열린 것: G4(바인딩), G6(VTune), G7(VM), G8(퍼징 캠페인과 처리량 측정 잔여), G9(포인터가 관문).
+**닫힌 GOAL: G1, G2, G3, G4, G5(현 슬라이스 기준).** 열린 것: G6(threading 리포트와 추가 튜닝), G7(VM, 이제 바인딩이 있어 진행 가능), G8(확장 절차 문서와 precondition 퍼저 잔여), G9(현 val lowered 11/1050, 남은 관문은 지역 object, calls, globals).
 
 ## 완료한 기반 마일스톤
 
