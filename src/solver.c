@@ -7,7 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#  include <share.h>
+#else
 #  include <sys/stat.h>
 #endif
 
@@ -1750,8 +1752,11 @@ static int absolute_executable_path(const char *path) {
 
 static FILE *open_binary_read(const char *path) {
 #if defined(_WIN32)
-    FILE *file = NULL;
-    return fopen_s(&file, path, "rb") == 0 ? file : NULL;
+    /* fopen_s opens with exclusive (non-shared) access, so a concurrent
+       reader -- an on-access antivirus scan of a freshly written snapshot is
+       the measured case -- makes the open fail with a sharing violation.
+       Hashing only reads; deny nothing. */
+    return _fsopen(path, "rb", _SH_DENYNO);
 #else
     return fopen(path, "rb");
 #endif
@@ -2107,11 +2112,14 @@ static ql_status bitwuzla_select_executable(
 
 /* A snapshot is hashed immediately after it is written, and on Windows a
    freshly written executable is briefly held by on-access antivirus scans, so
-   the first open can fail with a sharing violation. Measured on an 8-way
-   concurrent batch: 6 of 80 checks lost their solver to exactly this window.
-   The retry is bounded and short; a path that stays unopenable still fails. */
-#define QL_DIGEST_OPEN_RETRIES 20u
-#define QL_DIGEST_OPEN_BACKOFF_MS 10u
+   the first open can fail with a sharing violation even when we deny no
+   sharing ourselves: the scanner's handle can be the exclusive one. Measured
+   on an 8-way concurrent batch, 11 of 320 checks failed at 200ms of retry and
+   5 of 320 still failed with shared-read opens, so the window under load is
+   seconds, not milliseconds. Three seconds of bounded retry costs nothing on
+   the uncontended path; a path that stays unopenable still fails. */
+#define QL_DIGEST_OPEN_RETRIES 60u
+#define QL_DIGEST_OPEN_BACKOFF_MS 50u
 
 static FILE *open_binary_read_retry(const char *path) {
     unsigned attempt;
