@@ -248,12 +248,21 @@ TEST(CLowerTypes, KeepsTheSignednessAndWidthATypedefStandsFor) {
               ReturnedSigned(result, 32u));
 }
 
+TEST(CLowerTypes, ResolvesATypedefThatNamesAPointer) {
+    Lowered lowered;
+    ASSERT_EQ(QL_STATUS_OK,
+              lowered.Lower("typedef int *TYP_0;\n"
+                            "int deref(TYP_0 a) { return *a; }",
+                            "deref"));
+    EXPECT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
+}
+
 TEST(CLowerTypes, NamesTheRealObstacleBehindATypedef) {
-    /* A typedef for a pointer is a pointer obstacle, not a type one. Getting
-       this wrong would hide the true blocker in the coverage tables. */
-    ExpectUnknown("typedef int *TYP_0;\n"
-                  "int deref(TYP_0 a) { return 0; }",
-                  "deref", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
+    /* The obstacle a typedef hides has to be reported as what it is, or the
+       coverage tables blame the wrong thing. */
+    ExpectUnknown("typedef int TYP_0[4];\n"
+                  "int indexed(TYP_0 a) { return 0; }",
+                  "indexed", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
     ExpectUnknown("struct TYP_0 { int f; };\n"
                   "typedef struct TYP_0 TYP_1;\n"
                   "int aggregate(TYP_1 a) { return 0; }",

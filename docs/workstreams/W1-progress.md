@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-2단계. struct 멤버 접근까지 닫았습니다. 남은 차단은 값으로 오가는 aggregate, 메모리에서 읽은 포인터, 호출, 전역입니다.
+2단계. 포인터 표면을 거의 닫았습니다(첫 차단 69). 남은 차단은 값으로 오가는 aggregate(577), 호출(227), 전역(87)입니다.
 
 ## 기준선
 
@@ -472,6 +472,52 @@ status 실패는 **0** 입니다. 중간에 struct 를 값으로 받는 함수�
 - **포인터 차 `p - q`**, 이중 포인터
 - 구조체 안 배열 멤버(`int FLD_0[4]`)
 
+### 8. 넓어진 포인터 표면
+
+커밋: (이 커밋)
+
+지시가 묶어 준 다섯 가지 중 넷을 넣었습니다.
+
+- **지역 포인터 선언** (`int *cursor = p + i;`). declarator 마다 타입을 따로 만들도록 고쳤습니다. 예전에는 선언 하나가 타입 하나였는데 `int *p, q;` 는 그렇지 않습니다
+- **이중 포인터**. `lower_type` 에 `indirection` 을 두어 `T`, `T *`, `T **` 를 구별합니다
+- **포인터 차** `p - q`. 바이트 차를 원소 크기로 나눕니다. 나누는 수가 0 이 아닌 상수라 guard 는 그 자리에서 만족되지만, verifier 가 요구하는 위치에는 여전히 서 있습니다
+- **typedef-to-pointer**. typedef 기록이 별 개수를 세도록 바꿔서 `typedef int *T` 가 거부 사유가 아니라 포인터 타입이 됩니다
+- **`&<designator>`**. `&p->f`, `&a[i]`, `&*p` 는 이미 주소가 있는 것이라 실어 나르기만 하면 됩니다
+
+#### IR 타입 캐시를 하나로 합쳤다
+
+폭별 슬롯(`bv_types[129]`, `pointer_types[129]`, ...)으로는 중첩 포인터를 표현할 수 없어서 캐시를 하나로 합쳤습니다. **키는 C 타입이 아니라 IR 모양**(kind, bit_width, element_type)입니다. IR bit-vector 는 signless 라 `char` 와 `unsigned char` 는 같은 IR 타입이어야 하고, load 는 포인터의 element type 이 결과 타입과 **같은 식별자**일 것을 요구하므로 같은 모양에 식별자가 둘이면 깨집니다. 처음에 C 타입으로 키를 잡았다가 바로 이 규칙 위반으로 잡혔습니다.
+
+#### 지역 포인터도 provenance 를 물려받는다
+
+`int *cursor = p + i; return *cursor;` 가 거부되는 것으로 드러났습니다. `has_object` 를 파라미터에만 두었는데, 파라미터에서 유래한 값을 담은 **지역 변수**도 물려받아야 합니다. 대입과 선언 초기화에서 물려받고, 분기 병합에서 PHI 가 생기면 **떨어뜨립니다**. 두 분기가 다른 값을 주면 어느 한쪽의 object 로 둘 다를 부를 수 없기 때문입니다.
+
+#### 결과 (val 1,050 본문)
+
+| 첫 차단 사유 | 집합 타입 단위 후 | 이번 단위 후 |
+|---|---:|---:|
+| (로어링 성공) | 11 | **14** |
+| `unsupported_pointer` | 300 | **69** |
+| `unsupported_type` | 460 | 577 |
+| `unsupported_call` | 157 | 227 |
+| `undeclared_identifier` | 61 | 87 |
+
+status 실패 0 입니다. 중간에 이중 포인터가 `ensure_ir_type` 까지 내려가 `INTERNAL_ERROR` 를 내는 것을 두 번 잡았습니다.
+
+**포인터는 첫 차단의 6.6% 로 내려왔습니다.** 남은 69 의 대부분이 아래 "하지 못한 것" 입니다.
+
+#### 하지 못한 것: 지역 object
+
+이 단위의 표제였는데 넣지 못했습니다. `&<식별자>` 는 지역 변수에 주소를 주는 일이고, 그러려면 **함수가 스스로 object 를 만들어야** 합니다. 지금은 지역 변수가 SSA 값이라 주소가 없습니다.
+
+임시로 얼버무리지 않고 `unsupported_pointer` 로 정직하게 보고합니다("taking the address of a local needs an object this slice does not create"). 커버리지 표가 빠진 부품을 정확히 가리킵니다.
+
+이 부품 하나가 열면 같이 열리는 것들입니다.
+
+- `&x`
+- struct 지역 변수, 값으로 오가는 struct (지금 `unsupported_type` 577 의 대부분)
+- 배열 지역 변수
+
 ## 막힌 것
 
 - 없음
@@ -498,9 +544,9 @@ status 실패는 **0** 입니다. 중간에 struct 를 값으로 받는 함수�
 
 ## 다음에 할 것
 
-1. **지역 object.** `&x`, 지역 포인터 선언, struct 지역 변수, 그리고 값으로 오가는 struct 가 전부 같은 부품(함수가 스스로 만드는 object)에서 열립니다. `unsupported_type` 460 의 대부분입니다
-2. 함수 호출과 외부 효과 (157)
-3. 전역 변수와 정적 저장 기간 (61)
+1. **지역 object.** 여전히 최우선입니다. `&x`, struct 지역 변수, 값으로 오가는 struct, 배열 지역이 전부 여기서 열립니다. `unsupported_type` 577 의 대부분입니다
+2. 함수 호출과 외부 효과 (227)
+3. 전역 변수와 정적 저장 기간 (87)
 4. 메모리에서 읽은 포인터의 object. 지금은 정직하게 거부합니다 연산, object identity, provenance, 유효 범위, alignment, load 와 store 입니다. **interpreter 에 메모리 모델을 같이 넣어야 합니다.** 지금 interpreter 는 포인터를 만나면 `UNSUPPORTED` 를 냅니다
 2. 전역 변수와 정적 저장 기간 (`undeclared_identifier` 31건)
 3. struct, union, enum (`unsupported_type` 잔여 103건)

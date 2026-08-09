@@ -271,8 +271,10 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
         /* Dereferencing a pointer parameter is modelled now; taking an
            address still is not, because it would need an object this slice
            does not create. */
+        /* A local lives in an SSA value, so it has no address to take until
+           the function can create an object for it. */
         {"int address(int x) { return *&x; }", "address",
-         QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, "pointer_expression"},
+         QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, "identifier"},
         {"int invoke(int x) { return helper(x); }", "invoke",
          QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, "call_expression"},
         {"int spin(int x) { while (x) x = x - 1; return x; }", "spin",

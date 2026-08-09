@@ -38,13 +38,27 @@ typedef struct lower_type {
     uint32_t width;
     uint32_t rank;
     uint32_t is_signed;
-    /* Meaningful only when `kind` is QL_C_SCALAR_POINTER. This slice carries
-       one level of indirection, to a scalar or to a record. */
+    /* How many stars stand between this type and `pointee`: zero when this
+       is not a pointer at all, one for `T *`, two for `T **`. */
+    uint32_t indirection;
+    /* The type at the bottom of the stars. */
     ql_c_scalar_type pointee;
-    /* The record this type is, or points at. SIZE_MAX when neither. */
+    /* The record this type is, or bottoms out at. SIZE_MAX when neither. */
     size_t record;
     ql_ir_type_id ir_type;
 } lower_type;
+
+/* An IR type the lowering has already built. The key is the IR shape, not
+   the C type: bit-vectors are signless, so `char` and `unsigned char` are one
+   IR type and must share one identifier. A load requires its pointer's
+   element type to be the very same identifier as its result type, so a second
+   identifier for the same shape would break it. */
+typedef struct lower_type_binding {
+    ql_ir_type_kind kind;
+    uint32_t bit_width;
+    ql_ir_type_id element_type;
+    ql_ir_type_id id;
+} lower_type_binding;
 
 /* One member of a struct or union, with the byte offset the target ABI gives
    it. */
@@ -98,7 +112,10 @@ typedef struct lower_value {
 typedef struct lower_typedef {
     char *name;
     char *underlying;
-    uint32_t is_indirect;
+    /* Stars between the typedef and what it names, so `typedef int *T` can
+       resolve to a pointer instead of being refused for being one. */
+    uint32_t pointer_depth;
+    uint32_t is_array_or_function;
     uint32_t is_aggregate;
 } lower_typedef;
 
@@ -157,13 +174,10 @@ typedef struct lower_context {
     lower_type return_type;
     ql_ir_block_id current_block;
     uint32_t current_terminated;
-    ql_ir_type_id bool_type;
-    ql_ir_type_id void_type;
     ql_ir_type_id memory_type;
-    ql_ir_type_id bv_types[129];
-    ql_ir_type_id pointer_types[129];
-    ql_ir_type_id bool_pointer_type;
-    ql_ir_type_id record_pointer_type;
+    lower_type_binding *type_cache;
+    size_t type_cache_count;
+    size_t type_cache_capacity;
     /* The memory state threaded through the function, and the objects the
        access guards are written against. */
     ql_ir_value_id memory_value;
@@ -513,7 +527,8 @@ static int type_same(lower_type left, lower_type right) {
     if (left.kind != QL_C_SCALAR_POINTER) {
         return 1;
     }
-    if (!ql_c_scalar_same(left.pointee, right.pointee)) {
+    if (left.indirection != right.indirection ||
+        !ql_c_scalar_same(left.pointee, right.pointee)) {
         return 0;
     }
     return left.record == right.record;
@@ -526,6 +541,7 @@ static lower_type make_pointer_type(ql_c_scalar_type pointee) {
     type.width = QL_C_POINTER_WIDTH;
     type.rank = 6u;
     type.is_signed = 0u;
+    type.indirection = 1u;
     type.pointee = pointee;
     type.record = SIZE_MAX;
     type.ir_type = QL_IR_INVALID_TYPE_ID;
@@ -540,6 +556,37 @@ static lower_type make_record_pointer_type(size_t record) {
     type = make_pointer_type(pointee);
     type.record = record;
     return type;
+}
+
+static lower_type make_record_type(size_t record);
+static lower_type type_from_scalar(ql_c_scalar_type scalar);
+
+/* One star off. */
+static lower_type pointer_target(lower_type pointer) {
+    if (pointer.indirection > 1u) {
+        lower_type target = pointer;
+        target.indirection = pointer.indirection - 1u;
+        target.ir_type = QL_IR_INVALID_TYPE_ID;
+        return target;
+    }
+    if (pointer.pointee.kind == QL_C_SCALAR_RECORD) {
+        return make_record_type(pointer.record);
+    }
+    return type_from_scalar(pointer.pointee);
+}
+
+/* One star on. */
+static lower_type make_pointer_to(lower_type target) {
+    if (target.kind == QL_C_SCALAR_POINTER) {
+        lower_type type = target;
+        type.indirection = target.indirection + 1u;
+        type.ir_type = QL_IR_INVALID_TYPE_ID;
+        return type;
+    }
+    if (target.kind == QL_C_SCALAR_RECORD) {
+        return make_record_pointer_type(target.record);
+    }
+    return make_pointer_type(scalar_of(target));
 }
 
 static lower_type make_record_type(size_t record) {
@@ -559,6 +606,9 @@ static uint32_t record_alignment(const lower_context *context, size_t record);
 static uint64_t pointee_byte_width(const lower_context *context,
                                    lower_type pointer) {
     uint32_t bits;
+    if (pointer.indirection > 1u) {
+        return QL_C_POINTER_WIDTH / 8u;
+    }
     if (pointer.pointee.kind == QL_C_SCALAR_RECORD) {
         return record_size(context, pointer.record);
     }
@@ -606,20 +656,26 @@ static uint32_t natural_alignment(uint64_t byte_width) {
    tables name the real obstacle. */
 static size_t typedef_declarator_name(const lower_context *context,
                                       size_t declarator,
-                                      uint32_t *is_indirect) {
+                                      uint32_t *pointer_depth,
+                                      uint32_t *is_array_or_function) {
     size_t guard = 0u;
 
-    *is_indirect = 0u;
+    *pointer_depth = 0u;
+    *is_array_or_function = 0u;
     while (declarator != SIZE_MAX && guard++ < 64u) {
         const char *kind = context->nodes[declarator].view.kind;
         if (strcmp(kind, "type_identifier") == 0 ||
             strcmp(kind, "identifier") == 0) {
             return declarator;
         }
-        if (strcmp(kind, "pointer_declarator") == 0 ||
-            strcmp(kind, "array_declarator") == 0 ||
+        if (strcmp(kind, "pointer_declarator") == 0) {
+            ++(*pointer_depth);
+            declarator = direct_field_child(context, declarator, "declarator");
+            continue;
+        }
+        if (strcmp(kind, "array_declarator") == 0 ||
             strcmp(kind, "function_declarator") == 0) {
-            *is_indirect = 1u;
+            *is_array_or_function = 1u;
             declarator = direct_field_child(context, declarator, "declarator");
             continue;
         }
@@ -656,7 +712,8 @@ static ql_status collect_typedefs(lower_context *context, ql_error *error) {
         end = subtree_end(context, index);
         for (child = index + 1u; child < end; ++child) {
             size_t name_node;
-            uint32_t is_indirect;
+            uint32_t pointer_depth;
+            uint32_t is_array_or_function;
             lower_typedef *entry;
             ql_status status;
 
@@ -666,7 +723,9 @@ static ql_status collect_typedefs(lower_context *context, ql_error *error) {
                        "declarator") != 0) {
                 continue;
             }
-            name_node = typedef_declarator_name(context, child, &is_indirect);
+            name_node = typedef_declarator_name(context, child,
+                                                &pointer_depth,
+                                                &is_array_or_function);
             if (name_node == SIZE_MAX) {
                 continue;
             }
@@ -682,7 +741,8 @@ static ql_status collect_typedefs(lower_context *context, ql_error *error) {
             memset(entry, 0, sizeof(*entry));
             entry->name = copy_node_text(context, name_node);
             entry->underlying = copy_node_text(context, type_node);
-            entry->is_indirect = is_indirect;
+            entry->pointer_depth = pointer_depth;
+            entry->is_array_or_function = is_array_or_function;
             entry->is_aggregate = is_aggregate;
             if (entry->name == NULL || entry->underlying == NULL) {
                 context->allocator->deallocate(context->allocator->user_data,
@@ -944,10 +1004,10 @@ static ql_status resolve_type_node(lower_context *context, size_t type_node,
     const char *kind = context->nodes[type_node].view.kind;
     ql_status status;
 
-    if (pointer_depth > 1u) {
+    if (pointer_depth > 2u) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, type_node,
-            "this slice carries one level of indirection", error);
+            "this slice carries at most two levels of indirection", error);
     }
     if (strcmp(kind, "struct_specifier") == 0 ||
         strcmp(kind, "union_specifier") == 0) {
@@ -998,13 +1058,10 @@ static ql_status resolve_type_node(lower_context *context, size_t type_node,
             return status;
         }
         if (base.kind == QL_C_SCALAR_RECORD) {
-            *output = pointer_depth == 0u
-                          ? base
-                          : make_record_pointer_type(base.record);
+            *output = pointer_depth == 0u ? base : make_pointer_to(base);
             return QL_STATUS_OK;
         }
-        *output = pointer_depth == 0u ? base
-                                      : make_pointer_type(scalar_of(base));
+        *output = pointer_depth == 0u ? base : make_pointer_to(base);
         return QL_STATUS_OK;
     }
 }
@@ -1235,10 +1292,29 @@ static ql_status parse_type_spelling(lower_context *context,
                 "type spelling names no ASM2C_GNU_V1 scalar type and no "
                 "typedef this unit declares", error);
         }
-        if (entry->is_indirect != 0u) {
+        if (entry->is_array_or_function != 0u) {
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-                "typedef names a pointer, array, or function type", error);
+                "typedef names an array or function type", error);
+        }
+        if (entry->pointer_depth != 0u) {
+            /* `typedef int *T` is a pointer type, not a reason to give up.
+               The indirection it adds rides on top of whatever the rest of
+               the chain resolves to. */
+            lower_type base;
+            ql_status resolved = parse_type_spelling(context,
+                                                     entry->underlying, node,
+                                                     1u, &base, error);
+            if (resolved != QL_STATUS_OK || context->unknown != 0u) {
+                return resolved;
+            }
+            if (entry->pointer_depth > 2u) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+                    "this slice carries at most two levels of indirection", error);
+            }
+            *output = make_pointer_to(base);
+            return QL_STATUS_OK;
         }
 
         if (++hops > 64u) {
@@ -1283,10 +1359,10 @@ static ql_status type_from_inventory(lower_context *context,
             "array and function-valued declarations are outside this "
             "lowering slice", error);
     }
-    if (inventory->pointer_depth > 1u) {
+    if (inventory->pointer_depth > 2u) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-            "this slice carries one level of indirection", error);
+            "this slice carries at most two levels of indirection", error);
     }
     if (inventory->pointer_depth == 1u) {
         lower_type pointee;
@@ -1296,9 +1372,7 @@ static ql_status type_from_inventory(lower_context *context,
         if (status != QL_STATUS_OK || context->unknown != 0u) {
             return status;
         }
-        *output = pointee.kind == QL_C_SCALAR_RECORD
-                      ? make_record_pointer_type(pointee.record)
-                      : make_pointer_type(scalar_of(pointee));
+        *output = make_pointer_to(pointee);
         return QL_STATUS_OK;
     }
     /* The inventory's base-kind classification is a fast syntactic hint.
@@ -1324,96 +1398,80 @@ static ql_status type_from_inventory(lower_context *context,
     }
 }
 
+/* Builds, and remembers, the IR type for a C type. Two occurrences of one C
+   type must share one IR type identifier, because a load requires its
+   pointer's element type to be that same identifier as its result type. One
+   cache keyed by the C type keeps that true for every shape, including the
+   nested pointers an ad-hoc slot per width could not express. */
 static ql_status ensure_ir_type(lower_context *context, lower_type *type,
                                 ql_error *error) {
     ql_ir_type_definition_v1 definition;
     ql_ir_type_id id;
     ql_status status;
+    size_t index;
 
     if (type->ir_type != QL_IR_INVALID_TYPE_ID) {
         return QL_STATUS_OK;
     }
     if (type->kind == QL_C_SCALAR_POINTER) {
-        lower_type pointee = type_from_scalar(type->pointee);
-        ql_ir_type_id *slot;
-        ql_status pointee_status;
-        if (type->pointee.kind == QL_C_SCALAR_RECORD) {
+        lower_type target = pointer_target(*type);
+        if (target.kind == QL_C_SCALAR_RECORD) {
             /* A record has no IR type of its own under this profile: a
                pointer to one is an address into bytes, and every member
                access reinterprets it at the member's type. */
-            pointee = make_integer_type(8u, 1u, 0u);
-            slot = &context->record_pointer_type;
-        } else if (type->pointee.kind == QL_C_SCALAR_BOOL) {
-            slot = &context->bool_pointer_type;
-        } else {
-            slot = &context->pointer_types[type->pointee.width];
+            target = make_integer_type(8u, 1u, 0u);
         }
-        if (*slot != QL_IR_INVALID_TYPE_ID) {
-            type->ir_type = *slot;
-            return QL_STATUS_OK;
-        }
-        pointee_status = ensure_ir_type(context, &pointee, error);
-        if (pointee_status != QL_STATUS_OK) {
-            return pointee_status;
+        status = ensure_ir_type(context, &target, error);
+        if (status != QL_STATUS_OK) {
+            return status;
         }
         ql_ir_type_definition_init(&definition, QL_IR_TYPE_POINTER);
         definition.bit_width = QL_C_POINTER_WIDTH;
-        definition.element_type = pointee.ir_type;
-        status = ql_ir_builder_add_type(context->builder, &definition, &id,
-                                        error);
-        if (status == QL_STATUS_OK) {
-            *slot = id;
-            type->ir_type = id;
-        }
-        return status;
-    }
-    if (type->kind == QL_C_SCALAR_VOID) {
-        if (context->void_type != QL_IR_INVALID_TYPE_ID) {
-            type->ir_type = context->void_type;
-            return QL_STATUS_OK;
-        }
+        definition.element_type = target.ir_type;
+    } else if (type->kind == QL_C_SCALAR_VOID) {
         ql_ir_type_definition_init(&definition, QL_IR_TYPE_VOID);
-        status = ql_ir_builder_add_type(context->builder, &definition, &id,
-                                        error);
-        if (status == QL_STATUS_OK) {
-            context->void_type = id;
-            type->ir_type = id;
-        }
-        return status;
-    }
-    if (type->kind == QL_C_SCALAR_BOOL) {
-        if (context->bool_type != QL_IR_INVALID_TYPE_ID) {
-            type->ir_type = context->bool_type;
-            return QL_STATUS_OK;
-        }
+    } else if (type->kind == QL_C_SCALAR_BOOL) {
         ql_ir_type_definition_init(&definition, QL_IR_TYPE_BOOL);
         definition.bit_width = 1u;
-        status = ql_ir_builder_add_type(context->builder, &definition, &id,
-                                        error);
-        if (status == QL_STATUS_OK) {
-            context->bool_type = id;
-            type->ir_type = id;
-        }
-        return status;
-    }
-    if (type->width == 0u || type->width > 128u) {
+    } else if (type->kind == QL_C_SCALAR_INTEGER && type->width != 0u &&
+               type->width <= 128u) {
+        ql_ir_type_definition_init(&definition, QL_IR_TYPE_BIT_VECTOR);
+        definition.bit_width = type->width;
+    } else {
         ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
-                     "invalid C integer width during IR lowering");
+                     "C type has no IR representation during lowering");
         return QL_STATUS_INTERNAL_ERROR;
     }
-    if (context->bv_types[type->width] != QL_IR_INVALID_TYPE_ID) {
-        type->ir_type = context->bv_types[type->width];
-        return QL_STATUS_OK;
+    for (index = 0u; index < context->type_cache_count; ++index) {
+        const lower_type_binding *binding = &context->type_cache[index];
+        if (binding->kind == definition.kind &&
+            binding->bit_width == definition.bit_width &&
+            binding->element_type == definition.element_type) {
+            type->ir_type = binding->id;
+            return QL_STATUS_OK;
+        }
     }
-    ql_ir_type_definition_init(&definition, QL_IR_TYPE_BIT_VECTOR);
-    definition.bit_width = type->width;
     status = ql_ir_builder_add_type(context->builder, &definition, &id,
                                     error);
-    if (status == QL_STATUS_OK) {
-        context->bv_types[type->width] = id;
-        type->ir_type = id;
+    if (status != QL_STATUS_OK) {
+        return status;
     }
-    return status;
+    status = grow_array(context->allocator, (void **)&context->type_cache,
+                        &context->type_cache_capacity,
+                        sizeof(*context->type_cache),
+                        context->type_cache_count + 1u, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    context->type_cache[context->type_cache_count].kind = definition.kind;
+    context->type_cache[context->type_cache_count].bit_width =
+        definition.bit_width;
+    context->type_cache[context->type_cache_count].element_type =
+        definition.element_type;
+    context->type_cache[context->type_cache_count].id = id;
+    ++context->type_cache_count;
+    type->ir_type = id;
+    return QL_STATUS_OK;
 }
 
 static ql_status emit_instruction(lower_context *context,
@@ -1769,7 +1827,7 @@ static ql_status emit_access_guard(lower_context *context,
 
 static ql_status emit_load(lower_context *context, lower_value pointer,
                            lower_value *output, ql_error *error) {
-    lower_type pointee = type_from_scalar(pointer.type.pointee);
+    lower_type pointee = pointer_target(pointer.type);
     ql_ir_value_id operands[2];
     ql_status status;
 
@@ -1811,7 +1869,7 @@ static ql_status emit_load(lower_context *context, lower_value pointer,
 
 static ql_status emit_store(lower_context *context, lower_value pointer,
                             lower_value value, ql_error *error) {
-    lower_type pointee = type_from_scalar(pointer.type.pointee);
+    lower_type pointee = pointer_target(pointer.type);
     lower_value converted;
     ql_ir_value_id operands[3];
     ql_ir_value_id combined;
@@ -1866,7 +1924,8 @@ static ql_status emit_pointer_offset(lower_context *context,
     ql_ir_value_id operands[2];
     ql_status status;
 
-    if (pointer.type.pointee.kind == QL_C_SCALAR_VOID) {
+    if (pointer.type.indirection == 1u &&
+        pointer.type.pointee.kind == QL_C_SCALAR_VOID) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, SIZE_MAX,
             "arithmetic on a pointer to void has no element size", error);
@@ -3120,9 +3179,71 @@ static ql_status lower_pointer_binary(lower_context *context,
         const int subtract = strcmp(operator_text, "-") == 0;
         if (left.type.kind == QL_C_SCALAR_POINTER &&
             right.type.kind == QL_C_SCALAR_POINTER) {
-            return lower_unknown(
-                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-                "the difference of two pointers is not in this slice", error);
+            /* C measures the gap in elements, so the byte difference is
+               divided by the element size. That size is a non-zero constant,
+               which is why the guard below can be satisfied outright while
+               still standing where the verifier requires one. */
+            lower_type difference_type = make_integer_type(64u, 4u, 1u);
+            lower_value left_bytes;
+            lower_value right_bytes;
+            ql_ir_value_id operands[2];
+            ql_ir_value_id gap;
+            ql_ir_value_id scale;
+            if (subtract == 0) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                    "two pointers cannot be added", error);
+            }
+            if (!type_same(left.type, right.type)) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                    "pointer difference needs both sides to have the same "
+                    "type", error);
+            }
+            status = emit_address_of_pointer(context, left, &left_bytes,
+                                             error);
+            if (status == QL_STATUS_OK) {
+                status = emit_address_of_pointer(context, right,
+                                                 &right_bytes, error);
+            }
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+            operands[0] = left_bytes.value;
+            operands[1] = right_bytes.value;
+            status = emit_instruction(context, QL_IR_OPCODE_SUB,
+                                      &difference_type, operands, 2u, NULL,
+                                      0u, QL_IR_EFFECT_NONE, &gap, error);
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+            status = add_uint_constant(context, difference_type,
+                                       pointee_byte_width(context,
+                                                          left.type),
+                                       &scale, error);
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+            memset(output, 0, sizeof(*output));
+            output->type = difference_type;
+            status = combine_defined(context, &left, &right,
+                                     &output->defined, error);
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+            if (output->defined == QL_IR_INVALID_VALUE_ID) {
+                status = ensure_bool_constants(context, error);
+                if (status != QL_STATUS_OK) {
+                    return status;
+                }
+                output->defined = context->true_value;
+            }
+            output->may_ub = 1u;
+            operands[0] = gap;
+            operands[1] = scale;
+            return emit_instruction(context, QL_IR_OPCODE_SDIV,
+                                    &difference_type, operands, 2u, NULL, 0u,
+                                    QL_IR_EFFECT_NONE, &output->value, error);
         }
         if (left.type.kind != QL_C_SCALAR_POINTER) {
             if (subtract) {
@@ -3515,6 +3636,8 @@ static lower_type member_load_type(lower_type member) {
     return member;
 }
 
+static lower_type address_type(void);
+
 static ql_status lower_designator_address(lower_context *context, size_t node,
                                           lower_value *output,
                                           lower_type *declared,
@@ -3562,6 +3685,7 @@ static ql_status lower_member_address(lower_context *context, size_t node,
             return status;
         }
         if (base.type.kind != QL_C_SCALAR_POINTER ||
+            base.type.indirection != 1u ||
             base.type.pointee.kind != QL_C_SCALAR_RECORD) {
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
@@ -3621,9 +3745,7 @@ static ql_status lower_member_address(lower_context *context, size_t node,
     }
     {
         lower_type loaded = member_load_type(member->type);
-        lower_type pointer = loaded.kind == QL_C_SCALAR_RECORD
-                                 ? make_record_pointer_type(loaded.record)
-                                 : make_pointer_type(scalar_of(loaded));
+        lower_type pointer = make_pointer_to(loaded);
         address.defined = base.defined;
         address.may_ub = base.may_ub;
         address.has_object = base.has_object;
@@ -3676,9 +3798,7 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
                 context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
                 "dereference applies to a pointer", error);
         }
-        *declared = output->type.pointee.kind == QL_C_SCALAR_RECORD
-                        ? make_record_type(output->type.record)
-                        : type_from_scalar(output->type.pointee);
+        *declared = pointer_target(output->type);
         return QL_STATUS_OK;
     }
     if (strcmp(kind, "field_expression") == 0) {
@@ -3730,10 +3850,19 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
         if (status != QL_STATUS_OK || context->unknown != 0u) {
             return status;
         }
-        *declared = base.type.pointee.kind == QL_C_SCALAR_RECORD
-                        ? make_record_type(base.type.record)
-                        : type_from_scalar(base.type.pointee);
+        *declared = pointer_target(base.type);
         return QL_STATUS_OK;
+    }
+    if (strcmp(kind, "identifier") == 0) {
+        /* A local or parameter lives in an SSA value, not in storage, so it
+           has no address to take. Giving it one means the function creating
+           an object for itself, which this slice does not do yet. Reporting
+           it as a pointer obstacle keeps the coverage tables pointed at the
+           part that is actually missing. */
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+            "taking the address of a local needs an object this slice does "
+            "not create", error);
     }
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
@@ -3822,8 +3951,36 @@ static ql_status lower_expression(lower_context *context, size_t node,
             "function calls require external-call or callee-summary semantics",
             error);
     }
-    if (strcmp(kind, "pointer_expression") == 0 ||
-        strcmp(kind, "subscript_expression") == 0 ||
+    if (strcmp(kind, "pointer_expression") == 0) {
+        size_t operator_node = direct_field_child(context, node, "operator");
+        char *operator_text = operator_node == SIZE_MAX
+                                  ? NULL
+                                  : copy_node_text(context, operator_node);
+        int is_address_of;
+        if (operator_text == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        is_address_of = strcmp(operator_text, "&") == 0;
+        context->allocator->deallocate(context->allocator->user_data,
+                                       operator_text);
+        if (is_address_of) {
+            /* Anything this slice can designate already has an address, so
+               taking it is just not loading. */
+            size_t argument_node = direct_field_child(context, node,
+                                                      "argument");
+            lower_type declared;
+            if (argument_node == SIZE_MAX) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION,
+                    node, "address-of has no operand", error);
+            }
+            return lower_designator_address(context, argument_node, output,
+                                            &declared, error);
+        }
+        return lower_designator_load(context, node, output, error);
+    }
+    if (strcmp(kind, "subscript_expression") == 0 ||
         strcmp(kind, "field_expression") == 0) {
         return lower_designator_load(context, node, output, error);
     }
@@ -3975,6 +4132,7 @@ static ql_status lower_assignment(lower_context *context, size_t node,
     }
     variable->value = converted.value;
     variable->initialized = 1u;
+    variable->has_object = converted.has_object;
     return QL_STATUS_OK;
 }
 
@@ -4067,19 +4225,13 @@ static ql_status parse_local_type(lower_context *context, size_t declaration,
             error);
     }
     {
+        /* Void and record bases are admissible here because a declarator may
+           still add a star. Whether they survive is decided per declarator. */
         ql_status status = parse_type_spelling(context, spelling, type_node,
-                                               0u, output, error);
+                                               1u, output, error);
         context->allocator->deallocate(context->allocator->user_data,
                                        spelling);
-        if (status != QL_STATUS_OK || context->unknown != 0u) {
-            return status;
-        }
-        if (output->kind == QL_C_SCALAR_RECORD) {
-            return lower_unknown(
-                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, type_node,
-                "a struct or union local is outside this slice", error);
-        }
-        return QL_STATUS_OK;
+        return status;
     }
 }
 
@@ -4088,7 +4240,8 @@ static ql_status lower_declaration(lower_context *context, size_t node,
     size_t type_node = direct_field_child(context, node, "type");
     size_t end = subtree_end(context, node);
     size_t index;
-    lower_type type;
+    lower_type base_type;
+    lower_type declarator_type;
     uint32_t is_const;
     size_t declarator_count = 0u;
     ql_status status;
@@ -4098,13 +4251,9 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             context, QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION, node,
             "local declaration has no type", error);
     }
-    status = parse_local_type(context, node, type_node, &type, &is_const,
-                              error);
+    status = parse_local_type(context, node, type_node, &base_type,
+                              &is_const, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
-        return status;
-    }
-    status = ensure_ir_type(context, &type, error);
-    if (status != QL_STATUS_OK) {
         return status;
     }
     for (index = node + 1u; index < end; ++index) {
@@ -4127,30 +4276,53 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             declarator = direct_field_child(context, declarator,
                                             "declarator");
         }
-        if (declarator == SIZE_MAX ||
-            strcmp(context->nodes[declarator].view.kind, "identifier") != 0) {
-            const char *kind = declarator != SIZE_MAX
-                                   ? context->nodes[declarator].view.kind
-                                   : "declarator";
-            if (strstr(kind, "pointer") != NULL ||
-                strstr(kind, "array") != NULL) {
+        {
+            uint32_t pointer_depth = 0u;
+            int rejected = 0;
+            size_t named = declarator == SIZE_MAX
+                               ? SIZE_MAX
+                               : member_declarator_name(context, declarator,
+                                                        &pointer_depth,
+                                                        &rejected);
+            if (named == SIZE_MAX || rejected != 0) {
                 return lower_unknown(
-                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
+                    context,
+                    rejected != 0
+                        ? QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER
+                        : QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION,
                     declarator != SIZE_MAX ? declarator : index,
-                    "pointer and array locals require memory semantics",
+                    "array and function locals are outside this slice",
                     error);
             }
-            return lower_unknown(
-                context, QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION, index,
-                "local declarator must be one scalar identifier", error);
+            if (pointer_depth > 2u) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, named,
+                    "this slice carries at most two levels of indirection", error);
+            }
+            declarator_type = base_type;
+            if (pointer_depth == 1u) {
+                declarator_type = make_pointer_to(base_type);
+            } else if (base_type.kind == QL_C_SCALAR_RECORD) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, named,
+                    "a struct or union local is outside this slice", error);
+            } else if (base_type.kind == QL_C_SCALAR_VOID) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, named,
+                    "void is not an object type here", error);
+            }
+            status = ensure_ir_type(context, &declarator_type, error);
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+            identifier = named;
         }
-        identifier = declarator;
         name = copy_node_text(context, identifier);
         if (name == NULL) {
             ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
             return QL_STATUS_OUT_OF_MEMORY;
         }
-        status = add_variable(context, name, strlen(name), type,
+        status = add_variable(context, name, strlen(name), declarator_type,
                               QL_IR_INVALID_VALUE_ID, 0u, is_const,
                               identifier, error);
         context->allocator->deallocate(context->allocator->user_data, name);
@@ -4165,7 +4337,8 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             if (status != QL_STATUS_OK || context->unknown != 0u) {
                 return status;
             }
-            status = convert_value(context, value, type, &converted, error);
+            status = convert_value(context, value, declarator_type,
+                                   &converted, error);
             if (status != QL_STATUS_OK) {
                 return status;
             }
@@ -4175,6 +4348,9 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             }
             variable->value = converted.value;
             variable->initialized = 1u;
+            /* A pointer local is only as well-founded as what was put in
+               it. */
+            variable->has_object = converted.has_object;
         } else if (is_const != 0u) {
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION,
@@ -4275,6 +4451,9 @@ static ql_status merge_branch_states(
             if (status != QL_STATUS_OK) {
                 return status;
             }
+            /* The branches disagreed, so whatever object one of them could
+               name, the merge cannot name both. */
+            variable->has_object = 0u;
         }
     }
     /* Memory is as much a merged value as any variable: a store on one branch
@@ -4876,6 +5055,9 @@ static ql_status initialize_parameters(lower_context *context,
 static void cleanup_context(lower_context *context) {
     pop_variables(context, 0u);
     release_typedefs(context);
+    context->allocator->deallocate(context->allocator->user_data,
+                                   context->type_cache);
+    context->type_cache = NULL;
     release_records(context);
     release_enumerators(context);
     context->allocator->deallocate(context->allocator->user_data,
@@ -4900,7 +5082,6 @@ ql_status QL_CALL ql_c_lower_selected_function(
     ql_c_function_view canonical;
     size_t function_node;
     size_t body_node;
-    size_t index;
     ql_status status;
 
     if (output == NULL || source == NULL || source_size == 0u) {
@@ -4945,21 +5126,11 @@ ql_status QL_CALL ql_c_lower_selected_function(
     context.unit = unit;
     context.function = canonical;
     context.result = result;
-    context.bool_type = QL_IR_INVALID_TYPE_ID;
-    context.void_type = QL_IR_INVALID_TYPE_ID;
     context.memory_type = QL_IR_INVALID_TYPE_ID;
-    context.bool_pointer_type = QL_IR_INVALID_TYPE_ID;
-    context.record_pointer_type = QL_IR_INVALID_TYPE_ID;
     context.memory_value = QL_IR_INVALID_VALUE_ID;
     context.true_value = QL_IR_INVALID_VALUE_ID;
     context.false_value = QL_IR_INVALID_VALUE_ID;
     context.current_block = QL_IR_INVALID_BLOCK_ID;
-    for (index = 0u; index < sizeof(context.bv_types) /
-                                     sizeof(context.bv_types[0]);
-         ++index) {
-        context.bv_types[index] = QL_IR_INVALID_TYPE_ID;
-        context.pointer_types[index] = QL_IR_INVALID_TYPE_ID;
-    }
 
     if (canonical.support != QL_C_FUNCTION_SUPPORTED) {
         status = lower_unknown(

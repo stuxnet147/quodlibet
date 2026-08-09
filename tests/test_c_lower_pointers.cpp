@@ -45,6 +45,20 @@ QL_PTR_FUNCTION(nullness, int ptr_null(int *p) { return p == 0; });
 QL_PTR_FUNCTION(narrow_load, int ptr_short(short *p, int i) {
     return p[i];
 });
+QL_PTR_FUNCTION(local_decl, int ptr_local(int *p, int i) {
+    int *cursor = p + i;
+    return *cursor;
+});
+QL_PTR_FUNCTION(distance, int ptr_distance(int *p, int i) {
+    int *far = p + i;
+    return (int) (far - p);
+});
+QL_PTR_FUNCTION(named_pointer, typedef int *QL_PTR_INTP;
+    int ptr_named(QL_PTR_INTP p, int i) { return p[i]; });
+QL_PTR_FUNCTION(address_of_element, int ptr_address(int *p, int i) {
+    int *slot = &p[i];
+    return *slot + 1;
+});
 
 namespace {
 
@@ -382,6 +396,52 @@ TEST(CLowerPointers, CarriesTheElementWidthIntoSubscriptArithmetic) {
         ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
         EXPECT_EQ(ptr_short(const_cast<int16_t *>(data), i),
                   Returned(run.result));
+    }
+}
+
+/* The pointer surface this unit added: a pointer local, the difference of two
+   pointers, a typedef that names a pointer, and taking the address of
+   something that already has one. */
+TEST(CLowerPointers, CarriesTheWiderPointerSurface) {
+    struct Case {
+        const char *name;
+        const char *source;
+        const char *function;
+        int32_t (*reference)(int32_t *, int32_t);
+    };
+    const Case cases[] = {
+        {"local", local_decl_source, "ptr_local",
+         [](int32_t *p, int32_t i) { return ptr_local(p, i); }},
+        {"distance", distance_source, "ptr_distance",
+         [](int32_t *p, int32_t i) { return ptr_distance(p, i); }},
+        {"typedef", named_pointer_source, "ptr_named",
+         [](int32_t *p, int32_t i) { return ptr_named(p, i); }},
+        {"address", address_of_element_source, "ptr_address",
+         [](int32_t *p, int32_t i) { return ptr_address(p, i); }},
+    };
+    uint64_t state = UINT64_C(0x4b7e2c9013fa65d8);
+    for (const Case &item : cases) {
+        Lowered lowered;
+        SCOPED_TRACE(item.name);
+        ASSERT_TRUE(lowered.Open(item.source, item.function));
+        for (std::size_t round = 0u; round < 64u; ++round) {
+            int32_t data[kElements];
+            const int32_t index =
+                static_cast<int32_t>(NextRandom(&state) % kElements);
+            for (std::size_t at = 0u; at < kElements; ++at) {
+                data[at] = static_cast<int32_t>(NextRandom(&state) & 0xffffu);
+            }
+            const Outcome run =
+                Execute(lowered.ir(), kBase,
+                        {static_cast<uint64_t>(
+                            static_cast<uint32_t>(index))},
+                        kBase, sizeof(data),
+                        reinterpret_cast<const uint8_t *>(data), nullptr);
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            EXPECT_EQ(item.reference(data, index), Returned(run.result));
+        }
     }
 }
 
