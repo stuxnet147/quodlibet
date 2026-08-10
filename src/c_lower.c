@@ -95,7 +95,8 @@ typedef struct lower_member {
   struct lower_type type;
   uint64_t offset;
   /* Its representation contributes to record layout. The raw address may be
-     an indirect-call event operand, but it never becomes an object pointer. */
+     copied, compared, or used as an indirect-call event operand, but it never
+     becomes an object pointer. */
   uint32_t is_function_pointer;
   lower_callee function;
 } lower_member;
@@ -5395,13 +5396,9 @@ static ql_status lower_member_address(lower_context *context, size_t node,
                          field_node, "the record has no such member", error);
   }
   if (member->is_function_pointer != 0u) {
-    if (function == NULL) {
-      return lower_unknown(
-          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, field_node,
-          "a function-pointer member is only a call target in this slice",
-          error);
+    if (function != NULL) {
+      *function = &member->function;
     }
-    *function = &member->function;
   }
   *declared = member->type;
 

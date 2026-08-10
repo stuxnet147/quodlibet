@@ -1455,6 +1455,22 @@ record의 function pointer member는 x86-64 ABI의 pointer 크기와 정렬로 l
 
 새 성공 중 415개는 record layout의 function pointer member 차단을 벗어났고 10개는 기존의 일반 간접 호출 차단에서 왔습니다. `tests/test_c_lower_records.cpp`는 callback member 뒤의 실제 compiled member offset을 대조합니다. `tests/test_c_lower_calls.cpp`는 정수 반환, 64비트 pointer 반환, target event operand, null UB를 compiled C와 대조합니다. 영향 범위의 `CLower*` 시험 82/82와 전체 train 비교가 통과했습니다. 기존 direct call 집합의 회귀가 없고 변경이 내부 C lowering에 한정되므로 전체 CTest는 반복하지 않았습니다.
 
+### 39. function pointer 값을 opaque 주소로 보존한다
+
+커밋: (이 단위)
+
+function pointer member의 64비트 표현은 object pointer가 아닌 opaque 주소 값으로 load와 store합니다. 따라서 null 여부와 다른 function pointer 값은 비교할 수 있고 같은 타입의 member 사이에서 복사할 수 있습니다. 이 값에 object provenance를 부여하거나 dereference하지 않습니다. 호출 위치에서는 앞 절의 동적 target operand로만 사용합니다. function pointer 배열은 scalar 하나로 축소하지 않고 계속 UNKNOWN입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 22,571 (75.54%) | **22,788 (76.27%)** |
+| 증가 | | **+217** |
+| 기존 성공 회귀 | | **0** |
+| verifier 통과 | 22,571 / 22,571 | **22,788 / 22,788** |
+| status 실패 | 0 | **0** |
+
+253개의 첫 차단이 제거됐고 36개는 뒤의 기존 한계로 이동했습니다. `tests/test_c_lower_records.cpp`는 유효한 callback 주소와 null을 실제 struct image에 넣고 compiled C의 비교 결과와 대조합니다. 간접 호출 시험을 포함한 `CLower*` 82/82와 전체 train 비교가 통과했습니다. 변경은 내부 member value 분류에 한정되므로 전체 CTest는 반복하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1464,10 +1480,10 @@ record의 function pointer member는 x86-64 ABI의 pointer 크기와 정렬로 l
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
 - `unsupported_type` 2,707
-- `uninitialized_read` 2,198
-- `unsupported_pointer` 915
-- `unsupported_control_flow` 520
-- `unsupported_call` 354
+- `uninitialized_read` 2,207
+- `unsupported_pointer` 664
+- `unsupported_control_flow` 525
+- `unsupported_call` 369
 
 ## 조율자에게 요청할 것
 

@@ -86,6 +86,9 @@ QL_REC_FUNCTION(function_pointer_layout,
     };
     int rec_after_callback(struct REC_CALLBACK_BOX *box) {
         return box->value + (int)sizeof(box->callback);
+    }
+    int rec_has_callback(struct REC_CALLBACK_BOX *box) {
+        return box->callback != 0;
     });
 
 namespace {
@@ -524,6 +527,23 @@ TEST(CLowerRecords, LaysOutAnOpaqueFunctionPointerMember) {
             << ql_ir_interp_ub_reason_string(run.result.ub_reason);
         EXPECT_EQ(rec_after_callback(&native), Returned(run.result));
     }
+
+    Lowered presence;
+    int (*callbacks[])(int) = {rec_callback_target, nullptr};
+    ASSERT_TRUE(presence.Open(function_pointer_layout_source,
+                              "rec_has_callback"));
+    for (int (*callback)(int) : callbacks) {
+        struct REC_CALLBACK_BOX native = {'x', callback, 17};
+        struct REC_CALLBACK_BOX image = native;
+        const Region region = {
+            kBase, sizeof(image), reinterpret_cast<const uint8_t *>(&image),
+            nullptr};
+        const Outcome run = Execute(presence.ir(), {kBase}, {}, {region});
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(rec_has_callback(&native), Returned(run.result));
+    }
 }
 
 TEST(CLowerRecords, LowersEnumeratorsAsTheConstantsTheyName) {
@@ -557,11 +577,11 @@ TEST(CLowerRecords, RefusesWholeRecordValues) {
         {"struct S { struct S inner; };\nint cyclic(struct S *p) "
          "{ return 0; }",
          "cyclic"},
-        /* Function-pointer bytes may determine later member offsets and may
-           be call targets, but are not ordinary object-pointer values. */
-        {"struct S { int (*callback)(int); int value; };\n"
-         "int pointer_value(struct S *p) { return p->callback != 0; }",
-         "pointer_value"},
+        /* An array of function pointers has aggregate shape this layout pass
+           deliberately does not flatten into one opaque scalar. */
+        {"struct S { int (*callbacks[2])(int); int value; };\n"
+         "int callback_array(struct S *p) { return p->value; }",
+         "callback_array"},
     };
     for (const Case &item : cases) {
         ql_c_frontend_unit *unit = nullptr;
