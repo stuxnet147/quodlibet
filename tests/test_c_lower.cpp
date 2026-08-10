@@ -267,7 +267,7 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
       {"int invoke(int x) { return helper(x); }", "invoke",
        QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, "call_expression"},
       {"char next(void); int loop_escape(void) { char x; do { x = next(); "
-       "} while (x != '\\xc0'); return x; }",
+       "} while (x != L'x'); return x; }",
        "loop_escape", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION,
        "char_literal"},
       {"int observe(int x) { volatile int y = x; return y; }", "observe",

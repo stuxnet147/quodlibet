@@ -120,6 +120,9 @@ QL_EXPR_FUNCTION(unsigned_negative_literal,
     unsigned expr_unsigned_negative_literal(unsigned a, unsigned b) {
         return -1u + (a - a) + (b - b);
     });
+QL_EXPR_FUNCTION(character_escapes, int expr_character_escapes(int a, int b) {
+    return a + b + '\xc0' + '\101' + '\n';
+});
 QL_EXPR_FUNCTION(void_assignment, int expr_void_assignment(int a, int b) {
     (void)(a = b);
     return a;
@@ -214,7 +217,6 @@ std::vector<uint8_t> Encode(uint64_t value, uint32_t width) {
     }
     return bytes;
 }
-
 struct Outcome {
     ql_ir_interp_result_v1 result{};
     ql_status status = QL_STATUS_INTERNAL_ERROR;
@@ -359,6 +361,9 @@ const Case kCases[] = {
              static_cast<unsigned>(a), static_cast<unsigned>(b)));
      },
      &Always},
+    {"character-escapes", character_escapes_source, "expr_character_escapes",
+     [](int32_t a, int32_t b) { return expr_character_escapes(a, b); },
+     &Always},
     {"void-assignment", void_assignment_source, "expr_void_assignment",
      [](int32_t a, int32_t b) { return expr_void_assignment(a, b); },
      &Always},
@@ -487,6 +492,13 @@ TEST(CLowerExpressions, RefusesWhatItCannotState) {
         {"typedef void TYP_NO_OBJECT;\n"
          "unsigned long f(void) { return sizeof(TYP_NO_OBJECT); }", "f",
          QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR},
+        /* The target byte cannot represent these escape values. A compiler
+           may diagnose them before translation, while the lowering receives
+           source text and must conservatively keep it UNKNOWN. */
+        {"int f(void) { return '\\x100'; }", "f",
+         QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION},
+        {"int f(void) { return '\\400'; }", "f",
+         QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION},
     };
     for (const Refused &item : cases) {
         ql_c_frontend_unit *unit = nullptr;

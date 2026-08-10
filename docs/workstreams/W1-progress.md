@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **20,249 / 29,880 (67.77%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 4,543, `uninitialized_read` 2,438, `type_error` 699입니다. 구조화 루프 버킷은 0이 되었습니다. 다음 단위는 타입과 definite initialization의 메시지별 큰 원인을 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **20,279 / 29,880 (67.87%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 4,499, `uninitialized_read` 2,448, `type_error` 702입니다. 구조화 루프 버킷은 0이 되었습니다. 다음 단위는 타입과 definite initialization의 메시지별 큰 원인을 닫습니다.
 
 ## 기준선
 
@@ -1298,7 +1298,7 @@ compiled differential은 두 전방 label, 중첩 block의 goto, 여러 합류 �
 
 ### 30. 순환 CFG와 구조적 C 루프를 내린다
 
-커밋: (이 단위)
+커밋: `702131e`
 
 IR payload에 이미 있던 `cfg_kind`를 사용해 `QL_IR_CFG_CYCLIC`을 추가했습니다. artifact schema와 payload 배치는 바꾸지 않았습니다. builder는 루프 헤더 결과를 먼저 노출한 뒤 back-edge가 완성될 때 incoming을 추가하는 append-only PHI API를 제공합니다. decoder와 reader view는 선언된 CFG 종류를 보존합니다.
 
@@ -1318,6 +1318,23 @@ C lowering은 `for`, `while`, `do while`을 구조 그대로 내립니다. 루�
 
 `tests/test_ir.cpp`는 self-loop의 교차 PHI가 병렬로 실행되는지, cyclic artifact가 왕복 후 독립 verifier를 통과하는지 확인합니다. `tests/test_ir_interp.cpp`는 세 루프와 `break`/`continue` 결과를 고정합니다. `tests/test_ir_differential.cpp`는 같은 루프 소스를 실제 컴파일해 경계값과 무작위 입력에서 IR interpreter와 비교합니다.
 
+### 31. 8비트 octal과 hexadecimal escape를 해석한다
+
+커밋: (이 단위)
+
+ordinary character와 string literal의 `\\ooo`, `\\xhh` escape를 실제 byte로 해석합니다. octal은 C 규칙대로 최대 세 자리, hexadecimal은 뒤따르는 모든 hex digit을 소비합니다. 값이 target `unsigned char`의 8비트를 넘으면 잘라내지 않고 UNKNOWN으로 남깁니다.
+
+ASM2C_GNU_V1의 plain `char`는 signed이므로 ordinary character constant는 8비트 byte를 C의 `int`로 sign extension합니다. string literal은 같은 byte를 변형하지 않고 memory image에 보관합니다. 따라서 `\'\\xc0\'`는 정수 `-64`, `"\\xc0"`의 첫 저장 byte는 `0xc0`입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 20,249 (67.77%) | **20,279 (67.87%)** |
+| 증가 | | **+30** |
+| verifier 통과 | 20,249 / 20,249 | **20,279 / 20,279** |
+| status 실패 | 0 | **0** |
+
+`tests/test_c_lower_expressions.cpp`는 ordinary character escape를 실제 컴파일된 C와 대조하고 범위를 넘는 escape를 UNKNOWN으로 고정합니다. `tests/test_c_lower_aggregates.cpp`는 string escape가 정확한 memory byte를 요구하는지 확인합니다. 전체 train 측정은 단일 `coverage` 프로세스가 순차 실행이라는 점을 고려해 6개 샤드로 병렬화한 뒤 카운터와 29,880개 상세 행을 합쳤습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1326,9 +1343,9 @@ C lowering은 `for`, `while`, `do while`을 구조 그대로 내립니다. 루�
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 4,543
-- `uninitialized_read` 2,438
-- `type_error` 699
+- `unsupported_type` 4,499
+- `uninitialized_read` 2,448
+- `type_error` 702
 - `unsupported_pointer` 607
 - `unsupported_control_flow` 423
 
@@ -1346,7 +1363,7 @@ C lowering은 `for`, `while`, `do while`을 구조 그대로 내립니다. 루�
 
 ## 다음에 할 것
 
-1. 최신 9,631개 UNKNOWN을 diagnostic message까지 다시 분류합니다. 요약 코드만으로는 타입과 definite-initialization 범주의 독립 원인을 정할 수 없습니다.
+1. 최신 9,601개 UNKNOWN을 diagnostic message까지 다시 분류합니다. 요약 코드만으로는 타입과 definite-initialization 범주의 독립 원인을 정할 수 없습니다.
 2. 남은 타입 철자와 선언 형태를 빈도순으로 닫고, uninitialized address escape는 외부 호출의 memory-write 계약을 먼저 고정합니다.
 3. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.
 4. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.

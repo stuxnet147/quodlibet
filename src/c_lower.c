@@ -984,6 +984,22 @@ static ql_status collect_storage_locals(lower_context *context,
    the entry block, so an unbounded literal would be an unbounded prologue. */
 #define LOWER_MAX_STRING_BYTES 256u
 
+static int literal_hex_digit(char character, unsigned *value) {
+  if (character >= '0' && character <= '9') {
+    *value = (unsigned)(character - '0');
+    return 1;
+  }
+  if (character >= 'a' && character <= 'f') {
+    *value = (unsigned)(character - 'a') + 10u;
+    return 1;
+  }
+  if (character >= 'A' && character <= 'F') {
+    *value = (unsigned)(character - 'A') + 10u;
+    return 1;
+  }
+  return 0;
+}
+
 /* Reads the bytes a literal denotes. Only the escapes C spells with a single
    letter and the octal and hex forms are decoded; anything else is refused
    rather than passed through as its own text, because a literal whose bytes
@@ -1017,6 +1033,40 @@ static int decode_string_literal(const char *text, size_t size,
       if (++index >= size) {
         return 0;
       }
+      if (text[index] == 'x') {
+        unsigned accumulated = 0u;
+        unsigned digit;
+        size_t digits = 0u;
+        ++index;
+        while (index < size && literal_hex_digit(text[index], &digit)) {
+          if (accumulated > (255u - digit) / 16u) {
+            return 0;
+          }
+          accumulated = accumulated * 16u + digit;
+          ++digits;
+          ++index;
+        }
+        if (digits == 0u) {
+          return 0;
+        }
+        out[written++] = (unsigned char)accumulated;
+        continue;
+      }
+      if (text[index] >= '0' && text[index] <= '7') {
+        unsigned accumulated = 0u;
+        size_t digits = 0u;
+        while (index < size && digits < 3u && text[index] >= '0' &&
+               text[index] <= '7') {
+          accumulated = accumulated * 8u + (unsigned)(text[index] - '0');
+          ++digits;
+          ++index;
+        }
+        if (accumulated > 255u) {
+          return 0;
+        }
+        out[written++] = (unsigned char)accumulated;
+        continue;
+      }
       switch (text[index]) {
       case 'n':
         value = 10u;
@@ -1026,9 +1076,6 @@ static int decode_string_literal(const char *text, size_t size,
         break;
       case 'r':
         value = 13u;
-        break;
-      case '0':
-        value = 0u;
         break;
       case 'a':
         value = 7u;
@@ -5992,7 +6039,11 @@ static ql_status lower_expression(lower_context *context, size_t node,
       return status;
     }
     output->defined = context->true_value;
-    return add_uint_constant(context, output->type, (uint64_t)decoded[0],
+    /* ASM2C_GNU_V1 has signed plain char. Clang and GCC therefore sign-extend
+       an ordinary one-byte character constant into its C `int` type. String
+       literals keep the decoded byte unchanged in memory. */
+    return add_uint_constant(context, output->type,
+                             (uint64_t)(int64_t)(int8_t)decoded[0],
                              &output->value, error);
   }
   if (strcmp(kind, "conditional_expression") == 0) {

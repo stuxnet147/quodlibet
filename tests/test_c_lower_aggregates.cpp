@@ -431,7 +431,7 @@ TEST(CLowerAggregates, AnIndexPastTheArrayIsUndefined) {
 }
 
 TEST(CLowerAggregates, AStringLiteralIsAnObjectHoldingItsOwnBytes) {
-    /* `const char S[] = "hi";` is an array whose bound the initialiser
+    /* `const char S[] = "\\xC0\\101";` is an array whose bound the initialiser
        states and whose bytes the program states, so the lowering pins the
        size at three and states the bytes as one memory image the entry block
        assumes.
@@ -441,11 +441,11 @@ TEST(CLowerAggregates, AStringLiteralIsAnObjectHoldingItsOwnBytes) {
        supply different bytes and the assumption rejects the run rather than
        quietly returning something else. */
     static const char source[] =
-        "const char AGG_TEXT[] = \"hi\";\n"
+        "const char AGG_TEXT[] = \"\\xC0\\101\";\n"
         "int pick(int i) { return AGG_TEXT[i]; }\n";
     Lowered lowered;
     ASSERT_TRUE(lowered.Open(source, "pick"));
-    const char expected[] = {'h', 'i', '\0'};
+    const char expected[] = {static_cast<char>(0xc0), 'A', '\0'};
     for (int32_t i = 0; i < 3; ++i) {
         SCOPED_TRACE(i);
         const Outcome run = Execute(lowered.ir(), {Widen(i)}, {3u}, expected);
@@ -457,7 +457,7 @@ TEST(CLowerAggregates, AStringLiteralIsAnObjectHoldingItsOwnBytes) {
 
     /* Bytes that are not the ones the program states are refused, not
        silently read. */
-    const char wrong[] = {'h', 'o', '\0'};
+    const char wrong[] = {static_cast<char>(0xc0), 'B', '\0'};
     const Outcome bad = Execute(lowered.ir(), {Widen(0)}, {3u}, wrong);
     ASSERT_EQ(QL_STATUS_OK, bad.status);
     EXPECT_EQ(QL_IR_INTERP_OUTCOME_ASSUMPTION_VIOLATED, bad.result.outcome);
