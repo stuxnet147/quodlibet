@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,515 / 29,880 (78.70%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,305, `unsupported_type` 2,095, `unsupported_pointer` 663입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,530 / 29,880 (78.75%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,305, `unsupported_type` 2,095, `unsupported_pointer` 663입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1728,6 +1728,25 @@ function pointer에는 data object authority를 주지 않습니다. 역참조, 
 
 `tests/test_c_lower_calls.cpp`는 callback의 외부 전달과 null 비교, data pointer 산술 거부, 직접 callback 호출의 별도 거부를 고정합니다. `tests/test_signature.cpp`는 callback 매개변수가 pointer ABI로 직렬화되고 lowered IR에 binding되는지 확인합니다. 영향 범위인 `CLower*`, `CReuse*`, `SourceSignature.*` 111/111이 통과했습니다. 변경은 function-shaped inventory와 function pointer 변환 분기에 한정되므로 solver, transport, plugin까지 포함한 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 G9 수용률과 기존 성공 회귀를 확인하는 필수 측정으로 실행했습니다.
 
+### 55. callback 매개변수를 선언된 서명으로 간접 호출한다
+
+선택된 함수의 function pointer 매개변수는 값뿐 아니라 원래 parameter declaration과 function declarator 위치를 함께 보존합니다. callback 호출 시 그 declarator에서 반환형, 실제 매개변수형, variadic 여부를 direct prototype과 같은 resolver로 복원합니다. 따라서 pointer-width라는 이유만으로 호출 인자의 개수나 폭을 추측하지 않습니다.
+
+호출 event는 member 간접 호출과 같은 `__ql_indirect_call_v1` symbol을 사용하고 첫 operand에 동적 callback 주소를 넣습니다. null target은 event를 만들기 전 explicit UB guard에서 멈춥니다. callback 호출은 memory와 event trace를 모두 소비하고 갱신하므로, parameter가 만들어진 뒤 call syntax를 다시 좁게 훑어 두 상태 입력을 entry signature에 포함합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,515 (78.70%) | **23,530 (78.75%)** |
+| 증가 | | **+15** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_call` | 404 | **388** |
+| verifier 통과 | 23,515 / 23,515 | **23,530 / 23,530** |
+| status 실패 | 0 | **0** |
+
+callback 관련 78개 subset에서 성공은 34개에서 49개로 늘었습니다. direct identifier callback 호출 16개 중 15개가 성공했고 1개는 호출 뒤의 기존 record type error로 이동했습니다. `(*callback)(...)` 표기 2개는 아직 별도 syntax 경계이며 두 함수 모두 앞선 loop 제한도 갖습니다. 전수 함수별 비교는 새 성공 15개, 기존 성공 회귀 0개, 변경 행 16개, 누락과 추가 행 0개입니다.
+
+`tests/test_c_lower_calls.cpp`는 실제 `CALLEE_double` 주소를 callback parameter로 주고 compiled C와 interpreter의 반환값 및 간접-call event를 대조하며, null target이 event 없이 UB가 되는 것도 고정합니다. 변경은 C variable 수명과 call lowering에 닿으므로 `CLower*`와 `CReuse*` 98/98을 실행했습니다. source-signature, solver, transport, plugin은 바뀌지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 G9 수용률과 기존 성공 회귀를 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1740,7 +1759,7 @@ function pointer에는 data object authority를 주지 않습니다. 역참조, 
 - `unsupported_type` 2,095
 - `unsupported_pointer` 663
 - `unsupported_control_flow` 547
-- `unsupported_call` 404
+- `unsupported_call` 388
 
 ## 조율자에게 요청할 것
 

@@ -166,6 +166,11 @@ typedef struct lower_variable {
   char *name;
   size_t name_size;
   lower_type type;
+  /* A function-typed parameter is adjusted to a function pointer in C. Keep
+     its full declarator beside the value so an indirect call can resolve the
+     callback's own parameters instead of guessing them from pointer bits. */
+  lower_callee function;
+  uint32_t has_function_signature;
   /* Set for a pointer whose object the table declares. */
   uint32_t has_object;
   uint32_t may_admit_object;
@@ -3489,6 +3494,9 @@ static void pop_variables(lower_context *context, size_t marker) {
     --context->variable_count;
     context->allocator->deallocate(
         context->allocator->user_data,
+        context->variables[context->variable_count].function.parameters);
+    context->allocator->deallocate(
+        context->allocator->user_data,
         context->variables[context->variable_count].name);
     memset(&context->variables[context->variable_count], 0,
            sizeof(context->variables[context->variable_count]));
@@ -6340,19 +6348,34 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     if (callee == NULL) {
       lower_variable *variable = find_variable(context, name, strlen(name));
       context->allocator->deallocate(context->allocator->user_data, name);
-      if (variable != NULL && variable->type.is_function_pointer != 0u) {
+      if (variable != NULL && variable->type.is_function_pointer != 0u &&
+          variable->has_function_signature != 0u) {
+        status = lower_identifier(context, function_node, &indirect_target,
+                                  error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          return status;
+        }
+        callee = &variable->function;
+        symbol = "__ql_indirect_call_v1";
+        is_indirect = 1u;
+        operand_count = 3u;
+        operands[2] = indirect_target.value;
+      } else if (variable != NULL &&
+                 variable->type.is_function_pointer != 0u) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
-            "calling a function-pointer value is outside this slice", error);
+            "a function-pointer call has no recoverable declaration", error);
+      } else {
+        return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL,
+                             node,
+                             "the callee has no declaration in this unit",
+                             error);
       }
-      return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL,
-                           node,
-                           "the callee has no declaration in this unit",
-                           error);
+    } else {
+      context->allocator->deallocate(context->allocator->user_data, name);
+      symbol = callee->name;
+      operand_count = 2u;
     }
-    context->allocator->deallocate(context->allocator->user_data, name);
-    symbol = callee->name;
-    operand_count = 2u;
   } else if (strcmp(context->nodes[function_node].view.kind,
                     "field_expression") == 0) {
     lower_value target_address;
@@ -11233,6 +11256,79 @@ static ql_status initialize_parameters(lower_context *context,
     }
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
+    }
+    if (type.is_function_pointer != 0u) {
+      lower_variable *variable =
+          &context->variables[context->variable_count - 1u];
+      size_t parameter_node = SIZE_MAX;
+      size_t declarator_node = SIZE_MAX;
+      size_t node;
+      uint32_t return_pointer_depth = 0u;
+
+      for (node = 0u; node < context->node_count; ++node) {
+        if (parameter_node == SIZE_MAX &&
+            strcmp(context->nodes[node].view.kind,
+                   "parameter_declaration") == 0 &&
+            range_equal(context->nodes[node].view.range, parameter.range)) {
+          parameter_node = node;
+        }
+        if (declarator_node == SIZE_MAX &&
+            range_equal(context->nodes[node].view.range,
+                        parameter.type.declarator_range)) {
+          declarator_node = node;
+        }
+      }
+      while (declarator_node != SIZE_MAX &&
+             (strcmp(context->nodes[declarator_node].view.kind,
+                     "pointer_declarator") == 0 ||
+              strcmp(context->nodes[declarator_node].view.kind,
+                     "abstract_pointer_declarator") == 0)) {
+        ++return_pointer_depth;
+        declarator_node =
+            direct_field_child(context, declarator_node, "declarator");
+      }
+      if (parameter_node == SIZE_MAX || declarator_node == SIZE_MAX ||
+          (strcmp(context->nodes[declarator_node].view.kind,
+                  "function_declarator") != 0 &&
+           strcmp(context->nodes[declarator_node].view.kind,
+                  "abstract_function_declarator") != 0)) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, SIZE_MAX,
+            "a callback parameter has no recoverable function declarator",
+            error);
+      }
+      variable->function.declaration_node = parameter_node;
+      variable->function.declarator_node = declarator_node;
+      variable->function.return_pointer_depth = return_pointer_depth;
+      variable->has_function_signature = 1u;
+    }
+  }
+  /* The early call scan runs before parameter variables exist. Revisit only
+     identifier callees now so callback invocations receive trace and memory
+     inputs without treating cast-like call syntax as an external call. */
+  for (index = context->body_node + 1u;
+       index < subtree_end(context, context->body_node); ++index) {
+    size_t function_node;
+    char *name;
+    lower_variable *variable;
+    if (strcmp(context->nodes[index].view.kind, "call_expression") != 0) {
+      continue;
+    }
+    function_node = direct_field_child(context, index, "function");
+    if (function_node == SIZE_MAX ||
+        strcmp(context->nodes[function_node].view.kind, "identifier") != 0) {
+      continue;
+    }
+    name = copy_node_text(context, function_node);
+    if (name == NULL) {
+      continue;
+    }
+    variable = find_variable(context, name, strlen(name));
+    context->allocator->deallocate(context->allocator->user_data, name);
+    if (variable != NULL && variable->has_function_signature != 0u) {
+      context->makes_calls = 1u;
+      context->uses_memory = 1u;
+      break;
     }
   }
   /* A pointer parameter brings an object with it, and a local whose

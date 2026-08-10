@@ -109,6 +109,10 @@ QL_CALL_FUNCTION(indirect, struct CALL_VTABLE {
     int call_indirect_pointer(struct CALL_VTABLE *table) {
         return table->pointer_callback() == 0;
     });
+QL_CALL_FUNCTION(parameter_indirect,
+    int call_parameter_indirect(int (*callback)(int), int value) {
+        return callback(value) + 1;
+    });
 static const char callback_argument_source[] =
     "int CALLEE_accept(int (*)(int), int);\n"
     "int pass_callback(int (*callback)(int), int value) {\n"
@@ -614,6 +618,43 @@ TEST(CLowerCalls, CarriesAFunctionPointerAsAnOpaqueExternalArgument) {
     ASSERT_TRUE(assigned.Open(callback_argument_source, "select_callback"));
 }
 
+TEST(CLowerCalls, CallsAFunctionPointerParameterWithItsDeclaredSignature) {
+    Lowered lowered;
+    uint8_t dummy = 0u;
+    ql_ir_interp_object_v1 object{};
+    ql_ir_interp_object_init(&object);
+    object.base = QL_IR_INTERP_FIRST_OBJECT_ADDRESS;
+    object.size = 1u;
+    object.initial = &dummy;
+
+    ASSERT_TRUE(lowered.Open(parameter_indirect_source,
+                             "call_parameter_indirect"));
+    for (int32_t value : {-91, 0, 37, 1000}) {
+        CallLog log;
+        const Outcome run = Execute(
+            lowered.ir(),
+            {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                 &CALLEE_double)),
+             Widen(value)},
+            &log, &object);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(call_parameter_indirect(CALLEE_double, value),
+                  Returned(run.result));
+        EXPECT_EQ(std::vector<std::string>{"__ql_indirect_call_v1"},
+                  log.symbols);
+    }
+
+    CallLog null_log;
+    const Outcome null_run =
+        Execute(lowered.ir(), {0u, Widen(7)}, &null_log, &object);
+    ASSERT_EQ(QL_STATUS_OK, null_run.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+              null_run.result.outcome);
+    EXPECT_TRUE(null_log.symbols.empty());
+}
+
 TEST(CLowerCalls, TakesOnlyTheCallsTheBranchActuallyRan) {
     Lowered lowered;
     ASSERT_TRUE(lowered.Open(branching_source, "call_branch"));
@@ -694,11 +735,6 @@ TEST(CLowerCalls, RefusesCallsItCannotCheckAgainstADeclaration) {
         /* Function pointers are opaque values in this slice. They may be
            transferred and null-tested, but not used as data addresses. */
         {"int f(int (*callback)(int)) { return callback + 1 != 0; }", "f"},
-        /* Direct callback invocation is the next slice, not an undeclared
-           external call accidentally accepted under the callback's name. */
-        {"int f(int (*callback)(int), int value) "
-         "{ return callback(value); }",
-         "f"},
     };
     for (const Case &item : cases) {
         ql_c_frontend_unit *unit = nullptr;
