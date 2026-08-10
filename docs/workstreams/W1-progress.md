@@ -1437,6 +1437,24 @@ GNU C가 허용하는 `return void_expression;`은 표현식의 호출과 memory
 
 새 성공은 void 표현식 반환 7개, GNU void 크기 10개, pointer 조건식 12개입니다. `tests/test_c_lower_calls.cpp`, `tests/test_c_lower_records.cpp`, `tests/test_c_lower_types.cpp`가 각각 호출 효과, 실제 compiled record-pointer 선택, GNU 크기를 고정합니다. 영향 범위인 모든 `CLower*` 시험 80/80과 전체 train 비교가 통과했고 기존 성공 회귀가 없었습니다. 변경은 내부 C lowering에만 한정되므로 이 중간 체크포인트에서는 무관한 solver와 transport 시험까지 포함하는 전체 CTest를 반복하지 않았습니다.
 
+### 38. function pointer member의 layout과 간접 호출을 보존한다
+
+커밋: (이 단위)
+
+record의 function pointer member는 x86-64 ABI의 pointer 크기와 정렬로 layout에 포함합니다. 따라서 사용하지 않는 callback member 때문에 그 뒤의 일반 member offset까지 UNKNOWN이 되지 않습니다. function pointer의 raw 값은 object pointer로 해석하지 않습니다. 일반 값으로 읽거나 비교하면 계속 UNKNOWN이고, member call의 target일 때만 간접 호출 event의 첫 operand로 전달합니다.
+
+간접 호출은 고정 symbol `__ql_indirect_call_v1`과 동적 target 주소, 실제 C 인자, trace, memory를 모두 IR에 남깁니다. member declarator의 반환형과 parameter type을 direct prototype과 같은 검사로 해석하며 pointer 반환의 별표도 보존합니다. target이 null이면 외부 call event 전에 explicit UB guard가 실패합니다. 따라서 서로 다른 callback 주소를 같은 외부 호출로 합치거나 null 호출을 정상 결과로 만들지 않습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 22,146 (74.12%) | **22,571 (75.54%)** |
+| 증가 | | **+425** |
+| 기존 성공 회귀 | | **0** |
+| verifier 통과 | 22,146 / 22,146 | **22,571 / 22,571** |
+| status 실패 | 0 | **0** |
+
+새 성공 중 415개는 record layout의 function pointer member 차단을 벗어났고 10개는 기존의 일반 간접 호출 차단에서 왔습니다. `tests/test_c_lower_records.cpp`는 callback member 뒤의 실제 compiled member offset을 대조합니다. `tests/test_c_lower_calls.cpp`는 정수 반환, 64비트 pointer 반환, target event operand, null UB를 compiled C와 대조합니다. 영향 범위의 `CLower*` 시험 82/82와 전체 train 비교가 통과했습니다. 기존 direct call 집합의 회귀가 없고 변경이 내부 C lowering에 한정되므로 전체 CTest는 반복하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1445,11 +1463,11 @@ GNU C가 허용하는 `return void_expression;`은 표현식의 호출과 memory
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 3,597
-- `uninitialized_read` 2,118
-- `unsupported_pointer` 631
-- `unsupported_control_flow` 493
-- `unsupported_call` 309
+- `unsupported_type` 2,707
+- `uninitialized_read` 2,198
+- `unsupported_pointer` 915
+- `unsupported_control_flow` 520
+- `unsupported_call` 354
 
 ## 조율자에게 요청할 것
 

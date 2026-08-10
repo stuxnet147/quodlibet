@@ -77,6 +77,16 @@ QL_REC_FUNCTION(conditional_pointer,
                    int choose_left) {
         return (choose_left ? left : right)->value;
     });
+QL_REC_FUNCTION(function_pointer_layout,
+    int rec_callback_target(int value) { return value + 1; }
+    struct REC_CALLBACK_BOX {
+        char tag;
+        int (*callback)(int);
+        int value;
+    };
+    int rec_after_callback(struct REC_CALLBACK_BOX *box) {
+        return box->value + (int)sizeof(box->callback);
+    });
 
 namespace {
 
@@ -498,6 +508,24 @@ TEST(CLowerRecords, AConditionalPreservesItsPointerTypeAndObject) {
     }
 }
 
+TEST(CLowerRecords, LaysOutAnOpaqueFunctionPointerMember) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(function_pointer_layout_source,
+                             "rec_after_callback"));
+    for (int32_t value : {-81, 0, 37, 100000}) {
+        struct REC_CALLBACK_BOX native = {'x', rec_callback_target, value};
+        struct REC_CALLBACK_BOX image = native;
+        const Region region = {
+            kBase, sizeof(image), reinterpret_cast<const uint8_t *>(&image),
+            nullptr};
+        const Outcome run = Execute(lowered.ir(), {kBase}, {}, {region});
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(rec_after_callback(&native), Returned(run.result));
+    }
+}
+
 TEST(CLowerRecords, LowersEnumeratorsAsTheConstantsTheyName) {
     Lowered lowered;
     ASSERT_TRUE(lowered.Open(labels_source, "rec_enum"));
@@ -529,6 +557,11 @@ TEST(CLowerRecords, RefusesWholeRecordValues) {
         {"struct S { struct S inner; };\nint cyclic(struct S *p) "
          "{ return 0; }",
          "cyclic"},
+        /* Function-pointer bytes may determine later member offsets and may
+           be call targets, but are not ordinary object-pointer values. */
+        {"struct S { int (*callback)(int); int value; };\n"
+         "int pointer_value(struct S *p) { return p->callback != 0; }",
+         "pointer_value"},
     };
     for (const Case &item : cases) {
         ql_c_frontend_unit *unit = nullptr;

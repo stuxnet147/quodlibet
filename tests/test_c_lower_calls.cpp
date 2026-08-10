@@ -89,6 +89,16 @@ QL_CALL_FUNCTION(pointerfollow, int *CALLEE_cell(void);
     int call_ptr_follow(void) { return *CALLEE_cell(); });
 QL_CALL_FUNCTION(voidreturn, void CALLEE_sink(int);
     void call_void_return(int value) { return CALLEE_sink(value); });
+QL_CALL_FUNCTION(indirect, struct CALL_VTABLE {
+        int (*callback)(int);
+        char *(*pointer_callback)(void);
+    };
+    int call_indirect(struct CALL_VTABLE *table, int value) {
+        return table->callback(value) + 1;
+    }
+    int call_indirect_pointer(struct CALL_VTABLE *table) {
+        return table->pointer_callback() == 0;
+    });
 
 namespace {
 
@@ -106,6 +116,16 @@ int32_t Read(const ql_ir_interp_argument_v1 &argument) {
         raw |= static_cast<uint32_t>(bytes[index]) << (index * 8u);
     }
     return static_cast<int32_t>(raw);
+}
+
+uint64_t Read64(const ql_ir_interp_argument_v1 &argument) {
+    uint64_t raw = 0u;
+    const uint8_t *bytes = static_cast<const uint8_t *>(argument.data);
+    for (std::size_t index = 0u; index < argument.size && index < 8u;
+         ++index) {
+        raw |= static_cast<uint64_t>(bytes[index]) << (index * 8u);
+    }
+    return raw;
 }
 
 int QL_CALL Invoke(void *user_data, const char *symbol,
@@ -165,6 +185,27 @@ int QL_CALL Invoke(void *user_data, const char *symbol,
     } else if (std::strcmp(symbol, "CALLEE_sink") == 0 &&
                argument_count == 1u && result_size == 0u) {
         CALLEE_sink(seen[0]);
+    } else if (std::strcmp(symbol, "__ql_indirect_call_v1") == 0) {
+        const uint64_t target = Read64(arguments[0]);
+        if (target == static_cast<uint64_t>(
+                          reinterpret_cast<uintptr_t>(&CALLEE_double)) &&
+            argument_count == 2u) {
+            value = CALLEE_double(seen[1]);
+        } else if (target == static_cast<uint64_t>(
+                                 reinterpret_cast<uintptr_t>(&CALLEE_high)) &&
+                   argument_count == 1u && result_size == 8u) {
+            const uint64_t address = static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(CALLEE_high()));
+            log->symbols.push_back(symbol);
+            log->arguments.push_back(seen);
+            for (std::size_t index = 0u; index < 8u; ++index) {
+                static_cast<uint8_t *>(result)[index] = static_cast<uint8_t>(
+                    (address >> (index * 8u)) & 0xffu);
+            }
+            return 1;
+        } else {
+            return 0;
+        }
     } else {
         /* Refusing is what an unspecified callee has to mean. */
         return 0;
@@ -477,6 +518,54 @@ TEST(CLowerCalls, AReturnOfAVoidExpressionStillRunsTheCall) {
     EXPECT_EQ(91, CALLEE_storage);
     EXPECT_EQ(std::vector<std::string>{"CALLEE_sink"}, log.symbols);
     EXPECT_EQ(1u, run.result.events);
+}
+
+TEST(CLowerCalls, AnIndirectCallCarriesItsTargetAndMatchesCompiledC) {
+    Lowered lowered;
+    struct CALL_VTABLE native = {CALLEE_double, CALLEE_high};
+    struct CALL_VTABLE image = native;
+    ql_ir_interp_object_v1 object{};
+    ql_ir_interp_object_init(&object);
+    object.base = QL_IR_INTERP_FIRST_OBJECT_ADDRESS;
+    object.size = sizeof(image);
+    object.initial = &image;
+    ASSERT_TRUE(lowered.Open(indirect_source, "call_indirect"));
+    for (int32_t value : {-91, 0, 37, 1000}) {
+        CallLog log;
+        const Outcome run = Execute(
+            lowered.ir(), {object.base, Widen(value)}, &log, &object);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(call_indirect(&native, value), Returned(run.result));
+        EXPECT_EQ(std::vector<std::string>{"__ql_indirect_call_v1"},
+                  log.symbols);
+        EXPECT_EQ(1u, run.result.events);
+    }
+
+    image.callback = nullptr;
+    CallLog null_log;
+    const Outcome null_run = Execute(
+        lowered.ir(), {object.base, Widen(7)}, &null_log, &object);
+    ASSERT_EQ(QL_STATUS_OK, null_run.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+              null_run.result.outcome);
+    EXPECT_TRUE(null_log.symbols.empty());
+    EXPECT_EQ(0u, null_run.result.events);
+
+    Lowered pointer_lowered;
+    CallLog pointer_log;
+    image = native;
+    ASSERT_TRUE(pointer_lowered.Open(indirect_source,
+                                     "call_indirect_pointer"));
+    const Outcome pointer_run = Execute(
+        pointer_lowered.ir(), {object.base}, &pointer_log, &object);
+    ASSERT_EQ(QL_STATUS_OK, pointer_run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, pointer_run.result.outcome)
+        << ql_ir_interp_ub_reason_string(pointer_run.result.ub_reason);
+    EXPECT_EQ(call_indirect_pointer(&native), Returned(pointer_run.result));
+    EXPECT_EQ(std::vector<std::string>{"__ql_indirect_call_v1"},
+              pointer_log.symbols);
 }
 
 TEST(CLowerCalls, TakesOnlyTheCallsTheBranchActuallyRan) {

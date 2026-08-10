@@ -72,12 +72,32 @@ typedef struct lower_type_binding {
   ql_ir_type_id id;
 } lower_type_binding;
 
+/* A direct prototype or a function-pointer member. Both carry the same C
+   call contract; only the IR event symbol and an indirect target operand
+   differ at the call site. */
+typedef struct lower_callee {
+  char *name;
+  size_t declaration_node;
+  size_t declarator_node;
+  uint32_t return_pointer_depth;
+  uint32_t is_variadic;
+  uint32_t resolved;
+  lower_type return_type;
+  lower_type *parameters;
+  size_t parameter_count;
+  size_t parameter_capacity;
+} lower_callee;
+
 /* One member of a struct or union, with the byte offset the target ABI gives
    it. */
 typedef struct lower_member {
   char *name;
   struct lower_type type;
   uint64_t offset;
+  /* Its representation contributes to record layout. The raw address may be
+     an indirect-call event operand, but it never becomes an object pointer. */
+  uint32_t is_function_pointer;
+  lower_callee function;
 } lower_member;
 
 /* A struct or union declared in this unit. Layout is computed on demand,
@@ -161,22 +181,6 @@ typedef struct lower_object {
   ql_ir_value_id size;
   uint32_t may_alias;
 } lower_object;
-
-/* A function this unit declares but does not define. Its types are resolved
-   the first time it is called, so a declaration mentioning something outside
-   this slice only costs the bodies that actually call it. */
-typedef struct lower_callee {
-  char *name;
-  size_t declaration_node;
-  size_t declarator_node;
-  uint32_t return_pointer_depth;
-  uint32_t is_variadic;
-  uint32_t resolved;
-  lower_type return_type;
-  lower_type *parameters;
-  size_t parameter_count;
-  size_t parameter_capacity;
-} lower_callee;
 
 /* A string literal. C makes it an array of char with static storage
    duration, so it is an object here like any other array, with its bytes
@@ -1442,8 +1446,16 @@ static void collect_calls(lower_context *context, size_t body_node) {
       continue;
     }
     function_node = direct_field_child(context, index, "function");
-    if (function_node == SIZE_MAX ||
-        strcmp(context->nodes[function_node].view.kind, "identifier") != 0) {
+    if (function_node == SIZE_MAX) {
+      continue;
+    }
+    if (strcmp(context->nodes[function_node].view.kind,
+               "field_expression") == 0) {
+      context->makes_calls = 1u;
+      context->uses_memory = 1u;
+      return;
+    }
+    if (strcmp(context->nodes[function_node].view.kind, "identifier") != 0) {
       /* A parenthesised callee is the cast Tree-sitter resolved toward
          a call, and casts neither touch memory nor are observable. */
       continue;
@@ -1882,6 +1894,9 @@ static void release_records(lower_context *context) {
   for (index = 0u; index < context->record_count; ++index) {
     lower_record *record = &context->records[index];
     for (member = 0u; member < record->member_count; ++member) {
+      context->allocator->deallocate(
+          context->allocator->user_data,
+          record->members[member].function.parameters);
       context->allocator->deallocate(context->allocator->user_data,
                                      record->members[member].name);
     }
@@ -2170,6 +2185,50 @@ static size_t member_declarator_name(const lower_context *context,
   return SIZE_MAX;
 }
 
+/* A function-pointer member has a fixed pointer-sized representation. Recover
+   the ordinary `T (*name)(...)` shape and the return stars outside its
+   function declarator. Arrays and bare function members still have no layout
+   this pass may claim. */
+static size_t function_pointer_member_name(const lower_context *context,
+                                           size_t declarator,
+                                           uint32_t *return_pointer_depth,
+                                           size_t *function_declarator) {
+  size_t guard = 0u;
+  uint32_t saw_function = 0u;
+  uint32_t saw_function_pointer = 0u;
+
+  *return_pointer_depth = 0u;
+  *function_declarator = SIZE_MAX;
+
+  while (declarator != SIZE_MAX && guard++ < 64u) {
+    const char *kind = context->nodes[declarator].view.kind;
+    if (strcmp(kind, "field_identifier") == 0 ||
+        strcmp(kind, "identifier") == 0 ||
+        strcmp(kind, "type_identifier") == 0) {
+      return saw_function != 0u && saw_function_pointer != 0u ? declarator
+                                                               : SIZE_MAX;
+    }
+    if (strcmp(kind, "function_declarator") == 0) {
+      saw_function = 1u;
+      *function_declarator = declarator;
+    } else if (strcmp(kind, "pointer_declarator") == 0) {
+      if (saw_function != 0u) {
+        saw_function_pointer = 1u;
+      } else {
+        ++(*return_pointer_depth);
+      }
+    } else if (strcmp(kind, "parenthesized_declarator") == 0) {
+      /* Tree-sitter leaves the declarator child unlabelled here. */
+      declarator = first_named_child(context, declarator);
+      continue;
+    } else {
+      return SIZE_MAX;
+    }
+    declarator = direct_field_child(context, declarator, "declarator");
+  }
+  return SIZE_MAX;
+}
+
 /* x86-64 SysV layout: each member sits at the next offset its alignment
    allows, the record's alignment is the widest member's, and the total is
    rounded up so that an array of the record stays aligned. A union puts every
@@ -2225,6 +2284,9 @@ static ql_status ensure_record_layout(lower_context *context, size_t record,
       lower_type member_type;
       uint64_t member_size;
       uint32_t member_alignment;
+      uint32_t is_function_pointer = 0u;
+      uint32_t function_return_pointer_depth = 0u;
+      size_t function_declarator = SIZE_MAX;
       const lower_record *reread;
 
       if (context->nodes[declarator].parent != child ||
@@ -2236,16 +2298,26 @@ static ql_status ensure_record_layout(lower_context *context, size_t record,
       name_node = member_declarator_name(context, declarator, &pointer_depth,
                                          &member_array_length, &rejected);
       if (rejected != 0 || name_node == SIZE_MAX) {
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, declarator,
-            "function and bit-field members, and members whose array "
-            "bound this pass cannot fold, are outside this slice",
-            error);
-      }
-      status = resolve_type_node(context, type_node, pointer_depth,
-                                 &member_type, error);
-      if (status != QL_STATUS_OK || context->unknown != 0u) {
-        return status;
+        name_node = function_pointer_member_name(
+            context, declarator, &function_return_pointer_depth,
+            &function_declarator);
+        if (name_node == SIZE_MAX) {
+          return lower_unknown(
+              context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, declarator,
+              "bit-field members and members whose array bound this pass "
+              "cannot fold are outside this slice",
+              error);
+        }
+        is_function_pointer = 1u;
+        member_array_length = 0u;
+        member_type =
+            make_integer_type(QL_C_POINTER_WIDTH, 4u, 0u);
+      } else {
+        status = resolve_type_node(context, type_node, pointer_depth,
+                                   &member_type, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          return status;
+        }
       }
       if (member_array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER) {
         /* A flexible array member has no size of its own, so the
@@ -2290,6 +2362,13 @@ static ql_status ensure_record_layout(lower_context *context, size_t record,
         return QL_STATUS_OUT_OF_MEMORY;
       }
       member->type = member_type;
+      member->is_function_pointer = is_function_pointer;
+      if (is_function_pointer != 0u) {
+        member->function.declaration_node = child;
+        member->function.declarator_node = function_declarator;
+        member->function.return_pointer_depth =
+            function_return_pointer_depth;
+      }
       if (entry->is_union != 0u) {
         member->offset = 0u;
         if (member_size > entry->size) {
@@ -4717,8 +4796,7 @@ static int abstract_pointer_depth(const lower_context *context,
   return declarator == SIZE_MAX;
 }
 
-static const lower_member *find_member(const lower_record *record,
-                                       const char *name);
+static lower_member *find_member(lower_record *record, const char *name);
 
 /* Determines the declared type of an unevaluated designator. This is kept
    separate from lower_expression because sizeof must not emit a load, call,
@@ -5207,8 +5285,7 @@ static size_t disguised_cast_type(lower_context *context, size_t node,
 
 /* The address a dereference or a subscript designates. Both a load and a
    store need it, so it is computed once here rather than twice. */
-static const lower_member *find_member(const lower_record *record,
-                                       const char *name) {
+static lower_member *find_member(lower_record *record, const char *name) {
   size_t index;
   for (index = 0u; index < record->member_count; ++index) {
     if (strcmp(record->members[index].name, name) == 0) {
@@ -5243,6 +5320,7 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
 
 static ql_status lower_member_address(lower_context *context, size_t node,
                                       lower_value *output, lower_type *declared,
+                                      lower_callee **function,
                                       ql_error *error) {
   size_t argument_node = direct_field_child(context, node, "argument");
   size_t field_node = direct_field_child(context, node, "field");
@@ -5251,7 +5329,7 @@ static ql_status lower_member_address(lower_context *context, size_t node,
   lower_type base_declared;
   lower_value address;
   lower_type u64 = address_type();
-  const lower_member *member;
+  lower_member *member;
   char *operator_text;
   char *field_name;
   ql_ir_value_id offset_constant;
@@ -5315,6 +5393,15 @@ static ql_status lower_member_address(lower_context *context, size_t node,
   if (member == NULL) {
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNDECLARED_IDENTIFIER,
                          field_node, "the record has no such member", error);
+  }
+  if (member->is_function_pointer != 0u) {
+    if (function == NULL) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, field_node,
+          "a function-pointer member is only a call target in this slice",
+          error);
+    }
+    *function = &member->function;
   }
   *declared = member->type;
 
@@ -5389,7 +5476,7 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
     return QL_STATUS_OK;
   }
   if (strcmp(kind, "field_expression") == 0) {
-    return lower_member_address(context, node, output, declared, error);
+    return lower_member_address(context, node, output, declared, NULL, error);
   }
   if (strcmp(kind, "parenthesized_expression") == 0) {
     size_t inner = first_named_child(context, node);
@@ -5674,7 +5761,9 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
                                        lower_value *output, ql_error *error) {
   size_t function_node = direct_field_child(context, node, "function");
   size_t arguments_node = direct_field_child(context, node, "arguments");
-  lower_callee *callee;
+  lower_callee *callee = NULL;
+  lower_value indirect_target;
+  const char *symbol = NULL;
   char *name;
   ql_ir_value_id operands[32];
   ql_ir_type_id result_types[3];
@@ -5686,24 +5775,58 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
   size_t argument_index = 0u;
   size_t end;
   size_t child;
+  uint32_t is_indirect = 0u;
   ql_status status;
 
-  if (function_node == SIZE_MAX || arguments_node == SIZE_MAX ||
-      strcmp(context->nodes[function_node].view.kind, "identifier") != 0) {
+  if (function_node == SIZE_MAX || arguments_node == SIZE_MAX) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
-        "only a call of a declared function by name is in this slice", error);
+        "call expression has no function or argument list", error);
   }
-  name = copy_node_text(context, function_node);
-  if (name == NULL) {
-    ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
-    return QL_STATUS_OUT_OF_MEMORY;
-  }
-  callee = find_callee(context, name);
-  context->allocator->deallocate(context->allocator->user_data, name);
-  if (callee == NULL) {
-    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
-                         "the callee has no declaration in this unit", error);
+  if (strcmp(context->nodes[function_node].view.kind, "identifier") == 0) {
+    name = copy_node_text(context, function_node);
+    if (name == NULL) {
+      ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+      return QL_STATUS_OUT_OF_MEMORY;
+    }
+    callee = find_callee(context, name);
+    context->allocator->deallocate(context->allocator->user_data, name);
+    if (callee == NULL) {
+      return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL,
+                           node,
+                           "the callee has no declaration in this unit",
+                           error);
+    }
+    symbol = callee->name;
+    operand_count = 2u;
+  } else if (strcmp(context->nodes[function_node].view.kind,
+                    "field_expression") == 0) {
+    lower_value target_address;
+    lower_type target_type;
+    status = lower_member_address(context, function_node, &target_address,
+                                  &target_type, &callee, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    if (callee == NULL) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, function_node,
+          "an indirect call needs a function-pointer member", error);
+    }
+    status = load_at_address(context, function_node, target_address,
+                             target_type, &indirect_target, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    symbol = "__ql_indirect_call_v1";
+    is_indirect = 1u;
+    operand_count = 3u;
+    operands[2] = indirect_target.value;
+  } else {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+        "only a declared function or function-pointer member can be called",
+        error);
   }
   status = resolve_callee(context, callee, node, error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
@@ -5716,7 +5839,6 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
      outer call a history and a memory from before the inner one ran --
      which is to say it would lose the inner call's effects. The two
      operands are filled in below, once the arguments are in. */
-  operand_count = 2u;
   end = subtree_end(context, arguments_node);
   for (child = arguments_node + 1u; child < end; ++child) {
     lower_value argument;
@@ -5779,6 +5901,28 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
         "the call passes fewer arguments than the callee declares", error);
   }
+  if (is_indirect != 0u) {
+    lower_value callable = indirect_target;
+    ql_ir_value_id zero;
+    status = emit_ub_guard(context, &indirect_target, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    status = add_uint_constant(context, indirect_target.type, 0u, &zero, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    status = emit_compare(context, QL_IR_OPCODE_NE, indirect_target.value,
+                          zero, &callable.defined, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    callable.may_ub = 1u;
+    status = emit_ub_guard(context, &callable, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+  }
   operands[0] = context->trace_value;
   operands[1] = context->memory_value;
 
@@ -5796,8 +5940,8 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
   definition.operand_count = operand_count;
   definition.result_types = result_types;
   definition.result_count = result_count;
-  definition.symbol = callee->name;
-  definition.symbol_size = strlen(callee->name);
+  definition.symbol = symbol;
+  definition.symbol_size = strlen(symbol);
   definition.effects =
       QL_IR_EFFECT_CALL | QL_IR_EFFECT_MEMORY | QL_IR_EFFECT_IO;
   status = ql_ir_builder_append_instruction(context->builder,
