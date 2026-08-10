@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,117 / 29,880 (97.45%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_control_flow` 123, `unsupported_type` 100, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,124 / 29,880 (97.47%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_control_flow` 123, `unsupported_type` 91, `undeclared_identifier` 68입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -2185,6 +2185,24 @@ goto와 label 사이의 선언을 실제로 건너뛰는 경우와 바깥에서 
 
 `tests/test_c_frontend.cpp`는 `restrict` parameter가 반환형 qualifier에 섞이지 않고 parameter에 남는지 확인합니다. `tests/test_c_lower_pointers.cpp`는 restrict pointer의 load 결과를 compiled C와 대조합니다. 공개 type inventory와 C lowering에 닿으므로 모든 CFrontend, SourceSignature, CReuse, CLower 범위 144/144를 실행했습니다. IR, solver, transport, plugin, EGraph는 바뀌지 않아 전체 CTest는 실행하지 않았습니다.
 
+### 79. block-scope extern object를 global storage에 연결한다
+
+함수 안 `extern T name;`은 automatic local을 만들지 않고 external-linkage object를 그 block에 선언합니다. 선택 함수 본문 안의 extern object declarator를 file-scope global과 같은 인벤토리에 합치고, 본문 선언 자체는 실행 시 no-op으로 처리합니다. 기존 global object의 caller-supplied image, load/store, final image와 memory ordering을 그대로 사용합니다. 크기가 없는 `extern T a[]`는 object size 근거가 없으므로 계속 UNKNOWN입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 29,117 (97.45%) | **29,124 (97.47%)** |
+| 증가 | | **+7** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_type` | 100 | **91** |
+| `undeclared_identifier` | 66 | **68** |
+| verifier 통과 | 29,117 / 29,117 | **29,124 / 29,124** |
+| status 실패 | 0 | **0** |
+
+기존 storage-class 진단 10개 중 7개가 성공했고, 2개는 다음 undeclared identifier 진단, 1개는 크기 없는 extern array 진단으로 이동했습니다. train의 block-scope extern object 입력은 이 10개가 전부여서 정확한 영향 상한입니다. 신규 성공 7개가 모두 verifier를 통과했고 status 실패는 0입니다.
+
+`tests/test_c_lower_globals.cpp`는 block extern read를 실제 external object를 읽는 compiled C와 대조합니다. 기존 global 전체와 CLowerTypes, CReuse 영향 범위 13/13이 통과했습니다. 분기는 block extern 선언에만 있고 공용 IR, interpreter, solver, plugin, EGraph, public API는 바뀌지 않아 전체 CTest와 전체 train은 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -2195,8 +2213,8 @@ goto와 label 사이의 선언을 실제로 건너뛰는 경우와 바깥에서 
 
 - `unsupported_call` 225
 - `unsupported_control_flow` 123
-- `unsupported_type` 100
-- `undeclared_identifier` 66
+- `unsupported_type` 91
+- `undeclared_identifier` 68
 - `unsupported_pointer` 59
 - `duplicate_declaration` 58
 - `unsupported_volatile_or_atomic` 50

@@ -419,12 +419,15 @@ TEST(CLowerTypes, StopsOnATypedefChainThatDoesNotTerminate) {
                   "cyclic", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
 }
 
-TEST(CLowerTypes, KeepsBlockScopeExternOutsideTheObjectInventory) {
-    ExpectUnknown("int local_extern(void) {\n"
-                  "  extern int value;\n"
-                  "  return value;\n"
-                  "}",
-                  "local_extern", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
+TEST(CLowerTypes, TreatsBlockScopeExternAsAStaticStorageObject) {
+    Lowered lowered;
+    ASSERT_EQ(QL_STATUS_OK,
+              lowered.Lower("int local_extern(void) {\n"
+                            "  extern int value;\n"
+                            "  return value;\n"
+                            "}",
+                            "local_extern"));
+    EXPECT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
 }
 
 TEST(CLowerTypes, LowersCastsBetweenScalarTypes) {

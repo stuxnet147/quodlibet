@@ -1043,25 +1043,38 @@ static ql_status remember_storage_name(lower_context *context, const char *text,
    address expression. It still needs an object even when the body only names
    the scalar directly: the incoming bytes are the persistent state left by a
    previous invocation, and writes must reach the final memory observation. */
-static int declaration_has_static_storage(const lower_context *context,
-                                          size_t declaration) {
+static int declaration_has_storage_class(const lower_context *context,
+                                         size_t declaration,
+                                         const char *expected) {
   size_t end = subtree_end(context, declaration);
   size_t child;
+  size_t expected_size = strlen(expected);
 
   for (child = declaration + 1u; child < end; ++child) {
     const ql_source_range range = context->nodes[child].view.range;
     if (context->nodes[child].parent != declaration ||
         strcmp(context->nodes[child].view.kind,
                "storage_class_specifier") != 0 ||
-        range.end_byte - range.start_byte != 6u ||
+        range.end_byte - range.start_byte != expected_size ||
         range.end_byte > context->source_size) {
       continue;
     }
-    if (memcmp(context->source + range.start_byte, "static", 6u) == 0) {
+    if (memcmp(context->source + range.start_byte, expected, expected_size) ==
+        0) {
       return 1;
     }
   }
   return 0;
+}
+
+static int declaration_has_static_storage(const lower_context *context,
+                                          size_t declaration) {
+  return declaration_has_storage_class(context, declaration, "static");
+}
+
+static int declaration_has_extern_storage(const lower_context *context,
+                                          size_t declaration) {
+  return declaration_has_storage_class(context, declaration, "extern");
 }
 
 /* An array or a record local is storage whether or not its address is ever
@@ -1458,16 +1471,30 @@ static size_t member_declarator_name(const lower_context *context,
                                      size_t declarator, uint32_t *pointer_depth,
                                      uint64_t *array_length, int *rejected);
 
-/* A file-scope declaration that names an object rather than a function. */
+/* A file-scope declaration, or an extern object declaration in the selected
+   function, that names static storage rather than a function. A block-scope
+   extern does not create an automatic object; it gives the linked object a
+   name in that block, so it belongs in the same inventory as file globals. */
 static ql_status collect_globals(lower_context *context, ql_error *error) {
   size_t index;
 
   for (index = 0u; index < context->node_count; ++index) {
     size_t end;
     size_t child;
+    ql_source_range range;
+    int file_scope;
+    int selected_block_extern;
 
-    if (strcmp(context->nodes[index].view.kind, "declaration") != 0 ||
-        context->nodes[index].depth != 1u) {
+    if (strcmp(context->nodes[index].view.kind, "declaration") != 0) {
+      continue;
+    }
+    range = context->nodes[index].view.range;
+    file_scope = context->nodes[index].depth == 1u;
+    selected_block_extern =
+        range.start_byte >= context->function.body_range.start_byte &&
+        range.end_byte <= context->function.body_range.end_byte &&
+        declaration_has_extern_storage(context, index);
+    if (!file_scope && !selected_block_extern) {
       continue;
     }
     end = subtree_end(context, index);
@@ -9781,6 +9808,12 @@ static ql_status lower_declaration(lower_context *context, size_t node,
       context, node, &only_function_prototypes, error);
   if (status != QL_STATUS_OK || only_function_prototypes != 0u) {
     return status;
+  }
+  if (declaration_has_extern_storage(context, node)) {
+    /* collect_globals has already made every object declarator in this
+       declaration name its external static-storage object. The declaration
+       itself performs no run-time initialization and introduces no local. */
+    return QL_STATUS_OK;
   }
   if (type_node == SIZE_MAX) {
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION,

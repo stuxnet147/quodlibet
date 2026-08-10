@@ -40,6 +40,11 @@ int GLOBAL_double(int a) { return GLOBAL_double_impl(a); }
 
 QL_GLOBAL_FUNCTION(reading, extern int GLOBAL_a;
     int global_read(int x) { return GLOBAL_a + x; });
+QL_GLOBAL_FUNCTION(block_extern,
+    int global_block_extern(int x) {
+        extern int GLOBAL_a;
+        return GLOBAL_a + x;
+    });
 QL_GLOBAL_FUNCTION(writing, extern int GLOBAL_a;
     int global_write(int x) {
         GLOBAL_a = x + 1;
@@ -369,6 +374,8 @@ TEST(CLowerGlobals, MatchesCompiledExecutionIncludingTheFinalGlobalState) {
     const Case cases[] = {
         {"read", reading_source, "global_read",
          [](int32_t x) { return global_read(x); }},
+        {"block-extern", block_extern_source, "global_block_extern",
+         [](int32_t x) { return global_block_extern(x); }},
         {"write", writing_source, "global_write",
          [](int32_t x) { return global_write(x); }},
         {"branch", branching_source, "global_branch",
