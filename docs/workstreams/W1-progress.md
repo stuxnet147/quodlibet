@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **27,554 / 29,880 (92.22%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_control_flow` 738, `unsupported_pointer` 439, `unsupported_call` 398, `unsupported_type` 369입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **27,907 / 29,880 (93.40%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_pointer` 447, `unsupported_call` 398, `unsupported_control_flow` 372, `unsupported_type` 369입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1923,6 +1923,25 @@ source signature에는 별도 `FLOAT` kind와 32/64 bit width를 기록하고 lo
 
 `tests/test_c_lower_locals.cpp`는 여러 동적 크기의 element 접근과 `sizeof`, 부작용이 있는 bound의 1회 평가, 0과 음수 bound의 UB를 concrete interpreter로 확인합니다. loop body와 다차원 VLA가 계속 UNKNOWN인 것도 고정합니다. 변경은 공용 local storage와 type lowering 경로에 닿으므로 관련 C lowering, parser reuse, IR verifier 영향 범위 122/122를 실행했습니다. 다른 subsystem을 포함한 전체 CTest는 실행하지 않았습니다. 전체 train coverage만 G9 성공률과 기존 성공 사례 회귀를 확인하기 위한 필수 측정으로 실행했습니다.
 
+### 65. loop에서 함수 뒤쪽의 직접 label로 빠져나간다
+
+기존 loop lowering은 순환 CFG와 header PHI, `break` 및 `continue` 상태 합류를 이미 표현했습니다. 함수 본문에 직접 놓인 뒤쪽 label도 미리 수집하고 goto edge의 SSA와 memory 상태를 label 시점까지 보존합니다. 그런데 loop 안에 goto 또는 ordinary label이 하나라도 있으면 이 두 경로가 만나기 전에 함수 전체를 거부하는 사전 검사가 있었습니다.
+
+그 일괄 차단을 제거해 `for`, `while`, `do` 안에서 함수 본문의 뒤쪽 직접 label로 나가는 goto를 기존 pending-state 경로로 내립니다. goto가 loop 안쪽 지역의 scope를 빠져나가면 function-scope 상태만 label에 전달하고, loop의 다른 경로는 기존 backedge PHI를 유지합니다. 함수 본문 앞쪽 label로 돌아가는 backward goto, loop나 조건문 안에 중첩된 label, 선언 초기화를 건너뛰는 goto는 각각 기존 진단으로 계속 UNKNOWN입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 27,554 (92.22%) | **27,907 (93.40%)** |
+| 증가 | | **+353** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_control_flow` | 738 | **372** |
+| verifier 통과 | 27,554 / 27,554 | **27,907 / 27,907** |
+| status 실패 | 0 | **0** |
+
+기존 일괄 차단 456개를 먼저 재측정해 353개가 성공했습니다. 나머지는 직접 function-body label이 아닌 target 59개, nested label 15개, backward goto 13개, 기존 pointer authority 8개 등 다음 제한으로 이동했습니다. 전체 train에서도 순증은 353개였고, 기존 성공 회귀와 누락 또는 추가 행은 0개였습니다.
+
+`tests/test_ir_differential.cpp`는 `for`, `while`, `do`에서 뒤쪽 label로 빠지는 함수를 실제 컴파일된 C와 edge 및 random 입력에서 대조합니다. `tests/test_c_lower.cpp`는 loop 안 nested label을 계속 UNKNOWN으로 고정합니다. 변경은 loop CFG와 goto 상태 합류에 닿으므로 C lowering, parser reuse, interpreter, compiled differential, verifier와 기존 forward-goto product 시험 141/141을 실행했습니다. solver, plugin, EGraph를 포함한 전체 CTest는 실행하지 않았고, 전체 train coverage만 G9 성공률과 기존 성공 사례 회귀를 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1931,11 +1950,11 @@ source signature에는 별도 `FLOAT` kind와 32/64 bit width를 기록하고 lo
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_control_flow` 738
-- `unsupported_pointer` 439
+- `unsupported_pointer` 447
 - `unsupported_call` 398
+- `unsupported_control_flow` 372
 - `unsupported_type` 369
-- `undeclared_identifier` 135
+- `undeclared_identifier` 138
 
 ## 조율자에게 요청할 것
 
@@ -1951,8 +1970,8 @@ source signature에는 별도 `FLOAT` kind와 32/64 bit width를 기록하고 lo
 
 ## 다음에 할 것
 
-1. 남은 `unsupported_control_flow`를 loop label, backward goto, VLA lifetime으로 나눠 큰 독립 단위부터 닫습니다.
+1. loop-carried pointer authority는 PHI가 object identity와 admission 상태를 보존하도록 만든 뒤 수용합니다.
 2. record by-value argument와 return은 source signature, CALL result, object copy 계약을 함께 정한 뒤 수용합니다.
-3. 남은 pointer authority와 undeclared callee는 alias 및 외부 호출 계약을 먼저 고정합니다.
-4. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.
+3. 선언 없는 callee와 identifier는 추출 context에서 복구 가능한 근거가 있는지 먼저 분리합니다.
+4. 남은 nested 및 backward goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 확장합니다.
 5. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.

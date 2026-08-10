@@ -10384,23 +10384,6 @@ static ql_status lower_discarded_expression(lower_context *context, size_t node,
   return emit_ub_guard(context, &value, error);
 }
 
-static int loop_contains_label_or_goto(lower_context *context, size_t node) {
-  size_t end = subtree_end(context, node);
-  size_t index;
-  for (index = node + 1u; index < end; ++index) {
-    const char *kind;
-    if ((context->nodes[index].view.flags & QL_C_SYNTAX_NODE_NAMED) == 0u) {
-      continue;
-    }
-    kind = context->nodes[index].view.kind;
-    if (strcmp(kind, "goto_statement") == 0 ||
-        strcmp(kind, "labeled_statement") == 0) {
-      return 1;
-    }
-  }
-  return 0;
-}
-
 static ql_status
 finish_loop_exit(lower_context *context, lower_break_scope *breaks,
                  ql_ir_block_id exit_block, lower_state *condition_exit,
@@ -10478,11 +10461,6 @@ static ql_status lower_pretest_loop(lower_context *context, size_t node,
   if (body_node == SIZE_MAX || (is_for == 0u && condition_node == SIZE_MAX)) {
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_LOOP, node,
                          "loop is missing its body or condition", error);
-  }
-  if (loop_contains_label_or_goto(context, node)) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
-        "goto and ordinary labels inside a loop are outside this slice", error);
   }
   if (is_for != 0u) {
     ++context->scope_depth;
@@ -10680,11 +10658,6 @@ static ql_status lower_do_loop(lower_context *context, size_t node,
   if (condition_node == SIZE_MAX || body_node == SIZE_MAX) {
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_LOOP, node,
                          "do loop is missing its body or condition", error);
-  }
-  if (loop_contains_label_or_goto(context, node)) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
-        "goto and ordinary labels inside a loop are outside this slice", error);
   }
   breaks.parent = parent_break;
   breaks.variable_count = variable_count;

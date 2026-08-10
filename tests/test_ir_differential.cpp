@@ -162,6 +162,38 @@ QL_DIFF_FUNCTION(
       } while ((seed & 3u) == 0u);
       return seed;
     });
+QL_DIFF_FUNCTION(
+    loop_goto, unsigned int diff_loop_goto(unsigned int a, unsigned int seed) {
+      unsigned int i = 0u;
+      unsigned int n = a & 15u;
+      for (; i < n; ++i) {
+        if ((seed ^ i) == 7u)
+          goto out;
+        seed += i;
+      }
+      seed ^= 0x55u;
+    out:
+      return seed + i;
+    });
+QL_DIFF_FUNCTION(loop_goto_shapes,
+                 unsigned int diff_loop_goto_shapes(unsigned int a,
+                                                     unsigned int seed) {
+                   unsigned int i = 0u;
+                   unsigned int n = a & 7u;
+                   while (i < n) {
+                     if ((seed ^ i) == 3u)
+                       goto out;
+                     seed += i++;
+                   }
+                   do {
+                     if (seed + i == 21u)
+                       goto out;
+                     seed ^= i++;
+                   } while (i < n + 2u);
+                   seed += 5u;
+                 out:
+                   return seed + i;
+                 });
 
 namespace {
 
@@ -530,6 +562,16 @@ const Case kCases[] = {
     {"loop_flow", loop_flow_source, "diff_loop", 32u, 32u, 32u, AlwaysDefined,
      [](uint64_t a, uint64_t b) {
        return FromU32(diff_loop(AsU32(a), AsU32(b)));
+     }},
+    {"loop_goto", loop_goto_source, "diff_loop_goto", 32u, 32u, 32u,
+     AlwaysDefined,
+     [](uint64_t a, uint64_t b) {
+       return FromU32(diff_loop_goto(AsU32(a), AsU32(b)));
+     }},
+    {"loop_goto_shapes", loop_goto_shapes_source, "diff_loop_goto_shapes",
+     32u, 32u, 32u, AlwaysDefined,
+     [](uint64_t a, uint64_t b) {
+       return FromU32(diff_loop_goto_shapes(AsU32(a), AsU32(b)));
      }},
 };
 

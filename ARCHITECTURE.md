@@ -259,9 +259,22 @@ binds the descriptor size to that byte count. Subscript bounds and
 The executor must supply a memory image with that computed size. A non-positive
 or overflowing source bound is undefined behavior, whereas a mismatching image
 violates the module's input assumptions. VLA declarations inside loops would
-need a fresh object lifetime on every iteration and remain outside the acyclic
-schema-v1 slice. Multidimensional arrays, static-storage VLAs, and initialized
-VLAs also remain outside this profile.
+need a fresh object lifetime on every iteration, which the current lowering
+does not represent. Multidimensional arrays, static-storage VLAs, and
+initialized VLAs also remain outside this profile.
+
+#### A loop may exit through a direct forward label
+
+Loop headers carry scalar, definedness, memory, and call-trace state through
+SSA PHIs. A `goto` inside a `for`, `while`, or `do` loop may leave that loop for
+a later label that is a direct child of the function body. The edge records
+only the function-scope state visible at its target, while the loop's other
+paths continue through their ordinary backedge PHIs. At the label, those exit
+states merge with any live lexical fallthrough.
+
+Nested labels and backward gotos remain outside the lowering. A forward goto
+that bypasses a function-scope declaration is also refused until the skipped
+initialization and definedness state can be represented explicitly.
 
 #### Memory model
 
@@ -281,9 +294,10 @@ a size, and the model holds three standing constraints:
 Pointer arguments, globals, strings, and local storage introduce descriptors
 before the body. An access through pointer bits read from memory, returned by
 a call, or cast from an integer introduces one auxiliary descriptor at that
-access site, because the source signature cannot name its target object.
-Schema v1 control flow is acyclic, so one descriptor per such site is finite;
-the lowering admits at most 128 and reports `UNKNOWN` above that explicit bound.
+syntactic access site, because the source signature cannot name its target
+object. This inventory is finite even when the CFG is cyclic; a loop-carried
+pointer must keep the same object authority across its backedge. The lowering
+admits at most 128 descriptors and reports `UNKNOWN` above that explicit bound.
 An auxiliary descriptor may exactly alias an earlier descriptor. This covers
 a derived pointer back into an existing object without admitting partial
 overlaps. Loading, comparing, or returning pointer bits without accessing
@@ -370,10 +384,10 @@ space, and the ABI profile exist nowhere else.
 
 IR schema v1 defines explicit types for bit vectors, floats, pointers, memory,
 and event traces, plus effect bits for memory, calls, volatile access, atomics,
-I/O, and undefined behavior. It is an acyclic typed SSA artifact with stable
-little-endian serialization and a content digest. Source integer signedness is
-carried by operation choice, not by bit-vector types, so source signatures must
-remain a separate artifact.
+I/O, and undefined behavior. Its declared CFG kind is either acyclic or cyclic;
+both are typed SSA artifacts with stable little-endian serialization and a
+content digest. Source integer signedness is carried by operation choice, not
+by bit-vector types, so source signatures must remain a separate artifact.
 
 ## Trust boundary and next layers
 
