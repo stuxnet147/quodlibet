@@ -3387,6 +3387,12 @@ static ql_status convert_value(lower_context *context, lower_value input,
     ql_status status;
 
     *output = input;
+    if (input.type.kind == QL_C_SCALAR_VOID ||
+        target.kind == QL_C_SCALAR_VOID) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+            "a void expression cannot convert to an object value", error);
+    }
     if (type_same(input.type, target) != 0) {
         output->type = target;
         return QL_STATUS_OK;
@@ -4923,12 +4929,19 @@ static ql_status lower_named_cast(lower_context *context, size_t type_node,
         return status;
     }
     if (target.kind == QL_C_SCALAR_VOID) {
-        /* `(void)e` discards the value, so there is nothing to hand back as
-           an expression result. Statement-level discarding is a separate
-           construct and is not folded in here. */
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, type_node,
-            "a cast to void produces no value", error);
+        /* The operand is still evaluated for effects and undefined
+           behaviour. Only its value disappears. Keeping its definedness on
+           the result lets an expression statement or comma-left observation
+           emit the same guard it would without the cast. */
+        status = lower_expression(context, value_node, &value, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        *output = value;
+        output->type = target;
+        output->value = QL_IR_INVALID_VALUE_ID;
+        output->has_object = 0u;
+        return QL_STATUS_OK;
     }
     status = lower_expression(context, value_node, &value, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
@@ -6928,7 +6941,7 @@ static ql_status lower_return_statement(lower_context *context, size_t node,
     }
     status = convert_value(context, value, context->return_type, &converted,
                            error);
-    if (status != QL_STATUS_OK) {
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
     }
     status = emit_ub_guard(context, &converted, error);

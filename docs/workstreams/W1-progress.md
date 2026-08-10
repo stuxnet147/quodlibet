@@ -1166,6 +1166,21 @@ Windows에서는 native CTest 510/510과 Python binding 37/37을 각각 통과�
 
 `tests/test_c_lower_pointers.cpp`는 범위를 크게 벗어난 subscript도 평가하지 않는지 확인하고, `tests/test_c_lower_records.cpp`는 스칼라와 배열 멤버 크기를 실제 컴파일된 C와 대조합니다.
 
+### 23. void cast는 값만 버리고 평가 결과는 버리지 않는다
+
+커밋: (이 단위)
+
+`(void)e`는 IR에 void 값을 만들지 않습니다. 대신 `e`를 정상 로어링해 호출, 대입, 메모리 효과를 그대로 남기고, 결과의 값 ID만 없앱니다. `defined`와 `may_ub`는 유지하므로 expression statement와 comma의 왼쪽처럼 값을 버리는 관찰 지점도 `e`의 UB guard를 냅니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 9,551 (31.96%) | **9,681 (32.40%)** |
+| `unsupported_expression` | 811 | **584** |
+| verifier 통과 | 9,551 / 9,551 | **9,681 / 9,681** |
+| status 실패 | 0 | **0** |
+
+`tests/test_c_lower_expressions.cpp`는 `(void)(a = b)`의 부작용을 컴파일된 C와 대조하고, `(void)(a / b)`가 0 나눗셈과 signed division overflow를 계속 UB로 보고하는지 확인합니다.
+
 ## 막힌 것
 
 - 없음

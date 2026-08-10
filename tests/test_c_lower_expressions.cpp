@@ -120,6 +120,14 @@ QL_EXPR_FUNCTION(unsigned_negative_literal,
     unsigned expr_unsigned_negative_literal(unsigned a, unsigned b) {
         return -1u + (a - a) + (b - b);
     });
+QL_EXPR_FUNCTION(void_assignment, int expr_void_assignment(int a, int b) {
+    (void)(a = b);
+    return a;
+});
+QL_EXPR_FUNCTION(void_divide, int expr_void_divide(int a, int b) {
+    (void)(a / b);
+    return 0;
+});
 
 namespace {
 
@@ -351,6 +359,14 @@ const Case kCases[] = {
              static_cast<unsigned>(a), static_cast<unsigned>(b)));
      },
      &Always},
+    {"void-assignment", void_assignment_source, "expr_void_assignment",
+     [](int32_t a, int32_t b) { return expr_void_assignment(a, b); },
+     &Always},
+    {"void-divide", void_divide_source, "expr_void_divide",
+     [](int32_t a, int32_t b) { return expr_void_divide(a, b); },
+     [](int32_t a, int32_t b) {
+         return b != 0 && (b != -1 || a != INT32_MIN);
+     }},
 };
 
 /* Small enough that the arithmetic in every case stays inside the defined
