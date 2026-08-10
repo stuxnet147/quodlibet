@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,150 / 29,880 (97.56%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 224, `unsupported_control_flow` 123, `unsupported_type` 78, `undeclared_identifier` 68입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+2026-08-11 작업은 안전한 체크포인트에서 중단했습니다. G9 로어링 커버리지를 버킷 단위로 좁히는 중이며, train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고 IR 로어링은 **29,150 / 29,880 (97.56%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 224, `unsupported_control_flow` 123, `unsupported_type` 78, `undeclared_identifier` 68입니다. 다음 세션은 [`W1-handoff.md`](W1-handoff.md)를 먼저 읽고 재개합니다.
 
 ## 기준선
 
@@ -2240,6 +2240,32 @@ CALL operand 배열은 event trace와 memory 뒤에 인자를 보존하지만 32
 기존 첫 차단 진단의 정확한 집합인 call 3개와 pointer 12개를 재측정해 15개가 모두 성공했고 전부 verifier를 통과했습니다. 두 변경은 각각 기존 32개와 128개 거부 검사 뒤만 열기 때문에 기존 성공 입력은 새 분기를 타지 않습니다. 15개 측정은 3.9초였습니다.
 
 `tests/test_c_lower_calls.cpp`는 scalar 인자 65개인 선언된 호출을 verifier까지 확인합니다. 같은 파일에서 앞선 block-scope extern 지원으로 이미 성공하게 된 혼합 선언의 낡은 UNKNOWN 기대를 positive 검증으로 고쳤습니다. `tests/test_c_lower_pointers.cpp`는 독립 pointer-load site 300개를 낮추고 검증합니다. call과 pointer 영향 범위 38/38이 통과했습니다. 공용 IR, interpreter, solver, plugin, EGraph, public API는 바뀌지 않았고 정확한 신규 경로 15개를 측정했으므로 전체 CTest와 전체 train은 실행하지 않았습니다.
+
+### 82. `volatile`의 실제 영향 범위와 구현 경계를 조사한다
+
+이 단위는 분석만 했고 코드 변경은 남기지 않았습니다. train unit에서 `volatile`를 포함한 파일은 66개이며 현재 결과는 다음과 같습니다.
+
+| 현재 첫 결과 | 건수 |
+|---|---:|
+| lowered | 9 |
+| `unsupported_volatile_or_atomic` | 50 |
+| `duplicate_declaration` | 6 |
+| `unsupported_pointer` | 1 |
+
+현재 lowered 9개도 `volatile` cast의 qualifier를 버리고 보통 LOAD/STORE로 처리하므로 의미론적으로 완성된 성공은 아닙니다. 따라서 올바른 구현의 회귀 집합은 직접 차단 50개만이 아니라 66개 전체입니다. 50개는 모두 `volatile`이고 `_Atomic` 또는 `atomic_*` 사용은 없었습니다.
+
+정확한 개선 상한을 보기 위해 qualifier 거부만 임시로 제거한 실험에서는 50개 중 42개가 verifier를 통과했고, 7개는 다음 control-flow 제약으로, 1개는 다음 call 제약으로 이동했습니다. 이 실험은 접근 순서를 관찰하지 못하는 의도적으로 불완전한 ceiling 측정이므로 전부 되돌렸습니다. 현재 `src/c_lower.c`에는 이 실험이나 후속 구현 초안이 남아 있지 않습니다.
+
+올바른 구현에는 다음 경계가 필요합니다.
+
+- qualifier를 base 하나의 플래그로 줄이지 않고 지원하는 pointer layer별로 보존합니다. 그래야 `volatile T **`의 첫 load와 `T * volatile *`의 첫 load를 구별할 수 있습니다.
+- volatile scalar, record local과 parameter는 SSA 값이 아니라 storage object로 내립니다. volatile pointee를 가진 보통 pointer 변수 자체는 불필요하게 storage로 옮기지 않습니다.
+- volatile LOAD/STORE에는 `QL_IR_EFFECT_VOLATILE`를 붙이고, 주소와 읽거나 쓴 값을 `QL_IR_OPCODE_TRACE_APPEND`로 event trace에 연결합니다. 외부 call과 같은 trace를 써야 source order가 보존됩니다.
+- volatile record를 통한 member 접근은 containing record의 qualifier를 member address에 상속합니다. typedef 안의 qualifier도 보존합니다.
+- file-scope initializer를 함수 호출 때 재생하는 모델 store는 함수의 runtime volatile event가 아니므로 trace append를 억제해야 합니다.
+- IR 형식과 verifier는 이미 `VOLATILE` effect와 `TRACE_APPEND`를 정의합니다. concrete interpreter는 아직 `TRACE_APPEND`를 실행하지 않으므로 이를 구현하지 않고 C lowering만 열면 differential 실행이 정직하지 않습니다.
+
+다음 검증은 긴 시험부터 시작하지 않습니다. 먼저 새 local, pointer, global initializer, record-member 사례와 `IrInterp.TRACE_APPEND`를 정확한 필터로 실행합니다. `src/ir_interp.c`를 바꾸게 되면 공용 실행 경로에 영향이 있으므로 집중 시험이 통과한 뒤 전체 CTest가 필요합니다. 반면 qualifier 분기를 타는 train 입력은 위 66개로 닫혀 있으므로 이 단위만 확인할 때 전체 train은 필요하지 않고 66개 전수 비교가 더 직접적입니다. 최종 G9 판정 때는 현재 커밋 상태에서 전체 train을 다시 측정합니다.
 
 ## 막힌 것
 
