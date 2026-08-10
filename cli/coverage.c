@@ -188,6 +188,22 @@ static void coverage_count_lower(ql_coverage_totals *totals,
         if ((unsigned)view.code < QL_COVERAGE_LOWER_CODE_MAX) {
             totals->lower_codes[(unsigned)view.code] += 1u;
         }
+  }
+}
+
+/* Keep the detail file one physical TSV row per definition even if a future
+   diagnostic grows structured whitespace. Existing consumers read the first
+   four fields; the diagnostic message is an append-only fifth field. */
+static void coverage_write_message(FILE *detail, const char *message) {
+    const unsigned char *cursor = (const unsigned char *)message;
+
+    if (cursor == NULL) {
+        return;
+    }
+    while (*cursor != '\0') {
+        const int byte = *cursor++;
+        (void)fputc(byte == '\t' || byte == '\r' || byte == '\n' ? ' ' : byte,
+                    detail);
     }
 }
 
@@ -250,6 +266,7 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
         ql_c_lower_result_view_v1 lower_view = { 0 };
         const char *outcome = "lower_error";
         const char *detail_code = NULL;
+        const char *detail_message = NULL;
         unsigned first_lower_code = 0u;
 
         function.struct_size = sizeof(function);
@@ -311,11 +328,11 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
                                                         &error) ==
                         QL_STATUS_OK) {
                         first_lower_code = (unsigned)first.code;
+                        detail_message = first.message;
                     }
                 }
             }
         }
-        ql_c_lower_result_destroy(lowered);
 
         if (detail != NULL) {
             const char *code_name = detail_code;
@@ -324,10 +341,13 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
                                 ? k_lower_code_names[first_lower_code]
                                 : "unknown_code";
             }
-            (void)fprintf(detail, "%s\t%s\t%s\t%s\n", path,
+            (void)fprintf(detail, "%s\t%s\t%s\t%s\t", path,
                           function.name != NULL ? function.name : "?", outcome,
                           code_name);
+            coverage_write_message(detail, detail_message);
+            (void)fputc('\n', detail);
         }
+        ql_c_lower_result_destroy(lowered);
     }
 
     ql_c_frontend_unit_destroy(unit);

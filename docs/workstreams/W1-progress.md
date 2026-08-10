@@ -1353,6 +1353,14 @@ ASM2C_GNU_V1의 plain `char`는 signed이므로 ordinary character constant는 8
 
 `uninitialized_read`는 476개 줄었지만 그중 67개는 뒤에 있던 다른 미지원 의미론으로 이동했으므로 최종 성공 순증은 409개입니다. `tests/test_c_lower_locals.cpp`는 초기화된 분기와 UB 분기, compound assignment를 interpreter로 고정합니다. 기존 UNKNOWN 목록도 새 계약에 맞게 갱신했습니다. 전체 검증은 Windows 530/530, Linux Clang 529/529, Linux ASan/UBSan 529/529입니다. `fuzz_c_lower`는 60초 동안 269,343회, `cov: 2833`, crash 0으로 끝났습니다.
 
+### 33. coverage detail에 첫 진단 메시지를 보존한다
+
+커밋: (이 단위)
+
+기존 detail TSV의 path, function, outcome, diagnostic code 네 열은 그대로 두고 첫 진단 메시지를 다섯 번째 열로 추가했습니다. 기존 `cut -f4`와 3열 이상을 읽는 판정률 도구는 그대로 동작합니다. 메시지의 tab과 줄바꿈은 한 행을 깨지 않도록 공백으로 정규화합니다.
+
+29,880개 train 행을 6개 프로세스로 다시 생성해 모든 행이 정확히 5열이고 verifier 실패와 status 실패가 0임을 확인했습니다. 이 측정으로 최신 9,192개 UNKNOWN의 첫 원인을 추정 없이 분류할 수 있습니다. 상위 메시지는 uninitialized address escape 1,972개, 지원하지 않는 record member 형태 967개, 알려지지 않은 type spelling 754개, function local 또는 다차원/동적 array 601개, record value 552개입니다.
+
 ## 막힌 것
 
 - 없음
@@ -1381,7 +1389,7 @@ ASM2C_GNU_V1의 plain `char`는 signed이므로 ordinary character constant는 8
 
 ## 다음에 할 것
 
-1. 최신 9,192개 UNKNOWN을 diagnostic message까지 다시 분류합니다. 요약 코드만으로는 타입과 definite-initialization 범주의 독립 원인을 정할 수 없습니다.
+1. reaching `}`인 integer 함수는 관찰되는 반환값이 없으므로 explicit UB로 내려 128개 `missing_return`을 닫습니다.
 2. 남은 타입 철자와 선언 형태를 빈도순으로 닫고, uninitialized address escape는 외부 호출의 memory-write 계약을 먼저 고정합니다.
 3. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.
 4. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.
