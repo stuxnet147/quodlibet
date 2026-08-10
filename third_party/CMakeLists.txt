@@ -252,6 +252,19 @@ if(QL_ENABLE_SAT)
         OUTPUT_NAME lrat-check
         C_STANDARD 11
         C_STANDARD_REQUIRED ON)
+    # getClause and setClause are file-scope C99 `inline`, which promises an
+    # external definition somewhere and the file provides none. An optimising
+    # build inlines every call and never asks for it; a build that suppresses
+    # inlining, which is what the sanitizer presets do, fails to link. That is
+    # a latent defect in the pinned source, not in how it is used here.
+    #
+    # The pinned bytes stay as they were checksummed, so the two definitions
+    # are given internal linkage from the command line instead of being edited.
+    # `inline` appears in this file exactly twice, on those two functions, so
+    # the substitution reaches nothing else.
+    if(NOT MSVC)
+        target_compile_options(ql_lrat_check PRIVATE "-Dinline=static inline")
+    endif()
 
     foreach(sat_target IN ITEMS ql_cadical ql_lrat_check)
         if(MSVC)

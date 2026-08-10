@@ -66,6 +66,20 @@ cake_lpr(경로 C, HOL4 로 기계어까지 검증)은 첫 절단에 넣지 않�
 3. 파서를 `tests/fuzz/` 표면에 추가 (닫힘)
 4. envelope 에 AIG 경로의 query digest 가 SMT 경로의 그것과 같은 값으로 기록 (method 본체에서)
 
+### 10. `linux-sanitize` 링크 실패 수정 (게이트 해제)
+
+조율자가 알려 준 두 번째 건은 shift 가 아니라 **링크 실패**였습니다. `third_party/drat-trim/lrat-check.c` 의 `getClause`(75줄)와 `setClause`(80줄)가 파일 범위 C99 `inline` 입니다. C99 에서 그것은 "외부 정의가 어딘가 있다"는 약속인데 그 파일은 외부 정의를 주지 않습니다. 최적화 빌드는 호출을 전부 인라인해서 외부 정의를 요구하지 않으므로 조용하고, **인라인을 억제하는 sanitizer 빌드는 링크가 깨집니다.**
+
+Linux 에서 clang 과 gcc 둘 다 `-O0` 로 재현했습니다. Windows clang 은 `-O0` 에서도 재현되지 않습니다. 그래서 `linux-sanitize` 에서만 보였습니다.
+
+**pin 한 바이트는 그대로 둡니다.** 소스를 고치면 checksum 이 빌드되는 것과 다른 것을 가리킵니다. 대신 `ql_lrat_check` target 에만 `-Dinline=static inline` 을 주어 두 정의에 내부 연결을 줍니다. 이 파일에서 `inline` 은 그 둘에만 나오므로 치환이 다른 것에 닿지 않습니다.
+
+확인한 것은 이렇습니다.
+
+- `linux-sanitize` 로 `ql_cadical` 과 `ql_lrat_check` 둘 다 빌드 성공
+- 그 sanitizer 빌드로 사소 UNSAT 을 풀고 LRAT 를 내고 `lrat-check` 가 **VERIFIED**. ASan/UBSan 진단 없음
+- `windows-clang` 재빌드 정상
+
 ### 9. shift 회로의 정의되지 않은 동작 수정
 
 `src/aig.c` 의 `width_constant` 가 `uint32_t width` 를 `index` 만큼 오른쪽으로 밀었고, `index` 는 피연산자 폭까지 갑니다. 폭 64 이상이면 32비트 값을 32칸 이상 미는 것이라 **정의되지 않은 동작**입니다. 폭 32 까지만 시험이 닿아 있어서 드러나지 않았습니다.
