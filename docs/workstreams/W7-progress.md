@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-항목 6. 지원 compiler/target matrix 자동 검증. `D:/projects/machine-model/datasets/records-local/summary.json` 의 compilers/optimizations 를 읽어 `ASM2C_GNU_V1` 프로파일의 provenance 표와 대조하는 시험.
+지시서 항목 1-6 을 전부 닫았습니다. 조율자 회신 대기 중이며 대기 동안 남은 판단 항목을 정리해 둡니다.
 
 ## 착수 시 조사한 것 (2026-08-10)
 
@@ -173,6 +173,23 @@ CTest 435/435 통과.
 
 **아직 재지 않은 것: Linux.** 스크립트는 `linux-clang` 을 그대로 받지만 표는 Windows 실측입니다. Linux 는 rpath 가 추가 축이라 별도로 재야 합니다.
 
+### 8. compiler/target matrix 자동 검증 (`tests/test_target_matrix.cpp`)
+
+`ARCHITECTURE.md` 와 `METHODS.md` 가 둘 다 `ASM2C_GNU_V1` 의 provenance 표를 "GCC 와 Clang, PIC 와 non-PIC, O0 부터 O3" 라고 적습니다. 그 문장이 말하는 대상인 코퍼스는 **이 저장소 바깥에서** 다시 만들어집니다. 그래서 문장이 조용히 거짓이 될 수 있습니다. 데이터셋에 새 컴파일러나 새 최적화 수준이 생겨도 여기서는 아무도 눈치채지 못합니다.
+
+시험은 dataset manifest 를 읽어 프로파일이 실제로 선언한 것과 대조합니다. 두 방향이 다르게 실패합니다.
+
+- **코퍼스가 프로파일이 덮지 않는 축으로 자란 경우.** 이것이 중요한 방향입니다. frozen provenance 밖의 입력에 판정을 요구하고 있다는 뜻이기 때문입니다.
+- **프로파일이 선언했는데 코퍼스가 쓰지 않는 축.** 결함은 아닙니다. 프로파일은 의도적으로 어느 한 코퍼스보다 넓습니다. 다만 검증되지 않은 주장이므로 실행이 말하게 했습니다. 현재 코퍼스는 clang 과 clang-nopic 뿐이라 **"프로파일은 GCC 를 선언하는데 이 코퍼스에는 하나도 없다"** 를 찍습니다.
+
+프로파일 쪽 값은 다시 적지 않고 `ql_semantic_contract_init` 이 채우는 것을 읽습니다. 프로파일이 바뀌면 여기서 드러나지 중복으로 남지 않습니다. 최적화 수준은 계약 축이 아니므로(`ARCHITECTURE.md` 가 semantic switch 가 아니라 validation provenance 라고 적습니다) 문서가 약속한 범위 안에 있는지만 봅니다.
+
+**JSON 리더를 먼저 시험합니다.** 손으로 쓴 스캐너가 조용히 빈 목록을 돌려주면 아래 검사가 전부 통과로 바뀝니다. 그래서 답을 아는 입력으로 리더 자체를 먼저 고정하고, 키 부재/잘못된 모양/닫히지 않은 배열/모르는 escape 를 전부 "읽기 실패" 로 돌려주게 했습니다. 빈 답이 아닙니다.
+
+**drift 를 실제로 잡는지 확인했습니다.** `msvc` 와 `Os` 를 넣은 manifest 를 가리키게 하니 두 시험이 정확히 그 이유로 실패했습니다. 데이터셋이 없는 기계에서는 경로와 `QL_ASM2C_SUMMARY` 를 말하며 skip 합니다. 코퍼스가 저장소 바깥에 있으므로 없는 것이 실패는 아니지만, **없다고 통과로 답하지는 않습니다.**
+
+CTest 458/458 통과.
+
 ## 내린 설계 결정
 
 - **새 target 을 `fuzz_targets.h` 가 아니라 별도 `fuzz_contract_targets.h` 에 둡니다.** 근거: `fuzz_targets.h` 와 `tests/test_fuzz.cpp` 는 W1 이 소유하는 표면(파서/로어링/IR)의 기록이고, W7 이 더하는 것은 계약 표면이라 소유가 다릅니다. `QL_FUZZ_REQUIRE`/`QL_FUZZ_REACHED` 규약은 그대로 따라서 두 헤더가 같은 규율 아래 있습니다.
@@ -261,4 +278,6 @@ campaign 은 그동안 두 번째 serialize 부터의 고정점을 검사합니�
 3. (완료) 동시성 측정 -> `docs/perf/concurrency.md`
 4. (완료) ABI 호환 시험과 plugin SDK 예제
 5. (부분 완료) 설치 패키지. 측정과 문서화는 끝났고 relocatable 탐색은 통과. 남은 두 결함은 루트 `CMakeLists.txt`(조율자)와 `bindings/python`(W4) 소유라 판단 대기
-6. (진행 중) compiler/target matrix 자동 검증 (`D:/projects/machine-model/datasets/records-local/summary.json`)
+6. (완료) compiler/target matrix 자동 검증
+
+지시서 항목은 전부 닫혔습니다. 남은 것은 다른 워크스트림 소유라 판단이 필요한 두 건뿐입니다(설치 패키지의 package config, 파이썬 확장의 install 위치). 원격 CI 재설계는 지시서가 명시적으로 범위 밖으로 두었습니다.
