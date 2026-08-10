@@ -87,6 +87,9 @@ QL_PTR_FUNCTION(cast_to_bytes, int ptr_bytes(int *p, int i) {
     char *bytes = (char *)p;
     return bytes[i * 4] + 1;
 });
+QL_PTR_FUNCTION(cast_from_bits, int ptr_from_bits(unsigned long long address) {
+    return ((int *)address)[0];
+});
 
 namespace {
 
@@ -493,6 +496,21 @@ TEST(CLowerPointers, LowersADoubleIndirectionWithoutAStatusFailure) {
         "}\n";
     Lowered lowered;
     ASSERT_TRUE(lowered.Open(source, "deref_twice"));
+}
+
+TEST(CLowerPointers, IntegerAddressBitsCanNameADynamicObject) {
+    Lowered lowered;
+    const int32_t data = 91;
+    ASSERT_TRUE(lowered.Open(cast_from_bits_source, "ptr_from_bits"));
+    const Outcome run =
+        Execute(lowered.ir(), 0u, {kBase}, kBase, sizeof(data),
+                reinterpret_cast<const uint8_t *>(&data), nullptr);
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+        << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+    EXPECT_EQ(ptr_from_bits(static_cast<unsigned long long>(
+                  reinterpret_cast<uintptr_t>(&data))),
+              Returned(run.result));
 }
 
 /* A cast to a pointer is a reinterpretation, not a computation: under this

@@ -113,9 +113,9 @@ typedef struct lower_value {
     uint32_t may_ub;
     /* Set when the table already names every object this pointer may access. */
     uint32_t has_object;
-    /* Set for a pointer read from memory. Its target object is admitted only
-       if an access actually follows, so merely comparing or returning loaded
-       pointer bits does not narrow the function domain. */
+    /* Set when pointer bits may name storage outside the current table. The
+       target object is admitted only if an access actually follows, so merely
+       comparing or returning those bits does not narrow the function domain. */
     uint32_t may_admit_object;
 } lower_value;
 
@@ -269,8 +269,9 @@ typedef struct lower_context {
     /* Objects the caller supplied, which are the ones the entry block states
        assumptions for. Anything past this the function made for itself. */
     size_t parameter_object_count;
-    /* Auxiliary live objects admitted when an access follows a pointer load.
-       One acyclic access site can name at most one new object in an execution. */
+    /* Auxiliary live objects admitted when an access follows pointer bits not
+       already covered by the table. One acyclic access site can name at most
+       one new object in an execution. */
     size_t dynamic_object_count;
     size_t dynamic_object_start;
     /* Names this function takes the address of, so their locals get storage
@@ -3492,7 +3493,13 @@ static ql_status convert_across_pointer(lower_context *context,
     if (status != QL_STATUS_OK) {
         return status;
     }
-    return emit_pointer_of_address(context, address, target, output, error);
+    status = emit_pointer_of_address(context, address, target, output, error);
+    if (status == QL_STATUS_OK) {
+        /* Under the flat-address profile, integer bits may name a live object.
+           Admit that object only if an access follows this conversion. */
+        output->may_admit_object = 1u;
+    }
+    return status;
 }
 
 static ql_status convert_value(lower_context *context, lower_value input,
@@ -5763,6 +5770,12 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     }
     output->type = callee->return_type;
     output->value = results[2];
+    if (output->type.kind == QL_C_SCALAR_POINTER) {
+        /* The callee may return an existing or newly exposed live object.
+           Its region is not part of the source signature, so a later access
+           admits an auxiliary descriptor just like a pointer load does. */
+        output->may_admit_object = 1u;
+    }
     return QL_STATUS_OK;
 }
 
@@ -8056,15 +8069,15 @@ static ql_status add_object(lower_context *context, const char *label,
     return status;
 }
 
-/* A pointer read from memory may name a live object that is not one of the
-   function's pointer arguments, globals, strings, or local slots. In an
-   acyclic body each access through such a pointer can contribute at most one
-   distinct object to an execution, so one symbolic object per access is a
-   complete finite table up to LOWER_MAX_DYNAMIC_OBJECTS. Merely comparing or
-   returning the loaded bits does not add an object. The object is added after
-   ordinary IR values already exist, through the private builder path; the
-   artifact and verifier allow that, while the public builder retains its
-   parameters-first contract. */
+/* Pointer bits read from memory, returned by a call, or cast from an integer
+   may name a live object that is not one of the function's pointer arguments,
+   globals, strings, or local slots. In an acyclic body each access through
+   such a pointer can contribute at most one distinct object to an execution,
+   so one symbolic object per access is a complete finite table up to
+   LOWER_MAX_DYNAMIC_OBJECTS. Merely comparing or returning the bits does not
+   add an object. The object is added after ordinary IR values already exist,
+   through the private builder path; the artifact and verifier allow that,
+   while the public builder retains its parameters-first contract. */
 static ql_status add_dynamic_object(lower_context *context,
                                     ql_error *error) {
     lower_type u64 = address_type();
@@ -8073,6 +8086,22 @@ static ql_status add_dynamic_object(lower_context *context,
     size_t index;
     ql_status status;
 
+    /* An integer-only signature can still turn address bits into a pointer.
+       In that case the pre-pass had no pointer, global, or call from which to
+       predict memory. Add the memory input before the dynamic object, using
+       the same private late-parameter path. */
+    if (context->uses_memory == 0u) {
+        status = ensure_memory_type(context, error);
+        if (status == QL_STATUS_OK) {
+            status = ql_internal_ir_builder_add_late_parameter(
+                context->builder, context->memory_type, "__memory", 8u,
+                &context->memory_value, error);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        context->uses_memory = 1u;
+    }
     status = ensure_ir_type(context, &u64, error);
     if (status != QL_STATUS_OK) {
         return status;

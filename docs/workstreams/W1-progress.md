@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **11,920 / 29,880 (39.89%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 4,080, `unsupported_loop` 4,056, `unsupported_pointer` 3,241, `unsupported_control_flow` 2,182입니다. 다음 단위는 메시지별 재분류로 정합니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **14,015 / 29,880 (46.90%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_loop` 4,340, `unsupported_type` 4,144, `unsupported_control_flow` 2,463, `uninitialized_read` 1,579, `unsupported_call` 1,473입니다. 다음 단위는 메시지별 재분류로 정합니다.
 
 ## 기준선
 
@@ -1219,6 +1219,24 @@ Windows에서는 native CTest 510/510과 Python binding 37/37을 각각 통과�
 | status 실패 | 0 | **0** |
 
 `tests/test_c_lower_records.cpp`는 서로 다른 head/tail 객체와 자기 자신을 가리키는 exact-alias 객체를 실제 컴파일된 C와 대조합니다. 같은 시험이 source signature와 late-parameter IR의 binding도 확인합니다. `tests/test_proof_smt_memory.cpp`는 양쪽 함수가 메모리에서 읽은 포인터를 따라가는 쌍을 product miter와 Bitwuzla까지 실행해 `PROVED_EQUIVALENT`를 확인합니다. 기존 aggregate differential도 포인터 멤버를 읽기만 하는 경우 보조 object가 생기지 않는 회귀 시험 역할을 합니다.
+
+### 26. 호출 반환값과 정수 주소도 접근 시점에 객체를 얻는다
+
+커밋: (이 단위)
+
+flat-address profile에서는 외부 호출이 반환한 포인터와 정수에서 포인터로 바꾼 주소도 기존 또는 외부 live object를 가리킬 수 있습니다. 이 값들도 실제 load/store가 뒤따를 때만 보조 descriptor를 추가합니다. 단순 null 비교나 포인터 반환은 새 전제조건을 만들지 않습니다. 호출은 기존처럼 trace와 memory를 소비하고 새 상태를 내며, 동적 object는 그 호출 결과 주소의 접근 가능 범위만 설명합니다.
+
+정수 인자만 받는 함수가 `(T *)address`를 역참조하면 기존 pre-pass에는 memory parameter를 예측할 단서가 없습니다. 이 경우 접근 직전에 `__memory`와 object base/size를 private late-parameter 경로로 함께 추가합니다. 이 경로를 넣기 전 코퍼스의 두 본문이 잘못 status 실패했으며, 지금은 둘 다 로어링되고 전체 status 실패가 다시 0입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 11,920 (39.89%) | **14,015 (46.90%)** |
+| 증가 | | **+2,095** |
+| `unsupported_pointer` | 3,241 | **211** |
+| verifier 통과 | 11,920 / 11,920 | **14,015 / 14,015** |
+| status 실패 | 0 | **0** |
+
+`tests/test_c_lower_calls.cpp`는 실제 C callee가 반환한 주소와 같은 객체를 interpreter에 공급해 호출, 포인터 결과, 후속 load를 한 번에 대조합니다. `tests/test_c_lower_pointers.cpp`는 64비트 정수 주소를 포인터로 바꾸는 코퍼스 형태를 실제 실행과 대조합니다. `tests/test_proof_smt_calls.cpp`는 같은 포인터 반환 호출을 서로 다르게 쓴 두 함수를 product miter와 Bitwuzla까지 보내 동적 object와 호출 congruence가 함께 `PROVED_EQUIVALENT`를 만드는지 확인합니다.
 
 ## 막힌 것
 

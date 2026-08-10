@@ -220,15 +220,15 @@ a size, and the model holds three standing constraints:
 - an object's range does not wrap the address space.
 
 Pointer arguments, globals, strings, and local storage introduce descriptors
-before the body. An access through a pointer loaded from memory introduces one
-auxiliary descriptor at that access site, because the source signature cannot
-name its target object. Schema v1 control flow is acyclic, so one descriptor
-per such site is finite; the lowering admits at most 32 and reports `UNKNOWN`
-above that explicit bound. An auxiliary descriptor may exactly alias an
-earlier descriptor. This covers a loaded pointer back into an existing object
-without admitting partial overlaps. Loading, comparing, or returning pointer
-bits without accessing their target introduces no descriptor and no new
-domain assumption.
+before the body. An access through pointer bits read from memory, returned by
+a call, or cast from an integer introduces one auxiliary descriptor at that
+access site, because the source signature cannot name its target object.
+Schema v1 control flow is acyclic, so one descriptor per such site is finite;
+the lowering admits at most 32 and reports `UNKNOWN` above that explicit bound.
+An auxiliary descriptor may exactly alias an earlier descriptor. This covers
+a derived pointer back into an existing object without admitting partial
+overlaps. Loading, comparing, or returning pointer bits without accessing
+their target introduces no descriptor and no new domain assumption.
 
 An access of `W` bytes at address `a` is defined exactly when `[a, a + W)`
 lies inside one live object and `a` is naturally aligned for `W`. Both the

@@ -36,6 +36,8 @@ int CALLEE_sum(int a, int b) { return a + b; }
 char *CALLEE_high(void) {
     return reinterpret_cast<char *>(static_cast<uintptr_t>(UINT64_C(1) << 32));
 }
+static int CALLEE_storage = 73;
+int *CALLEE_cell(void) { return &CALLEE_storage; }
 }
 
 QL_CALL_FUNCTION(single, int CALLEE_double(int);
@@ -69,6 +71,8 @@ QL_CALL_FUNCTION(widening, int CALLEE_double(int);
    return type. Reading them is what lets this declaration be found at all. */
 QL_CALL_FUNCTION(pointerresult, char *CALLEE_high(void);
     int call_ptr_result(void) { return CALLEE_high() == 0; });
+QL_CALL_FUNCTION(pointerfollow, int *CALLEE_cell(void);
+    int call_ptr_follow(void) { return *CALLEE_cell(); });
 
 namespace {
 
@@ -103,6 +107,22 @@ int QL_CALL Invoke(void *user_data, const char *symbol,
         /* The same address the reference returns, in the width the callee's
            declaration gives its result. */
         const uint64_t address = UINT64_C(1) << 32;
+        if (result_size != 8u) {
+            ADD_FAILURE() << "a pointer result should be 8 bytes, not "
+                          << result_size;
+            return 0;
+        }
+        log->symbols.push_back(symbol);
+        log->arguments.push_back(seen);
+        for (std::size_t index = 0u; index < 8u; ++index) {
+            static_cast<uint8_t *>(result)[index] =
+                static_cast<uint8_t>((address >> (index * 8u)) & 0xffu);
+        }
+        return 1;
+    }
+    if (std::strcmp(symbol, "CALLEE_cell") == 0 && argument_count == 0u) {
+        const uint64_t address =
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CALLEE_cell()));
         if (result_size != 8u) {
             ADD_FAILURE() << "a pointer result should be 8 bytes, not "
                           << result_size;
@@ -215,7 +235,8 @@ struct Outcome {
 };
 
 Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
-                CallLog *log) {
+                CallLog *log,
+                const ql_ir_interp_object_v1 *dynamic_object = nullptr) {
     ql_ir_view_v1 view{};
     std::vector<std::vector<uint8_t>> storage;
     std::vector<ql_ir_interp_input_v1> inputs;
@@ -245,6 +266,23 @@ Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
             storage.push_back(std::vector<uint8_t>());
             continue;
         }
+        const std::string name = value.name != nullptr ? value.name : "";
+        if (name.find(".__base") != std::string::npos) {
+            EXPECT_NE(nullptr, dynamic_object);
+            storage.push_back(Encode(dynamic_object != nullptr
+                                         ? dynamic_object->base
+                                         : 0u,
+                                     type.bit_width));
+            continue;
+        }
+        if (name.find(".__size") != std::string::npos) {
+            EXPECT_NE(nullptr, dynamic_object);
+            storage.push_back(Encode(dynamic_object != nullptr
+                                         ? dynamic_object->size
+                                         : 0u,
+                                     type.bit_width));
+            continue;
+        }
         EXPECT_LT(next, scalars.size());
         storage.push_back(Encode(scalars[next++],
                                  type.kind == QL_IR_TYPE_BOOL
@@ -261,6 +299,10 @@ Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
     callees.user_data = log;
     ql_ir_interp_options_init(&options);
     options.callees = &callees;
+    if (dynamic_object != nullptr) {
+        options.objects = dynamic_object;
+        options.object_count = 1u;
+    }
     run.result.struct_size = sizeof(run.result);
     run.status = ql_ir_interp_run(nullptr, ir,
                                   inputs.empty() ? nullptr : inputs.data(),
@@ -370,34 +412,26 @@ TEST(CLowerCalls, MatchesCompiledExecutionForACalleeThatReturnsAPointer) {
     EXPECT_EQ(1u, run.result.events);
 }
 
-TEST(CLowerCalls, WillNotDereferenceAPointerACalleeReturned) {
-    /* A returned pointer has no object the guard could name, so following it
-       is refused rather than guarded against a storage nobody declared. */
-    const char source[] =
-        "char *CALLEE_high(void);\n"
-        "int follow(void) { return *CALLEE_high(); }";
-    ql_c_frontend_unit *unit = nullptr;
-    ql_c_lower_result *result = nullptr;
-    ql_c_function_view function{};
-    ql_c_lower_result_view_v1 view{};
-    ql_error error{};
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_frontend_analyze(nullptr, source, std::strlen(source),
-                                    &unit, &error));
-    function.struct_size = sizeof(function);
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_frontend_select_function(unit, "follow", 6u, &function,
-                                            &error));
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_lower_selected_function(nullptr, source,
-                                           std::strlen(source), unit,
-                                           &function, &result, &error));
-    view.struct_size = sizeof(view);
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_lower_result_get_view(result, &view, &error));
-    EXPECT_EQ(QL_C_LOWER_UNKNOWN, view.support);
-    ql_c_lower_result_destroy(result);
-    ql_c_frontend_unit_destroy(unit);
+TEST(CLowerCalls, FollowsAPointerTheCalleeReturned) {
+    /* The source signature cannot name the returned object. The dynamic
+       descriptor binds the interpreter to the same real storage the compiled
+       callee returns, so this compares both the call and the following load. */
+    Lowered lowered;
+    CallLog log;
+    ql_ir_interp_object_v1 object{};
+    ql_ir_interp_object_init(&object);
+    object.base =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(CALLEE_cell()));
+    object.size = sizeof(CALLEE_storage);
+    object.initial = &CALLEE_storage;
+    ASSERT_TRUE(lowered.Open(pointerfollow_source, "call_ptr_follow"));
+    const Outcome run = Execute(lowered.ir(), {}, &log, &object);
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+        << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+    EXPECT_EQ(call_ptr_follow(), Returned(run.result));
+    EXPECT_EQ(std::vector<std::string>{"CALLEE_cell"}, log.symbols);
+    EXPECT_EQ(1u, run.result.events);
 }
 
 TEST(CLowerCalls, TakesOnlyTheCallsTheBranchActuallyRan) {

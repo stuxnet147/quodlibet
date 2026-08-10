@@ -264,9 +264,10 @@ Both sides share the initial memory constant and one base and size constant per
 object descriptor, so the two functions run over the same storage without
 either side describing it to the other. Pointer-argument descriptors come
 first and are matched through the problem's argument correspondence. Globals,
-strings, local storage, and auxiliary descriptors for accesses through loaded
-pointers follow in lowering order and match by position. The two sides must
-therefore declare the same number of these internal descriptors; otherwise the
+strings, local storage, and auxiliary descriptors for accesses through
+otherwise unbound pointer bits follow in lowering order and match by position.
+The two sides must therefore declare the same number of these internal
+descriptors; otherwise the
 method returns `UNKNOWN` rather than guessing an identity relation. Auxiliary
 descriptors may name an earlier region exactly, while partial overlap remains
 forbidden.

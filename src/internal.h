@@ -17,10 +17,10 @@ void ql_internal_registry_unregister_owner(ql_registry *registry,
 const ql_allocator *ql_internal_registry_allocator(
     const ql_registry *registry);
 uint64_t ql_internal_registry_generation(const ql_registry *registry);
-/* Lowering may discover an auxiliary memory object only when it accesses a
-   pointer loaded from memory. Artifacts permit parameters anywhere in the
-   value table, while the public builder deliberately keeps its simpler
-   parameters-first contract. */
+/* Lowering may discover an auxiliary memory object only when it accesses
+   pointer bits not already covered by the table. Artifacts permit parameters
+   anywhere in the value table, while the public builder deliberately keeps
+   its simpler parameters-first contract. */
 ql_status ql_internal_ir_builder_add_late_parameter(
     ql_ir_builder *builder, ql_ir_type_id type, const char *name,
     size_t name_size, ql_ir_value_id *output, ql_error *error);

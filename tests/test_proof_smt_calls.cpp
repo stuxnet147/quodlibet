@@ -156,6 +156,26 @@ TEST(SmtProductCalls, TwoCallsInARowCancelPairwise) {
     EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, view.verdict);
 }
 
+TEST(SmtProductCalls, MatchingPointerResultsNameTheSameDynamicObject) {
+    constexpr char left[] =
+        "struct D { int value; }; struct D *CALLEE_get(void);"
+        " int f(void){ return CALLEE_get()->value; }";
+    constexpr char right[] =
+        "struct D { int value; }; struct D *CALLEE_get(void);"
+        " int g(void){ struct D *p = CALLEE_get(); return p[0].value; }";
+    w2::Pair pair;
+    OutcomeRun run;
+
+    if (!BackendAvailable()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    const ql_smt_product_outcome_view_v1 view =
+        Decide(left, "f", right, "g", OrderedCallObservations(), &pair, &run);
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_UNSAT, view.violation_answer);
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_SAT, view.domain_answer);
+    EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, view.verdict) << view.diagnostic;
+}
+
 TEST(SmtProductCalls, ADifferentCalleeDoesNotCancel) {
     /* Two different callees are two different functions, and nothing says
        they agree anywhere. The miter must not decide this. */
