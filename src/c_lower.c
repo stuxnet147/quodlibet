@@ -4990,6 +4990,40 @@ static ql_status query_designator_type(lower_context *context, size_t node,
     *output = make_integer_type(32u, 3u, 1u);
     return QL_STATUS_OK;
   }
+  if (strcmp(kind, "number_literal") == 0) {
+    char *text = copy_node_text(context, node);
+    size_t index;
+    uint64_t value = 0u;
+    uint32_t base;
+    int is_small_integer = 1;
+    if (text == NULL) {
+      ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+      return QL_STATUS_OUT_OF_MEMORY;
+    }
+    if (text[0] == '\0') {
+      is_small_integer = 0;
+    }
+    base = text[0] == '0' && text[1] != '\0' ? 8u : 10u;
+    for (index = 0u; text[index] != '\0'; ++index) {
+      uint32_t digit;
+      if (text[index] < '0' || text[index] > '9') {
+        is_small_integer = 0;
+        break;
+      }
+      digit = (uint32_t)(text[index] - '0');
+      if (digit >= base ||
+          value > ((uint64_t)INT_MAX - digit) / base) {
+        is_small_integer = 0;
+        break;
+      }
+      value = value * base + digit;
+    }
+    context->allocator->deallocate(context->allocator->user_data, text);
+    if (is_small_integer != 0) {
+      *output = make_integer_type(32u, 3u, 1u);
+      return QL_STATUS_OK;
+    }
+  }
   if (strcmp(kind, "string_literal") == 0) {
     lower_string *literal = find_string(context, node);
     if (literal == NULL) {
@@ -5132,6 +5166,67 @@ static ql_status query_designator_type(lower_context *context, size_t node,
     }
     *output = member->type;
     return QL_STATUS_OK;
+  }
+  if (strcmp(kind, "cast_expression") == 0) {
+    size_t descriptor = direct_field_child(context, node, "type");
+    size_t type_node;
+    size_t end;
+    size_t child;
+    uint32_t pointer_depth = 0u;
+    ql_status status;
+
+    if (descriptor == SIZE_MAX) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+          "an unevaluated cast expression has no target type", error);
+    }
+    type_node = direct_field_child(context, descriptor, "type");
+    if (type_node == SIZE_MAX) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, descriptor,
+          "an unevaluated cast type descriptor names no type", error);
+    }
+    end = subtree_end(context, descriptor);
+    for (child = descriptor + 1u; child < end; ++child) {
+      if (context->nodes[child].parent != descriptor ||
+          context->nodes[child].view.field_name == NULL ||
+          strcmp(context->nodes[child].view.field_name, "declarator") != 0) {
+        continue;
+      }
+      if (!abstract_pointer_depth(context, child, &pointer_depth)) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
+            "an unevaluated cast to an array or function type is outside "
+            "this type query",
+            error);
+      }
+      if (pointer_depth > 2u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
+            "this slice carries at most two levels of indirection", error);
+      }
+      break;
+    }
+    if (strcmp(context->nodes[type_node].view.kind,
+               "atomic_type_specifier") == 0) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_VOLATILE_OR_ATOMIC,
+          type_node,
+          "sizeof of a cast to an atomic type is outside this type query",
+          error);
+    }
+    if (pointer_depth == 0u) {
+      char *spelling = copy_node_text(context, type_node);
+      if (spelling == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+      }
+      status =
+          parse_type_spelling(context, spelling, type_node, 1u, output, error);
+      context->allocator->deallocate(context->allocator->user_data, spelling);
+      return status;
+    }
+    return resolve_type_node(context, type_node, pointer_depth, output, error);
   }
   return lower_unknown(
       context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,

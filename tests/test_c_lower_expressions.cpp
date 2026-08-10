@@ -117,6 +117,13 @@ QL_EXPR_FUNCTION(sizeof_types,
         return (int)(sizeof(TYP_SIZE_WORD) + sizeof(int *) +
                      sizeof(struct expr_size_pair)) + (a - a) + (b - b);
     });
+QL_EXPR_FUNCTION(sizeof_values,
+    struct expr_size_value { char bytes[7]; int tail; };
+    int expr_sizeof_values(int a, int b) {
+        return (int)(sizeof(32) +
+                     sizeof(((struct expr_size_value *)0)->bytes)) +
+               (a - a) + (b - b);
+    });
 /* Tree-sitter includes a literal's leading sign in number_literal. The
    lowering must still select the type of the magnitude before applying the
    unary minus, including the unsigned-wrap case. */
@@ -360,6 +367,9 @@ const Case kCases[] = {
     {"sizeof-types", sizeof_types_source, "expr_sizeof_types",
      [](int32_t a, int32_t b) { return expr_sizeof_types(a, b); },
      &Always},
+    {"sizeof-values", sizeof_values_source, "expr_sizeof_values",
+     [](int32_t a, int32_t b) { return expr_sizeof_values(a, b); },
+     &Always},
     {"signed-literals", signed_literals_source, "expr_signed_literals",
      [](int32_t a, int32_t b) { return expr_signed_literals(a, b); },
      &Always},
@@ -491,6 +501,9 @@ TEST(CLowerExpressions, RefusesWhatItCannotState) {
         /* `sizeof(expression)` must not lower its operand. A future static
            type query may accept this without ever evaluating `1 / a`. */
         {"unsigned long f(int a) { return sizeof(1 / a); }", "f",
+         QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION},
+        /* A leading zero selects octal syntax; 9 is not an octal digit. */
+        {"unsigned long f(void) { return sizeof(09); }", "f",
          QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION},
         /* The first slice accepts complete scalar, pointer and record type
            descriptors, but not array declarators. */
