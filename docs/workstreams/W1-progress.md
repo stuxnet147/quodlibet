@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **14,015 / 29,880 (46.90%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_loop` 4,340, `unsupported_type` 4,144, `unsupported_control_flow` 2,463, `uninitialized_read` 1,579, `unsupported_call` 1,473입니다. 다음 단위는 메시지별 재분류로 정합니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **14,507 / 29,880 (48.55%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_loop` 4,655, `unsupported_type` 4,187, `unsupported_control_flow` 2,715, `uninitialized_read` 1,691입니다. 다음 단위는 메시지별 재분류로 정합니다.
 
 ## 기준선
 
@@ -1238,6 +1238,22 @@ flat-address profile에서는 외부 호출이 반환한 포인터와 정수에�
 
 `tests/test_c_lower_calls.cpp`는 실제 C callee가 반환한 주소와 같은 객체를 interpreter에 공급해 호출, 포인터 결과, 후속 load를 한 번에 대조합니다. `tests/test_c_lower_pointers.cpp`는 64비트 정수 주소를 포인터로 바꾸는 코퍼스 형태를 실제 실행과 대조합니다. `tests/test_proof_smt_calls.cpp`는 같은 포인터 반환 호출을 서로 다르게 쓴 두 함수를 product miter와 Bitwuzla까지 보내 동적 object와 호출 congruence가 함께 `PROVED_EQUIVALENT`를 만드는지 확인합니다.
 
+### 27. variadic 호출의 추가 인자에 default promotions를 적용한다
+
+커밋: (이 단위)
+
+ellipsis 앞의 고정 인자는 계속 prototype의 선언 타입으로 변환합니다. 그 뒤 추가 인자는 C default argument promotions를 적용합니다. 현재 restricted slice에는 부동소수점 값이 없으므로 작은 정수와 `_Bool`은 integer promotion, 데이터 포인터는 같은 타입 유지가 전부입니다. 지원 타입 밖의 값은 추측하지 않고 `unsupported_call` UNKNOWN입니다. 호출 IR에는 promotion 뒤의 폭과 부호가 operand 타입으로 남으므로 interpreter callback, 호출 trace, product congruence가 같은 ABI 인자를 봅니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 14,015 (46.90%) | **14,507 (48.55%)** |
+| 증가 | | **+492** |
+| `unsupported_call` | 1,473 | **162** |
+| verifier 통과 | 14,015 / 14,015 | **14,507 / 14,507** |
+| status 실패 | 0 | **0** |
+
+첫 차단 `a variadic callee has no fixed signature` 1,317개를 제거했지만 825개는 뒤의 loop, control flow, type 한계로 이동했습니다. `tests/test_c_lower_calls.cpp`는 `short`와 `unsigned char`가 모두 32비트 `int`로 전달되는지 실제 `va_arg(int)` 실행과 대조합니다. `tests/test_proof_smt_calls.cpp`는 한쪽만 명시적 `int` 지역을 거치는 같은 variadic 호출을 Bitwuzla까지 보내 `PROVED_EQUIVALENT`를 확인합니다.
+
 ## 막힌 것
 
 - 없음
@@ -1265,6 +1281,6 @@ flat-address profile에서는 외부 호출이 반환한 포인터와 정수에�
 ## 다음에 할 것
 
 1. 최신 17,902개 UNKNOWN을 diagnostic message까지 다시 분류합니다. 요약 코드만으로는 `unsupported_type` 4,080과 `unsupported_loop` 4,056 내부의 독립 원인을 정할 수 없습니다.
-2. 비순환 CFG에서 정확히 내릴 수 있는 `switch`와 전방 `goto`, variadic call, 남은 타입 철자를 빈도순으로 닫습니다.
+2. 비순환 CFG에서 정확히 내릴 수 있는 `switch`와 전방 `goto`, 남은 타입 철자를 빈도순으로 닫습니다.
 3. `for`, `while`, `do`와 후방 `goto`는 IR schema v1의 비순환 계약과 충돌합니다. G9 99%를 위해 schema v2 순환 CFG와 W6 CHC/PDR proof method를 함께 설계하고 구현해야 합니다.
 4. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.

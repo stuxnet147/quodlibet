@@ -12,6 +12,7 @@
 #include "quodlibet/ir_verify.h"
 
 #include <cstddef>
+#include <cstdarg>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -30,6 +31,14 @@
 extern "C" {
 int CALLEE_double(int a) { return a * 2; }
 int CALLEE_sum(int a, int b) { return a + b; }
+int CALLEE_variadic(int tag, ...) {
+    va_list arguments;
+    va_start(arguments, tag);
+    const int first = va_arg(arguments, int);
+    const int second = va_arg(arguments, int);
+    va_end(arguments);
+    return tag + first + second;
+}
 /* An address whose low 32 bits are zero. Nothing dereferences it; it exists
    so that a caller which kept only 32 bits of the result would see null where
    the compiled reference sees an address. */
@@ -67,6 +76,10 @@ QL_CALL_FUNCTION(discarded, int CALLEE_double(int);
     });
 QL_CALL_FUNCTION(widening, int CALLEE_double(int);
     int call_widen(short a) { return CALLEE_double(a); });
+QL_CALL_FUNCTION(variadic, int CALLEE_variadic(int, ...);
+    int call_variadic(short a, unsigned char b) {
+        return CALLEE_variadic(3, a, b);
+    });
 /* The stars between the return type and the callee's name belong to the
    return type. Reading them is what lets this declaration be found at all. */
 QL_CALL_FUNCTION(pointerresult, char *CALLEE_high(void);
@@ -141,6 +154,11 @@ int QL_CALL Invoke(void *user_data, const char *symbol,
     } else if (std::strcmp(symbol, "CALLEE_sum") == 0 &&
                argument_count == 2u) {
         value = CALLEE_sum(seen[0], seen[1]);
+    } else if (std::strcmp(symbol, "CALLEE_variadic") == 0 &&
+               argument_count == 3u) {
+        EXPECT_EQ(4u, arguments[1].size);
+        EXPECT_EQ(4u, arguments[2].size);
+        value = seen[0] + seen[1] + seen[2];
     } else {
         /* Refusing is what an unspecified callee has to mean. */
         return 0;
@@ -362,6 +380,12 @@ TEST(CLowerCalls, MatchesCompiledExecutionIncludingTheCallSequence) {
              return call_widen(static_cast<short>(a));
          },
          {"CALLEE_double"}},
+        {"variadic", variadic_source, "call_variadic", 2,
+         [](int32_t a, int32_t b) {
+             return call_variadic(static_cast<short>(a),
+                                  static_cast<unsigned char>(b));
+         },
+         {"CALLEE_variadic"}},
     };
 
     uint64_t state = UINT64_C(0x3d81f0b46e295ca7);
@@ -503,10 +527,6 @@ TEST(CLowerCalls, RefusesCallsItCannotCheckAgainstADeclaration) {
     const Case cases[] = {
         /* No declaration, so nothing says what the arguments or result are. */
         {"int f(int a) { return missing(a); }", "f"},
-        /* A variadic callee has no fixed signature to convert against. */
-        {"int vprintf_like(const char *, ...);\n"
-         "int f(int a) { return vprintf_like(0, a); }",
-         "f"},
         /* The wrong number of arguments is a mistake, not a semantics. */
         {"int CALLEE_sum(int, int);\nint f(int a) { return CALLEE_sum(a); }",
          "f"},

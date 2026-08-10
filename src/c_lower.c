@@ -5540,10 +5540,8 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
         }
         if (strcmp(context->nodes[child].view.kind,
                    "variadic_parameter") == 0) {
-            return lower_unknown(
-                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
-                "a variadic callee has no fixed signature to check against",
-                error);
+            callee->is_variadic = 1u;
+            continue;
         }
         if (strcmp(context->nodes[child].view.kind,
                    "parameter_declaration") != 0) {
@@ -5685,6 +5683,8 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     for (child = arguments_node + 1u; child < end; ++child) {
         lower_value argument;
         lower_value converted;
+        const int is_variadic_argument =
+            argument_index >= callee->parameter_count;
 
         if (context->nodes[child].parent != arguments_node ||
             (context->nodes[child].view.flags & QL_C_SYNTAX_NODE_NAMED) ==
@@ -5692,7 +5692,7 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
             strcmp(context->nodes[child].view.kind, "comment") == 0) {
             continue;
         }
-        if (argument_index >= callee->parameter_count) {
+        if (is_variadic_argument != 0 && callee->is_variadic == 0u) {
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
                 "the call passes more arguments than the callee declares",
@@ -5707,9 +5707,28 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
         if (status != QL_STATUS_OK || context->unknown != 0u) {
             return status;
         }
-        status = convert_value(context, argument,
-                               callee->parameters[argument_index], &converted,
-                               error);
+        if (is_variadic_argument != 0) {
+            /* C's default argument promotions are the only type contract the
+               ellipsis supplies. This slice has no floating values, so the
+               rule is integer promotion or an unchanged data pointer. */
+            if (argument.type.kind == QL_C_SCALAR_POINTER) {
+                converted = argument;
+                status = QL_STATUS_OK;
+            } else if (argument.type.kind == QL_C_SCALAR_BOOL ||
+                       argument.type.kind == QL_C_SCALAR_INTEGER) {
+                status = integer_promote(context, argument, &converted,
+                                         error);
+            } else {
+                status = lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, child,
+                    "a variadic argument has no default promotion in this "
+                    "slice", error);
+            }
+        } else {
+            status = convert_value(context, argument,
+                                   callee->parameters[argument_index],
+                                   &converted, error);
+        }
         if (status != QL_STATUS_OK || context->unknown != 0u) {
             return status;
         }
@@ -5720,7 +5739,7 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
         operands[operand_count++] = converted.value;
         ++argument_index;
     }
-    if (argument_index != callee->parameter_count) {
+    if (argument_index < callee->parameter_count) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
             "the call passes fewer arguments than the callee declares",
