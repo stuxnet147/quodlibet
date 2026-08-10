@@ -61,6 +61,9 @@ QL_PTR_FUNCTION(step, int ptr_step(int *p, int i) {
     return old * 3 + p[i];
 });
 QL_PTR_FUNCTION(nullness, int ptr_null(int *p) { return p == 0; });
+QL_PTR_FUNCTION(opaque_nullness,
+    struct PTR_OPAQUE;
+    int ptr_opaque_null(struct PTR_OPAQUE *p) { return p == 0; });
 QL_PTR_FUNCTION(conditional_null_right,
     int ptr_conditional_null_right(int *p, int choose) {
         return (choose ? p : 0) == 0;
@@ -437,6 +440,43 @@ TEST(CLowerPointers, ComparesPointersAgainstNull) {
                                   sizeof(data),
                                   reinterpret_cast<const uint8_t *>(data),
                                   nullptr)
+                              .result));
+}
+
+TEST(CLowerPointers, CarriesAnIncompleteRecordAsAnOpaquePointer) {
+    static const char call_source[] =
+        "struct CALL_OPAQUE;\n"
+        "int CALLEE_opaque(struct CALL_OPAQUE *);\n"
+        "int ptr_pass_opaque(struct CALL_OPAQUE *p) {\n"
+        "  return CALLEE_opaque(p);\n"
+        "}\n";
+    static const char complete_arithmetic_source[] =
+        "struct COMPLETE_STEP { int value; };\n"
+        "int ptr_step_complete(struct COMPLETE_STEP *p, unsigned int i) {\n"
+        "  return (p + i) == p;\n"
+        "}\n";
+    Lowered lowered;
+    const uint8_t dummy = 0u;
+
+    ASSERT_TRUE(lowered.Open(opaque_nullness_source, "ptr_opaque_null"));
+    EXPECT_EQ(1, Returned(Execute(lowered.ir(), 0u, {}, kBase, sizeof(dummy),
+                                  &dummy, nullptr)
+                              .result));
+    EXPECT_EQ(0, Returned(Execute(lowered.ir(), kBase, {}, kBase,
+                                  sizeof(dummy), &dummy, nullptr)
+                              .result));
+
+    Lowered call;
+    ASSERT_TRUE(call.Open(call_source, "ptr_pass_opaque"));
+
+    Lowered complete_arithmetic;
+    ASSERT_TRUE(complete_arithmetic.Open(complete_arithmetic_source,
+                                         "ptr_step_complete"));
+    EXPECT_EQ(1, Returned(Execute(complete_arithmetic.ir(), kBase, {0u},
+                                  kBase, sizeof(dummy), &dummy, nullptr)
+                              .result));
+    EXPECT_EQ(0, Returned(Execute(complete_arithmetic.ir(), kBase, {1u},
+                                  kBase, sizeof(dummy), &dummy, nullptr)
                               .result));
 }
 

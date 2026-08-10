@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,044 / 29,880 (97.20%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_control_flow` 149, `unsupported_type` 148, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,056 / 29,880 (97.24%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_type` 143, `unsupported_control_flow` 142, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -2096,6 +2096,40 @@ label entry에서 보이던 변수만 cycle에 운반합니다. 선언 초기화
 
 `tests/test_ir_differential.cpp`는 top-level label의 복수 backedge와 loop 안 label의 backedge를 종료 가능한 compiled C와 edge 및 random 입력에서 대조합니다. C lowering, parser reuse, IR interpreter, compiled differential, verifier 영향 범위 152/152가 통과했습니다. 공용 IR, interpreter, solver, plugin 구현은 바뀌지 않아 전체 CTest는 실행하지 않았습니다.
 
+### 74. 불완전 record를 opaque pointer identity로 운반한다
+
+본문이 없는 `struct` 또는 `union` tag도 서로 구별되는 record identity로 수집합니다. 이 identity는 pointer 선언, 복사, null 비교, 선언된 외부 callee로의 전달에만 쓸 수 있습니다. member 접근, 역참조, store, pointer 산술과 차이는 완전한 object layout이 필요하므로 계속 명시적 UNKNOWN입니다. 완전한 record의 기존 인덱스 순서를 바꾸지 않기 위해 정의가 있는 record를 먼저 기존 순서대로 수집하고, 끝까지 정의를 찾지 못한 tag만 뒤에 붙입니다.
+
+완전한 record pointer 산술은 크기를 0으로 사용하지 않도록 연산 전에 지연 layout을 확정합니다. `tests/test_c_lower_pointers.cpp`는 opaque pointer의 null 비교와 외부 전달뿐 아니라 완전한 record의 `p + 1`이 `p`와 다른 실행 결과를 만드는지 확인합니다. 불완전 record member 접근은 기존 거부 진단을 유지합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 29,044 (97.20%) | **29,049 (97.22%)** |
+| 증가 | | **+5** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_type` | 148 | **143** |
+| verifier 통과 | 29,044 / 29,044 | **29,049 / 29,049** |
+| status 실패 | 0 | **0** |
+
+기존 `struct or union has no definition in this unit` 첫 차단 51개를 재측정해 5개가 성공했고 46개는 실제 object layout 사용 때문에 계속 UNKNOWN입니다. 완전한 record 경로도 지연 layout 확정의 영향을 받을 수 있으므로 단위 테스트만으로 끝내지 않았습니다. `struct` 또는 `union`을 포함한 train 입력 22,227개를 영향 범위의 상한으로 측정했고, parse 가능한 22,225개가 기준선과 전부 대응했습니다. 아래 75번 변경까지 합친 최종 비교에서 순증 12개, 기존 성공 회귀 0개, verifier 실패 0개였습니다. 2개 syntax error는 lowering 행을 만들지 않았습니다.
+
+### 75. 같은 scope의 nested automatic을 backward label cycle에 운반한다
+
+후방 goto와 target label이 같은 compound 안에 있으면 label보다 앞에서 선언되어 두 지점에 모두 보이는 automatic을 cyclic header PHI에 포함합니다. label 이후 선언은 entry PHI에 넣지 않고 본문 실행이 다시 선언 지점을 지날 때 초기화합니다. 바깥 scope에서 nested label로 들어오는 forward edge처럼 label에서 보이는 변수 수가 다른 경로는 합치지 않고 UNKNOWN으로 남깁니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 29,049 (97.22%) | **29,056 (97.24%)** |
+| 증가 | | **+7** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_control_flow` | 149 | **142** |
+| verifier 통과 | 29,049 / 29,049 | **29,056 / 29,056** |
+| status 실패 | 0 | **0** |
+
+기존 `goto needs bypassed initialization or nested automatic state` 첫 차단 80개를 재측정해 7개가 성공했고 73개는 다른 scope 진입이나 실제 초기화 우회 때문에 계속 UNKNOWN입니다. goto를 포함한 train 입력 2,153개는 순증 7개, 기존 성공 회귀 0개, 누락 0개였습니다. 두 변경의 공용 C lowering 및 compiled differential 범위인 `CLower*`와 `IrDifferential.*` 117/117도 통과했습니다.
+
+solver, plugin, EGraph, public API는 바뀌지 않아 전체 CTest는 실행하지 않았습니다. 전체 train도 반복하지 않았습니다. 불완전 record 51개, 모든 goto 2,153개, 모든 record 포함 입력 22,227개가 각각 신규 수용 경로와 기존 성공 회귀를 포함하는 영향 상한이기 때문입니다.
+
 ## 막힌 것
 
 - 없음
@@ -2105,8 +2139,8 @@ label entry에서 보이던 변수만 cycle에 운반합니다. 선언 초기화
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
 - `unsupported_call` 225
-- `unsupported_control_flow` 149
-- `unsupported_type` 148
+- `unsupported_type` 143
+- `unsupported_control_flow` 142
 - `undeclared_identifier` 66
 - `unsupported_pointer` 59
 - `duplicate_declaration` 58
@@ -2128,7 +2162,7 @@ label entry에서 보이던 변수만 cycle에 운반합니다. 선언 초기화
 ## 다음에 할 것
 
 1. 선언 없는 callee와 identifier는 추출 context에서 복구 가능한 근거가 있는지 먼저 분리합니다.
-2. 남은 nested goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 확장합니다.
+2. 남은 nested goto는 서로 다른 lexical state map, structured entry, loop-carried 상태를 보존하는 경우에만 확장합니다.
 3. selected-function record의 source-signature schema는 layout image를 독립적으로 교차 검사할 수 있을 때만 확장합니다.
 4. function pointer의 남은 깊이 제한은 실제 call signature를 복구할 수 있는 형태만 확장합니다.
-5. 각 단위마다 compiled differential, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다. source-signature가 표현하는 범위는 binding도 함께 검사합니다.
+5. 각 단위마다 먼저 다른 subsystem과 기존 성공 경로에 미치는 범위를 판정합니다. compiled differential, verifier 전수 통과, status 실패 0을 영향 상한에서 확인하고, 더 작은 상한이 없을 때만 전체 train을 측정합니다. source-signature가 표현하는 범위는 binding도 함께 검사합니다.

@@ -179,12 +179,14 @@ QL_DIFF_FUNCTION(
                                             unsigned int seed) {
       x &= 7u;
       while (x != 0u) {
+        unsigned int inner = x;
       again:
-        seed += x;
-        --x;
-        if ((x & 1u) != 0u) {
+        seed += inner;
+        if (inner != 0u) {
+          --inner;
           goto again;
         }
+        --x;
       }
       return seed;
     });

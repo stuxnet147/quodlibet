@@ -247,6 +247,20 @@ prepass cannot bind a statically named callee to a return temporary. Record
 parameters or returns on the selected source function use the separate
 boundary rule below.
 
+#### Incomplete records have opaque pointer identity only
+
+A named `struct` or `union` declaration without a body receives a distinct
+record identity even when no definition exists in the translation unit. A
+pointer to that record can be copied, compared with null, and passed to a
+declared external callee without inventing an object layout. Different tags
+remain different pointer types.
+
+Dereferencing such a pointer, accessing a member, storing a record, or using
+record-sized pointer arithmetic remains `UNKNOWN`. Those operations first
+require a complete target layout. A complete record whose layout has merely
+not been computed yet is laid out at that point; it is not confused with an
+incomplete type or assigned a zero-byte pointer stride.
+
 #### Small selected-function records use one object-image value
 
 A record of at most 32 bytes passed to or returned from the selected source
@@ -342,10 +356,13 @@ scalar value, definedness, memory, and call-trace PHIs as a structured loop.
 Each backward goto appends its predecessor state to those PHIs, including when
 one label has several backedges.
 
-Only variables visible at label entry participate in the cycle. A goto that
-needs nested automatic state, bypasses an initialization, or enters a loop or
-switch from outside remains `UNKNOWN`. A loop-carried pointer must also retain
-compatible object authority across every backedge.
+Variables visible at label entry participate in the cycle, including an
+automatic declared earlier in the same compound when the backward goto starts
+inside that compound. A declaration after the label is initialised again only
+when execution reaches it. Incoming paths whose lexical state maps disagree,
+a jump that bypasses an initialisation, and entry into a loop or switch from
+outside remain `UNKNOWN`. A loop-carried pointer must also retain compatible
+object authority across every backedge.
 
 #### Data pointers retain up to three levels of indirection
 

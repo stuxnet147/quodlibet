@@ -2037,16 +2037,39 @@ static void release_callees(lower_context *context) {
   context->callee_capacity = 0u;
 }
 
+static ql_status append_record(lower_context *context, char *tag,
+                               size_t body, uint32_t is_union,
+                               ql_error *error) {
+  lower_record *record;
+  ql_status status = grow_array(
+      context->allocator, (void **)&context->records,
+      &context->record_capacity, sizeof(*context->records),
+      context->record_count + 1u, error);
+
+  if (status != QL_STATUS_OK) {
+    context->allocator->deallocate(context->allocator->user_data, tag);
+    return status;
+  }
+  record = &context->records[context->record_count++];
+  memset(record, 0, sizeof(*record));
+  record->tag = tag;
+  record->body_node = body;
+  record->is_union = is_union;
+  record->layout_state = LOWER_LAYOUT_PENDING;
+  return QL_STATUS_OK;
+}
+
 static ql_status collect_records(lower_context *context, ql_error *error) {
   size_t index;
 
+  /* Preserve the established index order for complete records. Opaque
+     forward tags are appended only after every definition has been seen. */
   for (index = 0u; index < context->node_count; ++index) {
     const char *kind = context->nodes[index].view.kind;
     uint32_t is_union;
     size_t body;
     size_t name_node;
     char *tag;
-    lower_record *record;
     ql_status status;
 
     if (strcmp(kind, "struct_specifier") == 0) {
@@ -2058,7 +2081,6 @@ static ql_status collect_records(lower_context *context, ql_error *error) {
     }
     body = direct_field_child(context, index, "body");
     if (body == SIZE_MAX) {
-      /* A mention without a body refers to a definition elsewhere. */
       continue;
     }
     name_node = direct_field_child(context, index, "name");
@@ -2071,19 +2093,45 @@ static ql_status collect_records(lower_context *context, ql_error *error) {
       context->allocator->deallocate(context->allocator->user_data, tag);
       continue;
     }
-    status = grow_array(context->allocator, (void **)&context->records,
-                        &context->record_capacity, sizeof(*context->records),
-                        context->record_count + 1u, error);
+    status = append_record(context, tag, body, is_union, error);
     if (status != QL_STATUS_OK) {
-      context->allocator->deallocate(context->allocator->user_data, tag);
       return status;
     }
-    record = &context->records[context->record_count++];
-    memset(record, 0, sizeof(*record));
-    record->tag = tag;
-    record->body_node = body;
-    record->is_union = is_union;
-    record->layout_state = LOWER_LAYOUT_PENDING;
+  }
+  for (index = 0u; index < context->node_count; ++index) {
+    const char *kind = context->nodes[index].view.kind;
+    uint32_t is_union;
+    size_t name_node;
+    char *tag;
+    ql_status status;
+
+    if (strcmp(kind, "struct_specifier") == 0) {
+      is_union = 0u;
+    } else if (strcmp(kind, "union_specifier") == 0) {
+      is_union = 1u;
+    } else {
+      continue;
+    }
+    if (direct_field_child(context, index, "body") != SIZE_MAX) {
+      continue;
+    }
+    name_node = direct_field_child(context, index, "name");
+    if (name_node == SIZE_MAX) {
+      continue;
+    }
+    tag = copy_node_text(context, name_node);
+    if (tag == NULL) {
+      ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+      return QL_STATUS_OUT_OF_MEMORY;
+    }
+    if (find_record(context, tag, is_union) != SIZE_MAX) {
+      context->allocator->deallocate(context->allocator->user_data, tag);
+      continue;
+    }
+    status = append_record(context, tag, SIZE_MAX, is_union, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
   }
   return QL_STATUS_OK;
 }
@@ -2752,6 +2800,11 @@ static ql_status ensure_record_layout(lower_context *context, size_t record,
                          "record is not declared in this unit", error);
   }
   entry = &context->records[record];
+  if (entry->body_node == SIZE_MAX) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                         "an incomplete struct or union has no object layout",
+                         error);
+  }
   if (entry->layout_state == LOWER_LAYOUT_DONE) {
     return QL_STATUS_OK;
   }
@@ -2950,6 +3003,15 @@ static ql_status parse_type_spelling(lower_context *context,
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
             "struct or union has no definition in this unit", error);
+      }
+      if (context->records[record].body_node == SIZE_MAX) {
+        if (allow_void == 0u) {
+          return lower_unknown(
+              context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+              "an incomplete struct or union cannot be used by value", error);
+        }
+        *output = make_record_type(record);
+        return QL_STATUS_OK;
       }
       status = ensure_record_layout(context, record, node, error);
       if (status != QL_STATUS_OK || context->unknown != 0u) {
@@ -3664,6 +3726,12 @@ static ql_status emit_load(lower_context *context, lower_value pointer,
                          error);
   }
   pointee = pointer_target(pointer.type);
+  if (pointee.kind == QL_C_SCALAR_RECORD) {
+    status = ensure_record_layout(context, pointee.record, SIZE_MAX, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+  }
 
   status = require_pointer_object(
       context, SIZE_MAX, &pointer,
@@ -3718,6 +3786,12 @@ static ql_status emit_store(lower_context *context, lower_value pointer,
         "a function pointer does not designate data to store", error);
   }
   pointee = pointer_target(pointer.type);
+  if (pointee.kind == QL_C_SCALAR_RECORD) {
+    status = ensure_record_layout(context, pointee.record, SIZE_MAX, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+  }
 
   status = require_pointer_object(
       context, SIZE_MAX, &pointer,
@@ -3755,7 +3829,7 @@ static ql_status emit_store(lower_context *context, lower_value pointer,
 
 /* `p + n` moves by n elements, so the offset is scaled by the pointee's
    storage width before it reaches PTR_ADD. */
-static ql_status emit_pointer_offset(lower_context *context,
+static ql_status emit_pointer_offset(lower_context *context, size_t node,
                                      lower_value pointer, lower_value offset,
                                      int subtract, lower_value *output,
                                      ql_error *error) {
@@ -3767,8 +3841,21 @@ static ql_status emit_pointer_offset(lower_context *context,
   ql_status status;
 
   if (pointer.type.is_function_pointer != 0u) {
-    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
                          "function pointer arithmetic is outside this slice",
+                         error);
+  }
+  if (pointer.type.indirection == 1u &&
+      pointer.type.pointee.kind == QL_C_SCALAR_RECORD) {
+    status =
+        ensure_record_layout(context, pointer.type.record, node, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+  }
+  if (pointee_byte_width(context, pointer.type) == 0u) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                         "pointer arithmetic needs a complete element type",
                          error);
   }
 
@@ -5578,6 +5665,18 @@ static ql_status lower_pointer_binary(lower_context *context,
             "type",
             error);
       }
+      if (left.type.indirection == 1u &&
+          left.type.pointee.kind == QL_C_SCALAR_RECORD) {
+        status = ensure_record_layout(context, left.type.record, node, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          return status;
+        }
+      }
+      if (pointee_byte_width(context, left.type) == 0u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+            "pointer difference needs a complete element type", error);
+      }
       status = emit_address_of_pointer(context, left, &left_bytes, error);
       if (status == QL_STATUS_OK) {
         status = emit_address_of_pointer(context, right, &right_bytes, error);
@@ -5625,9 +5724,10 @@ static ql_status lower_pointer_binary(lower_context *context,
                              "an integer minus a pointer is not a C expression",
                              error);
       }
-      return emit_pointer_offset(context, right, left, 0, output, error);
+      return emit_pointer_offset(context, node, right, left, 0, output, error);
     }
-    return emit_pointer_offset(context, left, right, subtract, output, error);
+    return emit_pointer_offset(context, node, left, right, subtract, output,
+                               error);
   }
   if (strcmp(operator_text, "==") == 0) {
     opcode = QL_IR_OPCODE_EQ;
@@ -6822,7 +6922,7 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
           context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
           "a subscript needs one pointer operand and one integer", error);
     }
-    status = emit_pointer_offset(context, base, index, 0, output, error);
+    status = emit_pointer_offset(context, node, base, index, 0, output, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
@@ -11402,6 +11502,7 @@ static int goto_skips_declaration(const lower_context *context,
   size_t node;
   uint32_t begin = context->nodes[goto_node].view.range.end_byte;
   uint32_t finish = context->nodes[label_node].view.range.start_byte;
+  const int backward = finish <= begin;
 
   for (node = context->body_node + 1u; node < end; ++node) {
     uint32_t at;
@@ -11414,11 +11515,12 @@ static int goto_skips_declaration(const lower_context *context,
     if (scope != SIZE_MAX &&
         strcmp(context->nodes[scope].view.kind, "compound_statement") == 0 &&
         node_contains(context, scope, label_node)) {
-      if (scope != context->body_node && at < finish) {
+      if (scope != context->body_node && at < finish &&
+          (backward == 0 || !node_contains(context, scope, goto_node))) {
         /* Pending goto states currently carry function-scope variables.
-           Entering a nested scope with a live automatic would require a
-           second lexical state map even when the declaration precedes the
-           goto, so keep that case explicit UNKNOWN. */
+           Entering a nested scope with a live automatic still requires a
+           second lexical state map. A backward edge that starts inside the
+           same scope already has that automatic in its label-entry state. */
         return 1;
       }
       if (at > begin && at < finish) {
@@ -11538,7 +11640,7 @@ static ql_status lower_labeled_statement(lower_context *context, size_t node,
   lower_label *label = NULL;
   lower_state fallthrough;
   size_t index;
-  size_t variable_count = function_scope_variable_count(context);
+  size_t variable_count;
   ql_ir_block_id block;
   ql_status status = QL_STATUS_OK;
 
@@ -11553,6 +11655,16 @@ static ql_status lower_labeled_statement(lower_context *context, size_t node,
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
         "label was not collected in the function scope", error);
+  }
+  variable_count = label->has_backward_incoming != 0u
+                       ? context->variable_count
+                       : function_scope_variable_count(context);
+  for (index = 0u; index < label->incoming.count; ++index) {
+    if (label->incoming.states[index].count != variable_count) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+          "goto paths disagree on the variables visible at the label", error);
+    }
   }
   label->lowered = 1u;
   if (context->current_terminated == 0u) {

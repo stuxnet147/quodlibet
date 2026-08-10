@@ -275,6 +275,14 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
       {"_Noreturn int declared_no_return(int x) { return x; }",
        "declared_no_return", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
        "type_qualifier"},
+      {"struct Opaque; int incomplete_member(struct Opaque *p) "
+       "{ return p->value; }",
+       "incomplete_member", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+       "field_expression"},
+      {"struct Opaque; int incomplete_step(struct Opaque *p) "
+       "{ return (p + 1) == p; }",
+       "incomplete_step", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+       "binary_expression"},
       {"int bypass(int x) { goto done; int y = x; done: return x; }", "bypass",
        QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, "goto_statement"},
       {"int multidimensional(void) { int values[2][3]; values[0][0] = 1; "
