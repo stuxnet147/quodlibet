@@ -748,7 +748,7 @@ val 첫 차단은 이제 `unsupported_type` 351, `unsupported_pointer` 160, `uns
 
 ### 14. 배열과 지역 집합체, 그리고 W8 의 트리 접근자
 
-커밋: `PENDING`
+커밋: `b25985d`
 
 #### 먼저 쟀더니 과제가 달랐다
 
