@@ -81,6 +81,13 @@ QL_AGG_FUNCTION(address, int agg_address(int a) {
     buf[2] = p[0] + p[1];
     return buf[2];
 });
+QL_AGG_FUNCTION(constant_expression_bound,
+    int agg_constant_expression_bound(int selector, int value) {
+        int values[(4 * 4) + 1];
+        values[0] = selector;
+        values[16] = value;
+        return values[(selector & 1) * 16];
+    });
 QL_AGG_FUNCTION(param, int agg_param(int a[], int n) {
     return a[0] + a[n];
 });
@@ -417,6 +424,11 @@ TEST(CLowerAggregates, MatchesCompiledExecutionOnArraysAndRecords) {
            through that pointer is writing the array. */
         {"address", address_source, "agg_address", 1, sizeof(int[3]),
          [](int32_t a, int32_t) { return agg_address(a); }},
+        {"constant-expression-bound", constant_expression_bound_source,
+         "agg_constant_expression_bound", 2, sizeof(int[17]),
+         [](int32_t a, int32_t b) {
+             return agg_constant_expression_bound(a, b);
+         }},
         {"initialized-array", initialized_array_source, "agg_init_array", 2,
          sizeof(int[3]),
          [](int32_t a, int32_t b) { return agg_init_array(a, b); }},

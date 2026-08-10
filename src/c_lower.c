@@ -2099,8 +2099,8 @@ static int positional_initializer_count(const lower_context *context,
    that is a run-time expression, or one this pass cannot fold, is refused
    rather than guessed at. `T a[]` with no bound is a pointer parameter in C,
    and is reported as a zero length for the caller to interpret. */
-static int constant_array_bound(const lower_context *context, size_t node,
-                                uint64_t *length) {
+static int constant_array_bound_value(const lower_context *context,
+                                      size_t node, uint64_t *value_out) {
   const char *kind;
   char *text;
   int ok = 0;
@@ -2116,26 +2116,81 @@ static int constant_array_bound(const lower_context *context, size_t node,
   if (strcmp(kind, "number_literal") == 0) {
     char *stop = NULL;
     unsigned long long value = strtoull(text, &stop, 0);
-    /* Only a plain unsuffixed or integer-suffixed count, and never zero:
-       a zero-length array has no bytes for an access to be inside. */
-    if (stop != text && value != 0ull && value <= (1ull << 32)) {
+    /* Only a plain unsuffixed or integer-suffixed value. Zero may occur in
+       an intermediate constant expression; the outer bound rejects a final
+       zero because it has no bytes for an access to be inside. */
+    if (stop != text && value <= (1ull << 32)) {
       while (*stop == 'u' || *stop == 'U' || *stop == 'l' || *stop == 'L') {
         ++stop;
       }
       if (*stop == '\0') {
-        *length = (uint64_t)value;
+        *value_out = (uint64_t)value;
         ok = 1;
       }
     }
   } else if (strcmp(kind, "identifier") == 0) {
     const lower_enumerator *enumerator = find_enumerator(context, text);
-    if (enumerator != NULL && enumerator->value != 0u) {
-      *length = (uint64_t)enumerator->value;
+    if (enumerator != NULL) {
+      *value_out = (uint64_t)enumerator->value;
       ok = 1;
     }
   }
   context->allocator->deallocate(context->allocator->user_data, text);
+  if (ok != 0) {
+    return 1;
+  }
+  if (strcmp(kind, "parenthesized_expression") == 0) {
+    return constant_array_bound_value(context, first_named_child(context, node),
+                                      value_out);
+  }
+  if (strcmp(kind, "binary_expression") == 0) {
+    size_t left_node = direct_field_child(context, node, "left");
+    size_t right_node = direct_field_child(context, node, "right");
+    size_t operator_node = direct_field_child(context, node, "operator");
+    uint64_t left;
+    uint64_t right;
+    uint64_t result = 0u;
+    char *operator_text;
+
+    if (left_node == SIZE_MAX || right_node == SIZE_MAX ||
+        operator_node == SIZE_MAX ||
+        !constant_array_bound_value(context, left_node, &left) ||
+        !constant_array_bound_value(context, right_node, &right) ||
+        left > (uint64_t)INT_MAX || right > (uint64_t)INT_MAX) {
+      return 0;
+    }
+    operator_text = copy_node_text(context, operator_node);
+    if (operator_text == NULL) {
+      return 0;
+    }
+    if (strcmp(operator_text, "+") == 0 &&
+        left <= (uint64_t)INT_MAX - right) {
+      result = left + right;
+      ok = 1;
+    } else if (strcmp(operator_text, "-") == 0 && left >= right) {
+      result = left - right;
+      ok = 1;
+    } else if (strcmp(operator_text, "*") == 0 &&
+               (right == 0u || left <= (uint64_t)INT_MAX / right)) {
+      result = left * right;
+      ok = 1;
+    } else if (strcmp(operator_text, "<<") == 0 && right < 31u &&
+               left <= ((uint64_t)INT_MAX >> right)) {
+      result = left << right;
+      ok = 1;
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   operator_text);
+    if (ok != 0) {
+      *value_out = result;
+    }
+  }
   return ok;
+}
+
+static int constant_array_bound(const lower_context *context, size_t node,
+                                uint64_t *length) {
+  return constant_array_bound_value(context, node, length) && *length != 0u;
 }
 
 static size_t member_declarator_name(const lower_context *context,

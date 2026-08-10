@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,453 / 29,880 (78.49%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,296, `unsupported_type` 2,118, `unsupported_pointer` 634입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,472 / 29,880 (78.55%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,299, `unsupported_type` 2,094, `unsupported_pointer` 634입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1622,6 +1622,23 @@ null은 새 object authority를 요구하지 않습니다. 따라서 다른 arm�
 
 `extern` 원형 진단 4개를 좁게 재측정해 모두 성공한 뒤 전체 train을 비교했습니다. 전체 비교에서 저장 지정자가 없는 블록 범위 원형 3개도 추가로 성공했으며 원문이 실제 prototype임을 확인했습니다. `tests/test_c_lower_calls.cpp`는 두 형태를 compiled 실행과 대조하고, 함수 원형과 실제 `extern` 객체가 섞인 선언은 계속 UNKNOWN으로 고정합니다. 영향 범위의 `CLowerCalls.*` 9/9와 `CLower*` 89/89가 통과했고 전체 train 함수별 비교에서 누락, 예상 밖 진단 변경, 기존 성공 회귀가 없었습니다. 변경은 C 지역 선언과 callee 수집의 접점에 한정되므로 전체 CTest는 실행하지 않았습니다.
 
+### 49. 지역 배열 bound의 작은 정수 상수식을 정확히 접는다
+
+지역 배열 bound가 숫자 literal 또는 enumerator 하나인 경우에 더해 괄호와 `+`, `-`, `*`, `<<`로 구성된 작은 정수 상수식을 정적으로 계산합니다. 모든 피연산자와 중간 결과가 음수가 아닌 `int` 범위에 있고, 뺄셈 underflow, 곱셈 overflow, 부정의 signed left shift가 없는 경우만 수용합니다. 따라서 계산 결과는 C의 signed `int` 평가와 정확히 같습니다.
+
+전역값이나 매개변수에 의존하는 runtime bound, 함수 호출, 아직 정적 타입 query가 없는 `sizeof` bound, 다차원 배열은 계속 UNKNOWN입니다. 상수식을 일반 실행식으로 lowering하지 않으므로 bound 계산을 위해 호출, load, UB guard 같은 실행 효과를 만들지 않습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,453 (78.49%) | **23,472 (78.55%)** |
+| 증가 | | **+19** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_type` | 2,118 | **2,094** |
+| verifier 통과 | 23,453 / 23,453 | **23,472 / 23,472** |
+| status 실패 | 0 | **0** |
+
+합성 연산자로만 된 첫 배열-bound 차단 29개를 좁게 측정해 19개가 성공했습니다. 나머지 10개는 기존의 타입 철자 2개, mutable static 3개, uninitialized address escape 3개, undeclared identifier 2개로 이동했습니다. `tests/test_c_lower_aggregates.cpp`는 `(4 * 4) + 1` 크기 배열의 양 끝 접근을 compiled 함수와 대조합니다. `tests/test_c_lower.cpp`는 runtime bound와 다차원 배열을 계속 UNKNOWN으로 고정합니다. 영향 범위의 `CLowerAggregates.*` 9/9와 `CLower*` 89/89가 통과했고 전체 train 함수별 비교에서 누락과 기존 성공 회귀가 없었습니다. 변경은 지역 배열 declarator의 정적 bound 판정에 한정되므로 전체 CTest는 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1630,8 +1647,8 @@ null은 새 object authority를 요구하지 않습니다. 따라서 다른 arm�
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `uninitialized_read` 2,296
-- `unsupported_type` 2,118
+- `uninitialized_read` 2,299
+- `unsupported_type` 2,094
 - `unsupported_pointer` 634
 - `unsupported_control_flow` 545
 - `unsupported_call` 397
