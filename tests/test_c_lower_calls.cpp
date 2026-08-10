@@ -235,6 +235,12 @@ static const char callback_typedef_argument_source[] =
     "int pass_typedef_callback(CALL_INT_TYPEDEF callback, int value) {\n"
     "  return CALLEE_accept(callback, value);\n"
     "}\n";
+static const char declared_callback_argument_source[] =
+    "int FUN_7(int);\n"
+    "int CALLEE_accept(int (*)(int), int);\n"
+    "int pass_declared_callback(int value) {\n"
+    "  return CALLEE_accept(FUN_7, value);\n"
+    "}\n";
 
 namespace {
 
@@ -1022,6 +1028,10 @@ TEST(CLowerCalls, CarriesAFunctionPointerAsAnOpaqueExternalArgument) {
     Lowered typed;
     ASSERT_TRUE(typed.Open(callback_typedef_argument_source,
                            "pass_typedef_callback"));
+
+    Lowered declared;
+    ASSERT_TRUE(declared.Open(declared_callback_argument_source,
+                              "pass_declared_callback"));
 }
 
 TEST(CLowerCalls, CallsAFunctionPointerParameterWithItsDeclaredSignature) {

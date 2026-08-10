@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,806 / 29,880 (96.41%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_control_flow` 311, `unsupported_call` 225, `unsupported_type` 148, `undeclared_identifier` 146입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,886 / 29,880 (96.67%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_control_flow` 311, `unsupported_call` 225, `unsupported_type` 148, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -2057,6 +2057,25 @@ CALL 결과의 모든 chunk는 concrete callback 결과와 product-call congruen
 
 `tests/test_c_lower_calls.cpp`는 padding이 있는 실제 8바이트 record를 selected function의 입력과 출력으로 왕복시키고, 함수 내부 member 수정 결과를 compiled C와 concrete interpreter에서 대조합니다. 기존 거부 테스트는 40바이트 record가 계속 UNKNOWN인지 고정합니다. 변경은 C lowering 내부의 boundary pack/unpack과 parameter object에 한정되므로 C lowering, parser reuse, IR interpreter와 verifier 영향 범위 149/149를 실행했습니다. 공용 IR, interpreter, solver, plugin 구현은 바뀌지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage만 G9 성공률과 기존 성공 회귀 0건을 현재 코드에서 확인하기 위해 실행했습니다.
 
+### 72. 선언된 corpus function designator를 opaque token으로 보존한다
+
+파일에 prototype이 있는 `FUN_<10진 번호>`를 값 문맥에서 변수나 enumerator가 아니라는 이유로 거부하고 있었습니다. prototype의 반환형과 callback parameter 문맥이 타입을 이미 고정하므로 추정할 필요가 없습니다. 32비트 suffix 범위에서 `0xffff000000000000 + 번호`를 non-null opaque function-pointer token으로 사용합니다. 이 값은 비교, 선택, 선언된 외부 callee로 전달하는 데 쓸 수 있지만 data storage로 역참조할 수 없습니다.
+
+prototype이 없는 이름은 계속 UNKNOWN입니다. 선택된 `FUN_0`의 function definition도 이 규칙의 callee 목록에 넣지 않았습니다. 따라서 재귀 호출을 외부 uninterpreted call로 바꿔 내부 memory와 termination 의미를 잃는 일은 없습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 28,806 (96.41%) | **28,886 (96.67%)** |
+| 증가 | | **+80** |
+| 기존 성공 회귀 | | **0** |
+| `undeclared_identifier` | 146 | **66** |
+| verifier 통과 | 28,806 / 28,806 | **28,886 / 28,886** |
+| status 실패 | 0 | **0** |
+
+기존 일반 identifier 첫 차단 136개를 좁게 재측정해 80개가 성공했고 56개는 실제 선언이 없거나 이 profile의 명시적 function-symbol 철자 밖이라 남았습니다. 전체 train에서도 순증은 80개였고 기존 성공 회귀, 중복, 누락은 모두 0개였습니다.
+
+`tests/test_c_lower_calls.cpp`는 `int FUN_7(int)` prototype을 가진 designator가 정확한 callback parameter로 전달되는지 고정합니다. 변경은 C identifier와 call argument lowering에만 닿으므로 C lowering, parser reuse, IR interpreter와 verifier 영향 범위 149/149를 실행했습니다. 공용 IR, interpreter, solver, plugin 구현은 바뀌지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage만 G9 수치와 기존 성공 회귀 0건을 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -2068,7 +2087,7 @@ CALL 결과의 모든 chunk는 concrete callback 결과와 product-call congruen
 - `unsupported_control_flow` 311
 - `unsupported_call` 225
 - `unsupported_type` 148
-- `undeclared_identifier` 146
+- `undeclared_identifier` 66
 - `unsupported_pointer` 61
 - `duplicate_declaration` 58
 - `unsupported_volatile_or_atomic` 50

@@ -263,6 +263,20 @@ Source-signature schema v1 cannot describe a record value, so a pipeline that
 requires `ql_source_signature_bind_ir` still refuses this boundary. Records
 larger than 32 bytes remain `UNKNOWN`; no bytes are truncated.
 
+#### Declared corpus function designators are opaque tokens
+
+A declared `FUN_<decimal>` used as a value has the function-pointer type its
+prototype states and the deterministic token `0xffff000000000000 + decimal`.
+The mapping is injective over the admitted 32-bit suffix range and never uses
+zero. The value can be compared, selected, passed to a declared callee, or
+used where the existing function-pointer slice permits it. It cannot be read
+as data storage.
+
+This rule applies only when the unit contains the prototype. A missing
+declaration is still `UNKNOWN`, and the selected function's own definition is
+not turned into an external token. In particular, recursive `FUN_0` calls do
+not silently acquire uninterpreted external-call semantics.
+
 #### Corpus globals carry no promised initial value
 
 A file-scope object with no initialiser is, in ISO C, a tentative definition

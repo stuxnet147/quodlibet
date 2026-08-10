@@ -1432,6 +1432,8 @@ static ql_status collect_address_taken(lower_context *context, size_t body_node,
 /* A call may write memory and is itself observable, so both the memory and
    the trace parameter have to exist before the body runs. */
 static lower_callee *find_callee(lower_context *context, const char *name);
+static ql_status resolve_callee(lower_context *context, lower_callee *callee,
+                                size_t node, ql_error *error);
 
 static size_t member_declarator_name(const lower_context *context,
                                      size_t declarator, uint32_t *pointer_depth,
@@ -5141,10 +5143,10 @@ static ql_status lower_identifier(lower_context *context, size_t node,
   variable = find_variable(context, name, strlen(name));
   if (variable == NULL) {
     const lower_enumerator *enumerator = find_enumerator(context, name);
-    context->allocator->deallocate(context->allocator->user_data, name);
     if (enumerator != NULL) {
       lower_type type = make_integer_type(32u, 3u, 1u);
       ql_status constant_status = ensure_bool_constants(context, error);
+      context->allocator->deallocate(context->allocator->user_data, name);
       memset(output, 0, sizeof(*output));
       output->type = type;
       output->may_ub = 0u;
@@ -5155,9 +5157,57 @@ static ql_status lower_identifier(lower_context *context, size_t node,
       return add_uint_constant(context, type, enumerator->value, &output->value,
                                error);
     }
+    {
+      lower_callee *callee = find_callee(context, name);
+      const char *digits = strncmp(name, "FUN_", 4u) == 0 ? name + 4u : NULL;
+      char *stop = NULL;
+      unsigned long long ordinal = 0ull;
+      if (digits != NULL && *digits != '\0') {
+        errno = 0;
+        ordinal = strtoull(digits, &stop, 10);
+      }
+      if (callee != NULL && digits != NULL && stop != digits &&
+          stop != NULL && *stop == '\0' && errno == 0 &&
+          ordinal <= UINT64_C(0xffffffff)) {
+        lower_value address;
+        lower_type function_type;
+        status = resolve_callee(context, callee, node, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          context->allocator->deallocate(context->allocator->user_data, name);
+          return status;
+        }
+        status = ensure_bool_constants(context, error);
+        if (status != QL_STATUS_OK) {
+          context->allocator->deallocate(context->allocator->user_data, name);
+          return status;
+        }
+        memset(&address, 0, sizeof(address));
+        address.type = address_type();
+        address.defined = context->true_value;
+        status = add_uint_constant(
+            context, address.type,
+            UINT64_C(0xffff000000000000) + (uint64_t)ordinal,
+            &address.value, error);
+        function_type = make_function_pointer_type(callee->return_type);
+        if (status == QL_STATUS_OK) {
+          status = emit_pointer_of_address(context, address, function_type,
+                                           output, error);
+        }
+        context->allocator->deallocate(context->allocator->user_data, name);
+        if (status == QL_STATUS_OK) {
+          output->defined = context->true_value;
+          output->has_object = 0u;
+          output->may_admit_object = 0u;
+        }
+        return status;
+      }
+    }
+    context->allocator->deallocate(context->allocator->user_data, name);
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNDECLARED_IDENTIFIER, node,
-        "identifier does not name a parameter, local, or enumerator", error);
+        "identifier does not name a parameter, local, enumerator, or declared "
+        "corpus function",
+        error);
   }
   context->allocator->deallocate(context->allocator->user_data, name);
   status = ensure_variable_value(context, variable, error);
