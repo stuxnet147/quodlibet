@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,124 / 29,880 (97.47%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_control_flow` 123, `unsupported_type` 91, `undeclared_identifier` 68입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,135 / 29,880 (97.51%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 227, `unsupported_control_flow` 123, `unsupported_type` 78, `undeclared_identifier` 68입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -2203,6 +2203,24 @@ goto와 label 사이의 선언을 실제로 건너뛰는 경우와 바깥에서 
 
 `tests/test_c_lower_globals.cpp`는 block extern read를 실제 external object를 읽는 compiled C와 대조합니다. 기존 global 전체와 CLowerTypes, CReuse 영향 범위 13/13이 통과했습니다. 분기는 block extern 선언에만 있고 공용 IR, interpreter, solver, plugin, EGraph, public API는 바뀌지 않아 전체 CTest와 전체 train은 실행하지 않았습니다.
 
+### 80. 큰 문자 배열의 0 초기화를 별도 상한으로 받는다
+
+일반 aggregate initializer와 record copy의 256-element 상한은 유지합니다. 1-byte integer element의 0 초기화만 corpus 최대 scratch buffer를 포함하는 4096개까지 허용합니다. 넓은 scalar, pointer, record와 nested array는 기존 상한에 남으므로 수천 개의 복합 initializer를 새로 펼치지 않습니다. automatic initializer는 실행 시 실제 byte store를 내며, 초기 메모리 제약인 `MEMORY_IMAGE`로 바꾸지 않습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 29,124 (97.47%) | **29,135 (97.51%)** |
+| 증가 | | **+11** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_type` | 91 | **78** |
+| `unsupported_call` | 225 | **227** |
+| verifier 통과 | 29,124 / 29,124 | **29,135 / 29,135** |
+| status 실패 | 0 | **0** |
+
+기존 큰 local array 0 초기화 진단 13개 중 11개가 성공했고 2개는 다음 미선언 callee 진단으로 이동했습니다. 이 진단 13개가 새 분기를 탈 수 있는 전체 train 집합입니다. 11개 lowered 결과가 모두 verifier를 통과했고 status 실패는 0입니다. 4096개까지 실제 store를 내므로 대상 13개 측정과 verifier에는 26.8초가 걸렸습니다. 일반 경로의 상한을 넓히지 않아 이 비용은 해당 큰 배열에만 생깁니다.
+
+`tests/test_c_lower_aggregates.cpp`는 1024-byte 배열의 0 초기화, 한 byte 수정, 반환값과 최종 object image를 compiled C와 대조합니다. aggregate와 parser reuse 영향 범위 17/17이 통과했습니다. 공용 IR, interpreter, solver, plugin, EGraph, public API는 바뀌지 않았고 영향 집합이 13개로 닫혀 있어 전체 CTest와 전체 train은 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -2211,9 +2229,9 @@ goto와 label 사이의 선언을 실제로 건너뛰는 경우와 바깥에서 
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_call` 225
+- `unsupported_call` 227
 - `unsupported_control_flow` 123
-- `unsupported_type` 91
+- `unsupported_type` 78
 - `undeclared_identifier` 68
 - `unsupported_pointer` 59
 - `duplicate_declaration` 58

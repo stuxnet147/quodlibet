@@ -2511,6 +2511,11 @@ static ql_status resolve_type_node_allowing_void(
    An array or function declarator inside a record is not laid out here. */
 /* `T a[]` said an array but not how long. */
 #define LOWER_MAX_INITIALIZER_ELEMENTS UINT64_C(256)
+/* A zero-filled byte array is common as a bounded scratch buffer and emits
+   one simple byte store per element. Keep the general aggregate bound small,
+   but admit the measured corpus's largest such buffer without also admitting
+   thousands of nested records or wide scalar initializers. */
+#define LOWER_MAX_ZERO_BYTE_ELEMENTS UINT64_C(4096)
 
 /* Counts positional elements without interpreting them. Designators need a
    member/index map rather than a count and are left for their own work unit. */
@@ -9281,7 +9286,14 @@ static ql_status zero_initialize_object(lower_context *context, size_t node,
     lower_type element = array_element(type);
     uint64_t width = type_byte_width(context, element);
     uint64_t index;
-    if (type.array_length > LOWER_MAX_INITIALIZER_ELEMENTS || width == 0u) {
+    const int bounded_byte_array =
+        type.array_length <= LOWER_MAX_ZERO_BYTE_ELEMENTS &&
+        element.array_length == 0u &&
+        element.kind == QL_C_SCALAR_INTEGER && element.width == 8u &&
+        width == 1u;
+    if ((type.array_length > LOWER_MAX_INITIALIZER_ELEMENTS &&
+         !bounded_byte_array) ||
+        width == 0u) {
       return lower_unknown(
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
           "zero-initializing this local array would exceed the "

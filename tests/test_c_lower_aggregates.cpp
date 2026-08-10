@@ -49,6 +49,12 @@ QL_AGG_FUNCTION(bytes, int agg_bytes(int a) {
     small[3] = (char)(a + 3);
     return small[0] + small[3];
 });
+QL_AGG_FUNCTION(large_zero, int agg_large_zero(int a, int b) {
+    unsigned char values[1024] = {0};
+    unsigned index = (unsigned)a & 1023u;
+    values[index] = (unsigned char)b;
+    return values[0] + values[index] + values[1023];
+});
 QL_AGG_FUNCTION(record, struct AGG_PAIR { int first; int second; };
     int agg_record(int a, int b) {
         struct AGG_PAIR p;
@@ -453,6 +459,9 @@ TEST(CLowerAggregates, MatchesCompiledExecutionOnArraysAndRecords) {
            arithmetic, or every index but zero lands somewhere else. */
         {"bytes", bytes_source, "agg_bytes", 1, sizeof(char[4]),
          [](int32_t a, int32_t) { return agg_bytes(a); }},
+        {"large-zero", large_zero_source, "agg_large_zero", 2,
+         sizeof(unsigned char[1024]),
+         [](int32_t a, int32_t b) { return agg_large_zero(a, b); }},
         {"record", record_source, "agg_record", 2, sizeof(struct AGG_PAIR),
          [](int32_t a, int32_t b) { return agg_record(a, b); }},
         {"anonymous-struct", anonymous_struct_source,
