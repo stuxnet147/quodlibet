@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-항목 3. 동시성 측정. 병렬 worker 수와 solver 동시성별 처리량, cancellation overhead 를 재서 `docs/perf/` 에 적습니다.
+항목 4 의 남은 절반. plugin SDK 예제(`examples/plugin/`)와 그것이 실제로 빌드되고 로드되는지 고정하는 시험.
 
 ## 착수 시 조사한 것 (2026-08-10)
 
@@ -105,6 +105,41 @@ corrupt model 을 그대로 나르는 것은 의도입니다. adapter 는 transp
 
 CTest 282/282 통과 (직전 278 + 신규 4).
 
+### 4. 동시성과 취소 비용 측정 (`scripts/perf/bench-concurrency.py`, `docs/perf/concurrency.md`)
+
+**소유 겹침을 먼저 정리했습니다.** W7.md 는 `docs/perf/` 의 동시성 절을 W7 소유로, W8.md 는 `docs/perf/` 전부를 W8 소유로 적어 실제로 겹쳤습니다. 조율자에게 ask 로 올려 A 안(신규 `docs/perf/concurrency.md` 는 W7 소유, `baseline.md` 는 W8 유지, 링크 한 줄은 W8 이 연결)으로 확정했습니다. 스크립트는 벤치가 두 곳으로 갈리지 않도록 W8 의 관례를 따라 `scripts/perf/bench-concurrency.py` 입니다.
+
+**W8 의 `bench-batch.py` 가 worker 수별 처리량과 occupancy 를 이미 덮습니다.** 그래서 W7 은 그것이 다루지 않는 축, 즉 예산 guard 비용과 취소 지연을 잽니다. 공개 파이썬 표면이 cancel token 이 아니라 예산을 노출하고 코어가 예산 소진 실행을 취소된 실행과 같은 경로로 UNKNOWN 회수하므로 예산이 취소의 관측 손잡이입니다.
+
+**가장 쓸모 있는 결과: 취소 지연이 마감에 비례하지 않고 단계 경계로 양자화됩니다.**
+
+| 예산 | median 복귀 |
+|---|---|
+| 1 ns | 0.0002s |
+| 1 ms | 0.461s |
+| 10 ms | 0.407s |
+| 100 ms | 0.410s |
+| 500 ms | 0.812s |
+| 없음 | 0.862s (proved) |
+
+1 ms, 10 ms, 100 ms 세 마감이 전부 같은 ~0.41초에 돌아옵니다. 예산 guard 가 solver 호출 안이 아니라 pipeline 단계 경계에서만 검사되기 때문입니다. 채점기에 뜻하는 바는 **100 ms 마감과 1 ms 마감이 같은 값이 든다**는 것입니다. 건전성은 전 구간 유지되어 초과 실행도 전부 `unknown` + `total-time-exhausted` 이고 `proved-*` 가 새지 않았습니다.
+
+**arming 비용은 분해하지 못했고 그렇게 적었습니다.** 처음에는 median 만 찍어 workers=2 에서 42.8% 오버헤드가 나왔는데, min/max 를 같이 찍자 두 범위가 완전히 겹쳐 소음이었음이 드러났습니다. 그래서 하네스가 min/median/max 와 '범위 분리 여부'를 항상 찍도록 고쳤습니다. **median 하나는 재지 못한 것을 잰 것처럼 보이게 합니다.** workers=1 에서만 산포가 좁아(양쪽 ±6%) "직렬 실행에서 예산을 걸어 두는 것은 이 해상도에서 공짜" 라고 말할 수 있습니다.
+
+worker 수별 처리량은 8 worker 4.31x 로 `baseline.md` 의 4.67x 와 같은 자리이며 교차 확인으로만 실었습니다.
+
+측정 중 부수적으로 확인한 것: 빌드가 3.13 헤더로 만든 abi3 확장을 3.11 에서 호출하면 `SystemError: PY_SSIZE_T_CLEAN` 로 실패합니다. G4 가 닫은 방향(낮은 태그로 만들어 높은 인터프리터에서 사용)의 반대이므로 결함이 아니라 사용법이며 `concurrency.md` 재현 절에 적었습니다.
+
+### 5. 공개 ABI 호환 시험 (`tests/test_abi_compat.cpp`)
+
+계약을 문서가 아니라 시험이 들고 있게 했습니다. 세 가지입니다.
+
+1. **더 오래된 헤더로 빌드된 caller 가 그대로 등록됩니다.** 필요한 prefix 크기만큼만 잡은 실제 버퍼에 descriptor 를 담아 넘깁니다. 패딩이 아니라 진짜 할당 경계라 `struct_size` 를 넘겨 읽으면 sanitizer 가 잡습니다.
+2. **prefix 보다 1 byte 작으면 `ABI_MISMATCH` 로 거부되고** 진단이 무엇을 요구했는지 말합니다. ABI 세대가 다른 경우는 크기가 아니라 버전으로 거부되며 두 검사가 독립임을 고정합니다. 이 build 가 모르는 **더 큰** 구조체는 prefix 까지 읽고 받아들입니다. 거부하면 플러그인 하나가 새 헤더로 나올 때마다 host 업그레이드가 강제됩니다.
+3. **기존 필드가 움직이지 않았음을 compile time 에 고정합니다.** `struct_size` 가 offset 0 인 것과 필드 순서를 `static_assert` 로 박았습니다. 크기 검사는 재배치를 잡지 못하므로 이것이 없으면 1 번과 2 번이 뜻을 잃습니다. 상대 순서로 박아 32/64bit 양쪽에서 성립합니다.
+
+CMake 변경이 필요 없었습니다. 6개 시험 전부 통과.
+
 ## 내린 설계 결정
 
 - **새 target 을 `fuzz_targets.h` 가 아니라 별도 `fuzz_contract_targets.h` 에 둡니다.** 근거: `fuzz_targets.h` 와 `tests/test_fuzz.cpp` 는 W1 이 소유하는 표면(파서/로어링/IR)의 기록이고, W7 이 더하는 것은 계약 표면이라 소유가 다릅니다. `QL_FUZZ_REQUIRE`/`QL_FUZZ_REACHED` 규약은 그대로 따라서 두 헤더가 같은 규율 아래 있습니다.
@@ -152,7 +187,7 @@ campaign 은 그동안 두 번째 serialize 부터의 고정점을 검사합니�
 
 1. (완료) 퍼저 확대
 2. (완료) solver fault-injection 확대. in-process 와 process transport 양쪽
-3. (진행 중) 동시성 측정 -> `docs/perf/`. `bindings` 의 `check_batch` 를 부하 생성기로
-4. ABI 호환 시험과 plugin SDK 예제
+3. (완료) 동시성 측정 -> `docs/perf/concurrency.md`
+4. (진행 중) ABI 호환 시험 완료. 남은 것은 plugin SDK 예제. 조율자가 `596489f` 로 루트에 `examples/` 훅을 넣어 주었으므로 `examples/CMakeLists.txt` 와 `examples/plugin/` 을 만들면 빌드에 들어갑니다
 5. 설치 패키지와 relocatable Bitwuzla 탐색
 6. compiler/target matrix 자동 검증 (`D:/projects/machine-model/datasets/records-local/summary.json`)
