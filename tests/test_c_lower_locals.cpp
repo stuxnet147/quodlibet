@@ -55,6 +55,22 @@ QL_LOCAL_FUNCTION(narrow_slot, int loc_narrow(int a) {
     *p = *p + 1;
     return v;
 });
+QL_LOCAL_FUNCTION(late_init, int loc_late(int a) {
+    int v;
+    v = a + 3;
+    int *p = &v;
+    return *p;
+});
+QL_LOCAL_FUNCTION(branch_init, int loc_branch_init(int a, int b) {
+    int v;
+    if (b) {
+        v = a + 1;
+    } else {
+        v = a - 1;
+    }
+    int *p = &v;
+    return *p;
+});
 
 namespace {
 
@@ -245,6 +261,39 @@ uint64_t Widen(int32_t value) {
     return static_cast<uint64_t>(static_cast<uint32_t>(value));
 }
 
+void ExpectUnknown(const char *source,
+                   ql_c_lower_diagnostic_code expected_code) {
+    ql_c_frontend_unit *unit = nullptr;
+    ql_c_lower_result *result = nullptr;
+    ql_c_function_view function{};
+    ql_c_lower_result_view_v1 view{};
+    ql_c_lower_diagnostic_view_v1 diagnostic{};
+    ql_error error{};
+    const std::size_t size = std::strlen(source);
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_analyze(nullptr, source, size, &unit, &error));
+    function.struct_size = sizeof(function);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_select_function(unit, "f", 1u, &function,
+                                            &error));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_lower_selected_function(nullptr, source, size, unit,
+                                           &function, &result, &error))
+        << error.message;
+    view.struct_size = sizeof(view);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_lower_result_get_view(result, &view, &error));
+    EXPECT_EQ(QL_C_LOWER_UNKNOWN, view.support);
+    diagnostic.struct_size = sizeof(diagnostic);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_lower_result_diagnostic_at(result, 0u, &diagnostic,
+                                              &error));
+    EXPECT_EQ(expected_code, diagnostic.code);
+    ql_c_lower_result_destroy(result);
+    ql_c_frontend_unit_destroy(unit);
+}
+
 TEST(CLowerLocals, MatchesCompiledExecutionWithStorageForLocals) {
     struct Case {
         const char *name;
@@ -267,6 +316,10 @@ TEST(CLowerLocals, MatchesCompiledExecutionWithStorageForLocals) {
         /* A short slot is two bytes, not a machine word. */
         {"narrow", narrow_slot_source, "loc_narrow", {2u}, 1,
          [](int32_t a, int32_t) { return loc_narrow(a); }},
+        {"late", late_init_source, "loc_late", {4u}, 1,
+         [](int32_t a, int32_t) { return loc_late(a); }},
+        {"branch-init", branch_init_source, "loc_branch_init", {4u}, 2,
+         [](int32_t a, int32_t b) { return loc_branch_init(a, b); }},
     };
 
     uint64_t state = UINT64_C(0x27f4b8c1590ae362);
@@ -313,38 +366,23 @@ TEST(CLowerLocals, SizesTheSlotFromTheDeclaredTypeNotAWord) {
 }
 
 TEST(CLowerLocals, RefusesStorageWithNothingPutInIt) {
-    ql_c_frontend_unit *unit = nullptr;
-    ql_c_lower_result *result = nullptr;
-    ql_c_function_view function{};
-    ql_c_lower_result_view_v1 view{};
-    ql_c_lower_diagnostic_view_v1 diagnostic{};
-    ql_error error{};
     const char *source = "int f(int a) { int v; int *p = &v; return *p; }";
-    const std::size_t size = std::strlen(source);
-
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_frontend_analyze(nullptr, source, size, &unit, &error));
-    function.struct_size = sizeof(function);
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_frontend_select_function(unit, "f", 1u, &function,
-                                            &error));
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_lower_selected_function(nullptr, source, size, unit,
-                                           &function, &result, &error))
-        << error.message;
-    view.struct_size = sizeof(view);
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_lower_result_get_view(result, &view, &error));
     /* Storage without an initialiser holds an indeterminate value, which C
        does not let you read. Refusing beats inventing one. */
-    EXPECT_EQ(QL_C_LOWER_UNKNOWN, view.support);
-    diagnostic.struct_size = sizeof(diagnostic);
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_lower_result_diagnostic_at(result, 0u, &diagnostic,
-                                              &error));
-    EXPECT_EQ(QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, diagnostic.code);
-    ql_c_lower_result_destroy(result);
-    ql_c_frontend_unit_destroy(unit);
+    ExpectUnknown(source, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ);
+}
+
+TEST(CLowerLocals, RefusesStorageInitializedOnOnlyOneBranch) {
+    const char *source =
+        "int f(int a) { int v; if (a) v = 1; return *&v; }";
+    ExpectUnknown(source, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ);
+}
+
+TEST(CLowerLocals, RefusesShadowedAddressTakenNamesWithoutAStatusFailure) {
+    const char *source =
+        "int f(int a) { int v; { long long v = a; a += (int)v; } "
+        "v = a; return *&v; }";
+    ExpectUnknown(source, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
 }
 
 }  // namespace

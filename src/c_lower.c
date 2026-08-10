@@ -2979,6 +2979,33 @@ static ql_status add_variable(lower_context *context, const char *name,
             if (strcmp(context->stack_slots[slot].name, variable->name) != 0) {
                 continue;
             }
+            for (index = context->variable_count; index != 0u; --index) {
+                const lower_variable *visible =
+                    &context->variables[index - 1u];
+                if (visible->name_size == name_size &&
+                    memcmp(visible->name, name, name_size) == 0) {
+                    context->allocator->deallocate(
+                        context->allocator->user_data, variable->name);
+                    memset(variable, 0, sizeof(*variable));
+                    return lower_unknown(
+                        context,
+                        QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+                        "shadowing an address-taken name needs a distinct "
+                        "stack object", error);
+                }
+            }
+            if (type_same(context->stack_slots[slot].type, type) == 0 ||
+                context->stack_slots[slot].type.array_length !=
+                    type.array_length) {
+                context->allocator->deallocate(
+                    context->allocator->user_data, variable->name);
+                memset(variable, 0, sizeof(*variable));
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
+                    node,
+                    "an address-taken name resolves to declarations with "
+                    "different storage types", error);
+            }
             /* The slot was created before the entry block; the variable only
                binds to it now. */
             variable->is_stack = 1u;
@@ -3055,11 +3082,11 @@ static void restore_state(lower_context *context, const lower_state *state) {
     context->memory_value = state->memory;
     context->trace_value = state->trace;
     for (index = 0u; index < state->count; ++index) {
+        context->variables[index].initialized = state->initialized[index];
         if (context->variables[index].is_stack != 0u) {
             continue;
         }
         context->variables[index].value = state->values[index];
-        context->variables[index].initialized = state->initialized[index];
     }
 }
 
@@ -5029,6 +5056,16 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
                 context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
                 "this local lives in a value, not in storage", error);
         }
+        if (variable->initialized == 0u) {
+            /* A plain assignment to the local reaches its stack address
+               through resolve_assignment_target instead of this path. Any
+               other address use can escape to a read before the lowering has
+               put a value in the slot, which this slice does not model. */
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, node,
+                "the address of an uninitialized local may escape before a "
+                "value is stored", error);
+        }
         *output = stack_address(context, variable);
         *declared = variable->type;
         return QL_STATUS_OK;
@@ -5742,6 +5779,10 @@ static ql_status lower_statement(lower_context *context, size_t node,
    target is an address, computed once so that `a[i()] += 1` calls `i` once. */
 typedef struct lower_target {
     lower_variable *variable; /* NULL when the target is an address */
+    /* The local backing an address target, when it is a stack slot. This is
+       separate from variable because the write still has to go through
+       memory, but it also establishes definite initialization. */
+    lower_variable *stack_variable;
     lower_value address;
     lower_type declared;
 } lower_target;
@@ -5778,6 +5819,7 @@ static ql_status resolve_assignment_target(lower_context *context,
             target->variable = variable;
             return QL_STATUS_OK;
         }
+        target->stack_variable = variable;
         target->address = stack_address(context, variable);
         return QL_STATUS_OK;
     }
@@ -5847,9 +5889,15 @@ static ql_status write_assignment_target(lower_context *context, size_t node,
         if (status != QL_STATUS_OK) {
             return status;
         }
-        return emit_store(context, target->address, address, error);
+        status = emit_store(context, target->address, address, error);
+    } else {
+        status = emit_store(context, target->address, converted, error);
     }
-    return emit_store(context, target->address, converted, error);
+    if (status == QL_STATUS_OK && context->unknown == 0u &&
+        target->stack_variable != NULL) {
+        target->stack_variable->initialized = 1u;
+    }
+    return status;
 }
 
 /* `x = v`, `x op= v`, `++x` and `x++` all read, combine, and write the same
@@ -5896,6 +5944,13 @@ static ql_status lower_read_modify_write(lower_context *context, size_t node,
         }
         old.defined = context->true_value;
     } else {
+        if (target.stack_variable != NULL &&
+            target.stack_variable->initialized == 0u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, left_node,
+                "a compound assignment reads its target before writing it",
+                error);
+        }
         status = load_at_address(context, left_node, target.address,
                                  target.declared, &old, error);
         if (status != QL_STATUS_OK || context->unknown != 0u) {
@@ -6288,18 +6343,6 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             }
             continue;
         }
-        if (variable->is_stack != 0u) {
-            if (value_node == SIZE_MAX) {
-                /* Storage without an initialiser holds an indeterminate
-                   value, which C does not let you read and this slice does
-                   not model. Refusing beats inventing a value for it. */
-                return lower_unknown(
-                    context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ,
-                    identifier,
-                    "a local whose address is taken needs an initialiser in "
-                    "this slice", error);
-            }
-        }
         if (value_node != SIZE_MAX) {
             lower_value value;
             lower_value converted;
@@ -6412,7 +6455,13 @@ static ql_status merge_branch_states(
         if (variable->is_stack != 0u) {
             /* Memory already carries it, and the memory PHI below merges
                that. A second PHI over a value it does not have would be
-               wrong. */
+               wrong. Definite initialization still has to hold on both live
+               paths before a later read or address escape is allowed. */
+            variable->initialized =
+                left->initialized[index] != 0u &&
+                        right->initialized[index] != 0u
+                    ? 1u
+                    : 0u;
             continue;
         }
         if (left->initialized[index] == 0u ||
