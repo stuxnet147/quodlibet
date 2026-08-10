@@ -29,6 +29,11 @@
 
 #include "blake3.h"
 
+/* Compiles to nothing unless QL_STAGE_TIMING is defined. Two hooks: the spawn
+   itself, and the loop that feeds the child and waits for it. W8 added them
+   and owns them. */
+#include "stage_timer.h"
+
 /* Extracted verbatim from the Bitwuzla adapter in src/solver.c. Every comment
    below that cites a measurement is describing a fix that was made there and
    is preserved here unchanged; the extraction is behaviour-preserving, and the
@@ -639,7 +644,11 @@ ql_status ql_process_run(const ql_allocator *allocator,
     options.flags = UV_PROCESS_WINDOWS_HIDE;
 #endif
     capture.process.data = &capture;
-    uv_status = uv_spawn(capture.loop, &capture.process, &options);
+    {
+        QL_STAGE_MARK(stage_spawn);
+        uv_status = uv_spawn(capture.loop, &capture.process, &options);
+        QL_STAGE_ADD(QL_STAGE_SOLVER_SPAWN, stage_spawn);
+    }
     if (uv_status != 0) {
         ql_error_set(error, QL_STATUS_NOT_FOUND,
                      "could not start solver executable '%s': %s",
@@ -712,7 +721,11 @@ ql_status ql_process_run(const ql_allocator *allocator,
         }
     }
 
-    (void)uv_run(capture.loop, UV_RUN_DEFAULT);
+    {
+        QL_STAGE_MARK(stage_run);
+        (void)uv_run(capture.loop, UV_RUN_DEFAULT);
+        QL_STAGE_ADD(QL_STAGE_SOLVER_RUN, stage_run);
+    }
     if (capture.callback_status != QL_STATUS_OK) {
         ql_error_set(error, capture.callback_status, "%s",
                      capture.callback_message);

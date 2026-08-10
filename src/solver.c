@@ -16,6 +16,11 @@
    exactly one copy of it. */
 #include "process_runner.h"
 
+/* Compiles to nothing unless QL_STAGE_TIMING is defined. The hooks split one
+   solver round trip into the integrity hashing this file does, the spawn the
+   kernel does, and the solving Bitwuzla does. W8 added them and owns them. */
+#include "stage_timer.h"
+
 #ifndef QL_BITWUZLA_EXECUTABLE
 #  define QL_BITWUZLA_EXECUTABLE ""
 #  define QL_BITWUZLA_AVAILABILITY QL_SOLVER_UNAVAILABLE
@@ -2317,8 +2322,12 @@ static ql_status QL_CALL bitwuzla_check(
         arguments[argument_count++] = memory_limit_text;
     }
 
-    status = verify_snapshot_digest(
-        state, "before the solver check", error);
+    {
+        QL_STAGE_MARK(stage_digest);
+        status = verify_snapshot_digest(
+            state, "before the solver check", error);
+        QL_STAGE_ADD(QL_STAGE_SOLVER_DIGEST, stage_digest);
+    }
     if (status != QL_STATUS_OK) {
         buffer_dispose(&query);
         return status;
@@ -2342,8 +2351,12 @@ static ql_status QL_CALL bitwuzla_check(
         process_error = *error;
     }
     buffer_dispose(&query);
-    integrity_status = verify_snapshot_digest(
-        state, "during the solver check", error);
+    {
+        QL_STAGE_MARK(stage_digest);
+        integrity_status = verify_snapshot_digest(
+            state, "during the solver check", error);
+        QL_STAGE_ADD(QL_STAGE_SOLVER_DIGEST, stage_digest);
+    }
     if (integrity_status != QL_STATUS_OK) {
         if (status == QL_STATUS_OK) {
             ql_process_result_dispose(&state->allocator, &output);

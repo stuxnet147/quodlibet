@@ -49,6 +49,14 @@ enum {
     QL_STAGE_SMT2,
     QL_STAGE_SOLVER_SETUP,
     QL_STAGE_SOLVER_CHECK,
+    /* Inside QL_STAGE_SOLVER_CHECK, so the reader subtracts these out of it
+       the same way it subtracts the parses out of the frontend and lowering.
+       The three answer different questions about the same round trip: how
+       much of it is our own integrity hashing, how much is the kernel putting
+       a process on a core, and how much is Bitwuzla actually solving. */
+    QL_STAGE_SOLVER_DIGEST,
+    QL_STAGE_SOLVER_SPAWN,
+    QL_STAGE_SOLVER_RUN,
     QL_STAGE_REPLAY,
     QL_STAGE_OUTCOME,
     QL_STAGE_TOTAL,

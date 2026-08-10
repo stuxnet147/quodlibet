@@ -47,6 +47,9 @@ SLOTS = [
     "smt2",
     "solver_setup",
     "solver_check",
+    "solver_digest",
+    "solver_spawn",
+    "solver_run",
     "replay",
     "outcome",
     "total",
@@ -62,7 +65,12 @@ REPORT = [
     ("miter encoding", lambda r: r["product"] - r["smt2"]),
     ("SMT-LIB serialise", lambda r: r["smt2"]),
     ("solver setup/teardown", lambda r: r["solver_setup"]),
-    ("solver round trips", lambda r: r["solver_check"]),
+    ("solver: integrity hash", lambda r: r["solver_digest"]),
+    ("solver: process spawn", lambda r: r["solver_spawn"]),
+    ("solver: bitwuzla run", lambda r: r["solver_run"]),
+    ("solver: rest of trip",
+     lambda r: r["solver_check"] - r["solver_digest"]
+     - r["solver_spawn"] - r["solver_run"]),
     ("counterexample replay", lambda r: r["replay"]),
     ("outcome JSON", lambda r: r["outcome"]),
 ]
@@ -278,6 +286,10 @@ def main() -> int:
     parser.add_argument("--workers", default="1",
                         help="comma separated worker counts")
     parser.add_argument("--timing-file", default="/tmp/ql-stages.tsv")
+    parser.add_argument("--max-ms", type=float, default=0.0,
+                        help="drop pairs whose serial judgement took longer "
+                             "than this, to measure throughput scaling "
+                             "separately from the tail")
     args = parser.parse_args()
 
     os.environ["QL_STAGE_TIMING_FILE"] = args.timing_file
@@ -309,10 +321,21 @@ def main() -> int:
     # UNKNOWN without ever reaching the SMT method, so leaving them in would
     # divide the stage totals by a denominator that includes judgements the
     # stages never ran for. This pass also serves as the warm-up.
-    _, _, verdicts, _ = run(quodlibet, pairs, 1, args.timing_file)
+    _, _, verdicts, first_durations = run(
+        quodlibet, pairs, 1, args.timing_file)
     kept = [p for p, v in zip(pairs, verdicts) if v == "proved-equivalent"]
     print(f"judged    {len(kept)} of {len(pairs)} reach a verdict of "
           f"proved-equivalent; the rest are UNKNOWN (unsupported C)")
+    if args.max_ms:
+        # A batch cannot finish before its slowest member, so on a sample with
+        # a heavy tail the batch wall measures the tail and not the scaling.
+        # Dropping the outliers is how the two questions get separated; both
+        # numbers are reported in docs/perf so neither stands alone.
+        before = len(kept)
+        kept = [p for p, v, d in zip(pairs, verdicts, first_durations)
+                if v == "proved-equivalent" and 1000.0 * d <= args.max_ms]
+        print(f"tail cut  {before - len(kept)} of {before} judged pairs took "
+              f"longer than {args.max_ms:.0f} ms serially and are excluded")
     if not kept:
         print("error: no judged pairs", file=sys.stderr)
         return 1
