@@ -6854,6 +6854,43 @@ static int inferred_array_length(lower_context *context, size_t initializer,
   return 1;
 }
 
+/* True only for a non-empty list made entirely of `.member = value` pairs.
+   Mixing positional and designated entries changes the next positional
+   member in C, so that larger state machine remains outside this slice. */
+static int is_field_designated_initializer(const lower_context *context,
+                                           size_t node) {
+  size_t end;
+  size_t child;
+  int saw_pair = 0;
+
+  if (node == SIZE_MAX ||
+      strcmp(context->nodes[node].view.kind, "initializer_list") != 0) {
+    return 0;
+  }
+  end = subtree_end(context, node);
+  for (child = node + 1u; child < end; ++child) {
+    size_t designator;
+    size_t value;
+    if (context->nodes[child].parent != node ||
+        (context->nodes[child].view.flags & QL_C_SYNTAX_NODE_NAMED) == 0u ||
+        strcmp(context->nodes[child].view.kind, "comment") == 0) {
+      continue;
+    }
+    if (strcmp(context->nodes[child].view.kind, "initializer_pair") != 0) {
+      return 0;
+    }
+    designator = direct_field_child(context, child, "designator");
+    value = direct_field_child(context, child, "value");
+    if (designator == SIZE_MAX || value == SIZE_MAX ||
+        strcmp(context->nodes[designator].view.kind, "field_designator") !=
+            0) {
+      return 0;
+    }
+    saw_pair = 1;
+  }
+  return saw_pair;
+}
+
 /* Produces an address at a byte offset inside local aggregate storage. Arrays
    use a pointer to their element, because C array values never exist as IR
    values; records and scalars use a pointer to the declared type. */
@@ -6983,6 +7020,7 @@ static ql_status initialize_object(lower_context *context, size_t node,
                                    uint32_t brace_elided, ql_error *error) {
   const int is_list =
       strcmp(context->nodes[node].view.kind, "initializer_list") == 0;
+  int is_field_designated = 0;
   ql_status status;
 
   if (type.array_length == 0u && type.kind != QL_C_SCALAR_RECORD) {
@@ -7070,11 +7108,16 @@ static ql_status initialize_object(lower_context *context, size_t node,
   if (is_list) {
     uint64_t count;
     if (!positional_initializer_count(context, node, &count)) {
-      return lower_unknown(
-          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
-          "designated or oversized aggregate initialization needs a "
-          "member or index map",
-          error);
+      if (type.array_length == 0u && type.kind == QL_C_SCALAR_RECORD &&
+          is_field_designated_initializer(context, node)) {
+        is_field_designated = 1;
+      } else {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "designated or oversized aggregate initialization needs a "
+            "member or index map",
+            error);
+      }
     }
   }
   status = zero_initialize_object(context, node, address, type, error);
@@ -7118,6 +7161,7 @@ static ql_status initialize_object(lower_context *context, size_t node,
     size_t child;
     size_t ordinal = 0u;
     for (child = node + 1u; child < end; ++child) {
+      size_t initializer = child;
       lower_type child_type;
       uint64_t offset;
       lower_value child_address;
@@ -7127,13 +7171,45 @@ static ql_status initialize_object(lower_context *context, size_t node,
         continue;
       }
       if (strcmp(context->nodes[child].view.kind, "initializer_pair") == 0) {
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, child,
-            "designated aggregate initialization needs a member or "
-            "index map",
-            error);
-      }
-      if (type.array_length != 0u) {
+        size_t designator;
+        size_t field;
+        lower_record *record;
+        lower_member *member;
+        char *name;
+        if (!is_field_designated) {
+          return lower_unknown(
+              context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, child,
+              "designated aggregate initialization needs a member or "
+              "index map",
+              error);
+        }
+        designator = direct_field_child(context, child, "designator");
+        initializer = direct_field_child(context, child, "value");
+        field = designator == SIZE_MAX ? SIZE_MAX
+                                       : first_named_child(context, designator);
+        if (field == SIZE_MAX || initializer == SIZE_MAX ||
+            strcmp(context->nodes[field].view.kind, "field_identifier") !=
+                0) {
+          return lower_unknown(
+              context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, child,
+              "record designator does not name one direct member", error);
+        }
+        name = copy_node_text(context, field);
+        if (name == NULL) {
+          ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+          return QL_STATUS_OUT_OF_MEMORY;
+        }
+        record = &context->records[type.record];
+        member = find_member(record, name);
+        context->allocator->deallocate(context->allocator->user_data, name);
+        if (member == NULL) {
+          return lower_unknown(
+              context, QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION, field,
+              "record initializer designates no declared member", error);
+        }
+        child_type = member->type;
+        offset = member->offset;
+      } else if (type.array_length != 0u) {
         if ((uint64_t)ordinal >= type.array_length) {
           return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, child,
                                "too many positional array initializers", error);
@@ -7156,8 +7232,8 @@ static ql_status initialize_object(lower_context *context, size_t node,
       status = aggregate_child_address(context, address, offset, child_type,
                                        &child_address, error);
       if (status == QL_STATUS_OK) {
-        status = initialize_object(context, child, child_address, child_type,
-                                   1u, error);
+        status = initialize_object(context, initializer, child_address,
+                                   child_type, 1u, error);
       }
       if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;

@@ -118,6 +118,16 @@ QL_AGG_FUNCTION(initialized_string, int agg_init_string(int i) {
     char text[] = "Az!";
     return (int)sizeof(text) * 100 + text[((unsigned)i) & 3u];
 });
+QL_AGG_FUNCTION(designated_record,
+    struct AGG_DESIGNATED { int head; short skipped; int values[3]; };
+    int agg_designated(int a, int b) {
+        struct AGG_DESIGNATED value = {
+            .head = a,
+            .values = {3, b, 5},
+        };
+        return value.head + value.skipped + value.values[0] +
+               value.values[1] + value.values[2];
+    });
 static const char string_alias_source[] =
     "const char STR_0[] = \"Az!\";\n"
     "int agg_string_alias(int i) {\n"
@@ -383,6 +393,9 @@ TEST(CLowerAggregates, MatchesCompiledExecutionOnArraysAndRecords) {
         {"static-const-array", static_const_array_source,
          "agg_static_const", 1, sizeof(int[4]),
          [](int32_t a, int32_t) { return agg_static_const(a); }},
+        {"designated-record", designated_record_source,
+         "agg_designated", 2, sizeof(struct AGG_DESIGNATED),
+         [](int32_t a, int32_t b) { return agg_designated(a, b); }},
     };
 
     uint64_t state = UINT64_C(0x71b3e0c95d24af86);

@@ -1505,6 +1505,23 @@ unsized alias 109개의 초기 장벽을 모두 제거했습니다. 71개는 바
 
 `tests/test_c_lower_aggregates.cpp`는 일반 C string initializer를 같은 원문의 compiled 함수와 대조하고 `sizeof`로 inferred bound도 확인합니다. 코퍼스 전용 alias는 일반 C가 아니므로 동일 byte literal을 쓰는 compiled 함수와 결과를 비교하되 같은 원문의 compiled differential이라고 주장하지 않습니다. 영향 범위의 `CLower*` 시험 84/84와 전체 train 비교가 통과했습니다. 변경은 내부 C aggregate 초기화에 한정되므로 전체 CTest는 반복하지 않았습니다.
 
+### 42. record field designated initializer를 member map으로 내린다
+
+record의 `.member = value` 목록은 선언 순서가 아니라 지정한 member의 실제 offset과 type을 사용합니다. 먼저 record 전체를 0으로 초기화한 뒤 기존 positional initializer와 같은 결정적 syntax 순서로 각 initializer를 평가하고 저장합니다. 생략한 member는 0을 유지하고, 지정한 member가 array 또는 record이면 기존 중첩 initializer 경로를 그대로 사용합니다. union도 선택한 member의 공용 offset에 저장합니다.
+
+이번 단위는 목록 전체가 direct field designator인 경우만 수용합니다. positional entry와 designator를 섞으면 C의 다음 positional member 상태를 별도로 추적해야 하므로 계속 UNKNOWN입니다. `[index]` array designator와 존재하지 않는 member도 수용하지 않습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 22,946 (76.79%) | **23,031 (77.08%)** |
+| 증가 | | **+85** |
+| 기존 성공 회귀 | | **0** |
+| 첫 field-designator 차단 | 121 | **0** |
+| verifier 통과 | 22,946 / 22,946 | **23,031 / 23,031** |
+| status 실패 | 0 | **0** |
+
+121개의 첫 차단 가운데 85개가 성공했고 36개는 뒤의 기존 제한으로 이동했습니다. `tests/test_c_lower_aggregates.cpp`는 생략한 scalar member의 zero-fill, 중첩 array member, target layout offset을 같은 원문의 compiled 함수와 64개 입력에서 대조합니다. 영향 범위의 `CLower*` 시험 84/84와 전체 train 비교가 통과했습니다. 변경은 내부 aggregate 초기화에 한정되므로 전체 CTest는 반복하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1513,11 +1530,11 @@ unsized alias 109개의 초기 장벽을 모두 제거했습니다. 71개는 바
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 2,726
-- `uninitialized_read` 2,214
-- `unsupported_pointer` 574
-- `unsupported_control_flow` 525
-- `unsupported_call` 371
+- `unsupported_type` 2,743
+- `uninitialized_read` 2,225
+- `unsupported_pointer` 576
+- `unsupported_control_flow` 528
+- `unsupported_call` 373
 
 ## 조율자에게 요청할 것
 
