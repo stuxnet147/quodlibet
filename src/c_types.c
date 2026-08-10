@@ -110,20 +110,33 @@ int ql_c_scalar_from_spelling(const char *spelling,
     return 0;
 }
 
-/* Every AnghaBench source carries `typedef long scalar_t__;` in its preamble,
-   commented "Either arithmetic or pointer type", and the sample this table
-   was written against found that spelling in 3,998 of 4,000 files and no
-   other spelling of it anywhere. Under the profile's LP64 target that is a
-   signed 64-bit integer, wide enough to hold the pointers the comment admits.
-   The table exists because record extraction drops the preamble, not because
-   the meaning is uncertain. */
+/* The AnghaBench preamble, transcribed. Every source in the corpus opens with
+   the same fixed block, and record extraction drops it, which is why the names
+   below reach the lowering undeclared:
+
+       typedef unsigned long size_t;  // Customize by platform.
+       typedef long intptr_t; typedef unsigned long uintptr_t;
+       typedef long scalar_t__;  // Either arithmetic or pointer type.
+
+   These are transcriptions, not guesses. In a 2,000 file sample every file
+   that mentions `size_t` also declares it, all 1,981 of them with that one
+   spelling and no other anywhere; `intptr_t` and `uintptr_t` come from the
+   same single line in the same 1,981; `scalar_t__` was measured earlier at
+   3,998 of 4,000. Widths are the profile's LP64 target, so `long` is 64 bits,
+   and `scalar_t__` is wide enough to hold the pointers its comment admits.
+
+   A unit's own declaration still wins: the caller consults this table only
+   after failing to find the name among the typedefs the unit declares. */
 static const struct {
     const char *spelling;
     uint32_t width;
     uint32_t rank;
     uint32_t is_signed;
 } k_corpus_typedefs[] = {
-    {"scalar_t__", 64u, 4u, 1u}
+    {"scalar_t__", 64u, 4u, 1u},
+    {"size_t", 64u, 4u, 0u},
+    {"intptr_t", 64u, 4u, 1u},
+    {"uintptr_t", 64u, 4u, 0u}
 };
 
 int ql_c_scalar_from_corpus_typedef(const char *spelling,

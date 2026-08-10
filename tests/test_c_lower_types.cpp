@@ -276,11 +276,12 @@ TEST(CLowerTypes, RefusesATypeNameTheUnitNeverDeclared) {
                   "unknown_name", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
 }
 
-/* `scalar_t__` is the one name that is resolved without the unit declaring
-   it, and that is not an exception to the rule above. Every AnghaBench source
-   spells `typedef long scalar_t__;` in its preamble; record extraction keeps
-   only the type and callee context and drops that line, so the definition is
-   known even though the extracted unit no longer carries it. */
+/* The preamble names are the ones resolved without the unit declaring them,
+   and that is not an exception to the rule above. Every AnghaBench source
+   opens with the same fixed block, `typedef long scalar_t__;` among it;
+   record extraction keeps only the type and callee context and drops that
+   block, so the definitions are known even though the extracted unit no
+   longer carries them. */
 TEST(CLowerTypes, ResolvesTheTypedefTheCorpusPreambleDeclares) {
     Lowered lowered;
     ASSERT_EQ(QL_STATUS_OK,
@@ -293,6 +294,52 @@ TEST(CLowerTypes, ResolvesTheTypedefTheCorpusPreambleDeclares) {
     EXPECT_EQ(INT64_C(2147483648),
               ReturnedSigned(RunModule(lowered.ir(),
                                        {UINT64_C(2147483647)}), 64u));
+}
+
+TEST(CLowerTypes, ResolvesTheRestOfTheCorpusPreamble) {
+    /* The same preamble also spells `typedef unsigned long size_t;` and
+       `typedef long intptr_t; typedef unsigned long uintptr_t;`. Width and
+       signedness are both observable here: an unsigned 64-bit `size_t`
+       shifted left by 32 keeps its bits, and a signed 64-bit `intptr_t`
+       carries its sign where a 32-bit one would have dropped it. */
+    struct Case {
+        const char *source;
+        const char *name;
+        std::vector<uint64_t> arguments;
+        int64_t expected;
+    };
+    const Case cases[] = {
+        {"size_t high(size_t a) { return a << 32; }", "high",
+         {UINT64_C(3)}, INT64_C(12884901888)},
+        {"intptr_t negate(intptr_t a) { return -a; }", "negate",
+         {UINT64_C(4294967296)}, INT64_C(-4294967296)},
+        {"uintptr_t shift(uintptr_t a) { return a >> 32; }", "shift",
+         {UINT64_C(12884901888)}, INT64_C(3)},
+    };
+    for (const Case &item : cases) {
+        Lowered lowered;
+        SCOPED_TRACE(item.source);
+        ASSERT_EQ(QL_STATUS_OK, lowered.Lower(item.source, item.name));
+        ASSERT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
+        EXPECT_EQ(item.expected,
+                  ReturnedSigned(RunModule(lowered.ir(), item.arguments),
+                                 64u));
+    }
+}
+
+TEST(CLowerTypes, LetsTheUnitOverrideAPreambleTypedef) {
+    /* The fallback is for the preamble extraction removed, not an override:
+       a unit that declares `size_t` itself means what it says. */
+    Lowered lowered;
+    ASSERT_EQ(QL_STATUS_OK,
+              lowered.Lower("typedef unsigned short size_t;\n"
+                            "int narrow_size(size_t a) { return a + 1; }",
+                            "narrow_size"));
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
+    /* An unsigned short promotes to int, so this is 65536 rather than the
+       zero a 16-bit wrap would give. */
+    EXPECT_EQ(65536, ReturnedSigned(RunModule(lowered.ir(),
+                                              {UINT64_C(65535)}), 32u));
 }
 
 TEST(CLowerTypes, LetsTheUnitOverrideTheCorpusTypedef) {

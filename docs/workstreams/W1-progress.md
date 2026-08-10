@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-다음 지시 대기. 호출을 닫았고 **판정 대상이 17에서 75로** 늘었습니다. 측정된 다음 순위는 전역(347), 값으로 오가는 aggregate 와 배열(284)입니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링 **7,233 (24.21%)**, val 288, val 판정률 279/288. 다음 관문은 측정으로 확정된 **메모리에서 읽은 포인터의 provenance** (train 4,932건) 이고, 그 다음이 loop-free slice 밖의 식(2,928)과 복합 대입(1,021)입니다. loop 2,783 을 닫으면 W6 CHC/PDR 선행이 풀립니다.
 
 ## 기준선
 
@@ -1003,6 +1003,70 @@ cast 에 대한 differential 은 `void *` 를 거쳐 되돌아오는 경우와 `
 #### 보고
 
 직렬 `ctest` 에서 `quodlibet.python_bindings` 가 두 번 실패하고 세 번째와 단독 실행에서 통과했습니다. 부하 아래의 flaky 로 보입니다. W1 파일이 아니라 손대지 않았습니다.
+
+### 18. preamble 의 나머지, 그리고 포인터를 반환하는 콜리
+
+커밋: (이 단위)
+
+#### 표는 한 이름이 아니라 preamble 전체였다
+
+지난 단위가 `scalar_t__` 를 코퍼스의 사실로 옮겨 적었습니다. 이번에 미해석 타입 철자 3,998 건을 실제로 세어 보니 `size_t` 3,295, `uintptr_t` 43, `intptr_t` 7 이었습니다. 원문을 보면 이유가 분명합니다. AnghaBench 의 서두는 고정 블록입니다.
+
+```
+#define NULL ((void*)0)
+typedef unsigned long size_t;  // Customize by platform.
+typedef long intptr_t; typedef unsigned long uintptr_t;
+typedef long scalar_t__;  // Either arithmetic or pointer type.
+typedef int bool;
+```
+
+record 추출이 이 블록 **전체**를 버리는데 표에는 한 줄만 옮겨져 있었습니다. 2,000 파일 표본에서 `size_t` 를 언급하는 1,981 파일 전부가 저 한 철자로 선언하고 다른 철자는 없으며, `intptr_t` 와 `uintptr_t` 는 같은 1,981 파일의 같은 줄에서 옵니다. 전사이지 추측이 아닙니다.
+
+표를 하나만 두었으므로 `src/signature.c` 도 자동으로 같이 알게 됩니다. 사실을 두 벌 두지 않는다는 지난 단위의 결정이 여기서 이득으로 돌아왔습니다.
+
+#### 선언이 있는데 없다고 말하고 있었다
+
+`unsupported_call` 4,820 중 **4,815** 가 "the callee has no declaration in this unit" 였는데, 추출된 unit 은 콜리를 전부 선언합니다. 원인은 수집기였습니다.
+
+`T *f(...)` 의 파스는 `declaration -> pointer_declarator -> function_declarator` 입니다. `collect_callees` 가 declaration 바로 아래의 `function_declarator` 만 받고 있어서 **포인터를 반환하는 콜리는 하나도 수집되지 않았습니다.** 코퍼스에서 그것이 콜리의 대부분이었습니다.
+
+별을 declarator 사슬에서 세어 `return_pointer_depth` 로 싣고, function_declarator 를 declarator_node 로 둡니다. `resolve_callee` 가 별을 세려고 부르던 `member_declarator_name` 은 function_declarator 를 만나면 언제나 거부하므로 항상 0 을 주고 있었습니다. 그 호출을 지웠습니다. 죽은 코드가 아니라 **틀린 답을 주고 있던 코드**였습니다.
+
+#### `f(void)` 는 파라미터가 없다는 뜻이다
+
+포인터 반환 콜리 시험을 쓰다 드러났습니다. `char *CALLEE_high(void);` 가 `type_error: void is not an object type here` 로 막혔습니다. `resolve_callee` 가 `void` 를 먼저 타입으로 풀려 하고, 파라미터 위치의 `void` 는 객체 타입이 아니므로 오류가 났습니다. 그 뒤에 있던 `parameter.kind == VOID` 분기는 도달할 수 없는 코드였습니다.
+
+타입을 풀기 전에 철자로 알아봅니다. 별이 없는 `void` 파라미터는 파라미터가 아닙니다.
+
+#### 정확성을 같은 표본에서 같이 보였다
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 6,129 (20.51%) | **7,233 (24.21%)** |
+| val 로어링 (1,050) | 251 | **288** |
+| val 판정률 | 244/251 (97.2%) | **279/288 (96.9%)** |
+| status 실패 | 0 | **0** |
+| `ctest` (직렬) | 503 | **507** |
+| train 처리량 | 11.9초 | 12.9초 |
+
+새 differential 은 **컴파일된 실행만이 말할 수 있는 것**을 고르려고 이렇게 잡았습니다.
+
+- 콜리가 하위 32비트가 0 인 주소를 돌려주고 본문이 null 과 비교합니다. 반환 폭이 32비트였다면 주소가 null 로 잘려 반대 답이 나옵니다
+- `size_t` 를 32비트 왼쪽 shift, `intptr_t` 부호 반전, `uintptr_t` 를 32비트 오른쪽 shift 합니다. 폭과 부호가 셋 다 답에 드러납니다
+
+건전성 쪽도 같이 고정했습니다. 콜리가 돌려준 포인터에는 guard 가 이름 붙일 object 가 없으므로 역참조는 계속 거부합니다(`WillNotDereferenceAPointerACalleeReturned`). 선언을 찾게 되었다고 provenance 규칙이 느슨해지지 않았습니다.
+
+#### 조율자에게: `bool` 은 이 코퍼스에서 `int` 입니다
+
+같은 preamble 이 `typedef int bool;` 를 담고 있는데, 지금 세 곳(`src/c_types.c` 의 철자표, `src/c_frontend.c`, `src/signature.c`)이 `bool` 을 `_Bool` 로 봅니다. train 29,880 본문 중 **1,801 개가 bare `bool` 을 쓰고 스스로 선언하는 unit 은 0 개**입니다.
+
+C17 에서 `bool` 은 키워드가 아니라 `<stdbool.h>` 의 매크로이므로, 프로파일의 철자 어휘에 그것이 있는 것 자체가 정확하지 않습니다. 폭이 1비트냐 32비트냐는 `bool` 멤버 뒤에 오는 멤버의 offset 을 바꾸므로 메모리 의미에 닿습니다.
+
+좌우가 같이 움직이므로 지금 **틀린 판정을 내고 있지는 않습니다.** 커버리지 차단도 아닙니다. 그래서 이번 단위에 섞지 않았습니다. 다만 `signature.c` 를 다시 여는 변경이므로 조율자 판단이 필요합니다.
+
+#### 다음 관문은 포인터 provenance 입니다
+
+포인터가 2,548 에서 5,058 로 늘었는데 되돌아간 것이 아니라 옮겨간 것입니다. 그중 **4,308 + 624 = 4,932 가 "메모리에서 읽은 포인터에 object 가 없다"** 한 가지입니다. 단위 7에서 정직하게 거부하기로 한 그 규칙이고, 이제 train 최대 단일 차단입니다.
 
 ## 막힌 것
 

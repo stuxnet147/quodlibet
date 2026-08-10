@@ -30,6 +30,12 @@
 extern "C" {
 int CALLEE_double(int a) { return a * 2; }
 int CALLEE_sum(int a, int b) { return a + b; }
+/* An address whose low 32 bits are zero. Nothing dereferences it; it exists
+   so that a caller which kept only 32 bits of the result would see null where
+   the compiled reference sees an address. */
+char *CALLEE_high(void) {
+    return reinterpret_cast<char *>(static_cast<uintptr_t>(UINT64_C(1) << 32));
+}
 }
 
 QL_CALL_FUNCTION(single, int CALLEE_double(int);
@@ -59,6 +65,10 @@ QL_CALL_FUNCTION(discarded, int CALLEE_double(int);
     });
 QL_CALL_FUNCTION(widening, int CALLEE_double(int);
     int call_widen(short a) { return CALLEE_double(a); });
+/* The stars between the return type and the callee's name belong to the
+   return type. Reading them is what lets this declaration be found at all. */
+QL_CALL_FUNCTION(pointerresult, char *CALLEE_high(void);
+    int call_ptr_result(void) { return CALLEE_high() == 0; });
 
 namespace {
 
@@ -88,6 +98,23 @@ int QL_CALL Invoke(void *user_data, const char *symbol,
 
     for (std::size_t index = 0u; index < argument_count; ++index) {
         seen.push_back(Read(arguments[index]));
+    }
+    if (std::strcmp(symbol, "CALLEE_high") == 0 && argument_count == 0u) {
+        /* The same address the reference returns, in the width the callee's
+           declaration gives its result. */
+        const uint64_t address = UINT64_C(1) << 32;
+        if (result_size != 8u) {
+            ADD_FAILURE() << "a pointer result should be 8 bytes, not "
+                          << result_size;
+            return 0;
+        }
+        log->symbols.push_back(symbol);
+        log->arguments.push_back(seen);
+        for (std::size_t index = 0u; index < 8u; ++index) {
+            static_cast<uint8_t *>(result)[index] =
+                static_cast<uint8_t>((address >> (index * 8u)) & 0xffu);
+        }
+        return 1;
     }
     if (std::strcmp(symbol, "CALLEE_double") == 0 && argument_count == 1u) {
         value = CALLEE_double(seen[0]);
@@ -323,6 +350,54 @@ TEST(CLowerCalls, MatchesCompiledExecutionIncludingTheCallSequence) {
             EXPECT_EQ(item.expected_symbols.size(), run.result.events);
         }
     }
+}
+
+TEST(CLowerCalls, MatchesCompiledExecutionForACalleeThatReturnsAPointer) {
+    /* The declaration is `char *CALLEE_high(void);`, so the callee is named
+       inside the pointer declarator rather than under the declaration itself.
+       Reading the stars off that chain is what makes the callee findable and
+       what gives its result the pointer's width: a 32-bit result would have
+       truncated this address to null and answered 1. */
+    Lowered lowered;
+    CallLog log;
+    ASSERT_TRUE(lowered.Open(pointerresult_source, "call_ptr_result"));
+    const Outcome run = Execute(lowered.ir(), {}, &log);
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+        << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+    EXPECT_EQ(call_ptr_result(), Returned(run.result));
+    EXPECT_EQ(std::vector<std::string>{"CALLEE_high"}, log.symbols);
+    EXPECT_EQ(1u, run.result.events);
+}
+
+TEST(CLowerCalls, WillNotDereferenceAPointerACalleeReturned) {
+    /* A returned pointer has no object the guard could name, so following it
+       is refused rather than guarded against a storage nobody declared. */
+    const char source[] =
+        "char *CALLEE_high(void);\n"
+        "int follow(void) { return *CALLEE_high(); }";
+    ql_c_frontend_unit *unit = nullptr;
+    ql_c_lower_result *result = nullptr;
+    ql_c_function_view function{};
+    ql_c_lower_result_view_v1 view{};
+    ql_error error{};
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_analyze(nullptr, source, std::strlen(source),
+                                    &unit, &error));
+    function.struct_size = sizeof(function);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_select_function(unit, "follow", 6u, &function,
+                                            &error));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_lower_selected_function(nullptr, source,
+                                           std::strlen(source), unit,
+                                           &function, &result, &error));
+    view.struct_size = sizeof(view);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_lower_result_get_view(result, &view, &error));
+    EXPECT_EQ(QL_C_LOWER_UNKNOWN, view.support);
+    ql_c_lower_result_destroy(result);
+    ql_c_frontend_unit_destroy(unit);
 }
 
 TEST(CLowerCalls, TakesOnlyTheCallsTheBranchActuallyRan) {

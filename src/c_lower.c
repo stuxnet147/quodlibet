@@ -157,6 +157,7 @@ typedef struct lower_callee {
     char *name;
     size_t declaration_node;
     size_t declarator_node;
+    uint32_t return_pointer_depth;
     uint32_t is_variadic;
     uint32_t resolved;
     lower_type return_type;
@@ -1570,13 +1571,30 @@ static ql_status collect_callees(lower_context *context, ql_error *error) {
             size_t declarator = child;
             size_t name_node;
             lower_callee *entry;
+            uint32_t return_pointer_depth = 0u;
+            size_t hops = 0u;
             ql_status status;
 
             if (context->nodes[child].parent != index ||
                 context->nodes[child].view.field_name == NULL ||
                 strcmp(context->nodes[child].view.field_name,
-                       "declarator") != 0 ||
-                strcmp(context->nodes[child].view.kind,
+                       "declarator") != 0) {
+                continue;
+            }
+            /* `T *f(...)` nests the function declarator inside the pointer
+               declarators, and those stars belong to the return type. Walking
+               them off here is what lets a callee that returns a pointer be
+               declared at all: stopping at the outermost node would leave it
+               looking undeclared at every call site. */
+            while (declarator != SIZE_MAX && hops++ < 8u &&
+                   strcmp(context->nodes[declarator].view.kind,
+                          "pointer_declarator") == 0) {
+                ++return_pointer_depth;
+                declarator = direct_field_child(context, declarator,
+                                                "declarator");
+            }
+            if (declarator == SIZE_MAX ||
+                strcmp(context->nodes[declarator].view.kind,
                        "function_declarator") != 0) {
                 continue;
             }
@@ -1603,6 +1621,7 @@ static ql_status collect_callees(lower_context *context, ql_error *error) {
             }
             entry->declaration_node = index;
             entry->declarator_node = declarator;
+            entry->return_pointer_depth = return_pointer_depth;
             ++context->callee_count;
         }
     }
@@ -4925,10 +4944,6 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
     size_t type_node;
     size_t end;
     size_t child;
-    uint32_t pointer_depth = 0u;
-    uint64_t return_array_length = 0u;
-    int rejected = 0;
-    size_t named;
     ql_status status;
 
     if (callee->resolved != 0u) {
@@ -4941,12 +4956,10 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
                              error);
     }
     /* Stars between the return type and the function name belong to the
-       return type, not to the function. */
-    named = member_declarator_name(context, callee->declarator_node,
-                                   &pointer_depth, &return_array_length,
-                                   &rejected);
-    (void)named;
-    status = resolve_type_node(context, type_node, pointer_depth,
+       return type, not to the function; `collect_callees` counted them off
+       the declarator chain on the way in. */
+    status = resolve_type_node(context, type_node,
+                               callee->return_pointer_depth,
                                &callee->return_type, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
@@ -5016,13 +5029,31 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
                 }
             }
         }
+        if (depth == 0u) {
+            /* `f(void)` declares no parameters at all, so this has to be
+               recognised before the type is resolved: at parameter position
+               `void` is not an object type, and asking for one reports a type
+               error on a prototype that is perfectly ordinary C. */
+            char *spelling = copy_node_text(context, parameter_type);
+            int is_void;
+            if (spelling == NULL) {
+                ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                return QL_STATUS_OUT_OF_MEMORY;
+            }
+            is_void = strcmp(spelling, "void") == 0;
+            context->allocator->deallocate(context->allocator->user_data,
+                                           spelling);
+            if (is_void) {
+                continue;
+            }
+        }
         status = resolve_type_node(context, parameter_type, depth, &parameter,
                                    error);
         if (status != QL_STATUS_OK || context->unknown != 0u) {
             return status;
         }
         if (parameter.kind == QL_C_SCALAR_VOID) {
-            /* `f(void)` declares no parameters at all. */
+            /* Defensive: the spelling check above already took this path. */
             continue;
         }
         if (parameter.kind == QL_C_SCALAR_RECORD) {
