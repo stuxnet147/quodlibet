@@ -267,6 +267,12 @@ TEST(CLowerTypes, NamesTheRealObstacleBehindATypedef) {
                   "typedef struct TYP_0 TYP_1;\n"
                   "int aggregate(TYP_1 a) { return 0; }",
                   "aggregate", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
+    /* Typedef and surface stars add together. Treating this as only two
+       levels used to make one corpus function look supported under the
+       wrong signature. */
+    ExpectUnknown("typedef int **TYP_0;\n"
+                  "int too_deep(TYP_0 *p) { return 0; }",
+                  "too_deep", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
 }
 
 TEST(CLowerTypes, RefusesATypeNameTheUnitNeverDeclared) {

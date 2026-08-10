@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **20,279 / 29,880 (67.87%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 4,499, `uninitialized_read` 2,448, `type_error` 702입니다. 구조화 루프 버킷은 0이 되었습니다. 다음 단위는 타입과 definite initialization의 메시지별 큰 원인을 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **22,117 / 29,880 (74.02%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 3,607, `uninitialized_read` 2,118, `unsupported_pointer` 648입니다. 구조화 루프 버킷은 0이고 잘못된 pointer-depth 전파 뒤의 `type_error`는 14개만 남았습니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1397,6 +1397,28 @@ mutable static은 호출 사이의 persistent state가 필요하고, `static con
 
 157개가 첫 storage-duration 차단을 벗어났고, 그중 94개는 뒤의 initializer, pointer, control-flow 한계로 이동해 최종 성공 순증은 63개입니다. `tests/test_c_lower_aggregates.cpp`는 `static const int[4]`를 실제 컴파일 C와 64개 입력으로 대조합니다. 별도 회귀 시험은 mutable static, static pointer, local extern이 UNKNOWN인지 고정합니다. 전체 검증은 Windows 532/532, Linux Clang 531/531, Linux ASan/UBSan 531/531입니다. `fuzz_c_lower`는 60초 동안 284,124회, crash 0으로 끝났습니다.
 
+### 36. 시그니처와 typedef의 포인터 깊이를 모두 보존한다
+
+커밋: (이 단위)
+
+시그니처 inventory와 선언 type node는 포인터 깊이 2를 허용한다고 검사하면서 실제 타입에는 별표를 하나만 더하고 있었습니다. 직접 쓴 `T **`, `T *a[]`가 함수 매개변수에서 조정된 `T **`, `typedef T **P`가 각각 `T` 또는 `T *`로 잘못 내려갔습니다. 그 결과 정상적인 이중 역참조와 연속 subscript가 scalar에 적용된 것으로 오인됐고, record pointer도 record value로 잘못 분류됐습니다.
+
+`add_pointer_depth`가 base type에 선언자와 typedef가 기여한 별표를 하나씩 모두 적용합니다. 두 표면의 깊이는 합산하며 총 깊이가 이 slice의 상한 2를 넘으면 기존 진단의 UNKNOWN으로 남깁니다. 따라서 `typedef int **P; P *p`를 `int **`로 잘못 축소해 받지 않습니다. 실제 train에서 이전에 SUPPORTED였던 이 형태 한 건은 정확한 3중 포인터 UNKNOWN으로 교정됐습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 20,879 (69.88%) | **22,117 (74.02%)** |
+| 새 성공 | | **+1,239** |
+| 잘못된 기존 성공 교정 | | **-1** |
+| 순증 | | **+1,238** |
+| `type_error` | 708 | **14** |
+| verifier 통과 | 20,879 / 20,879 | **22,117 / 22,117** |
+| status 실패 | 0 | **0** |
+
+이전의 subscript 또는 dereference type error 가운데 487개가 바로 성공했습니다. record value나 record by-value로 잘못 분류됐던 612개도 실제 포인터 타입을 회복해 성공했고, 나머지는 뒤의 기존 한계로 이동했습니다. 기존 성공과 새 성공 집합을 함수별로 대조해 위의 의도된 3중 포인터 교정 외 회귀가 없음을 확인했습니다.
+
+`tests/test_c_lower_records.cpp`는 직접 `int **`, 배열 매개변수 조정, 이중 포인터 typedef 세 형태를 두 개의 실제 object image로 실행하고 컴파일된 C와 대조합니다. `tests/test_c_lower_types.cpp`는 typedef와 표면 별표를 합친 3중 포인터가 UNKNOWN인지 고정합니다. 관련 선택 시험 34개와 Windows 전체 CTest 533/533이 통과했습니다. 공개 ABI, allocator, scheduler를 바꾸지 않은 내부 lowering 수정이므로 이번 단위에서는 Linux 전체, sanitizer, fuzzer를 반복하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1405,11 +1427,11 @@ mutable static은 호출 사이의 persistent state가 필요하고, `static con
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 4,351
-- `uninitialized_read` 1,993
-- `type_error` 708
-- `unsupported_pointer` 651
-- `unsupported_control_flow` 444
+- `unsupported_type` 3,607
+- `uninitialized_read` 2,118
+- `unsupported_pointer` 648
+- `unsupported_control_flow` 493
+- `unsupported_call` 308
 
 ## 조율자에게 요청할 것
 

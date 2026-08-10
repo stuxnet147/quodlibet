@@ -737,6 +737,25 @@ static lower_type make_pointer_to(lower_type target) {
   return make_pointer_type(scalar_of(target));
 }
 
+/* Adds every star a declarator contributes. Several type paths used to check
+   that two levels were allowed and then add only one, silently turning `T **`
+   into `T *` or even `T`. Keep the total-depth check beside the construction
+   so typedef and surface declarator stars cannot together exceed the slice. */
+static ql_status add_pointer_depth(lower_context *context, size_t node,
+                                   lower_type base, uint32_t pointer_depth,
+                                   lower_type *output, ql_error *error) {
+  while (pointer_depth-- > 0u) {
+    if (base.kind == QL_C_SCALAR_POINTER && base.indirection >= 2u) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+          "this slice carries at most two levels of indirection", error);
+    }
+    base = make_pointer_to(base);
+  }
+  *output = base;
+  return QL_STATUS_OK;
+}
+
 static lower_type make_record_type(size_t record) {
   lower_type type;
   memset(&type, 0, sizeof(type));
@@ -1967,8 +1986,8 @@ static ql_status resolve_type_node(lower_context *context, size_t type_node,
       *output = make_record_type(record);
       return QL_STATUS_OK;
     }
-    *output = make_record_pointer_type(record);
-    return QL_STATUS_OK;
+    return add_pointer_depth(context, type_node, make_record_type(record),
+                             pointer_depth, output, error);
   }
   {
     char *spelling = copy_node_text(context, type_node);
@@ -1983,12 +2002,8 @@ static ql_status resolve_type_node(lower_context *context, size_t type_node,
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
-    if (base.kind == QL_C_SCALAR_RECORD) {
-      *output = pointer_depth == 0u ? base : make_pointer_to(base);
-      return QL_STATUS_OK;
-    }
-    *output = pointer_depth == 0u ? base : make_pointer_to(base);
-    return QL_STATUS_OK;
+    return add_pointer_depth(context, type_node, base, pointer_depth, output,
+                             error);
   }
 }
 
@@ -2354,8 +2369,8 @@ static ql_status parse_type_spelling(lower_context *context,
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
             "this slice carries at most two levels of indirection", error);
       }
-      *output = make_pointer_to(base);
-      return QL_STATUS_OK;
+      return add_pointer_depth(context, node, base, entry->pointer_depth,
+                               output, error);
     }
 
     if (++hops > 64u) {
@@ -2415,15 +2430,15 @@ static ql_status type_from_inventory(lower_context *context,
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
         "this slice carries at most two levels of indirection", error);
   }
-  if (inventory->pointer_depth == 1u) {
+  if (inventory->pointer_depth != 0u) {
     lower_type pointee;
     ql_status status = parse_type_spelling(context, inventory->base_spelling,
                                            node, 1u, &pointee, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
-    *output = make_pointer_to(pointee);
-    return QL_STATUS_OK;
+    return add_pointer_depth(context, node, pointee,
+                             inventory->pointer_depth, output, error);
   }
   /* The inventory's base-kind classification is a fast syntactic hint.
      Multi-keyword integer specifiers vary in Tree-sitter shape, so the

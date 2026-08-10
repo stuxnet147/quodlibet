@@ -64,6 +64,13 @@ QL_REC_FUNCTION(sizeof_members,
         return (int)(sizeof(p->tag) + sizeof(p->values) +
                      sizeof((*p).values[0]));
     });
+QL_REC_FUNCTION(direct_double_pointer,
+    int rec_direct_double(int **p) { return **p; });
+QL_REC_FUNCTION(array_adjusted_pointer,
+    int rec_array_adjust(int *items[]) { return items[0][0]; });
+QL_REC_FUNCTION(typedef_double_pointer,
+    typedef int **REC_INT_DOUBLE_POINTER;
+    int rec_typedef_double(REC_INT_DOUBLE_POINTER p) { return **p; });
 
 namespace {
 
@@ -77,7 +84,8 @@ public:
         ql_c_frontend_unit_destroy(unit_);
     }
 
-    bool Open(const char *source, const char *name) {
+    bool Open(const char *source, const char *name,
+              bool bind_signature = true) {
         ql_c_function_view function{};
         ql_c_lower_result_view_v1 view{};
         ql_ir_verify_report_v1 report{};
@@ -123,15 +131,16 @@ public:
                           << report.message;
             return false;
         }
-        if (ql_source_signature_from_c_function_v2(
-                nullptr, unit_, &function, source, size,
-                QL_C_DIALECT_ASM2C_GNU_V1,
-                QL_TARGET_ABI_X86_64_LINUX_SYSV_LP64,
-                &signature_artifact, &error) != QL_STATUS_OK ||
-            ql_source_signature_open(nullptr, signature_artifact, &signature,
-                                     &error) != QL_STATUS_OK ||
-            ql_source_signature_bind_ir(signature, ir_, &error) !=
-                QL_STATUS_OK) {
+        if (bind_signature &&
+            (ql_source_signature_from_c_function_v2(
+                 nullptr, unit_, &function, source, size,
+                 QL_C_DIALECT_ASM2C_GNU_V1,
+                 QL_TARGET_ABI_X86_64_LINUX_SYSV_LP64,
+                 &signature_artifact, &error) != QL_STATUS_OK ||
+             ql_source_signature_open(nullptr, signature_artifact, &signature,
+                                      &error) != QL_STATUS_OK ||
+             ql_source_signature_bind_ir(signature, ir_, &error) !=
+                 QL_STATUS_OK)) {
             ADD_FAILURE() << "signature bind: " << error.message;
             ql_source_signature_release(signature);
             ql_artifact_release(signature_artifact);
@@ -413,6 +422,47 @@ TEST(CLowerRecords, FollowsAPointerReadOutOfMemoryIntoADynamicObject) {
     ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, alias_run.result.outcome)
         << ql_ir_interp_ub_reason_string(alias_run.result.ub_reason);
     EXPECT_EQ(rec_through(&native_self), Returned(alias_run.result));
+}
+
+TEST(CLowerRecords, PreservesTwoPointerLevelsAcrossFunctionSignatures) {
+    struct Case {
+        const char *label;
+        const char *source;
+        const char *function;
+        int32_t (*reference)(int32_t **);
+        bool bind_signature;
+    };
+    const Case cases[] = {
+        {"direct", direct_double_pointer_source, "rec_direct_double",
+         rec_direct_double, true},
+        {"array-adjusted", array_adjusted_pointer_source, "rec_array_adjust",
+         rec_array_adjust, false},
+        {"typedef", typedef_double_pointer_source, "rec_typedef_double",
+         rec_typedef_double, true},
+    };
+    for (const Case &item : cases) {
+        Lowered lowered;
+        SCOPED_TRACE(item.label);
+        ASSERT_TRUE(lowered.Open(item.source, item.function,
+                                 item.bind_signature));
+        for (int32_t value : {-81, 0, 37, 100000}) {
+            int32_t native_value = value;
+            int32_t *native_pointer = &native_value;
+            const uint64_t model_pointer = kBase + UINT64_C(0x1000);
+            const Region pointer_object = {
+                kBase, sizeof(model_pointer),
+                reinterpret_cast<const uint8_t *>(&model_pointer), nullptr};
+            const Region value_object = {
+                model_pointer, sizeof(value),
+                reinterpret_cast<const uint8_t *>(&value), nullptr};
+            const Outcome run = Execute(lowered.ir(), {kBase}, {},
+                                        {pointer_object, value_object});
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            EXPECT_EQ(item.reference(&native_pointer), Returned(run.result));
+        }
+    }
 }
 
 TEST(CLowerRecords, LowersEnumeratorsAsTheConstantsTheyName) {
