@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,478 / 29,880 (78.57%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,301, `unsupported_type` 2,089, `unsupported_pointer` 634입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,482 / 29,880 (78.59%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,304, `unsupported_type` 2,089, `unsupported_pointer` 634입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1673,6 +1673,23 @@ null은 새 object authority를 요구하지 않습니다. 따라서 다른 arm�
 
 해당 첫 차단 5개는 같은 소스 계열의 `sizeof(*ARG_0->FLD_21)`이었고 모두 성공했습니다. `tests/test_c_lower_expressions.cpp`는 null record pointer 역참조가 unevaluated인 `sizeof(*(struct S *)0)` 값을 compiled 함수와 대조합니다. 영향 범위의 `CLowerExpressions.*` 4/4와 `CLower*` 89/89가 통과했고 전체 train 함수별 비교에서 누락, 다른 진단 이동, 기존 성공 회귀가 없었습니다. 변경은 `sizeof`의 record layout 확정에 한정되므로 전체 CTest는 실행하지 않았습니다.
 
+### 52. 지역 scalar의 단일 brace initializer를 값으로 내린다
+
+`int value = {expression};`과 `T *pointer = {0};`은 aggregate가 아니라 scalar object의 초기화이며, 중괄호 안 positional 값 하나를 선언 타입으로 변환합니다. 배열과 record의 scalar subobject 경로는 이미 이 규칙을 구현했지만 최상위 지역 scalar는 initializer list를 일반 expression으로 보내 구문 자체를 거부하고 있었습니다.
+
+initializer list를 재귀적으로 벗기되 각 단계에 named positional 값이 정확히 하나일 때만 기존 scalar expression과 conversion 경로로 보냅니다. 여러 값, 빈 목록, designated initializer는 `a scalar initializer needs one positional value` 진단으로 계속 UNKNOWN입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,478 (78.57%) | **23,482 (78.59%)** |
+| 증가 | | **+4** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_expression` | 130 | **123** |
+| verifier 통과 | 23,478 / 23,478 | **23,482 / 23,482** |
+| status 실패 | 0 | **0** |
+
+해당 첫 차단 7개를 좁게 재측정해 4개가 성공했고 pointer initializer 중복 3개는 뒤의 기존 uninitialized address escape로 이동했습니다. `tests/test_c_lower_locals.cpp`는 brace로 초기화한 int와 null pointer를 compiled 함수와 대조하고, 두 값을 넣은 scalar initializer는 계속 UNKNOWN으로 고정합니다. 영향 범위의 `CLowerLocals.*` 8/8과 `CLower*` 90/90이 통과했고 전체 train 함수별 비교에서 누락과 기존 성공 회귀가 없었습니다. 변경은 지역 scalar 선언 초기화에 한정되므로 전체 CTest는 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1681,7 +1698,7 @@ null은 새 object authority를 요구하지 않습니다. 따라서 다른 arm�
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `uninitialized_read` 2,301
+- `uninitialized_read` 2,304
 - `unsupported_type` 2,089
 - `unsupported_pointer` 634
 - `unsupported_control_flow` 545

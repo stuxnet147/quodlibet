@@ -71,6 +71,11 @@ QL_LOCAL_FUNCTION(branch_init, int loc_branch_init(int a, int b) {
     int *p = &v;
     return *p;
 });
+QL_LOCAL_FUNCTION(braced_scalar, int loc_braced_scalar(int a, int b) {
+    int value = {a};
+    int *pointer = {(int *)0};
+    return value + (pointer == 0) + (b - b);
+});
 
 namespace {
 
@@ -320,6 +325,8 @@ TEST(CLowerLocals, MatchesCompiledExecutionWithStorageForLocals) {
          [](int32_t a, int32_t) { return loc_late(a); }},
         {"branch-init", branch_init_source, "loc_branch_init", {4u}, 2,
          [](int32_t a, int32_t b) { return loc_branch_init(a, b); }},
+        {"braced-scalar", braced_scalar_source, "loc_braced_scalar", {}, 2,
+         [](int32_t a, int32_t b) { return loc_braced_scalar(a, b); }},
     };
 
     uint64_t state = UINT64_C(0x27f4b8c1590ae362);
@@ -376,6 +383,11 @@ TEST(CLowerLocals, RefusesStorageInitializedOnOnlyOneBranch) {
     const char *source =
         "int f(int a) { int v; if (a) v = 1; return *&v; }";
     ExpectUnknown(source, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ);
+}
+
+TEST(CLowerLocals, RefusesInvalidScalarBraceInitializers) {
+    ExpectUnknown("int f(void) { int value = {1, 2}; return value; }",
+                  QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION);
 }
 
 TEST(CLowerLocals, IndeterminateSsaAndCompoundReadsAreUndefined) {

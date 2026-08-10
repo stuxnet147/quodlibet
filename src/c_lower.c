@@ -7754,6 +7754,41 @@ static ql_status declaration_is_only_function_prototypes(
   return QL_STATUS_OK;
 }
 
+static ql_status scalar_initializer_expression(lower_context *context,
+                                               size_t node, size_t *output,
+                                               ql_error *error) {
+  size_t guard = 0u;
+
+  while (node != SIZE_MAX && guard++ < 64u &&
+         strcmp(context->nodes[node].view.kind, "initializer_list") == 0) {
+    size_t end = subtree_end(context, node);
+    size_t child;
+    size_t only = SIZE_MAX;
+    for (child = node + 1u; child < end; ++child) {
+      if (context->nodes[child].parent != node ||
+          (context->nodes[child].view.flags & QL_C_SYNTAX_NODE_NAMED) == 0u ||
+          strcmp(context->nodes[child].view.kind, "comment") == 0) {
+        continue;
+      }
+      if (only != SIZE_MAX ||
+          strcmp(context->nodes[child].view.kind, "initializer_pair") == 0) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, child,
+            "a scalar initializer needs one positional value", error);
+      }
+      only = child;
+    }
+    if (only == SIZE_MAX) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+          "a scalar initializer needs one positional value", error);
+    }
+    node = only;
+  }
+  *output = node;
+  return QL_STATUS_OK;
+}
+
 static ql_status lower_declaration(lower_context *context, size_t node,
                                    ql_error *error) {
   size_t type_node = direct_field_child(context, node, "type");
@@ -7921,7 +7956,12 @@ static ql_status lower_declaration(lower_context *context, size_t node,
     if (value_node != SIZE_MAX) {
       lower_value value;
       lower_value converted;
-      status = lower_expression(context, value_node, &value, error);
+      size_t expression_node;
+      status = scalar_initializer_expression(context, value_node,
+                                             &expression_node, error);
+      if (status == QL_STATUS_OK && context->unknown == 0u) {
+        status = lower_expression(context, expression_node, &value, error);
+      }
       if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
       }
