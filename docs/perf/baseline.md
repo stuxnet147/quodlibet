@@ -463,6 +463,46 @@ digest 가 같으므로 이 변경은 결과 중립이고 비교는 유효하다
 
 **넣지 않은 이유를 남겨 두는 이유.** 다음 사람이 같은 것을 다시 시도하지 않게 하기 위해서다. 이 워크스트림의 규율은 프로파일로 고르고 벤치로 확정하는 것이고, 확정에 실패한 것은 넣지 않는다.
 
+### 4. solver 세션: backend 설치를 판정마다가 아니라 워커마다 (2026-08-10, 조율자 승인 후)
+
+**프로파일 근거.** 위 스냅샷 계측. `ql_py_check` 가 판정마다 registry 를 새로 만들어(`bindings/python/src/ql_check.c`) backend state 도 판정마다 생겼다 없어졌고, 그때마다 4.49MB 복사 + 생성 해시 + 버전 프로브를 다시 했다.
+
+**변경.** 명시적 세션 객체다. `ql_solver_session_create` 가 설치를 한 번 세우고, `ql_solver_create_in_session` 이 그것을 빌리는 state 를 만든다. 세션은 run context 를 타고 내려가고(`ql_pipeline_set_solver_session`), 파이썬은 `quodlibet.SolverSession` 으로 노출되며 `check_batch` 가 **워커마다 하나씩** 연다.
+
+**약화된 것은 없다.** 판정마다 도는 무결성 해시 두 번(check 전과 중)은 그대로이고, 세션이 열릴 때 잡은 digest 를 기준으로 돈다. envelope 의 판정별 backend digest 기록도 그대로다. 시험이 둘 다 고정한다(`ManySolversShareOneSnapshotAndItsDigest`).
+
+**세션은 계약상 스레드 비안전이다.** 워커당 하나다. 헤더와 파이썬 docstring 에 적었고 `EachThreadGetsItsOwnSessionAndInstallation` 과 `test_check_batch_gives_every_worker_its_own_session` 이 고정한다. 해제는 결정적이다(`DestroyingTheSessionRemovesItsSnapshot` 가 destroy 반환 직후 디렉터리가 없음을 본다).
+
+**효과 1: 판정당** (1 워커, 48 판정, 세션 유무를 번갈아 5회)
+
+| | 판정당 |
+|---|---|
+| 세션 없음 | 22.07 ms |
+| 세션 | **9.79 ms** |
+| 차 | **-55.6%** |
+
+**예상은 3~4ms(약 10%) 였는데 12.3ms(55%) 가 나왔다.** 예상은 복사와 생성 해시만 셌고, 세션이 실제로 지우는 것에는 **버전 프로브 서브프로세스**도 들어간다. 그것이 모형에 없었다. 앞서 BLAKE3 때와 같은 방향의 오차이고 같은 교훈이다. **모형은 하한이다.**
+
+**효과 2: 배치** (`check_batch`, 48쌍)
+
+| workers | pairs/s | ms/pair |
+|---|---|---|
+| 1 | 93.9 | 10.65 |
+| 4 | 333.5 | 3.00 |
+| 8 | **465.3** | **2.15** |
+| 16 | 373.4 | 2.68 |
+
+세션 전 최고치는 8 워커 229.5 pairs/s 였다. **2.0 배다.**
+
+**효과 3: `ETXTBSY` 가 없어졌다.** 앞 절이 남겨 둔 잔존을 같은 사양으로 다시 쟀다.
+
+| | 실패 |
+|---|---|
+| `O_CLOEXEC` 까지 | 7 / 2,304 |
+| 세션까지 | **0 / 2,304** |
+
+예측한 대로다. 스냅샷 쓰기가 판정당에서 워커당으로 바뀌면 **창의 개수 자체가 배치 크기만큼 줄어든다.** 재시도를 넣지 않고 기다린 것이 옳았다. 재시도를 먼저 넣었다면 이 0 을 재시도의 공으로 잘못 읽었을 것이다.
+
 ## 아직 없는 것
 
 - **threading 리포트.** 워크로드는 준비됐다(`scripts/perf/bench-batch.py`). **WSL 에서 VTune 수집은 자식 프로세스를 띄우는 워크로드에서 걸린다.** 2026-08-10 에 두 번째 확인을 얻었다: 인수 시에는 threading 수집만 걸린다고 알려져 있었는데, **hotspots 수집도 같은 배치 워크로드에서 똑같이 매달렸다**(무출력, 결과 디렉터리는 생기지만 리포트가 안 나옴, 손으로 `pkill` 해야 끝남). 반면 자식을 안 띄우는 coverage 워크로드는 hotspots 가 정상이다. **가르는 것은 수집 종류가 아니라 자식 프로세스다.** threading 리포트는 G7 의 실제 Linux VM 에서 뜬다.

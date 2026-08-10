@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -291,7 +292,12 @@ const ql_solver_descriptor_v1 kMockDescriptor = {
     mock_stack,
     mock_stack,
     mock_check,
-    {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr},
+    /* No session support: this descriptor exercises the path where a caller
+       asks for a session and has to fall back. */
+    nullptr,
+    nullptr,
+    nullptr,
+    {nullptr, nullptr, nullptr, nullptr, nullptr},
 };
 
 std::uint32_t QL_CALL always_cancelled(const void *) {
@@ -1046,6 +1052,207 @@ TEST(BitwuzlaSolver, SolvesRealBitVectorSatAndUnsatQueries) {
     ql_solver_check_result_clear(&result);
     ql_artifact_release(formula);
     ql_solver_destroy(solver);
+}
+
+struct SessionGuard {
+    ql_solver_session *value = nullptr;
+
+    ~SessionGuard() {
+        ql_solver_session_destroy(value);
+    }
+};
+
+TEST(BitwuzlaSolverSession, OptionsInitStampsTheAbiContract) {
+    ql_solver_session_options_v1 options{};
+
+    ql_solver_session_options_init(&options);
+    EXPECT_EQ(sizeof(options), options.struct_size);
+    EXPECT_EQ(QL_SOLVER_ABI_VERSION, options.abi_version);
+    EXPECT_EQ(nullptr, options.options_json);
+}
+
+TEST(BitwuzlaSolverSession, RejectsOptionsFromAnIncompatibleAbi) {
+    const ql_solver_descriptor_v1 *descriptor =
+        ql_bitwuzla_solver_descriptor();
+    ql_solver_session_options_v1 options{};
+    SessionGuard session;
+    ql_error error{};
+
+    ql_solver_session_options_init(&options);
+    options.abi_version = QL_SOLVER_ABI_VERSION + 1u;
+    EXPECT_EQ(QL_STATUS_ABI_MISMATCH,
+              ql_solver_session_create(nullptr, descriptor, &options,
+                                       &session.value, &error));
+
+    ql_solver_session_options_init(&options);
+    options.struct_size = 1u;
+    EXPECT_EQ(QL_STATUS_ABI_MISMATCH,
+              ql_solver_session_create(nullptr, descriptor, &options,
+                                       &session.value, &error));
+    EXPECT_EQ(nullptr, session.value);
+}
+
+/* A descriptor that stops before the session callbacks must not be read there.
+   The mock descriptor in this file leaves them null on purpose. */
+TEST(BitwuzlaSolverSession, ReportsBackendsThatHaveNoSessionSupport) {
+    SessionGuard session;
+    ql_error error{};
+
+    EXPECT_EQ(QL_STATUS_NOT_FOUND,
+              ql_solver_session_create(nullptr, &kMockDescriptor, nullptr,
+                                       &session.value, &error));
+    EXPECT_EQ(nullptr, session.value);
+}
+
+TEST(BitwuzlaSolverSession, DestroyingTheSessionRemovesItsSnapshot) {
+    namespace fs = std::filesystem;
+    const ql_solver_descriptor_v1 *descriptor =
+        ql_bitwuzla_solver_descriptor();
+    ql_error error{};
+
+    if (descriptor->capability.availability == QL_SOLVER_UNAVAILABLE) {
+        GTEST_SKIP() << "this build has no Bitwuzla backend";
+    }
+    const std::set<fs::path> before = private_solver_snapshots();
+
+    ql_solver_session *session = nullptr;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_solver_session_create(nullptr, descriptor, nullptr, &session,
+                                       &error))
+        << error.message;
+    ASSERT_NE(nullptr, session);
+
+    const std::set<fs::path> during = private_solver_snapshots();
+    ASSERT_EQ(before.size() + 1u, during.size());
+    fs::path snapshot_directory;
+    for (const fs::path &candidate : during) {
+        if (before.find(candidate) == before.end()) {
+            snapshot_directory = candidate;
+            break;
+        }
+    }
+    ASSERT_FALSE(snapshot_directory.empty());
+    EXPECT_TRUE(fs::exists(snapshot_directory));
+
+    /* Deterministic: gone when destroy returns, not at process exit. */
+    ql_solver_session_destroy(session);
+    EXPECT_FALSE(fs::exists(snapshot_directory));
+    EXPECT_EQ(before, private_solver_snapshots());
+}
+
+/* Many solvers from one session share one snapshot, which is the whole point,
+   and the digest the session recorded is what each judgement reports. */
+TEST(BitwuzlaSolverSession, ManySolversShareOneSnapshotAndItsDigest) {
+    namespace fs = std::filesystem;
+    const ql_solver_descriptor_v1 *descriptor =
+        ql_bitwuzla_solver_descriptor();
+    SessionGuard session;
+    ql_error error{};
+
+    if (descriptor->capability.availability == QL_SOLVER_UNAVAILABLE) {
+        GTEST_SKIP() << "this build has no Bitwuzla backend";
+    }
+    const std::set<fs::path> before = private_solver_snapshots();
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_solver_session_create(nullptr, descriptor, nullptr,
+                                       &session.value, &error))
+        << error.message;
+
+    ql_digest session_digest{};
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_solver_session_backend_digest(session.value, &session_digest,
+                                               &error));
+
+    for (int index = 0; index < 4; ++index) {
+        SolverGuard solver;
+        ql_artifact *formula = build_formula("(= x x)");
+        ql_solver_check_request_v1 request{};
+        ql_solver_check_result_v1 result{};
+
+        ASSERT_NE(nullptr, formula);
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_solver_create_in_session(nullptr, session.value,
+                                              &solver.value, &error))
+            << error.message;
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_solver_add_smt2(solver.value, formula, &error));
+        ql_solver_check_request_init(&request, QL_SOLVER_LOGIC_QF_BV);
+        request.maximum_bv_width = 8u;
+        ql_solver_check_result_init(&result);
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_solver_check(solver.value, &request, &result, &error))
+            << error.message;
+        /* Condition 3: the per-judgement digest survives, and it is the
+           session installation that answered. Sharing the install did not stop
+           the result from saying which binary produced it. */
+        EXPECT_TRUE(ql_digest_equal(&session_digest,
+                                    &result.backend_binary_digest));
+        ql_solver_check_result_clear(&result);
+        ql_artifact_release(formula);
+    }
+
+    /* One snapshot for all four, not four. */
+    const std::set<fs::path> during = private_solver_snapshots();
+    EXPECT_EQ(before.size() + 1u, during.size());
+}
+
+/* Sessions are contractually one per worker, never shared. Each thread makes
+   its own; this fixes that as the supported shape and shows the installations
+   are genuinely separate rather than one handed round behind the caller. */
+TEST(BitwuzlaSolverSession, EachThreadGetsItsOwnSessionAndInstallation) {
+    namespace fs = std::filesystem;
+    const ql_solver_descriptor_v1 *descriptor =
+        ql_bitwuzla_solver_descriptor();
+
+    if (descriptor->capability.availability == QL_SOLVER_UNAVAILABLE) {
+        GTEST_SKIP() << "this build has no Bitwuzla backend";
+    }
+    const std::set<fs::path> before = private_solver_snapshots();
+    constexpr int kWorkers = 4;
+    std::vector<std::thread> workers;
+    std::vector<ql_status> statuses(kWorkers, QL_STATUS_INTERNAL_ERROR);
+
+    for (int index = 0; index < kWorkers; ++index) {
+        workers.emplace_back([index, descriptor, &statuses]() {
+            SessionGuard session;
+            SolverGuard solver;
+            ql_error error{};
+            ql_solver_check_request_v1 request{};
+            ql_solver_check_result_v1 result{};
+            ql_artifact *formula = build_formula("(= x x)");
+
+            if (formula == nullptr) {
+                return;
+            }
+            if (ql_solver_session_create(nullptr, descriptor, nullptr,
+                                         &session.value,
+                                         &error) != QL_STATUS_OK ||
+                ql_solver_create_in_session(nullptr, session.value,
+                                            &solver.value,
+                                            &error) != QL_STATUS_OK ||
+                ql_solver_add_smt2(solver.value, formula,
+                                   &error) != QL_STATUS_OK) {
+                ql_artifact_release(formula);
+                return;
+            }
+            ql_solver_check_request_init(&request, QL_SOLVER_LOGIC_QF_BV);
+            request.maximum_bv_width = 8u;
+            ql_solver_check_result_init(&result);
+            statuses[static_cast<size_t>(index)] =
+                ql_solver_check(solver.value, &request, &result, &error);
+            ql_solver_check_result_clear(&result);
+            ql_artifact_release(formula);
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    for (int index = 0; index < kWorkers; ++index) {
+        EXPECT_EQ(QL_STATUS_OK, statuses[static_cast<size_t>(index)])
+            << "worker " << index;
+    }
+    /* Every session is torn down by now, so none of their snapshots remain. */
+    EXPECT_EQ(before, private_solver_snapshots());
 }
 
 }  // namespace

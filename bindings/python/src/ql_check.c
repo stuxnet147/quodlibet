@@ -515,6 +515,13 @@ void ql_py_check(const ql_py_spec *spec, ql_py_result *result) {
                                       QL_SMT_PRODUCT_METHOD_NAME, options,
                                       NULL, 0u, &node_id, &error);
     }
+    if (status == QL_STATUS_OK && spec->solver_session != NULL) {
+        /* Lend the caller's backend installation to this run. Without it the
+           method establishes one of its own, which is what a lone check still
+           does. */
+        status = ql_pipeline_set_solver_session(pipeline,
+                                                spec->solver_session, &error);
+    }
     if (status == QL_STATUS_OK) {
         status = ql_pipeline_compile(pipeline, &error);
     }

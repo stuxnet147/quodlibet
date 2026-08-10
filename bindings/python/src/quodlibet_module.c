@@ -24,6 +24,7 @@
 #include "quodlibet/solver.h"
 #include "quodlibet/version.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -303,7 +304,58 @@ static char *kwlist[] = {"left_source",
                          "single_allocation_bytes",
                          "policy_json",
                          "argument_bindings",
+                         "solver_session",
                          NULL};
+
+/* The session travels as a capsule rather than a new heap type: the extension
+   is Py_LIMITED_API and a capsule carries an opaque C pointer with a name and
+   a destructor without a type object. The friendly wrapper is in the package.
+   The name is checked on the way in, so a capsule from somewhere else is
+   rejected rather than dereferenced. */
+static const char kSessionCapsuleName[] = "quodlibet.solver_session";
+
+static void session_capsule_destructor(PyObject *capsule) {
+    void *session = PyCapsule_GetPointer(capsule, kSessionCapsuleName);
+
+    if (session != NULL) {
+        ql_solver_session_destroy((ql_solver_session *)session);
+    }
+}
+
+static PyObject *quodlibet_solver_session_open(PyObject *self,
+                                               PyObject *unused) {
+    ql_solver_session_options_v1 options;
+    ql_solver_session *session = NULL;
+    ql_error error;
+    ql_status status;
+    PyObject *capsule;
+
+    (void)self;
+    (void)unused;
+    ql_error_clear(&error);
+    ql_solver_session_options_init(&options);
+    Py_BEGIN_ALLOW_THREADS
+    status = ql_solver_session_create(NULL, ql_bitwuzla_solver_descriptor(),
+                                      &options, &session, &error);
+    Py_END_ALLOW_THREADS
+    if (status != QL_STATUS_OK) {
+        ql_py_result failure;
+
+        memset(&failure, 0, sizeof(failure));
+        failure.status = status;
+        snprintf(failure.message, sizeof(failure.message), "%s",
+                 error.message);
+        (void)raise_from_result(&failure);
+        return NULL;
+    }
+    capsule = PyCapsule_New(session, kSessionCapsuleName,
+                            session_capsule_destructor);
+    if (capsule == NULL) {
+        ql_solver_session_destroy(session);
+        return NULL;
+    }
+    return capsule;
+}
 
 static PyObject *quodlibet_check(PyObject *self, PyObject *args,
                                  PyObject *keywords) {
@@ -332,13 +384,15 @@ static PyObject *quodlibet_check(PyObject *self, PyObject *args,
     const char *policy_json = NULL;
     Py_ssize_t policy_json_size = 0;
     PyObject *argument_bindings = NULL;
+    PyObject *session_capsule = NULL;
+    void *session_pointer = NULL;
     ql_py_spec spec;
     ql_py_result result;
     PyObject *dict;
 
     (void)self;
     if (!PyArg_ParseTupleAndKeywords(
-            args, keywords, "s#ss#siiKiiz#pKKzKKKKKz#O:check", kwlist,
+            args, keywords, "s#ss#siiKiiz#pKKzKKKKKz#OO:check", kwlist,
             &left_source, &left_source_size, &left_function, &right_source,
             &right_source_size, &right_function, &relation, &ub_policy,
             &observations, &memory_observation, &external_call_observation,
@@ -346,8 +400,18 @@ static PyObject *quodlibet_check(PyObject *self, PyObject *args,
             &solver_timeout_ms, &solver_memory_limit_mb, &solver_executable,
             &total_ns, &node_ns, &solver_ns, &memory_bytes,
             &single_allocation_bytes, &policy_json, &policy_json_size,
-            &argument_bindings)) {
+            &argument_bindings, &session_capsule)) {
         return NULL;
+    }
+
+    if (session_capsule != NULL && session_capsule != Py_None) {
+        void *session = PyCapsule_GetPointer(session_capsule,
+                                             kSessionCapsuleName);
+
+        if (session == NULL) {
+            return NULL;
+        }
+        session_pointer = session;
     }
 
     ql_py_spec_init(&spec);
@@ -392,6 +456,10 @@ static PyObject *quodlibet_check(PyObject *self, PyObject *args,
         return NULL;
     }
 
+    /* Borrowed for the duration of the call. The capsule is held by the
+       caller's argument tuple, so the session cannot be closed underneath
+       this check. */
+    spec.solver_session = session_pointer;
     spec.relation = (ql_relation)relation;
     spec.ub_policy = (ql_ub_policy)ub_policy;
     spec.observations = (uint64_t)observations;
@@ -457,6 +525,10 @@ static PyMethodDef methods[] = {
      METH_VARARGS | METH_KEYWORDS,
      "Run one equivalence check. Every argument is required; the friendly "
      "surface lives in the quodlibet package."},
+    {"solver_session_open", quodlibet_solver_session_open, METH_NOARGS,
+     "Open a solver session: one private backend installation shared by many "
+     "checks. Not thread safe; one per worker. Closing the capsule tears the "
+     "installation down."},
     {"backend_info", quodlibet_backend_info, METH_NOARGS,
      "Describe the pinned SMT backend this extension was built against."},
     {"core_version", quodlibet_core_version, METH_NOARGS,

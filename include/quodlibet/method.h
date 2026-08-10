@@ -37,7 +37,14 @@ typedef struct ql_run_context_v1 {
     const void *cancel_state;
     uint32_t (QL_CALL *is_cancelled)(const void *cancel_state);
     uint64_t run_id;
-    void *reserved[8];
+    /* Appended in place of one reserved slot, so the structure is the same
+       size and no existing field moved. A solver session the caller already
+       established, for methods that would otherwise build one per run; null
+       means build one. Typed as void* because method.h does not depend on
+       solver.h; methods that use it cast to ql_solver_session*. Read it only
+       when struct_size reaches past it. */
+    void *solver_session;
+    void *reserved[7];
 } ql_run_context_v1;
 
 typedef enum ql_method_flag {

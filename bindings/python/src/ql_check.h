@@ -54,6 +54,12 @@ typedef struct ql_py_spec {
     uint64_t solver_timeout_ms;
     uint64_t solver_memory_limit_mb;
     char *solver_executable;
+    /* Borrowed ql_solver_session*, or null to establish one for this check
+       alone. Not owned by the spec and not freed with it: the caller keeps a
+       session alive across many checks, which is the whole reason it exists.
+       A session is not thread safe, so the caller gives each worker its
+       own. */
+    void *solver_session;
 
     ql_budget_limits_v1 limits;
 

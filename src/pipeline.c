@@ -27,6 +27,7 @@ struct ql_pipeline {
     uint32_t compiled;
     uint32_t maximum_level;
     uint64_t registry_generation;
+    void *solver_session;
 };
 
 typedef struct ql_pipeline_result_item {
@@ -211,6 +212,18 @@ ql_status QL_CALL ql_pipeline_add_node(
     }
     ++pipeline->count;
     pipeline->compiled = 0u;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+ql_status QL_CALL ql_pipeline_set_solver_session(
+    ql_pipeline *pipeline, void *session, ql_error *error) {
+    if (pipeline == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "pipeline is required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    pipeline->solver_session = session;
     ql_error_clear(error);
     return QL_STATUS_OK;
 }
@@ -628,6 +641,7 @@ static ql_status QL_CALL run_pipeline_node(void *user_data, ql_error *error) {
     context.cancel_state = &cancel_state;
     context.is_cancelled = cancellation_requested;
     context.run_id = task->run_id;
+    context.solver_session = task->pipeline->solver_session;
     status = node->method->run(instance, &context, inputs, input_count,
                                &task->node_outputs[task->node_index],
                                &task->error);

@@ -29,6 +29,17 @@ QL_API ql_status QL_CALL ql_pipeline_from_json(
     ql_registry *registry, const ql_allocator *allocator, const char *json,
     size_t json_size, ql_pipeline **output, ql_error *error);
 
+/* Lend a solver session to every node this pipeline runs, so methods that
+   would each establish a backend share one the caller already established.
+   Typed as void* because pipeline.h does not depend on solver.h; pass a
+   ql_solver_session*. Null clears it.
+
+   The session is borrowed and must outlive the runs that use it. A session is
+   not thread safe, so a pipeline carrying one must not be run concurrently
+   from more than one thread: one session, one pipeline, one worker. */
+QL_API ql_status QL_CALL ql_pipeline_set_solver_session(
+    ql_pipeline *pipeline, void *session, ql_error *error);
+
 QL_API ql_status QL_CALL ql_pipeline_run(
     ql_pipeline *pipeline, ql_scheduler *scheduler, ql_artifact *input,
     const ql_cancel_token *cancel_token, ql_pipeline_result **output,

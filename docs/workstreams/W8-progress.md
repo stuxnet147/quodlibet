@@ -31,15 +31,18 @@ WU12. (B) solver 세션 객체. 조율자가 W7 대기 조건을 완화해 착�
 3. bindings: 파이썬 세션 객체와 `check_batch` 이전 (조건 5)
 4. 측정: 판정당 before/after 와 `ETXTBSY` 잔존 재측정
 
-**진행: 1단계 시작 전. 코드는 한 줄도 안 들어갔습니다.**
+**진행: 네 단계 전부 완료.**
 
-이 세션에서 헤더에 선언만 먼저 넣어 봤다가 **되돌렸습니다.** 구현 없는 공개 선언을 브랜치에 남기는 것은 반쪽 ABI 이고, 이 저장소가 가장 싫어하는 상태입니다. 다음 세션이 위 4단계를 1번부터 그대로 시작하면 됩니다.
+- **1단계 코어.** `ql_solver_session` 과 옵션 구조체(`struct_size`+`abi_version`), create/destroy, `ql_solver_create_in_session`, `ql_solver_session_backend_digest`. descriptor 는 `reserved[8]` 을 typed 콜백 셋 + `reserved[5]` 로 바꿔 크기와 기존 필드가 그대로이고, 새 필드는 `struct_size` 로 가려 읽으므로 옛 descriptor 도 계속 통과합니다. 어댑터 쪽은 설치(`ql_bitwuzla_install`)를 state 에서 분리해 세션이 소유하거나 state 가 소유하거나 둘 중 하나가 되게 했습니다.
+- **2단계 배선.** `ql_run_context_v1` 에 `solver_session` 을 reserved 한 칸에서 append 하고, `ql_pipeline_set_solver_session` 으로 파이프라인이 실어 내립니다. `run_check` 는 세션이 있으면 빌리고 없으면 예전대로 자기 것을 만듭니다.
+- **3단계 bindings.** 확장이 abi3 라 새 heap type 대신 capsule 로 넘깁니다. 파이썬은 `quodlibet.SolverSession` (context manager, `close()`, 닫힌 세션 사용은 `ValueError`)이고 `check_batch` 는 thread-local 로 **워커마다 하나**를 엽니다. 세션을 못 여는 backend 에서는 조용히 예전 경로로 돕니다.
+- **4단계 측정.** 아래.
 
-**다음 세션이 바로 쓸 수 있는 것.**
+**승인 조건 다섯 대응.** (1) 옵션 구조체 ABI: `OptionsInitStampsTheAbiContract`, `RejectsOptionsFromAnIncompatibleAbi`. (2) 스레드 비안전 워커당 하나: 헤더와 docstring 에 명시, `EachThreadGetsItsOwnSessionAndInstallation` 과 `test_check_batch_gives_every_worker_its_own_session`. (3) 세션 digest 기록 + per-check 해시 두 번 + envelope 판정별 digest: `ManySolversShareOneSnapshotAndItsDigest`, `test_a_session_does_not_change_the_verdict_or_the_digest`. (4) 결정적 해제: `DestroyingTheSessionRemovesItsSnapshot`. (5) `check_batch` 이전: 완료.
 
-- 확장 지점: `ql_solver_descriptor_v1` 의 `reserved[8]` 을 typed 필드 세 개 + `reserved[5]` 로 바꾸면 크기와 기존 필드 의미가 그대로입니다. `ql_solver_descriptor_validate` 의 `minimum_size` 는 `offsetof(..., reserved)` 로 계산되므로 **새 필드를 읽기 전에 `struct_size` 로 가려야** 옛 descriptor 가 계속 통과합니다(`src/solver.c:490`).
-- 세션이 옮겨 담을 상태는 `ql_bitwuzla_state` 의 `snapshot_directory`, `executable`, `executable_digest` 세 개입니다(`src/solver.c`).
-- 판정마다 남겨야 하는 것은 `verify_snapshot_digest` 호출 두 번(`bitwuzla_check` 안)과 envelope 의 backend digest 기록입니다.
+**효과.** 판정당 22.07 → 9.79 ms (**-55.6%**, 1 워커에서 번갈아 5회). `check_batch` 최고 처리량 229.5 → **465.3 pairs/s** (8 워커, 판정당 2.15ms). 그리고 **`ETXTBSY` 잔존이 7/2,304 에서 0/2,304 로 사라졌습니다** — 예측대로 스냅샷 쓰기가 판정당에서 워커당으로 바뀌어 창의 개수가 배치 크기만큼 줄었기 때문입니다.
+
+**예상 3~4ms 였는데 12.3ms 가 나온 이유.** 예상은 복사와 생성 해시만 셌는데 세션은 **버전 프로브 서브프로세스**도 지웁니다. 모형에 없던 항목입니다. BLAKE3 때와 같은 방향의 오차이고 같은 교훈입니다. 모형은 하한입니다.
 
 ## 이 디스패치에서 닫지 못한 것 (인계)
 

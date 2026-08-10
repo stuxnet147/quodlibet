@@ -427,7 +427,12 @@ const ql_solver_descriptor_v1 kHostileDescriptor = {
     hostile_stack,
     hostile_stack,
     hostile_check,
-    {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr},
+    /* No session support: this descriptor exercises the path where a caller
+       asks for a session and has to fall back. */
+    nullptr,
+    nullptr,
+    nullptr,
+    {nullptr, nullptr, nullptr, nullptr, nullptr},
 };
 
 /* One check against the hostile backend under a private allocator, returning

@@ -748,6 +748,141 @@ ql_status QL_CALL ql_solver_check_result_validate(
     return QL_STATUS_OK;
 }
 
+static char *copy_bytes_as_cstr(const ql_allocator *allocator,
+                                const char *bytes, size_t size);
+
+/* The session callbacks sit where three reserved slots used to, so a
+   descriptor compiled against the older header stops before them and must not
+   be read there. `struct_size` is the only thing that can tell us. */
+static int descriptor_has_sessions(
+    const ql_solver_descriptor_v1 *descriptor) {
+    const size_t needed = offsetof(ql_solver_descriptor_v1, reserved);
+
+    return descriptor->struct_size >= needed &&
+           descriptor->session_open != NULL &&
+           descriptor->session_close != NULL &&
+           descriptor->create_in_session != NULL;
+}
+
+struct ql_solver_session {
+    ql_allocator allocator;
+    const ql_solver_descriptor_v1 *descriptor;
+    char *options_json;
+    void *backend_session;
+    ql_digest backend_digest;
+};
+
+void QL_CALL ql_solver_session_options_init(
+    ql_solver_session_options_v1 *options) {
+    if (options == NULL) {
+        return;
+    }
+    memset(options, 0, sizeof(*options));
+    options->struct_size = sizeof(*options);
+    options->abi_version = QL_SOLVER_ABI_VERSION;
+}
+
+ql_status QL_CALL ql_solver_session_create(
+    const ql_allocator *allocator, const ql_solver_descriptor_v1 *descriptor,
+    const ql_solver_session_options_v1 *options, ql_solver_session **output,
+    ql_error *error) {
+    const ql_allocator *actual_allocator = resolve_allocator(allocator);
+    const size_t minimum_size =
+        offsetof(ql_solver_session_options_v1, reserved);
+    const char *options_json = NULL;
+    ql_solver_session *session;
+    ql_status status;
+
+    if (output == NULL || !ql_allocator_is_valid(actual_allocator)) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "valid allocator and session output are required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    *output = NULL;
+    if (options != NULL) {
+        if (options->abi_version != QL_SOLVER_ABI_VERSION ||
+            options->struct_size < minimum_size) {
+            ql_error_set(error, QL_STATUS_ABI_MISMATCH,
+                         "solver session options have an incompatible ABI or structure size");
+            return QL_STATUS_ABI_MISMATCH;
+        }
+        options_json = options->options_json;
+    }
+    status = ql_solver_descriptor_validate(descriptor, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    if (descriptor->capability.availability != QL_SOLVER_AVAILABLE) {
+        ql_error_set(error, QL_STATUS_NOT_FOUND,
+                     "solver backend '%s' is unavailable in this build",
+                     descriptor->name);
+        return QL_STATUS_NOT_FOUND;
+    }
+    if (!descriptor_has_sessions(descriptor)) {
+        ql_error_set(error, QL_STATUS_NOT_FOUND,
+                     "solver backend '%s' does not support sessions",
+                     descriptor->name);
+        return QL_STATUS_NOT_FOUND;
+    }
+
+    session = (ql_solver_session *)actual_allocator->allocate(
+        actual_allocator->user_data, sizeof(*session));
+    if (session == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY,
+                     "could not allocate solver session");
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    memset(session, 0, sizeof(*session));
+    session->allocator = *actual_allocator;
+    session->descriptor = descriptor;
+    if (options_json != NULL) {
+        session->options_json = copy_bytes_as_cstr(
+            actual_allocator, options_json, strlen(options_json));
+        if (session->options_json == NULL) {
+            actual_allocator->deallocate(actual_allocator->user_data, session);
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY,
+                         "could not copy solver session options");
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+    }
+    status = descriptor->session_open(actual_allocator, session->options_json,
+                                      &session->backend_session,
+                                      &session->backend_digest, error);
+    if (status != QL_STATUS_OK) {
+        actual_allocator->deallocate(actual_allocator->user_data,
+                                     session->options_json);
+        actual_allocator->deallocate(actual_allocator->user_data, session);
+        return status;
+    }
+    *output = session;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+void QL_CALL ql_solver_session_destroy(ql_solver_session *session) {
+    ql_allocator allocator;
+
+    if (session == NULL) {
+        return;
+    }
+    allocator = session->allocator;
+    session->descriptor->session_close(session->backend_session);
+    allocator.deallocate(allocator.user_data, session->options_json);
+    allocator.deallocate(allocator.user_data, session);
+}
+
+ql_status QL_CALL ql_solver_session_backend_digest(
+    const ql_solver_session *session, ql_digest *digest, ql_error *error) {
+    if (session == NULL || digest == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "solver session and digest output are required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    *digest = session->backend_digest;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
 ql_status QL_CALL ql_solver_create(
     const ql_allocator *allocator, const ql_solver_descriptor_v1 *descriptor,
     const char *options_json, ql_solver **output, ql_error *error) {
@@ -783,6 +918,46 @@ ql_status QL_CALL ql_solver_create(
     solver->descriptor = descriptor;
     status = descriptor->create(actual_allocator, options_json,
                                 &solver->backend_state, error);
+    if (status != QL_STATUS_OK) {
+        actual_allocator->deallocate(actual_allocator->user_data, solver);
+        return status;
+    }
+    *output = solver;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+ql_status QL_CALL ql_solver_create_in_session(
+    const ql_allocator *allocator, ql_solver_session *session,
+    ql_solver **output, ql_error *error) {
+    const ql_allocator *actual_allocator = resolve_allocator(allocator);
+    ql_solver *solver;
+    ql_status status;
+
+    if (output == NULL || !ql_allocator_is_valid(actual_allocator)) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "valid allocator and solver output are required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    *output = NULL;
+    if (session == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "solver session is required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    solver = (ql_solver *)actual_allocator->allocate(
+        actual_allocator->user_data, sizeof(*solver));
+    if (solver == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY,
+                     "could not allocate solver instance");
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    memset(solver, 0, sizeof(*solver));
+    solver->allocator = *actual_allocator;
+    solver->descriptor = session->descriptor;
+    status = session->descriptor->create_in_session(
+        actual_allocator, session->backend_session, session->options_json,
+        &solver->backend_state, error);
     if (status != QL_STATUS_OK) {
         actual_allocator->deallocate(actual_allocator->user_data, solver);
         return status;
@@ -1885,13 +2060,32 @@ fail_without_loop:
     return status;
 }
 
+/* The private installation: the snapshot, where it lives, and the digest every
+   check is measured against. Without a session one of these is built and torn
+   down inside each ql_bitwuzla_state; with a session one is built once and
+   many states borrow it. */
+typedef struct ql_bitwuzla_install {
+    char *snapshot_directory;
+    char *executable;
+    ql_digest executable_digest;
+} ql_bitwuzla_install;
+
 typedef struct ql_bitwuzla_state {
     ql_allocator allocator;
     char *snapshot_directory;
     char *executable;
     ql_digest executable_digest;
+    /* Zero when the strings above belong to a session. The per-check digest
+       verification does not care which, and that is the point: sharing the
+       installation does not change what is verified. */
+    int owns_install;
     ql_buffer transcript;
 } ql_bitwuzla_state;
+
+typedef struct ql_bitwuzla_session {
+    ql_allocator allocator;
+    ql_bitwuzla_install install;
+} ql_bitwuzla_session;
 
 static char *copy_bytes_as_cstr(const ql_allocator *allocator,
                                 const char *bytes, size_t size) {
@@ -2374,21 +2568,28 @@ static ql_status digest_executable(const char *path, ql_digest *digest,
     return QL_STATUS_OK;
 }
 
-static ql_status verify_snapshot_digest(
-    const ql_bitwuzla_state *state, const char *phase, ql_error *error) {
+static ql_status verify_executable_digest(
+    const char *executable, const ql_digest *expected, const char *phase,
+    ql_error *error) {
     ql_digest observed;
-    ql_status status = digest_executable(state->executable, &observed, error);
+    ql_status status = digest_executable(executable, &observed, error);
 
     if (status != QL_STATUS_OK) {
         return status;
     }
-    if (!ql_digest_equal(&state->executable_digest, &observed)) {
+    if (!ql_digest_equal(expected, &observed)) {
         ql_error_set(error, QL_STATUS_ABI_MISMATCH,
                      "Bitwuzla snapshot content changed %s", phase);
         return QL_STATUS_ABI_MISMATCH;
     }
     ql_error_clear(error);
     return QL_STATUS_OK;
+}
+
+static ql_status verify_snapshot_digest(
+    const ql_bitwuzla_state *state, const char *phase, ql_error *error) {
+    return verify_executable_digest(state->executable,
+                                    &state->executable_digest, phase, error);
 }
 
 static int exact_bitwuzla_version(const ql_buffer *stdout_text) {
@@ -2440,44 +2641,41 @@ static ql_status bitwuzla_verify_version(
     return QL_STATUS_OK;
 }
 
-static ql_status QL_CALL bitwuzla_create(
-    const ql_allocator *allocator, const char *options_json,
-    void **backend_state, ql_error *error) {
-    ql_bitwuzla_state *state;
+static void bitwuzla_install_close(const ql_allocator *allocator,
+                                   ql_bitwuzla_install *install) {
+    cleanup_snapshot_paths(install->executable, install->snapshot_directory);
+    allocator->deallocate(allocator->user_data, install->executable);
+    allocator->deallocate(allocator->user_data, install->snapshot_directory);
+    memset(install, 0, sizeof(*install));
+}
+
+/* Copy the executable somewhere private, hash it, and confirm it is the
+   version this build was pinned against. Hashing again straight after the
+   probe is not redundant: it is what makes the version we observed and the
+   binary we will keep running the same binary. */
+static ql_status bitwuzla_install_open(const ql_allocator *allocator,
+                                       const char *options_json,
+                                       ql_bitwuzla_install *install,
+                                       ql_error *error) {
     char *selected_executable = NULL;
     ql_status status;
 
-    if (backend_state == NULL) {
-        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
-                     "Bitwuzla backend state output is required");
-        return QL_STATUS_INVALID_ARGUMENT;
-    }
-    *backend_state = NULL;
-    state = (ql_bitwuzla_state *)allocator->allocate(
-        allocator->user_data, sizeof(*state));
-    if (state == NULL) {
-        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY,
-                     "could not allocate Bitwuzla backend state");
-        return QL_STATUS_OUT_OF_MEMORY;
-    }
-    memset(state, 0, sizeof(*state));
-    state->allocator = *allocator;
-    buffer_init(&state->transcript, allocator);
+    memset(install, 0, sizeof(*install));
     status = bitwuzla_select_executable(
         allocator, options_json, &selected_executable, error);
     if (status == QL_STATUS_OK) {
         status = create_executable_snapshot(
-            allocator, selected_executable, &state->snapshot_directory,
-            &state->executable, error);
+            allocator, selected_executable, &install->snapshot_directory,
+            &install->executable, error);
     }
     allocator->deallocate(allocator->user_data, selected_executable);
     if (status == QL_STATUS_OK) {
-        status = digest_executable(state->executable,
-                                   &state->executable_digest, error);
+        status = digest_executable(install->executable,
+                                   &install->executable_digest, error);
     }
     if (status == QL_STATUS_OK) {
         const ql_status probe_status = bitwuzla_verify_version(
-            allocator, state->executable, error);
+            allocator, install->executable, error);
         ql_error probe_error;
         ql_status integrity_status;
 
@@ -2486,8 +2684,9 @@ static ql_status QL_CALL bitwuzla_create(
         } else {
             probe_error = *error;
         }
-        integrity_status = verify_snapshot_digest(
-            state, "during the version probe", error);
+        integrity_status = verify_executable_digest(
+            install->executable, &install->executable_digest,
+            "during the version probe", error);
         if (integrity_status != QL_STATUS_OK) {
             status = integrity_status;
         } else {
@@ -2498,15 +2697,130 @@ static ql_status QL_CALL bitwuzla_create(
         }
     }
     if (status != QL_STATUS_OK) {
-        cleanup_snapshot_paths(state->executable,
-                               state->snapshot_directory);
+        bitwuzla_install_close(allocator, install);
+    }
+    return status;
+}
+
+static ql_status bitwuzla_state_create(const ql_allocator *allocator,
+                                       ql_bitwuzla_state **output,
+                                       ql_error *error) {
+    ql_bitwuzla_state *state = (ql_bitwuzla_state *)allocator->allocate(
+        allocator->user_data, sizeof(*state));
+
+    if (state == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY,
+                     "could not allocate Bitwuzla backend state");
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    memset(state, 0, sizeof(*state));
+    state->allocator = *allocator;
+    buffer_init(&state->transcript, allocator);
+    *output = state;
+    return QL_STATUS_OK;
+}
+
+static ql_status QL_CALL bitwuzla_create(
+    const ql_allocator *allocator, const char *options_json,
+    void **backend_state, ql_error *error) {
+    ql_bitwuzla_state *state;
+    ql_bitwuzla_install install;
+    ql_status status;
+
+    if (backend_state == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "Bitwuzla backend state output is required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    *backend_state = NULL;
+    status = bitwuzla_state_create(allocator, &state, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = bitwuzla_install_open(allocator, options_json, &install, error);
+    if (status != QL_STATUS_OK) {
         buffer_dispose(&state->transcript);
-        allocator->deallocate(allocator->user_data, state->executable);
-        allocator->deallocate(allocator->user_data,
-                              state->snapshot_directory);
         allocator->deallocate(allocator->user_data, state);
         return status;
     }
+    state->snapshot_directory = install.snapshot_directory;
+    state->executable = install.executable;
+    state->executable_digest = install.executable_digest;
+    state->owns_install = 1;
+    *backend_state = state;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+static ql_status QL_CALL bitwuzla_session_open(
+    const ql_allocator *allocator, const char *options_json,
+    void **backend_session, ql_digest *backend_digest, ql_error *error) {
+    ql_bitwuzla_session *session;
+    ql_status status;
+
+    if (backend_session == NULL || backend_digest == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "Bitwuzla session outputs are required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    *backend_session = NULL;
+    session = (ql_bitwuzla_session *)allocator->allocate(
+        allocator->user_data, sizeof(*session));
+    if (session == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY,
+                     "could not allocate Bitwuzla session");
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    memset(session, 0, sizeof(*session));
+    session->allocator = *allocator;
+    status = bitwuzla_install_open(allocator, options_json,
+                                   &session->install, error);
+    if (status != QL_STATUS_OK) {
+        allocator->deallocate(allocator->user_data, session);
+        return status;
+    }
+    *backend_digest = session->install.executable_digest;
+    *backend_session = session;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+static void QL_CALL bitwuzla_session_close(void *backend_session) {
+    ql_bitwuzla_session *session = (ql_bitwuzla_session *)backend_session;
+    ql_allocator allocator;
+
+    if (session == NULL) {
+        return;
+    }
+    allocator = session->allocator;
+    bitwuzla_install_close(&allocator, &session->install);
+    allocator.deallocate(allocator.user_data, session);
+}
+
+static ql_status QL_CALL bitwuzla_create_in_session(
+    const ql_allocator *allocator, void *backend_session,
+    const char *options_json, void **backend_state, ql_error *error) {
+    ql_bitwuzla_session *session = (ql_bitwuzla_session *)backend_session;
+    ql_bitwuzla_state *state;
+    ql_status status;
+
+    (void)options_json; /* The session already resolved them. */
+    if (backend_state == NULL || session == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "Bitwuzla session and backend state output are required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    *backend_state = NULL;
+    status = bitwuzla_state_create(allocator, &state, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    /* Borrowed, not owned. The digest is copied so every check in this state
+       is measured against what the session saw when it opened. */
+    state->snapshot_directory = session->install.snapshot_directory;
+    state->executable = session->install.executable;
+    state->executable_digest = session->install.executable_digest;
+    state->owns_install = 0;
     *backend_state = state;
     ql_error_clear(error);
     return QL_STATUS_OK;
@@ -2521,9 +2835,14 @@ static void QL_CALL bitwuzla_destroy(void *backend_state) {
     }
     allocator = state->allocator;
     buffer_dispose(&state->transcript);
-    cleanup_snapshot_paths(state->executable, state->snapshot_directory);
-    allocator.deallocate(allocator.user_data, state->executable);
-    allocator.deallocate(allocator.user_data, state->snapshot_directory);
+    if (state->owns_install != 0) {
+        ql_bitwuzla_install install;
+
+        install.snapshot_directory = state->snapshot_directory;
+        install.executable = state->executable;
+        install.executable_digest = state->executable_digest;
+        bitwuzla_install_close(&allocator, &install);
+    }
     allocator.deallocate(allocator.user_data, state);
 }
 
@@ -2988,7 +3307,10 @@ static const ql_solver_descriptor_v1 bitwuzla_descriptor = {
     bitwuzla_push,
     bitwuzla_pop,
     bitwuzla_check,
-    {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL},
+    bitwuzla_session_open,
+    bitwuzla_session_close,
+    bitwuzla_create_in_session,
+    {NULL, NULL, NULL, NULL, NULL},
 };
 
 const ql_solver_descriptor_v1 *QL_CALL

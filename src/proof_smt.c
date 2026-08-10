@@ -373,8 +373,21 @@ static ql_status run_check(const ql_allocator *allocator,
                      "the canonical Bitwuzla backend is not available in this build");
         return QL_STATUS_NOT_FOUND;
     }
-    status = ql_solver_create(allocator, descriptor, instance->solver_options,
-                              &solver, error);
+    /* A caller that judges many pairs establishes the backend once and puts
+       the session on the run context; without one this builds its own, which
+       is what every existing caller keeps doing. The session only supplies the
+       installation: the request below, the digest verification inside the
+       check, and the digest this result reports are identical either way. */
+    if (context != NULL &&
+        context->struct_size >= offsetof(ql_run_context_v1, reserved) &&
+        context->solver_session != NULL) {
+        status = ql_solver_create_in_session(
+            allocator, (ql_solver_session *)context->solver_session, &solver,
+            error);
+    } else {
+        status = ql_solver_create(allocator, descriptor,
+                                  instance->solver_options, &solver, error);
+    }
     if (status != QL_STATUS_OK) {
         return status;
     }

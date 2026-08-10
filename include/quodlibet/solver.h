@@ -150,6 +150,29 @@ typedef ql_status (QL_CALL *ql_solver_check_v1)(
     void *backend_state, const ql_solver_check_request_v1 *request,
     ql_solver_check_result_v1 *result, ql_error *error);
 
+/* Establishing a backend can cost far more than using it. The Bitwuzla
+   adapter copies a 4.49 MB executable into a private directory, hashes it and
+   probes its version before it can answer anything, which measured 5.4 ms of
+   every judgement (docs/perf/baseline.md). A session does that once and lends
+   the result to many judgements.
+
+   session_open reports the digest of what it established. Every check run in
+   the session is verified against that value, so a session shares an
+   installation without loosening what is checked about it.
+
+   A backend that does not fill these in keeps working; ql_solver_session_create
+   reports QL_STATUS_NOT_FOUND for it and callers fall back to
+   ql_solver_create. */
+typedef ql_status (QL_CALL *ql_solver_session_open_v1)(
+    const ql_allocator *allocator, const char *options_json,
+    void **backend_session, ql_digest *backend_digest, ql_error *error);
+/* Must release everything session_open established, including anything it put
+   on the filesystem, before it returns. */
+typedef void (QL_CALL *ql_solver_session_close_v1)(void *backend_session);
+typedef ql_status (QL_CALL *ql_solver_create_in_session_v1)(
+    const ql_allocator *allocator, void *backend_session,
+    const char *options_json, void **backend_state, ql_error *error);
+
 /* Descriptor and all pointed-to strings and callbacks must outlive every
    ql_solver instance created from it. No callback may invoke a shell. */
 typedef struct ql_solver_descriptor_v1 {
@@ -166,7 +189,15 @@ typedef struct ql_solver_descriptor_v1 {
     ql_solver_stack_v1 push;
     ql_solver_stack_v1 pop;
     ql_solver_check_v1 check;
-    void *reserved[8];
+    /* Appended in place of three reserved slots, so the structure is the same
+       size and no existing field moved. A descriptor whose struct_size stops
+       before these is still valid and simply has no session support; the
+       validator's minimum is still measured at `session_open`, which is where
+       `reserved` used to begin. Read them only behind that check. */
+    ql_solver_session_open_v1 session_open;
+    ql_solver_session_close_v1 session_close;
+    ql_solver_create_in_session_v1 create_in_session;
+    void *reserved[5];
 } ql_solver_descriptor_v1;
 
 typedef struct ql_solver ql_solver;
@@ -196,9 +227,64 @@ QL_API ql_status QL_CALL ql_solver_check_result_validate(
     const ql_solver_check_request_v1 *request,
     const ql_solver_check_result_v1 *result, ql_error *error);
 
+/* A session is the private backend installation that a run of judgements
+   shares, so the work of establishing it happens once rather than once per
+   judgement.
+
+   It does not relax any checking. The Bitwuzla adapter still hashes its
+   snapshot before and during every check against the digest taken when the
+   session was created, and the evidence envelope still records the backend
+   digest for each judgement. Sharing an installation is not sharing a
+   guarantee.
+
+   A session is NOT thread safe and that is deliberate, not an omission. One
+   session per worker thread. The state it hands out is single-threaded, and a
+   shared session would let two judgements interleave inside one solver. The
+   Python binding's check_batch creates one per worker for this reason. */
+typedef struct ql_solver_session ql_solver_session;
+
+typedef struct ql_solver_session_options_v1 {
+    size_t struct_size;
+    uint32_t abi_version;
+    uint32_t reserved32;
+    /* Backend options as the descriptor reads them, or null for defaults.
+       Copied into the session; the caller keeps its own string. */
+    const char *options_json;
+    void *reserved[8];
+} ql_solver_session_options_v1;
+
+QL_API void QL_CALL ql_solver_session_options_init(
+    ql_solver_session_options_v1 *options);
+
+/* QL_STATUS_NOT_FOUND when the descriptor carries no session support. That is
+   a fact about the backend, not a failure of the caller: fall back to
+   ql_solver_create. */
+QL_API ql_status QL_CALL ql_solver_session_create(
+    const ql_allocator *allocator, const ql_solver_descriptor_v1 *descriptor,
+    const ql_solver_session_options_v1 *options, ql_solver_session **output,
+    ql_error *error);
+
+/* Deterministic. Whatever the session put on the filesystem is gone when this
+   returns; nothing waits for process exit. Solvers created in the session must
+   already be destroyed. */
+QL_API void QL_CALL ql_solver_session_destroy(ql_solver_session *session);
+
+/* The digest the session took of its installation when it opened. Every check
+   run in this session is verified against this value. */
+QL_API ql_status QL_CALL ql_solver_session_backend_digest(
+    const ql_solver_session *session, ql_digest *digest, ql_error *error);
+
 QL_API ql_status QL_CALL ql_solver_create(
     const ql_allocator *allocator, const ql_solver_descriptor_v1 *descriptor,
     const char *options_json, ql_solver **output, ql_error *error);
+
+/* The same solver against an installation the session already established. A
+   null session behaves exactly like ql_solver_create. The session is borrowed
+   and must outlive the solver. */
+QL_API ql_status QL_CALL ql_solver_create_in_session(
+    const ql_allocator *allocator, ql_solver_session *session,
+    ql_solver **output, ql_error *error);
+
 QL_API void QL_CALL ql_solver_destroy(ql_solver *solver);
 QL_API ql_status QL_CALL ql_solver_add_smt2(
     ql_solver *solver, const ql_artifact *commands, ql_error *error);

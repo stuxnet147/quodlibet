@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
@@ -39,6 +40,7 @@ __all__ = [
     "PolicyResult",
     "check",
     "check_batch",
+    "SolverSession",
     "backend_info",
     "core_version",
     "RELATIONS",
@@ -325,6 +327,57 @@ def _build_result(raw: Mapping[str, Any]) -> CheckResult:
     )
 
 
+class SolverSession:
+    """One private backend installation, reused across many judgements.
+
+    Establishing the backend costs more than answering with it: the adapter
+    copies the solver executable somewhere private, hashes it and probes its
+    version before the first query. A session pays that once instead of once
+    per :func:`check`.
+
+    It changes nothing about what is verified. The snapshot is still hashed
+    before and during every check against the digest taken when the session
+    opened, and every result still reports the backend digest that answered
+    it.
+
+    **Not thread safe, by contract.** One session per worker thread. The state
+    it hands out is single-threaded, so a shared session would let two
+    judgements interleave inside one solver. :func:`check_batch` gives each of
+    its workers its own; code that builds its own pool must do the same.
+
+    Use it as a context manager, or call :meth:`close`. Closing drops the only
+    reference to the handle, and the installation is removed as that handle is
+    finalised rather than waiting for interpreter exit.
+    """
+
+    __slots__ = ("_capsule",)
+
+    def __init__(self) -> None:
+        self._capsule = _quodlibet.solver_session_open()
+
+    @property
+    def closed(self) -> bool:
+        return self._capsule is None
+
+    def close(self) -> None:
+        """Tear the installation down. Idempotent."""
+        self._capsule = None
+
+    def _handle(self) -> object:
+        """The capsule, or a refusal. Using a closed session must not quietly
+        fall back to establishing a backend per check: that would turn a
+        lifetime bug into a silent slowdown."""
+        if self._capsule is None:
+            raise ValueError("solver session is closed")
+        return self._capsule
+
+    def __enter__(self) -> "SolverSession":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
 def check(
     left_source: str,
     left_function: str,
@@ -342,6 +395,7 @@ def check(
     solver_timeout_ms: int | None = None,
     solver_memory_limit_mb: int = 0,
     argument_bindings: Sequence[tuple[int, int]] | None = None,
+    session: "SolverSession | None" = None,
 ) -> CheckResult:
     """Judge one pair of loop-free scalar C functions.
 
@@ -398,6 +452,7 @@ def check(
             if argument_bindings is None
             else [tuple(pair) for pair in argument_bindings]
         ),
+        solver_session=None if session is None else session._handle(),
         **limits,
     )
     return _build_result(raw)
@@ -421,17 +476,47 @@ def check_batch(
     count = workers or (os.cpu_count() or 1)
     count = min(count, len(specs))
 
+    # One session per worker, never shared: a session is not thread safe, and
+    # thread-local storage is what makes "per worker" true no matter how the
+    # pool assigns work. The sessions are closed together at the end rather
+    # than per task, which is the point -- a session closed after every
+    # judgement would establish the backend as often as having none at all.
+    local = threading.local()
+    sessions: list[SolverSession] = []
+    sessions_lock = threading.Lock()
+
+    def worker_session() -> SolverSession | None:
+        existing = getattr(local, "session", None)
+        if existing is not None:
+            return existing
+        try:
+            created = SolverSession()
+        except QuodlibetError:
+            # A backend that cannot open a session still judges; each check
+            # establishes its own installation, as it did before sessions.
+            local.session = None
+            return None
+        local.session = created
+        with sessions_lock:
+            sessions.append(created)
+        return created
+
     def run(spec: CheckSpec | Mapping[str, Any]) -> CheckResult | QuodlibetError:
         kwargs = spec.as_kwargs() if isinstance(spec, CheckSpec) else dict(spec)
+        kwargs.setdefault("session", worker_session())
         try:
             return check(**kwargs)
         except QuodlibetError as error:
             return error
 
-    if count == 1:
-        return [run(spec) for spec in specs]
-    with ThreadPoolExecutor(max_workers=count) as pool:
-        return list(pool.map(run, specs))
+    try:
+        if count == 1:
+            return [run(spec) for spec in specs]
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            return list(pool.map(run, specs))
+    finally:
+        for session in sessions:
+            session.close()
 
 
 def backend_info() -> dict[str, Any]:
