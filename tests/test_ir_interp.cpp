@@ -219,6 +219,60 @@ TEST(IrInterp, TreatsSignedOverflowAsUndefined) {
                     QL_IR_INTERP_UB_GUARD_FAILED);
 }
 
+TEST(IrInterp, ExecutesSwitchFallthroughBreakAndDefaultExactly) {
+    Module module;
+    ASSERT_TRUE(module.Open(
+        "int dispatch(int x) {\n"
+        "  int result = 1;\n"
+        "  switch (x) {\n"
+        "  case 0: result += 2;\n"
+        "  case 1:\n"
+        "    if (x == 1) { result = 11; break; }\n"
+        "    result += 4; break;\n"
+        "  case 2: return 20;\n"
+        "  default: result = 9;\n"
+        "  }\n"
+        "  return result;\n"
+        "}",
+        "dispatch"));
+    EXPECT_EQ(7, ExpectReturn(module, {0u}, 32u));
+    EXPECT_EQ(11, ExpectReturn(module, {1u}, 32u));
+    EXPECT_EQ(20, ExpectReturn(module, {2u}, 32u));
+    EXPECT_EQ(9, ExpectReturn(module, {3u}, 32u));
+}
+
+TEST(IrInterp, ExecutesDefaultInSourceOrderAndAnAllReturningSwitch) {
+    Module middle_default;
+    Module all_return;
+    ASSERT_TRUE(middle_default.Open(
+        "int dispatch(int x) {\n"
+        "  int result = 0;\n"
+        "  switch (x) {\n"
+        "  case 0: return 10;\n"
+        "  default: result = 5;\n"
+        "  case 2: result += 3; break;\n"
+        "  }\n"
+        "  return result;\n"
+        "}",
+        "dispatch"));
+    EXPECT_EQ(10, ExpectReturn(middle_default, {0u}, 32u));
+    EXPECT_EQ(3, ExpectReturn(middle_default, {2u}, 32u));
+    EXPECT_EQ(8, ExpectReturn(middle_default, {7u}, 32u));
+
+    ASSERT_TRUE(all_return.Open(
+        "int dispatch(int x) {\n"
+        "  switch (x) {\n"
+        "  case 'a': return 1;\n"
+        "  case 2 + 3: return 2;\n"
+        "  default: return 3;\n"
+        "  }\n"
+        "}",
+        "dispatch"));
+    EXPECT_EQ(1, ExpectReturn(all_return, {'a'}, 32u));
+    EXPECT_EQ(2, ExpectReturn(all_return, {5u}, 32u));
+    EXPECT_EQ(3, ExpectReturn(all_return, {9u}, 32u));
+}
+
 TEST(IrInterp, DividesAndRemaindersTowardZero) {
     Module module;
     Module remainder;

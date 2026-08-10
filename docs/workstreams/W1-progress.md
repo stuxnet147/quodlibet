@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **14,507 / 29,880 (48.55%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_loop` 4,655, `unsupported_type` 4,187, `unsupported_control_flow` 2,715, `uninitialized_read` 1,691입니다. 다음 단위는 메시지별 재분류로 정합니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **15,751 / 29,880 (52.71%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_loop` 4,749, `unsupported_type` 4,210, `uninitialized_read` 1,765, `unsupported_control_flow` 1,145입니다. 다음 단위는 전방 `goto`와 남은 진단의 메시지별 재분류로 정합니다.
 
 ## 기준선
 
@@ -1253,6 +1253,28 @@ ellipsis 앞의 고정 인자는 계속 prototype의 선언 타입으로 변환�
 | status 실패 | 0 | **0** |
 
 첫 차단 `a variadic callee has no fixed signature` 1,317개를 제거했지만 825개는 뒤의 loop, control flow, type 한계로 이동했습니다. `tests/test_c_lower_calls.cpp`는 `short`와 `unsigned char`가 모두 32비트 `int`로 전달되는지 실제 `va_arg(int)` 실행과 대조합니다. `tests/test_proof_smt_calls.cpp`는 한쪽만 명시적 `int` 지역을 거치는 같은 variadic 호출을 Bitwuzla까지 보내 `PROVED_EQUIVALENT`를 확인합니다.
+
+### 28. switch의 dispatch, fallthrough, break를 비순환 SSA로 내린다
+
+커밋: (이 단위)
+
+제어식을 한 번 평가하고 integer promotion을 적용한 뒤, 각 case 상수를 차례로 비교하는 비순환 dispatch chain을 만듭니다. case label은 지역 읽기나 호출을 받지 않는 integer constant expression으로 제한하고, 제어식의 승격 타입으로 변환해 비교합니다. `default`는 소스 중간에 있어도 dispatch의 마지막 no-match target이 되고, case 실행은 소스 순서대로 이어져 빈 label과 fallthrough를 그대로 보존합니다.
+
+각 case block에는 dispatch 경로와 바로 앞 case의 fallthrough 경로가 함께 들어올 수 있습니다. 기존 두 갈래 병합을 임의 개수 predecessor의 SSA 병합으로 일반화하여 scalar, definite initialization, pointer object 권한, memory, external-call trace를 모두 같은 PHI 규칙으로 합쳤습니다. switch exit도 no-match, 여러 `break`, 마지막 fallthrough를 한 번에 병합합니다.
+
+`break`는 만나는 즉시 아직 존재하지 않는 exit block으로 branch하지 않습니다. source block과 상태를 기록해 두고 모든 case를 내린 뒤 live exit가 실제로 있을 때만 block을 만들고 edge를 완성합니다. 모든 case와 default가 반환하는 switch에 도달 불가능한 빈 block을 남기지 않기 위한 조건입니다. 중첩 switch는 break scope stack으로 가장 안쪽 switch만 빠져나갑니다.
+
+switch body나 case에 직접 선언되어 뒤 case와 scope를 공유하는 형태는 경로별 object lifetime과 bypassed initialization을 따로 모델링해야 하므로 이번 단위에서는 compound block으로 감싼 선언만 받습니다. 부분 lowering하지 않고 `unsupported_control_flow` UNKNOWN으로 남깁니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 14,507 (48.55%) | **15,751 (52.71%)** |
+| 증가 | | **+1,244** |
+| `unsupported_control_flow` | 2,715 | **1,145** |
+| verifier 통과 | 14,507 / 14,507 | **15,751 / 15,751** |
+| status 실패 | 0 | **0** |
+
+`tests/test_ir_differential.cpp`는 unsigned 입력의 match, fallthrough, 중첩 조건 안 break, default를 실제 컴파일된 C와 edge 및 random 입력에서 대조합니다. interpreter 시험은 중간 `default`, all-return switch, 문자와 계산 상수를 고정합니다. product miter는 switch와 같은 if chain의 위반식이 UNSAT이고 domain이 SAT인지 Bitwuzla로 확인합니다.
 
 ## 막힌 것
 

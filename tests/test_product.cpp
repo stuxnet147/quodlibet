@@ -171,6 +171,37 @@ TEST(ProductMiter, CommutedAdditionHasNoViolationAndANonEmptyDomain) {
     EXPECT_EQ(QL_SOLVER_CHECK_SAT, SolveDomain(query.get()));
 }
 
+TEST(ProductMiter, SwitchFallthroughMatchesItsIfChain) {
+    constexpr char left[] =
+        "int dispatch(int x) {"
+        "  int result = 0;"
+        "  switch (x) {"
+        "  case 0: result = 10; break;"
+        "  case 1: result = 20;"
+        "  default: result += 3; break;"
+        "  }"
+        "  return result;"
+        "}";
+    constexpr char right[] =
+        "int dispatch_if(int x) {"
+        "  if (x == 0) return 10;"
+        "  if (x == 1) return 23;"
+        "  return 3;"
+        "}";
+    w2::Pair pair;
+    QueryHandle query;
+
+    ASSERT_NO_FATAL_FAILURE(BuildQuery(&pair, &query, left, "dispatch",
+                                       right, "dispatch_if",
+                                       w2::DefaultContract()));
+    const ql_solver_check_kind violation = SolveViolation(query.get());
+    if (violation == QL_SOLVER_CHECK_INVALID) {
+        GTEST_SKIP() << "Bitwuzla backend is unavailable";
+    }
+    EXPECT_EQ(QL_SOLVER_CHECK_UNSAT, violation);
+    EXPECT_EQ(QL_SOLVER_CHECK_SAT, SolveDomain(query.get()));
+}
+
 TEST(ProductMiter, DifferentReturnValuesProduceASatisfiableViolation) {
     w2::Pair pair;
     QueryHandle query;

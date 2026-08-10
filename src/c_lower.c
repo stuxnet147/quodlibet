@@ -226,6 +226,21 @@ typedef struct lower_state {
     ql_ir_value_id trace;
 } lower_state;
 
+/* A break leaves the innermost switch. Its target block is deliberately
+   created only after every case has been lowered: a switch whose default and
+   every case return has no live exit, and materialising an unused exit block
+   would violate the IR verifier's reachability invariant. Until then each
+   break records the edge's source and the state that reaches it. */
+typedef struct lower_break_scope {
+    struct lower_break_scope *parent;
+    size_t variable_count;
+    lower_state *states;
+    ql_ir_block_id *blocks;
+    size_t count;
+    size_t state_capacity;
+    size_t block_capacity;
+} lower_break_scope;
+
 typedef struct lower_context {
     const ql_allocator *allocator;
     const char *source;
@@ -256,6 +271,7 @@ typedef struct lower_context {
     ql_ir_block_id current_block;
     ql_ir_block_id entry_block;
     uint32_t current_terminated;
+    lower_break_scope *break_scope;
     ql_ir_type_id memory_type;
     lower_type_binding *type_cache;
     size_t type_cache_count;
@@ -7110,19 +7126,20 @@ static ql_status lower_compound(lower_context *context, size_t node,
 }
 
 static ql_status emit_typed_instruction_phi(lower_context *context,
-                                           ql_ir_type_id type,
-                                           const ql_ir_value_id *operands,
-                                           const ql_ir_block_id *blocks,
-                                           ql_ir_value_id *output,
-                                           ql_error *error) {
+                                            ql_ir_type_id type,
+                                            const ql_ir_value_id *operands,
+                                            const ql_ir_block_id *blocks,
+                                            size_t count,
+                                            ql_ir_value_id *output,
+                                            ql_error *error) {
     ql_ir_instruction_definition_v1 definition;
     ql_ir_instruction_id instruction;
 
     ql_ir_instruction_definition_init(&definition, QL_IR_OPCODE_PHI);
     definition.operands = operands;
-    definition.operand_count = 2u;
+    definition.operand_count = count;
     definition.block_operands = blocks;
-    definition.block_operand_count = 2u;
+    definition.block_operand_count = count;
     definition.result_types = &type;
     definition.result_count = 1u;
     return ql_ir_builder_append_instruction(
@@ -7130,94 +7147,145 @@ static ql_status emit_typed_instruction_phi(lower_context *context,
         output, error);
 }
 
-static ql_status merge_branch_states(
-    lower_context *context, const lower_state *left, ql_ir_block_id left_block,
-    const lower_state *right, ql_ir_block_id right_block, ql_error *error) {
+/* Joins every live predecessor of a block. Switch exits can have one edge for
+   the no-match path, several breaks, and one final fallthrough, so the
+   two-way if join is only a special case of this operation. */
+static ql_status merge_states_many(lower_context *context,
+                                   const lower_state *states,
+                                   const ql_ir_block_id *blocks,
+                                   size_t state_count, ql_error *error) {
     size_t index;
-    for (index = 0u; index < left->count; ++index) {
+    ql_ir_value_id *operands;
+    ql_status status = QL_STATUS_OK;
+
+    if (state_count == 0u) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "cannot merge an empty set of lowering states");
+        return QL_STATUS_INTERNAL_ERROR;
+    }
+    if (state_count == 1u) {
+        restore_state(context, &states[0]);
+        return QL_STATUS_OK;
+    }
+    for (index = 1u; index < state_count; ++index) {
+        if (states[index].count != states[0].count) {
+            ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                         "lowering states disagree on visible variables");
+            return QL_STATUS_INTERNAL_ERROR;
+        }
+    }
+    operands = context->allocator->allocate(
+        context->allocator->user_data,
+        state_count * sizeof(*operands));
+    if (operands == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    for (index = 0u; index < states[0].count; ++index) {
         lower_variable *variable = &context->variables[index];
+        size_t incoming;
+        uint32_t all_initialized = 1u;
+        uint32_t all_have_object = 1u;
+        uint32_t all_can_name_object = 1u;
+        uint32_t same_value = 1u;
+
+        for (incoming = 0u; incoming < state_count; ++incoming) {
+            all_initialized &= states[incoming].initialized[index] != 0u;
+            all_have_object &= states[incoming].has_object[index] != 0u;
+            all_can_name_object &=
+                states[incoming].has_object[index] != 0u ||
+                states[incoming].may_admit_object[index] != 0u;
+            operands[incoming] = states[incoming].values[index];
+            if (incoming != 0u &&
+                operands[incoming] != operands[0]) {
+                same_value = 0u;
+            }
+        }
         if (variable->is_stack != 0u) {
             /* Memory already carries it, and the memory PHI below merges
                that. A second PHI over a value it does not have would be
                wrong. Definite initialization still has to hold on both live
                paths before a later read or address escape is allowed. */
-            variable->initialized =
-                left->initialized[index] != 0u &&
-                        right->initialized[index] != 0u
-                    ? 1u
-                    : 0u;
+            variable->initialized = all_initialized;
             continue;
         }
-        if (left->initialized[index] == 0u ||
-            right->initialized[index] == 0u) {
+        if (all_initialized == 0u) {
             variable->initialized = 0u;
             variable->value = QL_IR_INVALID_VALUE_ID;
+            variable->has_object = 0u;
+            variable->may_admit_object = 0u;
             continue;
         }
         variable->initialized = 1u;
-        variable->has_object = left->has_object[index] != 0u &&
-                                       right->has_object[index] != 0u
-                                   ? 1u
-                                   : 0u;
+        variable->has_object = all_have_object;
         variable->may_admit_object =
-            variable->has_object == 0u &&
-                    (left->has_object[index] != 0u ||
-                     left->may_admit_object[index] != 0u) &&
-                    (right->has_object[index] != 0u ||
-                     right->may_admit_object[index] != 0u)
-                ? 1u
-                : 0u;
-        if (left->values[index] == right->values[index]) {
-            variable->value = left->values[index];
+            all_have_object == 0u && all_can_name_object != 0u;
+        if (same_value != 0u) {
+            variable->value = operands[0];
         } else {
-            ql_ir_value_id operands[2];
-            ql_ir_block_id blocks[2];
-            ql_status status;
-            operands[0] = left->values[index];
-            operands[1] = right->values[index];
-            blocks[0] = left_block;
-            blocks[1] = right_block;
             status = emit_instruction(context, QL_IR_OPCODE_PHI,
-                                      &variable->type, operands, 2u, blocks,
-                                      2u, QL_IR_EFFECT_NONE,
+                                      &variable->type, operands, state_count,
+                                      blocks, state_count, QL_IR_EFFECT_NONE,
                                       &variable->value, error);
             if (status != QL_STATUS_OK) {
-                return status;
+                goto cleanup;
             }
         }
     }
     /* Memory is as much a merged value as any variable: a store on one branch
        and not the other leaves the join with two versions to reconcile. */
-    if (context->makes_calls != 0u && left->trace != right->trace) {
-        ql_ir_value_id operands[2];
-        ql_ir_block_id blocks[2];
-        ql_status status;
-        operands[0] = left->trace;
-        operands[1] = right->trace;
-        blocks[0] = left_block;
-        blocks[1] = right_block;
-        status = emit_typed_instruction_phi(context, context->trace_type,
-                                            operands, blocks,
-                                            &context->trace_value, error);
-        if (status != QL_STATUS_OK) {
-            return status;
+    if (context->makes_calls != 0u) {
+        size_t incoming;
+        uint32_t same = 1u;
+        for (incoming = 0u; incoming < state_count; ++incoming) {
+            operands[incoming] = states[incoming].trace;
+            if (incoming != 0u && operands[incoming] != operands[0]) {
+                same = 0u;
+            }
         }
-    } else {
-        context->trace_value = left->trace;
+        if (same != 0u) {
+            context->trace_value = operands[0];
+        } else {
+            status = emit_typed_instruction_phi(
+                context, context->trace_type, operands, blocks, state_count,
+                &context->trace_value, error);
+        }
+        if (status != QL_STATUS_OK) {
+            goto cleanup;
+        }
     }
-    if (context->uses_memory != 0u && left->memory != right->memory) {
-        ql_ir_value_id operands[2];
-        ql_ir_block_id blocks[2];
-        operands[0] = left->memory;
-        operands[1] = right->memory;
-        blocks[0] = left_block;
-        blocks[1] = right_block;
-        return emit_typed_instruction_phi(context, context->memory_type,
-                                          operands, blocks,
-                                          &context->memory_value, error);
+    if (context->uses_memory != 0u) {
+        size_t incoming;
+        uint32_t same = 1u;
+        for (incoming = 0u; incoming < state_count; ++incoming) {
+            operands[incoming] = states[incoming].memory;
+            if (incoming != 0u && operands[incoming] != operands[0]) {
+                same = 0u;
+            }
+        }
+        if (same != 0u) {
+            context->memory_value = operands[0];
+        } else {
+            status = emit_typed_instruction_phi(
+                context, context->memory_type, operands, blocks, state_count,
+                &context->memory_value, error);
+        }
     }
-    context->memory_value = left->memory;
-    return QL_STATUS_OK;
+cleanup:
+    context->allocator->deallocate(context->allocator->user_data, operands);
+    return status;
+}
+
+static ql_status merge_branch_states(
+    lower_context *context, const lower_state *left, ql_ir_block_id left_block,
+    const lower_state *right, ql_ir_block_id right_block, ql_error *error) {
+    lower_state states[2];
+    ql_ir_block_id blocks[2];
+    states[0] = *left;
+    states[1] = *right;
+    blocks[0] = left_block;
+    blocks[1] = right_block;
+    return merge_states_many(context, states, blocks, 2u, error);
 }
 
 static ql_status lower_if_statement(lower_context *context, size_t node,
@@ -7360,6 +7428,527 @@ cleanup:
     return status;
 }
 
+typedef struct lower_switch_case {
+    size_t node;
+    size_t value_node; /* SIZE_MAX is the default label. */
+    ql_ir_block_id block;
+    ql_ir_block_id dispatch_block;
+} lower_switch_case;
+
+static void destroy_break_scope(lower_context *context,
+                                lower_break_scope *scope) {
+    size_t index;
+    for (index = 0u; index < scope->count; ++index) {
+        destroy_state(context, &scope->states[index]);
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   scope->states);
+    context->allocator->deallocate(context->allocator->user_data,
+                                   scope->blocks);
+    memset(scope, 0, sizeof(*scope));
+}
+
+/* Takes ownership of state when it succeeds. */
+static ql_status append_switch_exit(lower_context *context,
+                                    lower_break_scope *scope,
+                                    ql_ir_block_id block,
+                                    lower_state *state,
+                                    ql_error *error) {
+    ql_status status = grow_array(
+        context->allocator, (void **)&scope->states,
+        &scope->state_capacity, sizeof(*scope->states), scope->count + 1u,
+        error);
+    if (status == QL_STATUS_OK) {
+        status = grow_array(
+            context->allocator, (void **)&scope->blocks,
+            &scope->block_capacity, sizeof(*scope->blocks), scope->count + 1u,
+            error);
+    }
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    scope->states[scope->count] = *state;
+    scope->blocks[scope->count] = block;
+    memset(state, 0, sizeof(*state));
+    ++scope->count;
+    return QL_STATUS_OK;
+}
+
+static ql_status lower_break_statement(lower_context *context, size_t node,
+                                       ql_error *error) {
+    lower_state state;
+    ql_status status;
+
+    memset(&state, 0, sizeof(state));
+    if (context->break_scope == NULL) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+            "break statement has no enclosing supported switch", error);
+    }
+    status = save_state(context, context->break_scope->variable_count,
+                        &state, error);
+    if (status == QL_STATUS_OK) {
+        status = append_switch_exit(context, context->break_scope,
+                                    context->current_block, &state, error);
+    }
+    if (status != QL_STATUS_OK) {
+        destroy_state(context, &state);
+        return status;
+    }
+    /* The branch is installed after all cases have been lowered, when it is
+       known that the switch really has a live exit block. */
+    context->current_terminated = 1u;
+    return QL_STATUS_OK;
+}
+
+/* A case label must be an integer constant expression. This syntactic check
+   keeps lower_expression from accepting a local read, a call, or another
+   run-time operation merely because the same expression is valid elsewhere.
+   The ordinary expression lowering still supplies all C integer conversions
+   and definedness after this check. */
+static int is_case_constant_expression(lower_context *context, size_t node) {
+    const char *kind;
+    size_t child;
+
+    if (node == SIZE_MAX || node >= context->node_count) {
+        return 0;
+    }
+    kind = context->nodes[node].view.kind;
+    if (strcmp(kind, "number_literal") == 0 ||
+        strcmp(kind, "char_literal") == 0 ||
+        strcmp(kind, "sizeof_expression") == 0) {
+        return 1;
+    }
+    if (strcmp(kind, "identifier") == 0) {
+        char *name = copy_node_text(context, node);
+        int result;
+        if (name == NULL) {
+            return 0;
+        }
+        result = find_variable(context, name, strlen(name)) == NULL &&
+                 find_enumerator(context, name) != NULL;
+        context->allocator->deallocate(context->allocator->user_data, name);
+        return result;
+    }
+    if (strcmp(kind, "parenthesized_expression") == 0) {
+        child = first_named_child(context, node);
+        return is_case_constant_expression(context, child);
+    }
+    if (strcmp(kind, "unary_expression") == 0) {
+        child = direct_field_child(context, node, "argument");
+        return is_case_constant_expression(context, child);
+    }
+    if (strcmp(kind, "binary_expression") == 0) {
+        size_t left = direct_field_child(context, node, "left");
+        size_t right = direct_field_child(context, node, "right");
+        return is_case_constant_expression(context, left) &&
+               is_case_constant_expression(context, right);
+    }
+    if (strcmp(kind, "cast_expression") == 0) {
+        child = direct_field_child(context, node, "value");
+        return is_case_constant_expression(context, child);
+    }
+    if (strcmp(kind, "conditional_expression") == 0) {
+        size_t condition = direct_field_child(context, node, "condition");
+        size_t consequence = direct_field_child(context, node, "consequence");
+        size_t alternative = direct_field_child(context, node, "alternative");
+        return is_case_constant_expression(context, condition) &&
+               is_case_constant_expression(context, consequence) &&
+               is_case_constant_expression(context, alternative);
+    }
+    return 0;
+}
+
+static ql_status collect_switch_cases(lower_context *context, size_t body,
+                                      lower_switch_case **cases,
+                                      size_t *case_count,
+                                      size_t *case_capacity,
+                                      size_t *default_index,
+                                      ql_error *error) {
+    size_t end;
+    size_t child;
+
+    *default_index = SIZE_MAX;
+    if (body == SIZE_MAX ||
+        strcmp(context->nodes[body].view.kind, "compound_statement") != 0) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, body,
+            "switch body must be a compound statement in this slice", error);
+    }
+    end = subtree_end(context, body);
+    for (child = body + 1u; child < end; ++child) {
+        const char *kind;
+        size_t value;
+        ql_status status;
+        if (context->nodes[child].parent != body ||
+            (context->nodes[child].view.flags & QL_C_SYNTAX_NODE_NAMED) == 0u) {
+            continue;
+        }
+        kind = context->nodes[child].view.kind;
+        if (strcmp(kind, "comment") == 0) {
+            continue;
+        }
+        if (strcmp(kind, "case_statement") != 0) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
+                child,
+                "statements or declarations before the first direct case "
+                "label need switch-scope object analysis", error);
+        }
+        value = direct_field_child(context, child, "value");
+        if (value == SIZE_MAX && *default_index != SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
+                child, "switch has more than one default label", error);
+        }
+        {
+            size_t case_end = subtree_end(context, child);
+            size_t statement;
+            for (statement = child + 1u; statement < case_end; ++statement) {
+                const char *statement_kind;
+                if (context->nodes[statement].parent != child ||
+                    (context->nodes[statement].view.flags &
+                     QL_C_SYNTAX_NODE_NAMED) == 0u ||
+                    statement == value) {
+                    continue;
+                }
+                statement_kind = context->nodes[statement].view.kind;
+                if (strcmp(statement_kind, "comment") == 0) {
+                    continue;
+                }
+                if (strcmp(statement_kind, "declaration") == 0) {
+                    return lower_unknown(
+                        context,
+                        QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
+                        statement,
+                        "a declaration shared by later case labels must be "
+                        "wrapped in its own compound statement", error);
+                }
+                if (strcmp(statement_kind, "case_statement") == 0) {
+                    return lower_unknown(
+                        context,
+                        QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
+                        statement,
+                        "case labels must be direct children of the switch "
+                        "body in this slice", error);
+                }
+            }
+        }
+        status = grow_array(context->allocator, (void **)cases,
+                            case_capacity, sizeof(**cases),
+                            *case_count + 1u, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        memset(&(*cases)[*case_count], 0, sizeof(**cases));
+        (*cases)[*case_count].node = child;
+        (*cases)[*case_count].value_node = value;
+        (*cases)[*case_count].block = QL_IR_INVALID_BLOCK_ID;
+        (*cases)[*case_count].dispatch_block = QL_IR_INVALID_BLOCK_ID;
+        if (value == SIZE_MAX) {
+            *default_index = *case_count;
+        }
+        ++(*case_count);
+    }
+    return QL_STATUS_OK;
+}
+
+static ql_status lower_switch_case_body(lower_context *context,
+                                        const lower_switch_case *entry,
+                                        ql_error *error) {
+    size_t end = subtree_end(context, entry->node);
+    size_t child;
+    ql_status status = QL_STATUS_OK;
+
+    for (child = entry->node + 1u; child < end; ++child) {
+        if (context->nodes[child].parent != entry->node ||
+            (context->nodes[child].view.flags & QL_C_SYNTAX_NODE_NAMED) == 0u ||
+            child == entry->value_node ||
+            strcmp(context->nodes[child].view.kind, "comment") == 0) {
+            continue;
+        }
+        if (context->current_terminated != 0u) {
+            break;
+        }
+        status = lower_statement(context, child, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            break;
+        }
+    }
+    return status;
+}
+
+static ql_status lower_switch_statement(lower_context *context, size_t node,
+                                        ql_error *error) {
+    size_t condition_node = direct_field_child(context, node, "condition");
+    size_t body_node = direct_field_child(context, node, "body");
+    size_t variable_count = context->variable_count;
+    lower_switch_case *cases = NULL;
+    size_t case_count = 0u;
+    size_t case_capacity = 0u;
+    size_t default_index = SIZE_MAX;
+    size_t nondefault_count = 0u;
+    size_t index;
+    lower_value condition;
+    lower_value promoted_condition;
+    lower_state entry_state;
+    lower_state fallthrough_state;
+    uint32_t fallthrough_live = 0u;
+    ql_ir_block_id fallthrough_block = QL_IR_INVALID_BLOCK_ID;
+    ql_ir_block_id condition_block = context->current_block;
+    ql_ir_block_id dispatch_block = QL_IR_INVALID_BLOCK_ID;
+    ql_ir_block_id pending_dispatch = QL_IR_INVALID_BLOCK_ID;
+    ql_ir_block_id pending_match = QL_IR_INVALID_BLOCK_ID;
+    ql_ir_value_id pending_condition = QL_IR_INVALID_VALUE_ID;
+    lower_break_scope scope;
+    lower_break_scope *parent_scope = context->break_scope;
+    uint32_t entered_scope = 0u;
+    ql_status status;
+
+    memset(&entry_state, 0, sizeof(entry_state));
+    memset(&fallthrough_state, 0, sizeof(fallthrough_state));
+    memset(&scope, 0, sizeof(scope));
+    if (condition_node == SIZE_MAX || body_node == SIZE_MAX) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+            "switch statement is missing its condition or body", error);
+    }
+    status = collect_switch_cases(context, body_node, &cases, &case_count,
+                                  &case_capacity, &default_index, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        goto cleanup;
+    }
+    status = lower_expression(context, condition_node, &condition, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        goto cleanup;
+    }
+    if (condition.type.kind != QL_C_SCALAR_INTEGER &&
+        condition.type.kind != QL_C_SCALAR_BOOL) {
+        status = lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, condition_node,
+            "switch condition must have integer type", error);
+        goto cleanup;
+    }
+    status = integer_promote(context, condition, &promoted_condition, error);
+    if (status == QL_STATUS_OK) {
+        status = emit_ub_guard(context, &promoted_condition, error);
+    }
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        goto cleanup;
+    }
+    if (case_count == 0u) {
+        status = QL_STATUS_OK;
+        goto cleanup;
+    }
+    status = save_state(context, variable_count, &entry_state, error);
+    if (status != QL_STATUS_OK) {
+        goto cleanup;
+    }
+    for (index = 0u; index < case_count; ++index) {
+        status = add_block(context, "switch.case", &cases[index].block,
+                           error);
+        if (status != QL_STATUS_OK) {
+            goto cleanup;
+        }
+        if (cases[index].value_node != SIZE_MAX) {
+            ++nondefault_count;
+        }
+    }
+
+    dispatch_block = condition_block;
+    if (nondefault_count == 0u) {
+        cases[default_index].dispatch_block = dispatch_block;
+        status = set_branch(context, dispatch_block,
+                            cases[default_index].block, error);
+        if (status != QL_STATUS_OK) {
+            goto cleanup;
+        }
+    } else {
+        size_t emitted = 0u;
+        for (index = 0u; index < case_count; ++index) {
+            lower_value case_value;
+            lower_value converted_case;
+            ql_ir_value_id equal;
+            ql_ir_block_id next_dispatch = QL_IR_INVALID_BLOCK_ID;
+            if (cases[index].value_node == SIZE_MAX) {
+                continue;
+            }
+            if (!is_case_constant_expression(context,
+                                             cases[index].value_node)) {
+                status = lower_unknown(
+                    context,
+                    QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
+                    cases[index].value_node,
+                    "case label is not a supported integer constant "
+                    "expression", error);
+                goto cleanup;
+            }
+            restore_state(context, &entry_state);
+            context->current_block = dispatch_block;
+            context->current_terminated = 0u;
+            status = lower_expression(context, cases[index].value_node,
+                                      &case_value, error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                goto cleanup;
+            }
+            if (case_value.type.kind != QL_C_SCALAR_INTEGER &&
+                case_value.type.kind != QL_C_SCALAR_BOOL) {
+                status = lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR,
+                    cases[index].value_node,
+                    "case label must have integer type", error);
+                goto cleanup;
+            }
+            status = convert_value(context, case_value,
+                                   promoted_condition.type,
+                                   &converted_case, error);
+            if (status == QL_STATUS_OK) {
+                status = emit_ub_guard(context, &converted_case, error);
+            }
+            if (status == QL_STATUS_OK) {
+                status = emit_compare(context, QL_IR_OPCODE_EQ,
+                                      promoted_condition.value,
+                                      converted_case.value, &equal, error);
+            }
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                goto cleanup;
+            }
+            cases[index].dispatch_block = dispatch_block;
+            ++emitted;
+            if (emitted < nondefault_count) {
+                status = add_block(context, "switch.dispatch",
+                                   &next_dispatch, error);
+                if (status == QL_STATUS_OK) {
+                    status = set_cond_branch(
+                        context, dispatch_block, equal, cases[index].block,
+                        next_dispatch, error);
+                }
+                if (status != QL_STATUS_OK) {
+                    goto cleanup;
+                }
+                dispatch_block = next_dispatch;
+            } else if (default_index != SIZE_MAX) {
+                cases[default_index].dispatch_block = dispatch_block;
+                status = set_cond_branch(
+                    context, dispatch_block, equal, cases[index].block,
+                    cases[default_index].block, error);
+                if (status != QL_STATUS_OK) {
+                    goto cleanup;
+                }
+            } else {
+                /* The false target is the switch exit, which is created only
+                   after breaks and final fallthrough are known. */
+                pending_dispatch = dispatch_block;
+                pending_condition = equal;
+                pending_match = cases[index].block;
+            }
+        }
+    }
+
+    ++context->scope_depth;
+    entered_scope = 1u;
+    scope.parent = parent_scope;
+    scope.variable_count = variable_count;
+    context->break_scope = &scope;
+    for (index = 0u; index < case_count; ++index) {
+        restore_state(context, &entry_state);
+        context->current_block = cases[index].block;
+        context->current_terminated = 0u;
+        if (fallthrough_live != 0u) {
+            status = set_branch(context, fallthrough_block,
+                                cases[index].block, error);
+            if (status == QL_STATUS_OK) {
+                status = merge_branch_states(
+                    context, &entry_state, cases[index].dispatch_block,
+                    &fallthrough_state, fallthrough_block, error);
+            }
+            destroy_state(context, &fallthrough_state);
+            fallthrough_live = 0u;
+            if (status != QL_STATUS_OK) {
+                goto cleanup;
+            }
+        }
+        status = lower_switch_case_body(context, &cases[index], error);
+        pop_variables(context, variable_count);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            goto cleanup;
+        }
+        if (context->current_terminated == 0u) {
+            fallthrough_block = context->current_block;
+            status = save_state(context, variable_count,
+                                &fallthrough_state, error);
+            if (status != QL_STATUS_OK) {
+                goto cleanup;
+            }
+            fallthrough_live = 1u;
+        }
+    }
+    context->break_scope = parent_scope;
+    if (fallthrough_live != 0u) {
+        status = append_switch_exit(context, &scope, fallthrough_block,
+                                    &fallthrough_state, error);
+        fallthrough_live = 0u;
+        if (status != QL_STATUS_OK) {
+            goto cleanup;
+        }
+    }
+    if (scope.count != 0u || pending_dispatch != QL_IR_INVALID_BLOCK_ID) {
+        ql_ir_block_id exit_block;
+        status = add_block(context, "switch.exit", &exit_block, error);
+        if (status != QL_STATUS_OK) {
+            goto cleanup;
+        }
+        for (index = 0u; index < scope.count; ++index) {
+            status = set_branch(context, scope.blocks[index], exit_block,
+                                error);
+            if (status != QL_STATUS_OK) {
+                goto cleanup;
+            }
+        }
+        if (pending_dispatch != QL_IR_INVALID_BLOCK_ID) {
+            lower_state no_match_state;
+            memset(&no_match_state, 0, sizeof(no_match_state));
+            status = set_cond_branch(context, pending_dispatch,
+                                     pending_condition, pending_match,
+                                     exit_block, error);
+            if (status == QL_STATUS_OK) {
+                restore_state(context, &entry_state);
+                status = save_state(context, variable_count,
+                                    &no_match_state, error);
+            }
+            if (status == QL_STATUS_OK) {
+                status = append_switch_exit(context, &scope,
+                                            pending_dispatch,
+                                            &no_match_state, error);
+            }
+            if (status != QL_STATUS_OK) {
+                destroy_state(context, &no_match_state);
+                goto cleanup;
+            }
+        }
+        context->current_block = exit_block;
+        context->current_terminated = 0u;
+        status = merge_states_many(context, scope.states, scope.blocks,
+                                   scope.count, error);
+    } else {
+        context->current_block = QL_IR_INVALID_BLOCK_ID;
+        context->current_terminated = 1u;
+        status = QL_STATUS_OK;
+    }
+
+cleanup:
+    context->break_scope = parent_scope;
+    if (entered_scope != 0u) {
+        pop_variables(context, variable_count);
+        --context->scope_depth;
+    }
+    destroy_state(context, &entry_state);
+    destroy_state(context, &fallthrough_state);
+    destroy_break_scope(context, &scope);
+    context->allocator->deallocate(context->allocator->user_data, cases);
+    return status;
+}
+
 /* Falling off the end of a void function returns, so the same terminator
    serves the explicit `return;` and the implicit one. */
 static ql_status terminate_void_return(lower_context *context,
@@ -7447,6 +8036,12 @@ static ql_status lower_statement(lower_context *context, size_t node,
     if (strcmp(kind, "if_statement") == 0) {
         return lower_if_statement(context, node, error);
     }
+    if (strcmp(kind, "switch_statement") == 0) {
+        return lower_switch_statement(context, node, error);
+    }
+    if (strcmp(kind, "break_statement") == 0) {
+        return lower_break_statement(context, node, error);
+    }
     if (strcmp(kind, "return_statement") == 0) {
         return lower_return_statement(context, node, error);
     }
@@ -7475,10 +8070,8 @@ static ql_status lower_statement(lower_context *context, size_t node,
             "loops require invariants, unrolling, or a recurrence proof method",
             error);
     }
-    if (strcmp(kind, "switch_statement") == 0 ||
-        strcmp(kind, "goto_statement") == 0 ||
+    if (strcmp(kind, "goto_statement") == 0 ||
         strcmp(kind, "labeled_statement") == 0 ||
-        strcmp(kind, "break_statement") == 0 ||
         strcmp(kind, "continue_statement") == 0) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,

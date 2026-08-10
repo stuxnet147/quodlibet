@@ -117,6 +117,23 @@ QL_DIFF_FUNCTION(named_signed, typedef int QL_DIFF_INT;
                                                QL_DIFF_INT b) {
                      return (QL_DIFF_INT) (a * b);
                  });
+QL_DIFF_FUNCTION(switch_flow,
+                 unsigned int diff_switch(unsigned int x,
+                                          unsigned int seed) {
+                     switch (x) {
+                     case 0u: seed += 2u;
+                     case 1u:
+                         if ((seed & 1u) != 0u) {
+                             seed ^= 9u;
+                             break;
+                         }
+                         seed += 4u;
+                         break;
+                     case 5u: return seed + 20u;
+                     default: seed ^= 0x55u;
+                     }
+                     return seed;
+                 });
 
 namespace {
 
@@ -467,6 +484,11 @@ const Case kCases[] = {
      MulDefined,
      [](uint64_t a, uint64_t b) {
          return FromI32(diff_named_signed(AsI32(a), AsI32(b)));
+     }},
+    {"switch_flow", switch_flow_source, "diff_switch", 32u, 32u, 32u,
+     AlwaysDefined,
+     [](uint64_t a, uint64_t b) {
+         return FromU32(diff_switch(AsU32(a), AsU32(b)));
      }},
 };
 
