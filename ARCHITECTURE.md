@@ -223,7 +223,7 @@ supplied value only on that predicate and carries the local's definedness as
 `old_defined || wrote`, so a callee that does not write still makes a later
 read undefined. Arbitrary pointer escape remains refused.
 
-#### Record arguments to external calls are packed values
+#### Record arguments and returns at external calls are packed values
 
 A record passed by value to a declared external callee is represented by its
 complete target-layout object image, including padding bytes and the active
@@ -234,9 +234,18 @@ callee cannot mutate that object through a by-value argument.
 
 The packed operands are ordinary call values. Concrete callbacks receive the
 same byte image, and product-call congruence can cancel calls only when these
-values and the other observed call components match. Record-valued returns
-and record parameters or returns on the selected source function remain
-outside the current source-signature and IR result contracts.
+values and the other observed call components match. A direct declared call
+that returns a record similarly receives one little-endian 64-bit `CALL`
+result per eight bytes of the complete target-layout image. The lowering
+writes every result chunk bytewise into a fixed temporary object for that
+syntactic call site, then treats the temporary's address as the record value.
+This preserves padding and union bytes across a record initializer and direct
+member access. Every chunk participates in product-call congruence.
+
+An indirect record return remains outside the slice because the object
+prepass cannot bind a statically named callee to a return temporary. Record
+parameters or returns on the selected source function also remain outside the
+current source-signature and IR result contracts.
 
 #### Corpus globals carry no promised initial value
 

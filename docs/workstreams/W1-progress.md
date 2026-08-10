@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,487 / 29,880 (95.34%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 370, `unsupported_control_flow` 308, `unsupported_call` 263, `undeclared_identifier` 144입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,589 / 29,880 (95.68%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 370, `unsupported_control_flow` 311, `unsupported_call` 222, `undeclared_identifier` 144입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -2018,6 +2018,26 @@ C label은 함수 scope이므로 조건문이나 compound 안에 적혀 있어�
 
 `tests/test_ir_differential.cpp`는 앞쪽 분기에서 조건문 내부 label로 들어가는 함수를 실제 compiled C와 edge 및 random 입력에서 대조합니다. 기존 nested backward label은 계속 UNKNOWN으로 고정합니다. 변경은 label 수집, 조건문과 loop의 pending CFG 상태, 종료된 compound 탐색에 닿으므로 C lowering, parser reuse, interpreter, compiled differential, verifier 영향 범위 40/40을 실행했습니다. solver, plugin, EGraph를 포함한 전체 CTest는 실행하지 않았고, 전체 train coverage만 G9 성공률과 기존 성공 사례 회귀를 확인하기 위해 실행했습니다.
 
+### 70. 외부 callee의 record 반환을 object image로 복원한다
+
+직접 선언된 외부 함수가 record를 값으로 반환하면 target layout의 전체 object image를 8바이트씩 나눈 little-endian `CALL` 결과로 받습니다. 각 syntactic call site에 고정된 임시 object를 하나 미리 배정하고, CALL 뒤에 padding과 union representation까지 모든 결과 바이트를 그 object에 기록합니다. record initializer는 이 image를 destination에 복사하고 `CALLEE_make(...).member`는 임시 object를 직접 읽습니다. 일반 record lvalue는 기존 designator 경로를 유지하므로 일부 member만 초기화한 object의 나머지 indeterminate byte를 잘못 읽지 않습니다.
+
+CALL 결과의 모든 chunk는 concrete callback 결과와 product-call congruence에 함께 참여합니다. 간접 record return은 object prepass가 statically named callee에 temporary를 묶을 수 없으므로 status 오류를 내지 않고 계속 UNKNOWN입니다. 선택된 함수 자체의 record parameter 또는 return도 source-signature와 IR result 계약 밖에 남깁니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 28,487 (95.34%) | **28,589 (95.68%)** |
+| 증가 | | **+102** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_call` | 263 | **222** |
+| `unsupported_expression` | 73 | **9** |
+| verifier 통과 | 28,487 / 28,487 | **28,589 / 28,589** |
+| status 실패 | 0 | **0** |
+
+증가 102개는 기존 record-return 차단 41개와, 그 뒤 record member 접근까지 도달하지 못해 `unsupported_expression`에서 막히던 61개입니다. 전체 train의 29,880개 경로와 함수명 복합 키는 중복 없이 모두 대응했고 누락도 0개였습니다.
+
+`tests/test_c_lower_calls.cpp`는 padding이 있는 16바이트 record를 실제 compiled C와 interpreter callback에서 대조하고, local initializer와 직접 member 접근을 함께 검증합니다. `tests/test_proof_smt_calls.cpp`는 모든 packed return chunk가 한 CALL tuple로 합동성에 참여하는지 증명합니다. 최종 코드에서 C lowering, parser reuse, IR interpreter와 verifier, call-product, source-signature 영향 범위 175/175가 통과했습니다. 공용 IR, interpreter, solver, plugin 구현은 바뀌지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 범용 전체 테스트가 아니라 G9 수치와 기존 성공 회귀 0건을 현재 커밋 상태에서 확인하기 위한 필수 측정으로 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -2027,11 +2047,13 @@ C label은 함수 scope이므로 조건문이나 compound 안에 적혀 있어�
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
 - `unsupported_type` 370
-- `unsupported_control_flow` 308
-- `unsupported_call` 263
+- `unsupported_control_flow` 311
+- `unsupported_call` 222
 - `undeclared_identifier` 144
-- `unsupported_expression` 73
 - `unsupported_pointer` 61
+- `duplicate_declaration` 58
+- `unsupported_volatile_or_atomic` 50
+- `unsupported_expression` 9
 
 ## 조율자에게 요청할 것
 
@@ -2047,7 +2069,7 @@ C label은 함수 scope이므로 조건문이나 compound 안에 적혀 있어�
 
 ## 다음에 할 것
 
-1. 선택된 함수 또는 외부 callee의 record return은 source signature와 CALL result의 object-copy 계약을 함께 정한 뒤 수용합니다.
+1. 선택된 함수의 record parameter 또는 return은 source signature와 IR 입출력의 object-copy 계약을 함께 정한 뒤 수용합니다.
 2. 선언 없는 callee와 identifier는 추출 context에서 복구 가능한 근거가 있는지 먼저 분리합니다.
 3. 남은 nested 및 backward goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 확장합니다.
 4. function pointer의 남은 깊이 제한은 실제 call signature를 복구할 수 있는 형태만 확장합니다.

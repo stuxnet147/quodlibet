@@ -248,6 +248,17 @@ typedef struct lower_stack_slot {
   uint32_t is_parameter;
 } lower_stack_slot;
 
+/* Storage for the complete object image returned by one syntactic external
+   call. A record has no scalar IR value, so the CALL returns packed chunks
+   and the lowering writes them into this temporary before exposing the
+   record-valued expression as an object designator. */
+typedef struct lower_record_call_temp {
+  size_t node;
+  lower_type type;
+  size_t object;
+  ql_ir_value_id address;
+} lower_record_call_temp;
+
 typedef struct lower_state {
   ql_ir_value_id *values;
   ql_ir_value_id *defined;
@@ -351,6 +362,9 @@ typedef struct lower_context {
   lower_stack_slot *stack_slots;
   size_t stack_slot_count;
   size_t stack_slot_capacity;
+  lower_record_call_temp *record_call_temps;
+  size_t record_call_temp_count;
+  size_t record_call_temp_capacity;
   lower_callee *callees;
   size_t callee_count;
   size_t callee_capacity;
@@ -6470,6 +6484,7 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
                                           lower_value *output,
                                           lower_type *declared,
                                           ql_error *error);
+static int is_call_expression(const lower_context *context, size_t node);
 
 static ql_status lower_member_address(lower_context *context, size_t node,
                                       lower_value *output, lower_type *declared,
@@ -6518,12 +6533,23 @@ static ql_status lower_member_address(lower_context *context, size_t node,
     }
     record = base.type.record;
   } else {
-    /* `x.f` needs x's address, so x has to be something this slice can
-       designate: a dereference, a subscript, or another member. */
-    status = lower_designator_address(context, argument_node, &base,
-                                      &base_declared, error);
-    if (status != QL_STATUS_OK || context->unknown != 0u) {
-      return status;
+    if (is_call_expression(context, argument_node)) {
+      /* A returned record is not an lvalue, but its value is carried by the
+         temporary object's address. Keep ordinary record lvalues on the
+         designator path below: a partially initialised local may have one
+         member written without reading the indeterminate whole object. */
+      status = lower_expression(context, argument_node, &base, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+      base_declared = base.type;
+      base.type = make_pointer_to(base_declared);
+    } else {
+      status = lower_designator_address(context, argument_node, &base,
+                                        &base_declared, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
     }
     if (base_declared.kind != QL_C_SCALAR_RECORD) {
       return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
@@ -6906,10 +6932,11 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
     return status;
   }
   if (callee->return_type.kind == QL_C_SCALAR_RECORD) {
-    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
-                         "a callee returning a record by value is outside "
-                         "this slice",
-                         error);
+    status = ensure_record_layout(context, callee->return_type.record, node,
+                                  error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
   }
   parameters_node =
       direct_field_child(context, callee->declarator_node, "parameters");
@@ -7170,6 +7197,85 @@ static ql_status append_record_call_argument(
   return QL_STATUS_OK;
 }
 
+static lower_record_call_temp *find_record_call_temp(lower_context *context,
+                                                      size_t node) {
+  size_t index;
+  for (index = 0u; index < context->record_call_temp_count; ++index) {
+    if (context->record_call_temps[index].node == node) {
+      return &context->record_call_temps[index];
+    }
+  }
+  return NULL;
+}
+
+/* Materialises the little-endian CALL result chunks as the complete record
+   representation. Padding and union bytes are copied too: character access
+   may observe them, just as it may observe bytes of a by-value argument. */
+static ql_status store_record_call_results(
+    lower_context *context, lower_record_call_temp *temporary,
+    const ql_ir_value_id *results, size_t result_start, size_t result_count,
+    ql_error *error) {
+  lower_type byte = make_integer_type(8u, 1u, 0u);
+  lower_type u64 = address_type();
+  lower_value destination;
+  uint64_t size = record_size(context, temporary->type.record);
+  uint64_t offset;
+  ql_status status = ensure_bool_constants(context, error);
+
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  if ((size + 7u) / 8u != result_count) {
+    ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                 "record call result shape does not match its object size");
+    return QL_STATUS_INTERNAL_ERROR;
+  }
+  memset(&destination, 0, sizeof(destination));
+  destination.value = temporary->address;
+  destination.type = make_pointer_to(temporary->type);
+  destination.defined = context->true_value;
+  destination.has_object = 1u;
+
+  for (offset = 0u; offset < size; ++offset) {
+    const size_t chunk = (size_t)(offset / 8u);
+    const uint64_t within = offset % 8u;
+    lower_value packed;
+    lower_value value;
+    lower_value address;
+
+    memset(&packed, 0, sizeof(packed));
+    packed.value = results[result_start + chunk];
+    packed.type = u64;
+    packed.defined = context->true_value;
+    if (within != 0u) {
+      ql_ir_value_id shift;
+      ql_ir_value_id operands[2];
+      status = add_uint_constant(context, u64, within * 8u, &shift, error);
+      if (status == QL_STATUS_OK) {
+        operands[0] = packed.value;
+        operands[1] = shift;
+        status = emit_instruction(context, QL_IR_OPCODE_LSHR, &u64, operands,
+                                  2u, NULL, 0u, QL_IR_EFFECT_NONE,
+                                  &packed.value, error);
+      }
+    }
+    if (status == QL_STATUS_OK) {
+      status = convert_value(context, packed, byte, &value, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = aggregate_child_address(context, destination, offset, byte,
+                                       &address, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = emit_store(context, address, value, error);
+    }
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+  }
+  return QL_STATUS_OK;
+}
+
 /* An external call is uninterpreted: it may read and write memory and it is
    itself observable, so it consumes and produces both the memory state and
    the event trace. Whether the trace is compared is the contract's business,
@@ -7192,9 +7298,12 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
   size_t operand_count = 0u;
   size_t result_count = 0u;
   size_t value_result = SIZE_MAX;
+  size_t record_result_start = SIZE_MAX;
+  size_t record_result_count = 0u;
   size_t out_result_start = SIZE_MAX;
   size_t argument_index = 0u;
   size_t out_variable_count = 0u;
+  lower_record_call_temp *record_return = NULL;
   size_t end;
   size_t child;
   uint32_t is_indirect = 0u;
@@ -7281,6 +7390,24 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
   status = resolve_callee(context, callee, node, error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
+  }
+  if (callee->return_type.kind == QL_C_SCALAR_RECORD) {
+    record_return = find_record_call_temp(context, node);
+    if (record_return == NULL) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+          is_indirect != 0u
+              ? "an indirect record return needs a statically allocated "
+                "temporary"
+              : "a record return has no statically allocated temporary",
+          error);
+    }
+    if (!type_same(record_return->type, callee->return_type) ||
+        record_return->address == QL_IR_INVALID_VALUE_ID) {
+      ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                   "record call has no materialised return object");
+      return QL_STATUS_INTERNAL_ERROR;
+    }
   }
 
   /* The observable states this call is handed are the ones that stand
@@ -7441,7 +7568,26 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
 
   result_types[result_count++] = context->trace_type;
   result_types[result_count++] = context->memory_type;
-  if (callee->return_type.kind != QL_C_SCALAR_VOID) {
+  if (callee->return_type.kind == QL_C_SCALAR_RECORD) {
+    lower_type u64 = address_type();
+    uint64_t size = record_size(context, callee->return_type.record);
+    record_result_count = (size_t)((size + 7u) / 8u);
+    if (record_result_count == 0u ||
+        record_result_count > LOWER_MAX_CALL_RESULTS - result_count) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+          "the packed record return exceeds the bounded CALL result list",
+          error);
+    }
+    status = ensure_ir_type(context, &u64, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    record_result_start = result_count;
+    for (child = 0u; child < record_result_count; ++child) {
+      result_types[result_count++] = u64.ir_type;
+    }
+  } else if (callee->return_type.kind != QL_C_SCALAR_VOID) {
     status = ensure_ir_type(context, &callee->return_type, error);
     if (status != QL_STATUS_OK) {
       return status;
@@ -7527,6 +7673,14 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
       variable->may_admit_object = 1u;
     }
   }
+  if (record_return != NULL) {
+    status = store_record_call_results(
+        context, record_return, results, record_result_start,
+        record_result_count, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+  }
   memset(output, 0, sizeof(*output));
   status = ensure_bool_constants(context, error);
   if (status != QL_STATUS_OK) {
@@ -7540,7 +7694,11 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     return QL_STATUS_OK;
   }
   output->type = callee->return_type;
-  output->value = results[value_result];
+  output->value = record_return != NULL ? record_return->address
+                                        : results[value_result];
+  if (record_return != NULL) {
+    output->has_object = 1u;
+  }
   if (output->type.kind == QL_C_SCALAR_POINTER) {
     /* The callee may return an existing or newly exposed live object.
        Its region is not part of the source signature, so a later access
@@ -8635,24 +8793,19 @@ static ql_status initialize_record_copy(lower_context *context, size_t node,
                                         lower_value destination,
                                         lower_type type, ql_error *error) {
   lower_value source;
-  lower_type source_type;
-  ql_status status = lower_designator_address(context, node, &source,
-                                              &source_type, error);
+  ql_status status = lower_expression(context, node, &source, error);
 
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
   }
-  status = inherit_record_source_definedness(context, node, &source, error);
-  if (status != QL_STATUS_OK) {
-    return status;
-  }
-  if (source_type.array_length != 0u ||
-      source_type.kind != QL_C_SCALAR_RECORD || !type_same(type, source_type)) {
+  if (source.type.array_length != 0u ||
+      source.type.kind != QL_C_SCALAR_RECORD || !type_same(type, source.type)) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
-        "record copy initializer needs an lvalue of the same record type",
+        "record copy initializer needs a value of the same record type",
         error);
   }
+  source.type = make_pointer_to(source.type);
   return copy_record_bytes(context, node, source, destination, type, error);
 }
 
@@ -8749,6 +8902,17 @@ static ql_status zero_initialize_object(lower_context *context, size_t node,
     }
     return emit_store(context, address, zero, error);
   }
+}
+
+static int is_call_expression(const lower_context *context, size_t node) {
+  size_t guard = 0u;
+  while (node != SIZE_MAX && guard++ < 64u &&
+         strcmp(context->nodes[node].view.kind,
+                "parenthesized_expression") == 0) {
+    node = first_named_child(context, node);
+  }
+  return node != SIZE_MAX &&
+         strcmp(context->nodes[node].view.kind, "call_expression") == 0;
 }
 
 static ql_status initialize_object(lower_context *context, size_t node,
@@ -8850,7 +9014,8 @@ static ql_status initialize_object(lower_context *context, size_t node,
     }
   }
 
-  if (!is_list && type.kind == QL_C_SCALAR_RECORD && brace_elided == 0u) {
+  if (!is_list && type.kind == QL_C_SCALAR_RECORD &&
+      (brace_elided == 0u || is_call_expression(context, node))) {
     return initialize_record_copy(context, node, address, type, error);
   }
 
@@ -11765,6 +11930,170 @@ static ql_status add_string_objects(lower_context *context, ql_error *error) {
   return QL_STATUS_OK;
 }
 
+/* Avoid resolving every call prototype during object collection. Ordinary
+   scalar calls stay lazy; only a spelling that can denote a by-value
+   aggregate is inspected early enough to reserve its return temporary. */
+static int callee_may_return_aggregate(lower_context *context,
+                                       const lower_callee *callee) {
+  size_t type_node;
+  const char *kind;
+  char *name;
+  size_t guard = 0u;
+  int result = 0;
+
+  if (callee->return_pointer_depth != 0u) {
+    return 0;
+  }
+  type_node = direct_field_child(context, callee->declaration_node, "type");
+  if (type_node == SIZE_MAX) {
+    return 0;
+  }
+  kind = context->nodes[type_node].view.kind;
+  if (strcmp(kind, "struct_specifier") == 0 ||
+      strcmp(kind, "union_specifier") == 0) {
+    return 1;
+  }
+  if (strcmp(kind, "type_identifier") != 0) {
+    return 0;
+  }
+  name = copy_node_text(context, type_node);
+  if (name == NULL) {
+    return 0;
+  }
+  while (guard++ < 64u) {
+    const lower_typedef *entry = find_typedef(context, name);
+    char *next;
+    if (entry == NULL || entry->pointer_depth != 0u ||
+        entry->is_array_or_function != 0u) {
+      break;
+    }
+    if (entry->is_aggregate != 0u) {
+      result = 1;
+      break;
+    }
+    next = copy_text(context->allocator, entry->underlying,
+                     strlen(entry->underlying));
+    if (next == NULL) {
+      break;
+    }
+    context->allocator->deallocate(context->allocator->user_data, name);
+    name = next;
+  }
+  context->allocator->deallocate(context->allocator->user_data, name);
+  return result;
+}
+
+static ql_status resolve_callee_record_return(
+    lower_context *context, const lower_callee *callee, size_t node,
+    lower_type *output, ql_error *error) {
+  size_t type_node =
+      direct_field_child(context, callee->declaration_node, "type");
+  ql_status status;
+
+  if (type_node == SIZE_MAX) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+                         "the callee has no declared return type", error);
+  }
+  status = resolve_type_node_allowing_void(
+      context, type_node, callee->return_pointer_depth, output, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u ||
+      output->kind != QL_C_SCALAR_RECORD) {
+    return status;
+  }
+  return ensure_record_layout(context, output->record, node, error);
+}
+
+/* Record-valued call expressions need stable object identity even when they
+   execute in a loop. Allocate one temporary per syntactic call before the IR
+   builder's parameter prefix closes; repeated evaluations overwrite that
+   temporary after the previous full expression has ended. */
+static ql_status add_record_call_objects(lower_context *context,
+                                         ql_error *error) {
+  size_t node;
+  size_t ordinal = 0u;
+
+  for (node = context->body_node + 1u;
+       node < subtree_end(context, context->body_node); ++node) {
+    size_t function_node;
+    char *name;
+    lower_callee *callee;
+    lower_type return_type;
+    lower_record_call_temp *temporary;
+    char label[96];
+    size_t object;
+    ql_status status;
+
+    if (strcmp(context->nodes[node].view.kind, "call_expression") != 0) {
+      continue;
+    }
+    function_node = direct_field_child(context, node, "function");
+    if (function_node == SIZE_MAX) {
+      continue;
+    }
+    function_node = unwrap_indirect_call_designator(context, function_node);
+    if (function_node == SIZE_MAX ||
+        strcmp(context->nodes[function_node].view.kind, "identifier") != 0) {
+      continue;
+    }
+    name = copy_node_text(context, function_node);
+    if (name == NULL) {
+      ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+      return QL_STATUS_OUT_OF_MEMORY;
+    }
+    callee = find_callee(context, name);
+    context->allocator->deallocate(context->allocator->user_data, name);
+    if (callee == NULL) {
+      continue;
+    }
+    if (!callee_may_return_aggregate(context, callee)) {
+      continue;
+    }
+    status =
+        resolve_callee_record_return(context, callee, node, &return_type,
+                                     error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    if (return_type.kind != QL_C_SCALAR_RECORD) {
+      continue;
+    }
+    if ((record_size(context, return_type.record) + 7u) / 8u >
+        LOWER_MAX_CALL_RESULTS - 2u) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+          "the packed record return exceeds the bounded CALL result list",
+          error);
+    }
+    status = grow_array(context->allocator,
+                        (void **)&context->record_call_temps,
+                        &context->record_call_temp_capacity,
+                        sizeof(*context->record_call_temps),
+                        context->record_call_temp_count + 1u, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    if (snprintf(label, sizeof(label), "__call_record%zu@%zu", ordinal,
+                 context->object_count) < 0) {
+      ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                   "record call object label does not fit");
+      return QL_STATUS_INTERNAL_ERROR;
+    }
+    status = add_object(context, label, NULL, &object, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    temporary =
+        &context->record_call_temps[context->record_call_temp_count++];
+    memset(temporary, 0, sizeof(*temporary));
+    temporary->node = node;
+    temporary->type = return_type;
+    temporary->object = object;
+    temporary->address = QL_IR_INVALID_VALUE_ID;
+    ++ordinal;
+  }
+  return QL_STATUS_OK;
+}
+
 static ql_status add_object_parameters(lower_context *context,
                                        ql_error *error) {
   lower_type u64 = address_type();
@@ -11814,6 +12143,10 @@ static ql_status add_object_parameters(lower_context *context,
   }
   context->parameter_object_count = context->object_count;
   status = add_stack_slot_objects(context, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  status = add_record_call_objects(context, error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
   }
@@ -12196,6 +12529,53 @@ static ql_status materialize_stack_slots(lower_context *context,
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
+  }
+  return QL_STATUS_OK;
+}
+
+static ql_status materialize_record_call_temporaries(lower_context *context,
+                                                      ql_error *error) {
+  size_t index;
+
+  for (index = 0u; index < context->record_call_temp_count; ++index) {
+    lower_record_call_temp *temporary = &context->record_call_temps[index];
+    lower_type pointer = make_pointer_to(temporary->type);
+    lower_value raw;
+    lower_value typed;
+    ql_ir_value_id expected;
+    ql_ir_value_id predicate;
+    const uint64_t size = record_size(context, temporary->type.record);
+    ql_status status =
+        emit_assumptions_for_object(context, temporary->object, error);
+
+    if (status == QL_STATUS_OK) {
+      status = add_uint_constant(context, address_type(), size, &expected,
+                                 error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = emit_compare(context, QL_IR_OPCODE_EQ,
+                            context->objects[temporary->object].size, expected,
+                            &predicate, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = emit_assume(context, predicate, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = ensure_bool_constants(context, error);
+    }
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    memset(&raw, 0, sizeof(raw));
+    raw.value = context->objects[temporary->object].base;
+    raw.type = address_type();
+    raw.defined = context->true_value;
+    raw.has_object = 1u;
+    status = emit_pointer_of_address(context, raw, pointer, &typed, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    temporary->address = typed.value;
   }
   return QL_STATUS_OK;
 }
@@ -12668,6 +13048,10 @@ static void cleanup_context(lower_context *context) {
   context->stack_slots = NULL;
   context->stack_slot_count = 0u;
   context->allocator->deallocate(context->allocator->user_data,
+                                 context->record_call_temps);
+  context->record_call_temps = NULL;
+  context->record_call_temp_count = 0u;
+  context->allocator->deallocate(context->allocator->user_data,
                                  context->type_cache);
   context->type_cache = NULL;
   release_records(context);
@@ -12890,6 +13274,9 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
     }
     if (status == QL_STATUS_OK) {
       status = materialize_stack_slots(&context, error);
+    }
+    if (status == QL_STATUS_OK && context.unknown == 0u) {
+      status = materialize_record_call_temporaries(&context, error);
     }
     if (status == QL_STATUS_OK && context.unknown == 0u) {
       status = materialize_globals(&context, error);

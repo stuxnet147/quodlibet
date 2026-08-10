@@ -11,6 +11,7 @@
 #include "quodlibet/ir_interp.h"
 #include "quodlibet/ir_verify.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdarg>
 #include <cstdint>
@@ -68,9 +69,32 @@ struct CALL_RECORD {
 int CALLEE_record(struct CALL_RECORD value) {
     return value.left + value.right * 3 + value.tag * 11;
 }
+struct CALL_RETURN_RECORD {
+    unsigned long long wide;
+    int middle;
+    unsigned char tag;
+};
+struct CALL_RETURN_RECORD CALLEE_make_record(int left, int right) {
+    struct CALL_RETURN_RECORD value{};
+    value.wide = (static_cast<unsigned long long>(
+                      static_cast<unsigned int>(left))
+                  << 32u) |
+                 static_cast<unsigned int>(right);
+    value.middle = left - right;
+    value.tag = 9u;
+    return value;
+}
 int call_record_reference(int left, int right) {
     struct CALL_RECORD value = {left, static_cast<short>(right), 7u};
     return CALLEE_record(value) + 5;
+}
+int call_record_return_reference(int left, int right) {
+    const struct CALL_RETURN_RECORD value = CALLEE_make_record(left, right);
+    return static_cast<int>(value.wide & 0xffu) + value.middle * 3 +
+           value.tag * 11;
+}
+int call_record_return_member_reference(int left, int right) {
+    return CALLEE_make_record(left, right).middle;
 }
 }
 
@@ -141,6 +165,18 @@ static const char record_argument_source[] =
     "int call_record(int left, int right) {\n"
     "  struct CALL_RECORD value = {left, (short)right, 7};\n"
     "  return CALLEE_record(value) + 5;\n"
+    "}\n";
+static const char record_return_source[] =
+    "struct CALL_RETURN_RECORD { unsigned long long wide; int middle; "
+    "unsigned char tag; };\n"
+    "struct CALL_RETURN_RECORD CALLEE_make_record(int, int);\n"
+    "int call_record_return(int left, int right) {\n"
+    "  struct CALL_RETURN_RECORD value = CALLEE_make_record(left, right);\n"
+    "  return (int)(value.wide & 255u) + value.middle * 3 + "
+    "value.tag * 11;\n"
+    "}\n"
+    "int call_record_return_member(int left, int right) {\n"
+    "  return CALLEE_make_record(left, right).middle;\n"
     "}\n";
 QL_CALL_FUNCTION(indirect, struct CALL_VTABLE {
         int (*callback)(int);
@@ -319,6 +355,18 @@ int QL_CALL Invoke(void *user_data, const char *symbol,
         CALL_RECORD record{};
         std::memcpy(&record, arguments[0].data, sizeof(record));
         value = CALLEE_record(record);
+    } else if (std::strcmp(symbol, "CALLEE_make_record") == 0 &&
+               argument_count == 2u) {
+        if (result_size != sizeof(CALL_RETURN_RECORD)) {
+            ADD_FAILURE() << "record return image has the wrong packed width";
+            return 0;
+        }
+        const CALL_RETURN_RECORD record =
+            CALLEE_make_record(seen[0], seen[1]);
+        std::memcpy(result, &record, sizeof(record));
+        log->symbols.push_back(symbol);
+        log->arguments.push_back(seen);
+        return 1;
     } else if (std::strcmp(symbol, "CALLEE_double") == 0 &&
                argument_count == 1u) {
         value = CALLEE_double(seen[0]);
@@ -458,7 +506,8 @@ struct Outcome {
 
 Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
                 CallLog *log,
-                const ql_ir_interp_object_v1 *dynamic_object = nullptr) {
+                const ql_ir_interp_object_v1 *dynamic_object = nullptr,
+                std::size_t dynamic_object_count = 0u) {
     ql_ir_view_v1 view{};
     std::vector<std::vector<uint8_t>> storage;
     std::vector<ql_ir_interp_input_v1> inputs;
@@ -467,6 +516,10 @@ Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
     ql_error error{};
     Outcome run;
     std::size_t next = 0u;
+    std::size_t next_object = 0u;
+    const std::size_t supplied_object_count =
+        dynamic_object_count != 0u ? dynamic_object_count
+                                   : (dynamic_object != nullptr ? 1u : 0u);
 
     view.struct_size = sizeof(view);
     EXPECT_EQ(QL_STATUS_OK, ql_ir_get_view(ir, &view, &error));
@@ -491,18 +544,27 @@ Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
         const std::string name = value.name != nullptr ? value.name : "";
         if (name.find(".__base") != std::string::npos) {
             EXPECT_NE(nullptr, dynamic_object);
+            const std::size_t which =
+                supplied_object_count == 0u
+                    ? 0u
+                    : std::min(next_object, supplied_object_count - 1u);
             storage.push_back(Encode(dynamic_object != nullptr
-                                         ? dynamic_object->base
+                                         ? dynamic_object[which].base
                                          : 0u,
                                      type.bit_width));
             continue;
         }
         if (name.find(".__size") != std::string::npos) {
             EXPECT_NE(nullptr, dynamic_object);
+            const std::size_t which =
+                supplied_object_count == 0u
+                    ? 0u
+                    : std::min(next_object, supplied_object_count - 1u);
             storage.push_back(Encode(dynamic_object != nullptr
-                                         ? dynamic_object->size
+                                         ? dynamic_object[which].size
                                          : 0u,
                                      type.bit_width));
+            ++next_object;
             continue;
         }
         EXPECT_LT(next, scalars.size());
@@ -523,7 +585,7 @@ Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
     options.callees = &callees;
     if (dynamic_object != nullptr) {
         options.objects = dynamic_object;
-        options.object_count = 1u;
+        options.object_count = supplied_object_count;
     }
     run.result.struct_size = sizeof(run.result);
     run.status = ql_ir_interp_run(nullptr, ir,
@@ -712,6 +774,45 @@ TEST(CLowerCalls, PassesARecordByValueAsItsPackedObjectImage) {
                 << ql_ir_interp_ub_reason_string(run.result.ub_reason);
             EXPECT_EQ(call_record_reference(left, right), Returned(run.result));
             EXPECT_EQ(std::vector<std::string>{"CALLEE_record"}, log.symbols);
+        }
+    }
+}
+
+TEST(CLowerCalls, MaterializesARecordReturnedByValue) {
+    for (const char *function : {"call_record_return",
+                                 "call_record_return_member"}) {
+        Lowered lowered;
+        uint8_t first_initial[sizeof(CALL_RETURN_RECORD)]{};
+        uint8_t second_initial[sizeof(CALL_RETURN_RECORD)]{};
+        ql_ir_interp_object_v1 objects[2]{};
+        const std::size_t object_count =
+            std::strcmp(function, "call_record_return") == 0 ? 2u : 1u;
+        for (std::size_t index = 0u; index < object_count; ++index) {
+            ql_ir_interp_object_init(&objects[index]);
+            objects[index].base = QL_IR_INTERP_FIRST_OBJECT_ADDRESS +
+                                  index * sizeof(CALL_RETURN_RECORD);
+            objects[index].size = sizeof(CALL_RETURN_RECORD);
+            objects[index].initial =
+                index == 0u ? first_initial : second_initial;
+        }
+        ASSERT_TRUE(lowered.Open(record_return_source, function));
+        for (int32_t left : {-91, 0, 37}) {
+            for (int32_t right : {-17, 0, 29}) {
+                CallLog log;
+                const Outcome run = Execute(
+                    lowered.ir(), {Widen(left), Widen(right)}, &log, objects,
+                    object_count);
+                ASSERT_EQ(QL_STATUS_OK, run.status);
+                ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                    << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+                const int expected =
+                    std::strcmp(function, "call_record_return") == 0
+                        ? call_record_return_reference(left, right)
+                        : call_record_return_member_reference(left, right);
+                EXPECT_EQ(expected, Returned(run.result));
+                EXPECT_EQ(std::vector<std::string>{"CALLEE_make_record"},
+                          log.symbols);
+            }
         }
     }
 }
@@ -1059,6 +1160,14 @@ TEST(CLowerCalls, RefusesCallsItCannotCheckAgainstADeclaration) {
         /* Function pointers are opaque values in this slice. They may be
            transferred and null-tested, but not used as data addresses. */
         {"int f(int (*callback)(int)) { return callback + 1 != 0; }", "f"},
+        /* A direct record return has a preallocated temporary. An indirect
+           target's return type is known, but no static call site identifies
+           storage during the object prepass, so it remains UNKNOWN rather
+           than becoming an internal status failure. */
+        {"struct R { int value; };"
+         " int f(struct R (*callback)(void)) {"
+         " struct R value = callback(); return value.value; }",
+         "f"},
     };
     for (const Case &item : cases) {
         ql_c_frontend_unit *unit = nullptr;

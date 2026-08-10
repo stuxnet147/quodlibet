@@ -200,6 +200,33 @@ TEST(SmtProductCalls, MatchingOutLocalResultsCancelAsOneCallTuple) {
     EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, view.verdict) << view.diagnostic;
 }
 
+TEST(SmtProductCalls, MatchingRecordReturnImagesCancelAsOneCallTuple) {
+    /* A record result is split into packed 64-bit CALL results and then
+       materialised in each side's own temporary object. Congruence has to
+       relate every chunk for differently ordered member reads to agree. */
+    constexpr char left[] =
+        "struct R { unsigned long long wide; int middle; unsigned char tag; };"
+        " struct R CALLEE_make(int);"
+        " int f(int a){ struct R r = CALLEE_make(a);"
+        " return (int)(r.wide & 255u) + r.middle + r.tag; }";
+    constexpr char right[] =
+        "struct R { unsigned long long wide; int middle; unsigned char tag; };"
+        " struct R CALLEE_make(int);"
+        " int g(int b){ struct R r = CALLEE_make(b);"
+        " return r.tag + r.middle + (int)(r.wide & 255u); }";
+    w2::Pair pair;
+    OutcomeRun run;
+
+    if (!BackendAvailable()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    const ql_smt_product_outcome_view_v1 view =
+        Decide(left, "f", right, "g", OrderedCallObservations(), &pair, &run);
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_UNSAT, view.violation_answer);
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_SAT, view.domain_answer);
+    EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, view.verdict) << view.diagnostic;
+}
+
 TEST(SmtProductCalls, VariadicArgumentsUseDefaultPromotions) {
     constexpr char left[] =
         "int CALLEE_v(int, ...);"
