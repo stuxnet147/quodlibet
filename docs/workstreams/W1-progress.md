@@ -1,13 +1,13 @@
 # W1 진행 기록
 
-브랜치: `stuxnet147/w1-semantic-c-frontend`
+브랜치: `main`
 지시서: `docs/workstreams/W1.md`
 
 이 파일은 세션이 끊겼을 때 다음 세션이 읽는 유일한 기록입니다. 작업 단위를 커밋할 때 같이 커밋합니다.
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링 **8,541 (28.58%)**, val 349, val 판정률 337/349. 다음 관문은 측정으로 확정된 **메모리에서 읽은 포인터의 provenance** (pointer 5,614 의 대부분) 과 **`sizeof`** (1,371) 입니다. loop 3,020 을 닫으면 W6 CHC/PDR 선행이 풀립니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **11,920 / 29,880 (39.89%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 4,080, `unsupported_loop` 4,056, `unsupported_pointer` 3,241, `unsupported_control_flow` 2,182입니다. 다음 단위는 메시지별 재분류로 정합니다.
 
 ## 기준선
 
@@ -1200,6 +1200,26 @@ Windows에서는 native CTest 510/510과 Python binding 37/37을 각각 통과�
 
 `tests/test_c_lower_aggregates.cpp`는 inferred array, 중첩 record/array, `{0}`, null pointer member, 두 단계 typedef record를 실제 컴파일된 C와 대조합니다.
 
+### 25. 메모리에서 읽어 접근한 포인터에 유한 객체 슬롯을 붙인다
+
+커밋: (이 단위)
+
+포인터 인자, 전역, 문자열, 지역 저장소만으로 만든 기존 object 표는 `p->next->value`의 `next`가 가리키는 별도 객체를 이름 붙일 수 없었습니다. 이제 메모리에서 읽은 포인터를 실제로 역참조하거나 그 포인터를 통해 store할 때 보조 object 하나를 추가합니다. IR v1 본문은 비순환이므로 한 접근 지점은 한 실행에서 최대 한 새 객체만 요구합니다. 본문당 상한은 32개이며 넘으면 부분 로어링하지 않고 `unsupported_pointer` UNKNOWN입니다.
+
+단순히 포인터 비트를 load, 비교, 반환하는 경우에는 object를 추가하지 않습니다. 대상에 접근하지 않은 함수의 입력 도메인을 불필요하게 좁히지 않기 위한 조건입니다. 분기와 SSA 합류에서도 양쪽 값이 기존 object를 갖거나 메모리 load에서 왔을 때만 이 권한을 유지합니다. 외부 호출이 반환한 포인터처럼 대상 저장소를 설명할 근거가 없는 값은 계속 UNKNOWN입니다.
+
+보조 base/size는 본문 로어링 중 발견되므로 private builder 경로로 late parameter를 추가합니다. 모든 경로에 같은 전제조건이 걸리도록 본문을 다 만든 뒤 순수 prelude entry block을 앞에 붙입니다. 보조 descriptor는 이전 descriptor와 완전히 같은 base/size이거나 완전히 disjoint해야 합니다. 이 exact-alias 선택지가 있어야 load된 포인터가 이미 알려진 객체 안을 가리키는 유효한 실행을 배제하지 않습니다. 부분 overlap은 계속 금지합니다. 공개 IR builder의 parameters-first 계약은 바꾸지 않았습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 9,751 (32.63%) | **11,920 (39.89%)** |
+| 증가 | | **+2,169** |
+| `unsupported_pointer` | 6,674 | **3,241** |
+| verifier 통과 | 9,751 / 9,751 | **11,920 / 11,920** |
+| status 실패 | 0 | **0** |
+
+`tests/test_c_lower_records.cpp`는 서로 다른 head/tail 객체와 자기 자신을 가리키는 exact-alias 객체를 실제 컴파일된 C와 대조합니다. 같은 시험이 source signature와 late-parameter IR의 binding도 확인합니다. `tests/test_proof_smt_memory.cpp`는 양쪽 함수가 메모리에서 읽은 포인터를 따라가는 쌍을 product miter와 Bitwuzla까지 실행해 `PROVED_EQUIVALENT`를 확인합니다. 기존 aggregate differential도 포인터 멤버를 읽기만 하는 경우 보조 object가 생기지 않는 회귀 시험 역할을 합니다.
+
 ## 막힌 것
 
 - 없음
@@ -1226,20 +1246,7 @@ Windows에서는 native CTest 510/510과 Python binding 37/37을 각각 통과�
 
 ## 다음에 할 것
 
-1. **`unsupported_call` 4,820** (train 최대). 대부분 이 unit 이 선언하지 않은 콜리입니다. miter 는 이제 호출을 모델링하므로 남은 것은 로어링 쪽입니다
-2. **`unsupported_type` 6,580** 의 잔여 분포를 다시 재고 그 다음을 정할 것
-3. 호출이 있는 반례의 replay. witness 가 콜리를 나르게 해야 하고 `src/replay.c` 소유자와 같이 움직여야 합니다
-4. 로어링이 만든 object 에 좌우 각자의 정체성. 정적 데이터가 다른 쌍이 지금은 빈 도메인이 됩니다
-3. 해석 못 한 **타입 철자** (116), 선언 없는 **콜리** (105)
-4. 주소를 잡은 스칼라의 초기화자 요구 (64). 읽기 전에 반드시 쓰이는지를 보는 분석이 필요합니다
-5. 함수 안의 `static`. 초기화자가 한 번만 실행되는 것을 모델이 아직 말하지 못합니다
-3. 값으로 오가는 aggregate (남은 타입의 43.6%). 스칼라 슬롯은 섰으므로 aggregate 슬롯으로 넓히면 됩니다
-4. 배열 (남은 타입의 35.5%)
-5. 부동소수점은 1.4% 뿐이라 계속 뒤에 둡니다
-6. 메모리에서 읽은 포인터의 object. 지금은 정직하게 거부합니다 연산, object identity, provenance, 유효 범위, alignment, load 와 store 입니다. **interpreter 에 메모리 모델을 같이 넣어야 합니다.** 지금 interpreter 는 포인터를 만나면 `UNSUPPORTED` 를 냅니다
-2. 전역 변수와 정적 저장 기간 (`undeclared_identifier` 31건)
-3. struct, union, enum (`unsupported_type` 잔여 103건)
-4. 함수 호출과 외부 효과 (`unsupported_call` 55건)
-5. `docs/lowering/adding-a-construct.md` 와 그 절차대로 추가한 구문 하나
-
-각 단계마다 differential 사례를 같이 늘리고 val 1,050 으로 재측정합니다.
+1. 최신 17,902개 UNKNOWN을 diagnostic message까지 다시 분류합니다. 요약 코드만으로는 `unsupported_type` 4,080과 `unsupported_loop` 4,056 내부의 독립 원인을 정할 수 없습니다.
+2. 비순환 CFG에서 정확히 내릴 수 있는 `switch`와 전방 `goto`, variadic call, 남은 타입 철자를 빈도순으로 닫습니다.
+3. `for`, `while`, `do`와 후방 `goto`는 IR schema v1의 비순환 계약과 충돌합니다. G9 99%를 위해 schema v2 순환 CFG와 W6 CHC/PDR proof method를 함께 설계하고 구현해야 합니다.
+4. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.

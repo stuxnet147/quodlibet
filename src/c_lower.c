@@ -1,6 +1,7 @@
 #include "quodlibet/c_lower.h"
 
 #include "c_types.h"
+#include "internal.h"
 
 #include "quodlibet/ir_interp.h"
 
@@ -110,11 +111,12 @@ typedef struct lower_value {
     ql_ir_value_id defined;
     lower_type type;
     uint32_t may_ub;
-    /* Set when this pointer came from a parameter, directly or by
-       arithmetic. The object table is derived from the parameters, so a
-       pointer that arrived any other way has no object an access guard could
-       name. */
+    /* Set when the table already names every object this pointer may access. */
     uint32_t has_object;
+    /* Set for a pointer read from memory. Its target object is admitted only
+       if an access actually follows, so merely comparing or returning loaded
+       pointer bits does not narrow the function domain. */
+    uint32_t may_admit_object;
 } lower_value;
 
 /* One `typedef` name and the type it stands for. `underlying` is the
@@ -136,6 +138,7 @@ typedef struct lower_variable {
     lower_type type;
     /* Set for a pointer whose object the table declares. */
     uint32_t has_object;
+    uint32_t may_admit_object;
     /* Set when this variable lives in storage rather than in an SSA value,
        which is what taking its address requires. Its value is then whatever
        memory holds, and `value` is unused. */
@@ -148,12 +151,12 @@ typedef struct lower_variable {
     size_t scope_depth;
 } lower_variable;
 
-/* One storage region the function may touch. The object table is derived
-   from the pointer parameters in source order, so both sides of a problem
-   agree on it without exchanging anything. */
+/* One descriptor for a storage region the function may touch. Pointer
+   arguments come first; storage the lowering discovers follows. */
 typedef struct lower_object {
     ql_ir_value_id base;
     ql_ir_value_id size;
+    uint32_t may_alias;
 } lower_object;
 
 /* A function this unit declares but does not define. Its types are resolved
@@ -216,6 +219,8 @@ typedef struct lower_stack_slot {
 typedef struct lower_state {
     ql_ir_value_id *values;
     uint8_t *initialized;
+    uint8_t *has_object;
+    uint8_t *may_admit_object;
     size_t count;
     ql_ir_value_id memory;
     ql_ir_value_id trace;
@@ -249,6 +254,7 @@ typedef struct lower_context {
     size_t scope_depth;
     lower_type return_type;
     ql_ir_block_id current_block;
+    ql_ir_block_id entry_block;
     uint32_t current_terminated;
     ql_ir_type_id memory_type;
     lower_type_binding *type_cache;
@@ -263,6 +269,10 @@ typedef struct lower_context {
     /* Objects the caller supplied, which are the ones the entry block states
        assumptions for. Anything past this the function made for itself. */
     size_t parameter_object_count;
+    /* Auxiliary live objects admitted when an access follows a pointer load.
+       One acyclic access site can name at most one new object in an execution. */
+    size_t dynamic_object_count;
+    size_t dynamic_object_start;
     /* Names this function takes the address of, so their locals get storage
        instead of an SSA value. */
     char **address_taken;
@@ -2792,6 +2802,43 @@ static ql_status emit_access_guard(lower_context *context,
 
 static lower_value stack_address(const lower_context *context,
                                  const lower_variable *variable);
+static ql_status add_dynamic_object(lower_context *context,
+                                    ql_error *error);
+
+#define LOWER_MAX_DYNAMIC_OBJECTS 32u
+
+static ql_status admit_loaded_pointer(lower_context *context, size_t node,
+                                      lower_value *pointer,
+                                      ql_error *error) {
+    ql_status status;
+    if (context->dynamic_object_count >= LOWER_MAX_DYNAMIC_OBJECTS) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+            "this acyclic body accesses more external pointer objects than the "
+            "bounded object table carries", error);
+    }
+    status = add_dynamic_object(context, error);
+    if (status == QL_STATUS_OK) {
+        pointer->has_object = 1u;
+        pointer->may_admit_object = 0u;
+    }
+    return status;
+}
+
+static ql_status require_pointer_object(lower_context *context, size_t node,
+                                        lower_value *pointer,
+                                        const char *message,
+                                        ql_error *error) {
+    if (pointer->has_object != 0u) {
+        return QL_STATUS_OK;
+    }
+    if (pointer->may_admit_object != 0u) {
+        return admit_loaded_pointer(context, node, pointer, error);
+    }
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node, message,
+        error);
+}
 
 static ql_status emit_load(lower_context *context, lower_value pointer,
                            lower_value *output, ql_error *error) {
@@ -2799,15 +2846,12 @@ static ql_status emit_load(lower_context *context, lower_value pointer,
     ql_ir_value_id operands[2];
     ql_status status;
 
-    if (pointer.has_object == 0u) {
-        /* Its object is not in the table, so no guard could ever justify the
-           access. Refusing here leaves an UNKNOWN rather than IR that is
-           undefined on every input, which would be worse: it would look
-           lowered and prove nothing. */
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, SIZE_MAX,
-            "dereferencing a pointer read out of memory needs an object this "
-            "slice does not declare", error);
+    status = require_pointer_object(
+        context, SIZE_MAX, &pointer,
+        "dereferencing this pointer needs an object this slice cannot "
+        "declare", error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
     }
     if (pointee.kind == QL_C_SCALAR_VOID) {
         return lower_unknown(
@@ -2830,9 +2874,14 @@ static ql_status emit_load(lower_context *context, lower_value pointer,
     output->type = pointee;
     output->defined = context->true_value;
     output->may_ub = 0u;
-    return emit_typed_instruction(context, QL_IR_OPCODE_LOAD,
-                                  pointee.ir_type, operands, 2u,
-                                  QL_IR_EFFECT_MEMORY, &output->value, error);
+    status = emit_typed_instruction(context, QL_IR_OPCODE_LOAD,
+                                    pointee.ir_type, operands, 2u,
+                                    QL_IR_EFFECT_MEMORY, &output->value,
+                                    error);
+    if (status == QL_STATUS_OK && pointee.kind == QL_C_SCALAR_POINTER) {
+        output->may_admit_object = 1u;
+    }
+    return status;
 }
 
 static ql_status emit_store(lower_context *context, lower_value pointer,
@@ -2844,11 +2893,12 @@ static ql_status emit_store(lower_context *context, lower_value pointer,
     uint32_t may_ub = pointer.may_ub | value.may_ub;
     ql_status status;
 
-    if (pointer.has_object == 0u) {
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, SIZE_MAX,
-            "storing through a pointer read out of memory needs an object "
-            "this slice does not declare", error);
+    status = require_pointer_object(
+        context, SIZE_MAX, &pointer,
+        "storing through this pointer needs an object this slice cannot "
+        "declare", error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
     }
     if (pointee.kind == QL_C_SCALAR_VOID) {
         return lower_unknown(
@@ -3104,11 +3154,22 @@ static ql_status save_state(lower_context *context, size_t count,
     state->initialized = context->allocator->allocate(
         context->allocator->user_data,
         count * sizeof(*state->initialized));
-    if (state->values == NULL || state->initialized == NULL) {
+    state->has_object = context->allocator->allocate(
+        context->allocator->user_data,
+        count * sizeof(*state->has_object));
+    state->may_admit_object = context->allocator->allocate(
+        context->allocator->user_data,
+        count * sizeof(*state->may_admit_object));
+    if (state->values == NULL || state->initialized == NULL ||
+        state->has_object == NULL || state->may_admit_object == NULL) {
         context->allocator->deallocate(context->allocator->user_data,
                                        state->values);
         context->allocator->deallocate(context->allocator->user_data,
                                        state->initialized);
+        context->allocator->deallocate(context->allocator->user_data,
+                                       state->has_object);
+        context->allocator->deallocate(context->allocator->user_data,
+                                       state->may_admit_object);
         memset(state, 0, sizeof(*state));
         ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
         return QL_STATUS_OUT_OF_MEMORY;
@@ -3117,6 +3178,10 @@ static ql_status save_state(lower_context *context, size_t count,
         state->values[index] = context->variables[index].value;
         state->initialized[index] =
             (uint8_t)context->variables[index].initialized;
+        state->has_object[index] =
+            (uint8_t)context->variables[index].has_object;
+        state->may_admit_object[index] =
+            (uint8_t)context->variables[index].may_admit_object;
     }
     return QL_STATUS_OK;
 }
@@ -3127,6 +3192,9 @@ static void restore_state(lower_context *context, const lower_state *state) {
     context->trace_value = state->trace;
     for (index = 0u; index < state->count; ++index) {
         context->variables[index].initialized = state->initialized[index];
+        context->variables[index].has_object = state->has_object[index];
+        context->variables[index].may_admit_object =
+            state->may_admit_object[index];
         if (context->variables[index].is_stack != 0u) {
             continue;
         }
@@ -3139,6 +3207,10 @@ static void destroy_state(lower_context *context, lower_state *state) {
                                    state->values);
     context->allocator->deallocate(context->allocator->user_data,
                                    state->initialized);
+    context->allocator->deallocate(context->allocator->user_data,
+                                   state->has_object);
+    context->allocator->deallocate(context->allocator->user_data,
+                                   state->may_admit_object);
     memset(state, 0, sizeof(*state));
 }
 
@@ -4049,6 +4121,7 @@ static ql_status lower_identifier(lower_context *context, size_t node,
     output->type = variable->type;
     output->may_ub = 0u;
     output->has_object = variable->has_object;
+    output->may_admit_object = variable->may_admit_object;
     return QL_STATUS_OK;
 }
 
@@ -4985,6 +5058,7 @@ static ql_status lower_named_cast(lower_context *context, size_t type_node,
         output->type = target;
         output->value = QL_IR_INVALID_VALUE_ID;
         output->has_object = 0u;
+        output->may_admit_object = 0u;
         return QL_STATUS_OK;
     }
     status = lower_expression(context, value_node, &value, error);
@@ -5376,12 +5450,16 @@ static ql_status load_at_address(lower_context *context, size_t node,
            pointer. Loading through a pointer-to-pointer does not: the IR type
            of that load is already a pointer, and wrapping it again would be
            converting a pointer as though it were an address, which the IR
-           rejects. Either way the value carries no object, which is what
-           makes a later dereference of it refuse rather than pretend. */
+           rejects. Either way a later access may admit its target object. */
         *output = loaded;
         return QL_STATUS_OK;
     }
-    return emit_pointer_of_address(context, loaded, declared, output, error);
+    status = emit_pointer_of_address(context, loaded, declared, output,
+                                     error);
+    if (status == QL_STATUS_OK) {
+        output->may_admit_object = 1u;
+    }
+    return status;
 }
 
 /* Reads whatever a designator names. A record-valued designator has no value
@@ -5834,6 +5912,19 @@ static ql_status lower_conditional_expression(lower_context *context,
     output->type = common;
     output->may_ub = 1u;
     if (common.kind == QL_C_SCALAR_POINTER) {
+        const uint32_t consequence_accessible =
+            consequence.has_object | consequence.may_admit_object;
+        const uint32_t alternative_accessible =
+            alternative.has_object | alternative.may_admit_object;
+        output->has_object = consequence.has_object != 0u &&
+                                     alternative.has_object != 0u
+                                 ? 1u
+                                 : 0u;
+        output->may_admit_object =
+            output->has_object == 0u && consequence_accessible != 0u &&
+                    alternative_accessible != 0u
+                ? 1u
+                : 0u;
         return QL_STATUS_OK;
     }
     return QL_STATUS_OK;
@@ -6146,6 +6237,7 @@ static ql_status write_assignment_target(lower_context *context, size_t node,
         target->variable->value = converted.value;
         target->variable->initialized = 1u;
         target->variable->has_object = converted.has_object;
+        target->variable->may_admit_object = converted.may_admit_object;
         if (stored != NULL) {
             *stored = converted;
         }
@@ -6207,6 +6299,7 @@ static ql_status lower_read_modify_write(lower_context *context, size_t node,
         old.value = target.variable->value;
         old.type = target.variable->type;
         old.has_object = target.variable->has_object;
+        old.may_admit_object = target.variable->may_admit_object;
         status = ensure_bool_constants(context, error);
         if (status != QL_STATUS_OK) {
             return status;
@@ -6933,6 +7026,7 @@ static ql_status lower_declaration(lower_context *context, size_t node,
                 /* A pointer local is only as well-founded as what was put in
                    it. */
                 variable->has_object = converted.has_object;
+                variable->may_admit_object = converted.may_admit_object;
             }
         } else if (is_const != 0u) {
             return lower_unknown(
@@ -7029,6 +7123,18 @@ static ql_status merge_branch_states(
             continue;
         }
         variable->initialized = 1u;
+        variable->has_object = left->has_object[index] != 0u &&
+                                       right->has_object[index] != 0u
+                                   ? 1u
+                                   : 0u;
+        variable->may_admit_object =
+            variable->has_object == 0u &&
+                    (left->has_object[index] != 0u ||
+                     left->may_admit_object[index] != 0u) &&
+                    (right->has_object[index] != 0u ||
+                     right->may_admit_object[index] != 0u)
+                ? 1u
+                : 0u;
         if (left->values[index] == right->values[index]) {
             variable->value = left->values[index];
         } else {
@@ -7046,9 +7152,6 @@ static ql_status merge_branch_states(
             if (status != QL_STATUS_OK) {
                 return status;
             }
-            /* The branches disagreed, so whatever object one of them could
-               name, the merge cannot name both. */
-            variable->has_object = 0u;
         }
     }
     /* Memory is as much a merged value as any variable: a store on one branch
@@ -7434,9 +7537,9 @@ static ql_status check_function_specifiers(lower_context *context,
     return QL_STATUS_OK;
 }
 
-/* The object table is derived from the pointer parameters in source order,
-   so it needs nothing exchanged between the two sides of a problem: the same
-   signature yields the same table. The IR parameter list is therefore
+/* Pointer-argument objects lead the table in source order, so the problem's
+   argument correspondence can match them. Lowering-owned objects follow in
+   deterministic order. The initial IR parameter list is therefore
       [ the C parameters, in source order ]
       [ __memory, once, when the function has any pointer parameter ]
       [ <name>.__base and <name>.__size, per pointer parameter, in source
@@ -7876,11 +7979,12 @@ static ql_status emit_assume(lower_context *context, ql_ir_value_id predicate,
                             1u, NULL, 0u, QL_IR_EFFECT_NONE, NULL, error);
 }
 
-/* The model's three standing constraints, stated in the IR so that the SMT
-   encoding inherits them instead of restating them: objects are non-empty and
-   above the first page, they do not wrap, and distinct objects are disjoint.
-   The interpreter checks the same three on its object table, so a run and a
-   query cannot disagree about which layouts are admissible. */
+/* The standing constraints are stated in the IR so the SMT encoding inherits
+   them instead of restating them: descriptors are non-empty and above the
+   first page, their ranges do not wrap, and two descriptors are disjoint
+   unless an auxiliary descriptor names the exact same region. A concrete run
+   supplies each unique region once while binding aliased descriptor
+   parameters to the same base and size. */
 static ql_status emit_assumptions_for_object(lower_context *context,
                                              size_t index, ql_error *error);
 
@@ -7950,6 +8054,70 @@ static ql_status add_object(lower_context *context, const char *label,
         }
     }
     return status;
+}
+
+/* A pointer read from memory may name a live object that is not one of the
+   function's pointer arguments, globals, strings, or local slots. In an
+   acyclic body each access through such a pointer can contribute at most one
+   distinct object to an execution, so one symbolic object per access is a
+   complete finite table up to LOWER_MAX_DYNAMIC_OBJECTS. Merely comparing or
+   returning the loaded bits does not add an object. The object is added after
+   ordinary IR values already exist, through the private builder path; the
+   artifact and verifier allow that, while the public builder retains its
+   parameters-first contract. */
+static ql_status add_dynamic_object(lower_context *context,
+                                    ql_error *error) {
+    lower_type u64 = address_type();
+    lower_object *object;
+    char name[160];
+    size_t index;
+    ql_status status;
+
+    status = ensure_ir_type(context, &u64, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = grow_array(context->allocator, (void **)&context->objects,
+                        &context->object_capacity,
+                        sizeof(*context->objects),
+                        context->object_count + 1u, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    index = context->object_count;
+    object = &context->objects[index];
+    memset(object, 0, sizeof(*object));
+    object->may_alias = 1u;
+    if (snprintf(name, sizeof(name), "__dynamic%zu.__base",
+                 context->dynamic_object_count) < 0) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "dynamic object base name does not fit");
+        return QL_STATUS_INTERNAL_ERROR;
+    }
+    status = ql_internal_ir_builder_add_late_parameter(
+        context->builder, u64.ir_type, name, strlen(name), &object->base,
+        error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    if (snprintf(name, sizeof(name), "__dynamic%zu.__size",
+                 context->dynamic_object_count) < 0) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "dynamic object size name does not fit");
+        return QL_STATUS_INTERNAL_ERROR;
+    }
+    status = ql_internal_ir_builder_add_late_parameter(
+        context->builder, u64.ir_type, name, strlen(name), &object->size,
+        error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    if (context->dynamic_object_count == 0u) {
+        context->dynamic_object_start = index;
+    }
+    ++context->object_count;
+    ++context->dynamic_object_count;
+    return QL_STATUS_OK;
 }
 
 
@@ -8030,6 +8198,7 @@ static ql_status emit_assumptions_for_object(lower_context *context,
             ql_ir_value_id earlier_limit;
             ql_ir_value_id before;
             ql_ir_value_id after;
+            ql_ir_value_id disjoint;
             operands[0] = earlier->base;
             operands[1] = earlier->size;
             status = emit_instruction(context, QL_IR_OPCODE_ADD, &u64,
@@ -8046,8 +8215,32 @@ static ql_status emit_assumptions_for_object(lower_context *context,
                                       earlier->base, &after, error);
             }
             if (status == QL_STATUS_OK) {
-                status = emit_bool_or(context, before, after, &predicate,
+                status = emit_bool_or(context, before, after, &disjoint,
                                       error);
+            }
+            if (status == QL_STATUS_OK &&
+                (object->may_alias != 0u || earlier->may_alias != 0u)) {
+                ql_ir_value_id same_base;
+                ql_ir_value_id same_size;
+                ql_ir_value_id same_region;
+                status = emit_compare(context, QL_IR_OPCODE_EQ,
+                                      object->base, earlier->base,
+                                      &same_base, error);
+                if (status == QL_STATUS_OK) {
+                    status = emit_compare(context, QL_IR_OPCODE_EQ,
+                                          object->size, earlier->size,
+                                          &same_size, error);
+                }
+                if (status == QL_STATUS_OK) {
+                    status = emit_bool_and(context, same_base, same_size,
+                                           &same_region, error);
+                }
+                if (status == QL_STATUS_OK) {
+                    status = emit_bool_or(context, same_region, disjoint,
+                                          &predicate, error);
+                }
+            } else if (status == QL_STATUS_OK) {
+                predicate = disjoint;
             }
             if (status == QL_STATUS_OK) {
                 status = emit_assume(context, predicate, error);
@@ -8413,6 +8606,46 @@ static ql_status emit_object_assumptions(lower_context *context,
     return QL_STATUS_OK;
 }
 
+/* Late-discovered object parameters still need global model assumptions.
+   Build a pure prelude after the body is known, then make it the entry block.
+   This keeps every assumption on every path, including objects discovered in
+   opposite arms of an if. */
+static ql_status prepend_dynamic_object_assumptions(lower_context *context,
+                                                    ql_error *error) {
+    ql_ir_block_id prelude;
+    ql_ir_block_id saved_block = context->current_block;
+    uint32_t saved_terminated = context->current_terminated;
+    size_t index;
+    ql_status status;
+
+    if (context->dynamic_object_count == 0u) {
+        return QL_STATUS_OK;
+    }
+    status = add_block(context, "dynamic.objects", &prelude, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    context->current_block = prelude;
+    context->current_terminated = 0u;
+    for (index = context->dynamic_object_start;
+         index < context->object_count; ++index) {
+        status = emit_assumptions_for_object(context, index, error);
+        if (status != QL_STATUS_OK) {
+            goto restore;
+        }
+    }
+    status = set_branch(context, prelude, context->entry_block, error);
+    if (status == QL_STATUS_OK) {
+        status = ql_internal_ir_builder_replace_entry_block(
+            context->builder, context->entry_block, prelude, error);
+    }
+
+restore:
+    context->current_block = saved_block;
+    context->current_terminated = saved_terminated;
+    return status;
+}
+
 static ql_status initialize_parameters(lower_context *context,
                                        ql_error *error) {
     size_t index;
@@ -8581,6 +8814,7 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
     context.true_value = QL_IR_INVALID_VALUE_ID;
     context.false_value = QL_IR_INVALID_VALUE_ID;
     context.current_block = QL_IR_INVALID_BLOCK_ID;
+    context.entry_block = QL_IR_INVALID_BLOCK_ID;
 
     if (canonical.support != QL_C_FUNCTION_SUPPORTED) {
         status = lower_unknown(
@@ -8702,6 +8936,7 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
                                                    error);
         }
         if (status == QL_STATUS_OK) {
+            context.entry_block = entry;
             context.current_block = entry;
             context.current_terminated = 0u;
             status = emit_object_assumptions(&context, error);
@@ -8729,6 +8964,9 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
                 "a reachable path leaves an integer function without "
                 "returning", error);
         }
+    }
+    if (status == QL_STATUS_OK && context.unknown == 0u) {
+        status = prepend_dynamic_object_assumptions(&context, error);
     }
     if (status == QL_STATUS_OK && context.unknown == 0u) {
         status = ql_ir_builder_finish(context.builder, &result->ir_artifact,

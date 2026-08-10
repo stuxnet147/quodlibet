@@ -210,13 +210,25 @@ value is honoured, and the lowering writes it before the body runs.
 address and carries no provenance beyond it, which is what the profile's
 source material actually is: C recovered from x86-64 SysV object code, where
 casting a pointer to an integer and back, and computing `(char *)p + n`, are
-ordinary. Storage is described by objects, each a base address and a size,
-and the model holds three standing constraints:
+ordinary. Storage is described by object descriptors, each a base address and
+a size, and the model holds three standing constraints:
 
-- distinct live objects occupy disjoint byte ranges;
+- two descriptors either name the exact same live object or occupy disjoint
+  byte ranges; partial overlap is forbidden;
 - every object lies strictly above the first page, so address zero belongs to
   no object and dereferencing null is always undefined;
 - an object's range does not wrap the address space.
+
+Pointer arguments, globals, strings, and local storage introduce descriptors
+before the body. An access through a pointer loaded from memory introduces one
+auxiliary descriptor at that access site, because the source signature cannot
+name its target object. Schema v1 control flow is acyclic, so one descriptor
+per such site is finite; the lowering admits at most 32 and reports `UNKNOWN`
+above that explicit bound. An auxiliary descriptor may exactly alias an
+earlier descriptor. This covers a loaded pointer back into an existing object
+without admitting partial overlaps. Loading, comparing, or returning pointer
+bits without accessing their target introduces no descriptor and no new
+domain assumption.
 
 An access of `W` bytes at address `a` is defined exactly when `[a, a + W)`
 lies inside one live object and `a` is naturally aligned for `W`. Both the

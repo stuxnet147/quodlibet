@@ -479,11 +479,10 @@ TEST(CLowerPointers, CarriesTheWiderPointerSurface) {
     }
 }
 
-/* Loading through a pointer-to-pointer yields a value that is already an IR
-   pointer. Reading it a second time as though it were an address produced IR
-   the builder rejected, which surfaced as a status failure. A semantic limit
-   must always be UNKNOWN; a status is for an API or allocation fault. */
-TEST(CLowerPointers, RefusesADoubleIndirectionWithoutAStatusFailure) {
+/* A pointer loaded through a pointer-to-pointer gets an auxiliary object in
+   the flat table. The record differential test executes the corresponding
+   linked-object case; this one retains the original status regression. */
+TEST(CLowerPointers, LowersADoubleIndirectionWithoutAStatusFailure) {
     static const char source[] =
         "struct LINK_CELL { int value; };\n"
         "typedef struct LINK_CELL *CELL_PTR;\n"
@@ -492,35 +491,8 @@ TEST(CLowerPointers, RefusesADoubleIndirectionWithoutAStatusFailure) {
         "    q = *p;\n"
         "    return q->value;\n"
         "}\n";
-    ql_c_frontend_unit *unit = nullptr;
-    ql_c_lower_result *result = nullptr;
-    ql_c_function_view function{};
-    ql_c_lower_result_view_v1 view{};
-    ql_c_lower_diagnostic_view_v1 diagnostic{};
-    ql_error error{};
-    const std::size_t size = std::strlen(source);
-
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_frontend_analyze(nullptr, source, size, &unit, &error));
-    function.struct_size = sizeof(function);
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_frontend_select_function(unit, "deref_twice", 11u,
-                                            &function, &error));
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_lower_selected_function(nullptr, source, size, unit,
-                                           &function, &result, &error))
-        << error.message;
-    view.struct_size = sizeof(view);
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_lower_result_get_view(result, &view, &error));
-    EXPECT_EQ(QL_C_LOWER_UNKNOWN, view.support);
-    diagnostic.struct_size = sizeof(diagnostic);
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_lower_result_diagnostic_at(result, 0u, &diagnostic,
-                                              &error));
-    EXPECT_EQ(QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, diagnostic.code);
-    ql_c_lower_result_destroy(result);
-    ql_c_frontend_unit_destroy(unit);
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(source, "deref_twice"));
 }
 
 /* A cast to a pointer is a reinterpretation, not a computation: under this

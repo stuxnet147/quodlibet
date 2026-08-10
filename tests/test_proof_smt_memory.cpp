@@ -127,6 +127,41 @@ TEST(SmtProductMemory, BuildsAnArrayQueryWithSharedObjects) {
     ql_product_query_destroy(query);
 }
 
+/* A pointer loaded from memory can name storage beyond the source signature.
+   The lowering appends one auxiliary object for the access, and the product
+   must bind the matching late parameters on both sides to one shared region. */
+TEST(SmtProductMemory, ProvesThroughAPointerLoadedFromMemory) {
+    constexpr char left[] =
+        "struct D { int value; }; struct H { struct D *next; };"
+        " int f(struct H *p){ return p->next->value; }";
+    constexpr char right[] =
+        "struct D { int value; }; struct H { struct D *next; };"
+        " int g(struct H *q){ struct D *r = q->next; return r[0].value; }";
+    w2::Pair pair;
+    OutcomeRun run;
+    ql_product_query *query = nullptr;
+    ql_error error{};
+
+    if (!BackendAvailable()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build(left, "f", right, "g",
+                         w2::ContractObserving(MemoryObservations()), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_product_query_build(nullptr, pair.problem(), pair.left_ir(),
+                                     pair.right_ir(), &query, &error))
+        << error.message;
+    EXPECT_EQ(2u, ql_product_query_object_count(query));
+    ql_product_query_destroy(query);
+    ASSERT_EQ(QL_STATUS_OK, run.Run(pair, kTrusted, &error)) << error.message;
+    const ql_smt_product_outcome_view_v1 view = run.view();
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_UNSAT, view.violation_answer);
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_SAT, view.domain_answer);
+    EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, view.verdict) << view.diagnostic;
+}
+
 /* A string literal is an object whose bytes the program states. The lowering
    states them as one MEMORY_IMAGE rather than a store per byte, so the miter
    has to turn that into the array theory's initial contents for the range:

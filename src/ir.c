@@ -1,5 +1,7 @@
 #include "quodlibet/ir.h"
 
+#include "internal.h"
+
 #include <stdatomic.h>
 #include <string.h>
 
@@ -590,6 +592,39 @@ ql_status QL_CALL ql_ir_builder_add_parameter(
     entry->name_size = name_size;
     *output = (ql_ir_value_id)builder->graph.value_count;
     ++builder->graph.value_count;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+ql_status ql_internal_ir_builder_add_late_parameter(
+    ql_ir_builder *builder, ql_ir_type_id type, const char *name,
+    size_t name_size, ql_ir_value_id *output, ql_error *error) {
+    uint32_t sealed;
+    ql_status status;
+
+    if (builder == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "IR builder is required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    sealed = builder->graph.parameters_are_sealed;
+    builder->graph.parameters_are_sealed = 0u;
+    status = ql_ir_builder_add_parameter(builder, type, name, name_size,
+                                         output, error);
+    builder->graph.parameters_are_sealed = sealed;
+    return status;
+}
+
+ql_status ql_internal_ir_builder_replace_entry_block(
+    ql_ir_builder *builder, ql_ir_block_id expected,
+    ql_ir_block_id replacement, ql_error *error) {
+    if (builder == NULL || builder->graph.entry_block != expected ||
+        replacement >= builder->graph.block_count) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "IR entry replacement does not match the builder");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    builder->graph.entry_block = replacement;
     ql_error_clear(error);
     return QL_STATUS_OK;
 }

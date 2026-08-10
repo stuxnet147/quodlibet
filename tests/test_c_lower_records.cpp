@@ -10,6 +10,7 @@
 #include "quodlibet/c_lower.h"
 #include "quodlibet/ir_interp.h"
 #include "quodlibet/ir_verify.h"
+#include "quodlibet/signature.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -80,6 +81,8 @@ public:
         ql_c_function_view function{};
         ql_c_lower_result_view_v1 view{};
         ql_ir_verify_report_v1 report{};
+        ql_artifact *signature_artifact = nullptr;
+        ql_source_signature *signature = nullptr;
         ql_error error{};
         const std::size_t size = std::strlen(source);
 
@@ -120,6 +123,22 @@ public:
                           << report.message;
             return false;
         }
+        if (ql_source_signature_from_c_function_v2(
+                nullptr, unit_, &function, source, size,
+                QL_C_DIALECT_ASM2C_GNU_V1,
+                QL_TARGET_ABI_X86_64_LINUX_SYSV_LP64,
+                &signature_artifact, &error) != QL_STATUS_OK ||
+            ql_source_signature_open(nullptr, signature_artifact, &signature,
+                                     &error) != QL_STATUS_OK ||
+            ql_source_signature_bind_ir(signature, ir_, &error) !=
+                QL_STATUS_OK) {
+            ADD_FAILURE() << "signature bind: " << error.message;
+            ql_source_signature_release(signature);
+            ql_artifact_release(signature_artifact);
+            return false;
+        }
+        ql_source_signature_release(signature);
+        ql_artifact_release(signature_artifact);
         return true;
     }
 
@@ -214,6 +233,17 @@ Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &pointers,
         inputs[index].size = storage[index].size();
     }
     for (const Region &region : regions) {
+        bool already_present = false;
+        for (const ql_ir_interp_object_v1 &existing : objects) {
+            if (existing.base == region.base &&
+                existing.size == region.size) {
+                already_present = true;
+                break;
+            }
+        }
+        if (already_present) {
+            continue;
+        }
         ql_ir_interp_object_v1 object{};
         ql_ir_interp_object_init(&object);
         object.base = region.base;
@@ -348,41 +378,41 @@ TEST(CLowerRecords, StoresIntoAMemberAndLeavesItVisible) {
     }
 }
 
-/* A pointer read out of memory has no object in the table, so no guard could
-   ever justify dereferencing it. The lowering says so up front instead of
-   emitting IR that is undefined on every input, which would look lowered and
-   prove nothing. */
-TEST(CLowerRecords, RefusesToFollowAPointerReadOutOfMemory) {
-    ql_c_frontend_unit *unit = nullptr;
-    ql_c_lower_result *result = nullptr;
-    ql_c_function_view function{};
-    ql_c_lower_result_view_v1 view{};
-    ql_c_lower_diagnostic_view_v1 diagnostic{};
-    ql_error error{};
-    const std::size_t size = std::strlen(through_source);
+/* The second object is not implied by the function signature. It is the live
+   object named by the pointer bytes loaded from the first object. */
+TEST(CLowerRecords, FollowsAPointerReadOutOfMemoryIntoADynamicObject) {
+    Lowered lowered;
+    struct REC_LINK native_tail = {41, nullptr};
+    struct REC_LINK native_head = {7, &native_tail};
+    struct REC_LINK model_tail = {41, nullptr};
+    struct REC_LINK model_head = {
+        7, reinterpret_cast<struct REC_LINK *>(kBase + UINT64_C(0x1000))};
+    ASSERT_TRUE(lowered.Open(through_source, "rec_through"));
+    const Region head = {kBase, sizeof(model_head),
+                         reinterpret_cast<const uint8_t *>(&model_head),
+                         nullptr};
+    const Region tail = {kBase + UINT64_C(0x1000), sizeof(model_tail),
+                         reinterpret_cast<const uint8_t *>(&model_tail),
+                         nullptr};
+    const Outcome run = Execute(lowered.ir(), {kBase}, {}, {head, tail});
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+        << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+    EXPECT_EQ(rec_through(&native_head), Returned(run.result));
 
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_frontend_analyze(nullptr, through_source, size, &unit,
-                                    &error));
-    function.struct_size = sizeof(function);
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_frontend_select_function(unit, "rec_through", 11u,
-                                            &function, &error));
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_lower_selected_function(nullptr, through_source, size,
-                                           unit, &function, &result, &error))
-        << error.message;
-    view.struct_size = sizeof(view);
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_lower_result_get_view(result, &view, &error));
-    EXPECT_EQ(QL_C_LOWER_UNKNOWN, view.support);
-    diagnostic.struct_size = sizeof(diagnostic);
-    ASSERT_EQ(QL_STATUS_OK,
-              ql_c_lower_result_diagnostic_at(result, 0u, &diagnostic,
-                                              &error));
-    EXPECT_EQ(QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, diagnostic.code);
-    ql_c_lower_result_destroy(result);
-    ql_c_frontend_unit_destroy(unit);
+    struct REC_LINK native_self = {29, nullptr};
+    native_self.next = &native_self;
+    struct REC_LINK model_self = {
+        29, reinterpret_cast<struct REC_LINK *>(kBase)};
+    const Region self = {kBase, sizeof(model_self),
+                         reinterpret_cast<const uint8_t *>(&model_self),
+                         nullptr};
+    const Outcome alias_run =
+        Execute(lowered.ir(), {kBase}, {}, {self, self});
+    ASSERT_EQ(QL_STATUS_OK, alias_run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, alias_run.result.outcome)
+        << ql_ir_interp_ub_reason_string(alias_run.result.ub_reason);
+    EXPECT_EQ(rec_through(&native_self), Returned(alias_run.result));
 }
 
 TEST(CLowerRecords, LowersEnumeratorsAsTheConstantsTheyName) {

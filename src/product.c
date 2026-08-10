@@ -1239,8 +1239,8 @@ static ql_status encode_instruction(product_encoder *encoder,
         return declare_call_results(encoder, side, view);
     }
     if (view->opcode == QL_IR_OPCODE_ASSUME) {
-        /* The model's disjointness, first-page, and no-wrap constraints reach
-           the query through this list. They are not restated here; the
+        /* The model's alias-or-disjoint, first-page, and no-wrap constraints
+           reach the query through this list. They are not restated here; the
            lowering already put them in the IR. */
         return site_list_add(&side->assumes, allocator, block,
                              view->operands[0], 0u, encoder->error);

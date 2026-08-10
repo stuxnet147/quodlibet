@@ -261,16 +261,20 @@ is byte for byte the order `ql_ir_interp_run` uses; an access whose width is
 not a whole number of bytes is refused rather than rounded.
 
 Both sides share the initial memory constant and one base and size constant per
-object, so the two functions run over the same storage without either side
-describing it to the other. The object table follows from the pointer arguments
-in source order on each side and is matched through the problem's argument
-correspondence, so a correspondence that permutes the two argument lists still
-binds the same object to the same pair of constants.
+object descriptor, so the two functions run over the same storage without
+either side describing it to the other. Pointer-argument descriptors come
+first and are matched through the problem's argument correspondence. Globals,
+strings, local storage, and auxiliary descriptors for accesses through loaded
+pointers follow in lowering order and match by position. The two sides must
+therefore declare the same number of these internal descriptors; otherwise the
+method returns `UNKNOWN` rather than guessing an identity relation. Auxiliary
+descriptors may name an earlier region exactly, while partial overlap remains
+forbidden.
 
 **Neither the model's standing constraints nor the access-definedness predicate
 is restated here.** The lowering already emits them as ordinary IR: `ASSUME`
-instructions for disjointness, the first-page floor, and the no-wrap bound, and
-a `UB_GUARD` over ordinary arithmetic at each access. The miter encodes those
+instructions for exact-alias-or-disjoint regions, the first-page floor, and the
+no-wrap bound, and a `UB_GUARD` over ordinary arithmetic at each access. The miter encodes those
 instructions like any others, so the query and `ql_ir_interp_run` cannot come
 to disagree about which layouts are admissible or which accesses are defined.
 The assumptions are conjoined into both terminal queries, so an `unsat`

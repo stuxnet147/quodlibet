@@ -25,13 +25,12 @@ typedef struct ql_product_input_v1 {
     uint64_t reserved[2];
 } ql_product_input_v1;
 
-/* One storage region both sides receive. The object table is derived from the
-   pointer arguments in source order on each side and then matched through the
-   problem's argument correspondence, so the two functions share one table
-   without exchanging anything. `base_symbol` and `size_symbol` are the shared
-   SMT-LIB constants; `left_base_parameter` and `right_base_parameter` are the
-   IR parameter ordinals of that object's base on each side, with its size at
-   the next ordinal. */
+/* One storage-region descriptor both sides receive. Pointer-argument objects
+   are matched through the problem's argument correspondence; descriptors the
+   lowerings create are matched by position. `base_symbol` and `size_symbol`
+   are the shared SMT-LIB constants; `left_base_parameter` and
+   `right_base_parameter` are the IR parameter ordinals of that descriptor's
+   base on each side, with its size at the next ordinal. */
 typedef struct ql_product_object_v1 {
     size_t struct_size;
     uint32_t index;
