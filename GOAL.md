@@ -79,17 +79,17 @@
 - [x] 세 결과의 end-to-end 통합 시험 (`tests/test_proof_smt.cpp` 9개, 파이프라인 이름 선택 포함)
 - [x] scheduler/plugin 기능 동결 유지
 
-## G6. VTune 프로파일링과 극한 튜닝
+## G6. VTune 프로파일링과 극한 튜닝 (2026-08-10 닫힘)
 
 **요구.** VTune 으로 세밀하게 프로파일링하고 최대한 속도를 뽑는다. 병렬로 돌아야 하는 부분을 확실히 잡는다.
 
 **종료 조건**
 
-- [ ] `docs/perf/` 에 VTune hotspots 와 threading 리포트가 있고 재현 명령이 적혀 있다
-- [ ] **소거법이 아니라 프로파일 근거로** 고른 최적화가 before/after 수치와 함께 커밋되어 있다
-- [ ] 병렬로 돌아야 하는 구간이 실제로 병렬로 돈다는 것이 threading 리포트로 확인된다(worker 점유율)
-- [ ] 성능 기준선이 `docs/perf/baseline.md` 에 고정되고 회귀를 재는 방법이 적혀 있다
-- [ ] 튜닝이 건전성을 바꾸지 않았다(전 구성 CTest 통과, ASan/UBSan 통과)
+- [x] `docs/perf/` 에 VTune hotspots 리포트와 원본 아카이브, 재현 명령
+- [x] **프로파일 근거** 최적화가 before/after 와 함께 커밋: 중복 파스 -27%, BLAKE3 어셈블리 판정 -52%, 세션 재사용 -55.6%(처리량 465 pairs/s), 트리 이전, budget 마감 양자화 수정, lseek -1.09%
+- [x] 병렬 구간이 실제로 병렬로 돈다 - **VTune threading 수집이 세 환경 모두 실패했으나(Windows 수집기 무응답, WSL 자식프로세스 hang, VM 'Cannot load raw collector data'), 그 조건의 의도는 다른 계기로 충족.** worker 점유율 98%(hotspots 스택 귀속), 스레드 대 프로세스 대조로 포화 원인이 우리 코드가 아니라 solver/물리코어 12 임을 확정. **2026-08-10 사용자가 '의도 충족으로 인정' 판단.** 근거는 `docs/perf/`
+- [x] 성능 기준선 `docs/perf/baseline.md` 와 회귀 측정법
+- [x] 튜닝이 건전성을 바꾸지 않음 - Windows 483/483, Linux sanitize 482/482
 
 ## G7. asm2c-03 VM 에서 채점기/강화학습기로 돌아가는지 확인 (2026-08-10 닫힘)
 
