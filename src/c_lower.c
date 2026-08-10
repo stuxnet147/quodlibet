@@ -21,6 +21,10 @@
 #define LOWER_ARRAY_BOUND_FROM_INITIALIZER UINT64_MAX
 #define LOWER_ARRAY_BOUND_DYNAMIC (UINT64_MAX - UINT64_C(1))
 #define LOWER_MAX_POINTER_INDIRECTION 3u
+/* A selected function carries one by-value record as one bit-vector image.
+   Keep it within the concrete interpreter's existing public value capacity;
+   larger records remain UNKNOWN instead of silently dropping bytes. */
+#define LOWER_MAX_BOUNDARY_RECORD_BYTES QL_IR_INTERP_VALUE_CAPACITY
 
 typedef struct ql_c_lower_diagnostic_record {
   ql_c_lower_diagnostic_code code;
@@ -3046,14 +3050,19 @@ static ql_status type_from_inventory(lower_context *context,
       return status;
     }
     if (output->kind == QL_C_SCALAR_RECORD) {
-      /* Members of a record are reachable; the whole record as a value
-         is not, because this slice has no aggregate IR value and no
-         object to give it. */
-      return lower_unknown(
-          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
-          "a struct or union passed or returned by value is outside "
-          "this slice",
-          error);
+      uint64_t size;
+      status = ensure_record_layout(context, output->record, node, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+      size = record_size(context, output->record);
+      if (size == 0u || size > LOWER_MAX_BOUNDARY_RECORD_BYTES) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+            "a record passed or returned by value exceeds the bounded "
+            "function image",
+            error);
+      }
     }
     return QL_STATUS_OK;
   }
@@ -3111,8 +3120,15 @@ static ql_status ensure_ir_type(lower_context *context, lower_type *type,
     definition.bit_width = type->width;
     definition.float_format = type->width == 32u ? QL_IR_FLOAT_IEEE_BINARY32
                                                   : QL_IR_FLOAT_IEEE_BINARY64;
+  } else if (type->kind == QL_C_SCALAR_RECORD &&
+             record_size(context, type->record) != 0u &&
+             record_size(context, type->record) <=
+                 LOWER_MAX_BOUNDARY_RECORD_BYTES) {
+    ql_ir_type_definition_init(&definition, QL_IR_TYPE_BIT_VECTOR);
+    definition.bit_width =
+        (uint32_t)(record_size(context, type->record) * UINT64_C(8));
   } else if (type->kind == QL_C_SCALAR_INTEGER && type->width != 0u &&
-             type->width <= 128u) {
+             type->width <= QL_IR_INTERP_MAX_BIT_WIDTH) {
     ql_ir_type_definition_init(&definition, QL_IR_TYPE_BIT_VECTOR);
     definition.bit_width = type->width;
   } else {
@@ -3251,7 +3267,7 @@ static ql_status add_constant_bytes(lower_context *context, lower_type *type,
 static ql_status add_uint_constant(lower_context *context, lower_type type,
                                    uint64_t value, ql_ir_value_id *output,
                                    ql_error *error) {
-  uint8_t bytes[16];
+  uint8_t bytes[QL_IR_INTERP_VALUE_CAPACITY];
   size_t size;
   size_t index;
 
@@ -3269,6 +3285,24 @@ static ql_status add_uint_constant(lower_context *context, lower_type type,
   if (type.kind == QL_C_SCALAR_BOOL) {
     bytes[0] = bytes[0] != 0u ? 1u : 0u;
   }
+  return add_constant_bytes(context, &type, bytes, size, output, error);
+}
+
+static ql_status add_power_of_two_constant(lower_context *context,
+                                           lower_type type, uint32_t exponent,
+                                           ql_ir_value_id *output,
+                                           ql_error *error) {
+  uint8_t bytes[QL_IR_INTERP_VALUE_CAPACITY];
+  size_t size = (type.width + 7u) / 8u;
+
+  if (type.kind != QL_C_SCALAR_INTEGER || exponent >= type.width ||
+      size > sizeof(bytes)) {
+    ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                 "power-of-two constant is outside the lowering buffer");
+    return QL_STATUS_INTERNAL_ERROR;
+  }
+  memset(bytes, 0, sizeof(bytes));
+  bytes[exponent / 8u] = (uint8_t)(UINT32_C(1) << (exponent % 8u));
   return add_constant_bytes(context, &type, bytes, size, output, error);
 }
 
@@ -7193,6 +7227,150 @@ static ql_status append_record_call_argument(
       return status;
     }
     operands[(*operand_count)++] = packed;
+  }
+  return QL_STATUS_OK;
+}
+
+static lower_type record_image_type(const lower_context *context,
+                                    lower_type record) {
+  lower_type image = make_integer_type(
+      (uint32_t)(record_size(context, record.record) * UINT64_C(8)), 7u, 0u);
+  image.ir_type = record.ir_type;
+  return image;
+}
+
+/* Packs the complete record representation into the selected function's
+   single bit-vector carrier. Byte zero becomes the low eight bits, matching
+   IR constants, interpreter values, and external-call record chunks. */
+static ql_status pack_record_image(lower_context *context,
+                                   lower_value record, ql_ir_value_id *output,
+                                   ql_error *error) {
+  lower_type byte = make_integer_type(8u, 1u, 0u);
+  lower_type image = record_image_type(context, record.type);
+  lower_value source = record;
+  ql_ir_value_id packed = QL_IR_INVALID_VALUE_ID;
+  uint64_t size = record_size(context, record.type.record);
+  uint64_t offset;
+  ql_status status = emit_ub_guard(context, &record, error);
+
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  status = ensure_ir_type(context, &image, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  source.type = make_pointer_to(record.type);
+  source.defined = context->true_value;
+  source.may_ub = 0u;
+  for (offset = 0u; offset < size; ++offset) {
+    lower_value address;
+    lower_value loaded;
+    lower_value widened;
+    ql_ir_value_id shifted = QL_IR_INVALID_VALUE_ID;
+
+    memset(&widened, 0, sizeof(widened));
+    status = aggregate_child_address(context, source, offset, byte, &address,
+                                     error);
+    if (status == QL_STATUS_OK) {
+      status = emit_load(context, address, &loaded, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = convert_value(context, loaded, image, &widened, error);
+    }
+    if (status == QL_STATUS_OK && offset != 0u) {
+      ql_ir_value_id scale;
+      ql_ir_value_id operands[2];
+      status = add_power_of_two_constant(
+          context, image, (uint32_t)(offset * UINT64_C(8)), &scale, error);
+      if (status == QL_STATUS_OK) {
+        operands[0] = widened.value;
+        operands[1] = scale;
+        status = emit_instruction(context, QL_IR_OPCODE_MUL, &image, operands,
+                                  2u, NULL, 0u, QL_IR_EFFECT_NONE, &shifted,
+                                  error);
+      }
+    } else if (status == QL_STATUS_OK) {
+      shifted = widened.value;
+    }
+    if (status == QL_STATUS_OK) {
+      if (packed == QL_IR_INVALID_VALUE_ID) {
+        packed = shifted;
+      } else {
+        ql_ir_value_id operands[2] = {packed, shifted};
+        status = emit_instruction(context, QL_IR_OPCODE_BV_OR, &image,
+                                  operands, 2u, NULL, 0u, QL_IR_EFFECT_NONE,
+                                  &packed, error);
+      }
+    }
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+  }
+  if (packed == QL_IR_INVALID_VALUE_ID) {
+    ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                 "record image has no bytes to pack");
+    return QL_STATUS_INTERNAL_ERROR;
+  }
+  *output = packed;
+  return QL_STATUS_OK;
+}
+
+/* Restores one selected-function record parameter into its private object.
+   C passes the value, not caller storage, so later writes affect only this
+   function-owned copy. */
+static ql_status store_record_image(lower_context *context,
+                                    lower_value destination,
+                                    lower_type record, ql_ir_value_id image_id,
+                                    ql_error *error) {
+  lower_type byte = make_integer_type(8u, 1u, 0u);
+  lower_type image = record_image_type(context, record);
+  uint64_t size = record_size(context, record.record);
+  uint64_t offset;
+  ql_status status = ensure_bool_constants(context, error);
+
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  for (offset = 0u; offset < size; ++offset) {
+    lower_value packed;
+    lower_value value;
+    lower_value address;
+
+    memset(&packed, 0, sizeof(packed));
+    packed.value = image_id;
+    packed.type = image;
+    packed.defined = context->true_value;
+    if (offset != 0u) {
+      ql_ir_value_id amount;
+      ql_ir_value_id operands[2];
+      status = add_uint_constant(context, image, offset * UINT64_C(8), &amount,
+                                 error);
+      if (status == QL_STATUS_OK) {
+        operands[0] = packed.value;
+        operands[1] = amount;
+        status = emit_instruction(context, QL_IR_OPCODE_LSHR, &image, operands,
+                                  2u, NULL, 0u, QL_IR_EFFECT_NONE,
+                                  &packed.value, error);
+      }
+      if (status == QL_STATUS_OK) {
+        packed.may_ub = 1u;
+        status = emit_ub_guard(context, &packed, error);
+      }
+    }
+    if (status == QL_STATUS_OK) {
+      status = convert_value(context, packed, byte, &value, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = aggregate_child_address(context, destination, offset, byte,
+                                       &address, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = emit_store(context, address, value, error);
+    }
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
   }
   return QL_STATUS_OK;
 }
@@ -11359,8 +11537,12 @@ static ql_status terminate_value_return(lower_context *context,
 static ql_status terminate_undefined_return(lower_context *context,
                                             ql_error *error) {
   lower_value placeholder;
+  lower_type placeholder_type =
+      context->return_type.kind == QL_C_SCALAR_RECORD
+          ? record_image_type(context, context->return_type)
+          : context->return_type;
   ql_status status =
-      make_zero_scalar(context, context->return_type, &placeholder, error);
+      make_zero_scalar(context, placeholder_type, &placeholder, error);
 
   if (status != QL_STATUS_OK) {
     return status;
@@ -11403,12 +11585,27 @@ static ql_status lower_return_statement(lower_context *context, size_t node,
   }
   if (value_node == SIZE_MAX) {
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
-                         "integer and _Bool functions must return a value",
+                         "a non-void function must return a value",
                          error);
   }
   status = lower_expression(context, value_node, &value, error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
+  }
+  if (context->return_type.kind == QL_C_SCALAR_RECORD) {
+    ql_ir_value_id image;
+    if (value.type.array_length != 0u ||
+        value.type.kind != QL_C_SCALAR_RECORD ||
+        !type_same(value.type, context->return_type)) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+          "a record function must return the declared record type", error);
+    }
+    status = pack_record_image(context, value, &image, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    return terminate_value_return(context, image, error);
   }
   status =
       convert_value(context, value, context->return_type, &converted, error);
@@ -12524,8 +12721,13 @@ static ql_status materialize_stack_slots(lower_context *context,
     incoming.type = variable->type;
     incoming.defined = context->true_value;
     incoming.has_object = variable->has_object;
-    status =
-        emit_store(context, stack_address(context, variable), incoming, error);
+    if (variable->type.kind == QL_C_SCALAR_RECORD) {
+      status = store_record_image(context, stack_address(context, variable),
+                                  variable->type, variable->value, error);
+    } else {
+      status = emit_store(context, stack_address(context, variable), incoming,
+                          error);
+    }
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
@@ -12916,6 +13118,12 @@ static ql_status initialize_parameters(lower_context *context,
     }
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
+    }
+    if (type.kind == QL_C_SCALAR_RECORD) {
+      status = remember_storage_name(context, parameter.name, error);
+      if (status != QL_STATUS_OK) {
+        return status;
+      }
     }
     if (type.is_function_pointer != 0u) {
       lower_variable *variable =

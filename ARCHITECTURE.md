@@ -244,8 +244,24 @@ member access. Every chunk participates in product-call congruence.
 
 An indirect record return remains outside the slice because the object
 prepass cannot bind a statically named callee to a return temporary. Record
-parameters or returns on the selected source function also remain outside the
-current source-signature and IR result contracts.
+parameters or returns on the selected source function use the separate
+boundary rule below.
+
+#### Small selected-function records use one object-image value
+
+A record of at most 32 bytes passed to or returned from the selected source
+function is one bit-vector containing its complete little-endian object
+image. The limit is the concrete interpreter's existing value capacity. A
+parameter image is copied into a function-owned object before the body runs,
+so modifying the parameter never modifies caller storage. A returned record
+is read from its object after its complete-image definedness guard and packed
+back into the same carrier. Padding and union bytes participate in both
+directions.
+
+This is currently a lowering, verifier, and concrete-execution contract.
+Source-signature schema v1 cannot describe a record value, so a pipeline that
+requires `ql_source_signature_bind_ir` still refuses this boundary. Records
+larger than 32 bytes remain `UNKNOWN`; no bytes are truncated.
 
 #### Corpus globals carry no promised initial value
 

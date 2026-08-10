@@ -96,6 +96,15 @@ int call_record_return_reference(int left, int right) {
 int call_record_return_member_reference(int left, int right) {
     return CALLEE_make_record(left, right).middle;
 }
+struct SELECTED_RECORD {
+    int value;
+    unsigned char tag;
+};
+struct SELECTED_RECORD selected_record_roundtrip(struct SELECTED_RECORD input) {
+    input.value += input.tag;
+    input.tag = static_cast<unsigned char>(input.tag + 3u);
+    return input;
+}
 }
 
 QL_CALL_FUNCTION(single, int CALLEE_double(int);
@@ -177,6 +186,14 @@ static const char record_return_source[] =
     "}\n"
     "int call_record_return_member(int left, int right) {\n"
     "  return CALLEE_make_record(left, right).middle;\n"
+    "}\n";
+static const char selected_record_source[] =
+    "struct SELECTED_RECORD { int value; unsigned char tag; };\n"
+    "struct SELECTED_RECORD selected_record_roundtrip(\n"
+    "    struct SELECTED_RECORD input) {\n"
+    "  input.value += input.tag;\n"
+    "  input.tag = (unsigned char)(input.tag + 3u);\n"
+    "  return input;\n"
     "}\n";
 QL_CALL_FUNCTION(indirect, struct CALL_VTABLE {
         int (*callback)(int);
@@ -813,6 +830,44 @@ TEST(CLowerCalls, MaterializesARecordReturnedByValue) {
                 EXPECT_EQ(std::vector<std::string>{"CALLEE_make_record"},
                           log.symbols);
             }
+        }
+    }
+}
+
+TEST(CLowerCalls, CarriesASelectedFunctionsRecordBoundaryAsAnObjectImage) {
+    static_assert(sizeof(SELECTED_RECORD) == sizeof(uint64_t));
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(selected_record_source,
+                             "selected_record_roundtrip"));
+    for (const int32_t value : {-91, 0, 37}) {
+        for (const uint8_t tag : {uint8_t{0}, uint8_t{9}, uint8_t{251}}) {
+            SELECTED_RECORD input{};
+            input.value = value;
+            input.tag = tag;
+            uint64_t image = 0u;
+            std::memcpy(&image, &input, sizeof(input));
+
+            uint8_t initial[sizeof(SELECTED_RECORD)]{};
+            ql_ir_interp_object_v1 object{};
+            ql_ir_interp_object_init(&object);
+            object.base = QL_IR_INTERP_FIRST_OBJECT_ADDRESS;
+            object.size = sizeof(SELECTED_RECORD);
+            object.initial = initial;
+            CallLog log;
+            const Outcome run =
+                Execute(lowered.ir(), {image}, &log, &object, 1u);
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            ASSERT_EQ(sizeof(SELECTED_RECORD), run.result.value_size);
+
+            const SELECTED_RECORD expected =
+                selected_record_roundtrip(input);
+            SELECTED_RECORD actual{};
+            std::memcpy(&actual, run.result.value, sizeof(actual));
+            EXPECT_EQ(expected.value, actual.value);
+            EXPECT_EQ(expected.tag, actual.tag);
+            EXPECT_TRUE(log.symbols.empty());
         }
     }
 }

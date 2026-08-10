@@ -311,7 +311,7 @@ TEST(CLowerTypes, NamesTheRealObstacleBehindATypedef) {
     ExpectUnknown("typedef int TYP_0[4];\n"
                   "int indexed(TYP_0 a) { return 0; }",
                   "indexed", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
-    ExpectUnknown("struct TYP_0 { int f; };\n"
+    ExpectUnknown("struct TYP_0 { unsigned long long words[5]; };\n"
                   "typedef struct TYP_0 TYP_1;\n"
                   "int aggregate(TYP_1 a) { return 0; }",
                   "aggregate", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);

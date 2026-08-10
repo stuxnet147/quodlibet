@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,589 / 29,880 (95.68%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 370, `unsupported_control_flow` 311, `unsupported_call` 222, `undeclared_identifier` 144입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,806 / 29,880 (96.41%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_control_flow` 311, `unsupported_call` 225, `unsupported_type` 148, `undeclared_identifier` 146입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -2038,6 +2038,25 @@ CALL 결과의 모든 chunk는 concrete callback 결과와 product-call congruen
 
 `tests/test_c_lower_calls.cpp`는 padding이 있는 16바이트 record를 실제 compiled C와 interpreter callback에서 대조하고, local initializer와 직접 member 접근을 함께 검증합니다. `tests/test_proof_smt_calls.cpp`는 모든 packed return chunk가 한 CALL tuple로 합동성에 참여하는지 증명합니다. 최종 코드에서 C lowering, parser reuse, IR interpreter와 verifier, call-product, source-signature 영향 범위 175/175가 통과했습니다. 공용 IR, interpreter, solver, plugin 구현은 바뀌지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 범용 전체 테스트가 아니라 G9 수치와 기존 성공 회귀 0건을 현재 커밋 상태에서 확인하기 위한 필수 측정으로 실행했습니다.
 
+### 71. 선택된 함수의 작은 record 경계를 object image 값으로 운반한다
+
+선택된 함수가 32바이트 이하 record를 값으로 받거나 반환하면 전체 target-layout object image를 little-endian bit-vector 한 개로 운반합니다. parameter image는 body 실행 전에 함수 소유의 고정 object에 전부 기록하므로 parameter를 수정해도 caller storage에는 닿지 않습니다. record return은 complete-image definedness guard 뒤에 padding과 union representation까지 읽어 같은 carrier로 포장합니다. 32바이트 상한은 concrete interpreter의 기존 공개 value capacity와 같고, 더 큰 record는 byte를 버리지 않고 명시적 UNKNOWN으로 남깁니다.
+
+이 계약은 현재 C lowering, IR verifier, concrete interpreter와 compiled differential 경계까지입니다. source-signature schema v1은 record 값을 표현하지 못하므로 `ql_source_signature_bind_ir`가 필요한 proof pipeline은 아직 이 경계를 거부합니다. G9의 `SUPPORTED` 측정과 정확성 검사는 가능하지만, 이 제한을 일반 proof 지원으로 오해해서는 안 됩니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 28,589 (95.68%) | **28,806 (96.41%)** |
+| 증가 | | **+217** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_type` | 370 | **148** |
+| verifier 통과 | 28,589 / 28,589 | **28,806 / 28,806** |
+| status 실패 | 0 | **0** |
+
+기존 selected-function record 경계 첫 차단 229개를 먼저 재측정해 217개가 성공했습니다. 나머지는 32바이트를 넘는 record 7개, 기존 call 제한 3개, undeclared identifier 2개로 이동했습니다. 따라서 전체 진단에서는 `unsupported_call`이 222에서 225로, `undeclared_identifier`가 144에서 146으로 늘었지만 기존 성공의 회귀는 아닙니다. 전체 train의 29,880개 경로와 함수명 복합 키는 중복 없이 모두 대응했고 누락도 0개였습니다.
+
+`tests/test_c_lower_calls.cpp`는 padding이 있는 실제 8바이트 record를 selected function의 입력과 출력으로 왕복시키고, 함수 내부 member 수정 결과를 compiled C와 concrete interpreter에서 대조합니다. 기존 거부 테스트는 40바이트 record가 계속 UNKNOWN인지 고정합니다. 변경은 C lowering 내부의 boundary pack/unpack과 parameter object에 한정되므로 C lowering, parser reuse, IR interpreter와 verifier 영향 범위 149/149를 실행했습니다. 공용 IR, interpreter, solver, plugin 구현은 바뀌지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage만 G9 성공률과 기존 성공 회귀 0건을 현재 코드에서 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -2046,10 +2065,10 @@ CALL 결과의 모든 chunk는 concrete callback 결과와 product-call congruen
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 370
 - `unsupported_control_flow` 311
-- `unsupported_call` 222
-- `undeclared_identifier` 144
+- `unsupported_call` 225
+- `unsupported_type` 148
+- `undeclared_identifier` 146
 - `unsupported_pointer` 61
 - `duplicate_declaration` 58
 - `unsupported_volatile_or_atomic` 50
@@ -2069,8 +2088,8 @@ CALL 결과의 모든 chunk는 concrete callback 결과와 product-call congruen
 
 ## 다음에 할 것
 
-1. 선택된 함수의 record parameter 또는 return은 source signature와 IR 입출력의 object-copy 계약을 함께 정한 뒤 수용합니다.
-2. 선언 없는 callee와 identifier는 추출 context에서 복구 가능한 근거가 있는지 먼저 분리합니다.
-3. 남은 nested 및 backward goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 확장합니다.
+1. 선언 없는 callee와 identifier는 추출 context에서 복구 가능한 근거가 있는지 먼저 분리합니다.
+2. 남은 nested 및 backward goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 확장합니다.
+3. selected-function record의 source-signature schema는 layout image를 독립적으로 교차 검사할 수 있을 때만 확장합니다.
 4. function pointer의 남은 깊이 제한은 실제 call signature를 복구할 수 있는 형태만 확장합니다.
-5. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.
+5. 각 단위마다 compiled differential, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다. source-signature가 표현하는 범위는 binding도 함께 검사합니다.

@@ -565,7 +565,10 @@ TEST(CLowerRecords, RefusesRemainingWholeRecordValues) {
         const char *name;
     };
     const Case cases[] = {
-        {"struct S { int a; };\nint by_value(struct S s) { return s.a; }",
+        /* The selected-function image is deliberately bounded by the
+           concrete interpreter's 32-byte value capacity. */
+        {"struct S { unsigned long long words[5]; };\n"
+         "int by_value(struct S s) { return (int)s.words[0]; }",
          "by_value"},
         /* A discarded assignment is a byte snapshot, but using the assignment
            expression as a record value still needs an IR record value. */
