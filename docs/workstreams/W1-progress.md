@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,105 / 29,880 (97.41%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_control_flow` 123, `unsupported_type` 112, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,117 / 29,880 (97.45%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_control_flow` 123, `unsupported_type` 100, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -2166,6 +2166,25 @@ goto와 label 사이의 선언을 실제로 건너뛰는 경우와 바깥에서 
 
 `tests/test_c_lower_aggregates.cpp`는 익명 struct의 padding과 member offset, 익명 union의 겹친 byte를 실제 compiled C 및 concrete interpreter와 대조합니다. aggregate, record, parser reuse 영향 범위 29/29가 통과했습니다. 공개 ABI, IR 형식, interpreter, solver, plugin, EGraph는 바뀌지 않았고 익명 record 33개보다 넓은 경로도 없으므로 전체 CTest와 전체 train은 실행하지 않았습니다.
 
+### 78. parameter qualifier를 반환형 inventory에서 분리한다
+
+프런트엔드의 반환형 type inventory가 함수 declarator 전체를 훑으면서 parameter-list 아래의 `const`, `restrict`, `volatile`, `_Atomic`까지 반환형 qualifier로 합치고 있었습니다. 반환형 inventory를 만들 때 parameter-list subtree를 제외하여 반환형과 parameter의 qualifier를 각각 원래 선언 위치에만 보존합니다.
+
+`restrict` object pointer는 값이나 메모리 byte를 바꾸지 않고 alias 사용 계약만 추가합니다. 현재 lowering은 이 계약을 no-alias 가정으로 강화하지 않으므로 C가 허용하는 실행보다 넓은 보수적 모델입니다. syntactic pointer나 C가 pointer로 조정하는 array parameter에 붙은 경우만 받고, non-pointer `restrict`는 계속 UNKNOWN입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 29,105 (97.41%) | **29,117 (97.45%)** |
+| 증가 | | **+12** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_type` | 112 | **100** |
+| verifier 통과 | 29,105 / 29,105 | **29,117 / 29,117** |
+| status 실패 | 0 | **0** |
+
+기존 `restrict-qualified declarations require pointer semantics` 12개가 모두 성공했습니다. 특수 qualifier를 가진 train 입력 78개를 영향 상한으로 직전 상세 결과와 비교해 신규 성공 12개, 기존 성공 회귀 0개, verifier 실패 0개, status 실패 0개를 확인했습니다. 다른 29,802개 입력은 반환형 해석에서 이 qualifier 분기를 타지 않으므로 전체 train은 반복하지 않았습니다.
+
+`tests/test_c_frontend.cpp`는 `restrict` parameter가 반환형 qualifier에 섞이지 않고 parameter에 남는지 확인합니다. `tests/test_c_lower_pointers.cpp`는 restrict pointer의 load 결과를 compiled C와 대조합니다. 공개 type inventory와 C lowering에 닿으므로 모든 CFrontend, SourceSignature, CReuse, CLower 범위 144/144를 실행했습니다. IR, solver, transport, plugin, EGraph는 바뀌지 않아 전체 CTest는 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -2176,7 +2195,7 @@ goto와 label 사이의 선언을 실제로 건너뛰는 경우와 바깥에서 
 
 - `unsupported_call` 225
 - `unsupported_control_flow` 123
-- `unsupported_type` 112
+- `unsupported_type` 100
 - `undeclared_identifier` 66
 - `unsupported_pointer` 59
 - `duplicate_declaration` 58

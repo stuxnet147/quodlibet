@@ -39,7 +39,8 @@ ql_c_frontend_diagnostic_view FindFunctionDiagnostic(
 TEST(CFrontend, InventoriesDefinitionsTypesAndSelectsByName) {
     constexpr char source[] =
         "typedef unsigned long word;\n"
-        "static const word *lookup(const word *items, unsigned count) {\n"
+        "static const word *lookup(const word * restrict items, "
+        "unsigned count) {\n"
         "  return count != 0 ? items : 0;\n"
         "}\n"
         "void reset(void) {}\n";
@@ -68,7 +69,8 @@ TEST(CFrontend, InventoriesDefinitionsTypesAndSelectsByName) {
                                             &function, &error))
         << error.message;
     EXPECT_STREQ("lookup", function.name);
-    EXPECT_STREQ("static const word *lookup(const word *items, unsigned count)",
+    EXPECT_STREQ("static const word *lookup(const word * restrict items, "
+                 "unsigned count)",
                  function.signature_spelling);
     EXPECT_EQ(QL_C_FUNCTION_SUPPORTED, function.support);
     EXPECT_EQ(2u, function.parameter_count);
@@ -78,6 +80,8 @@ TEST(CFrontend, InventoriesDefinitionsTypesAndSelectsByName) {
     EXPECT_NE(0u, function.return_type.shape & QL_C_TYPE_SHAPE_POINTER);
     EXPECT_NE(0u,
               function.return_type.qualifiers & QL_C_TYPE_QUALIFIER_CONST);
+    EXPECT_EQ(0u, function.return_type.qualifiers &
+                      QL_C_TYPE_QUALIFIER_RESTRICT);
     EXPECT_STREQ("word", function.return_type.base_spelling);
     EXPECT_STREQ("*lookup", function.return_type.declarator_spelling);
 
@@ -89,6 +93,7 @@ TEST(CFrontend, InventoriesDefinitionsTypesAndSelectsByName) {
     EXPECT_EQ(QL_C_TYPE_BASE_TYPEDEF_NAME, first.type.base_kind);
     EXPECT_EQ(1u, first.type.pointer_depth);
     EXPECT_NE(0u, first.type.qualifiers & QL_C_TYPE_QUALIFIER_CONST);
+    EXPECT_NE(0u, first.type.qualifiers & QL_C_TYPE_QUALIFIER_RESTRICT);
 
     second.struct_size = sizeof(second);
     ASSERT_EQ(QL_STATUS_OK,

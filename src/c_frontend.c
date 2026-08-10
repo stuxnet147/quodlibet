@@ -403,13 +403,63 @@ static void destroy_type(const ql_allocator *allocator,
     memset(type, 0, sizeof(*type));
 }
 
+static ql_status collect_type_qualifiers(
+    const ql_allocator *allocator, const char *source, size_t source_size,
+    const ql_c_syntax_record *nodes, size_t node_count, size_t owner,
+    size_t declarator, size_t excluded_subtree, uint32_t *qualifiers,
+    ql_error *error) {
+    const size_t excluded_end = excluded_subtree == SIZE_MAX
+                                    ? SIZE_MAX
+                                    : subtree_end(nodes, node_count,
+                                                  excluded_subtree);
+    const size_t end = subtree_end(nodes, node_count, owner);
+    size_t current;
+
+    for (current = owner + 1u; current < end; ++current) {
+        char *spelling;
+        int belongs_to_declarator = 0;
+        size_t ancestor;
+
+        if (current >= excluded_subtree && current < excluded_end) {
+            continue;
+        }
+        if (strcmp(nodes[current].view.kind, "type_qualifier") != 0) {
+            continue;
+        }
+        if (nodes[current].parent == owner) {
+            belongs_to_declarator = 1;
+        } else if (declarator != SIZE_MAX) {
+            ancestor = nodes[current].parent;
+            while (ancestor != SIZE_MAX && ancestor != owner) {
+                if (ancestor == declarator) {
+                    belongs_to_declarator = 1;
+                    break;
+                }
+                ancestor = nodes[ancestor].parent;
+            }
+        }
+        if (belongs_to_declarator == 0) {
+            continue;
+        }
+        spelling = copy_source_range(allocator, source, source_size,
+                                     nodes[current].view.range, 1);
+        if (spelling == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        *qualifiers |= qualifier_from_spelling(spelling);
+        allocator->deallocate(allocator->user_data, spelling);
+    }
+    return QL_STATUS_OK;
+}
+
 static ql_status build_type_inventory(
     const ql_allocator *allocator, const char *source, size_t source_size,
     const ql_c_syntax_record *nodes, size_t node_count, size_t owner,
     size_t type_node, size_t declarator, ql_c_type_inventory_v1 *type,
     ql_error *error) {
     size_t current;
-    size_t end;
+    ql_status status;
 
     memset(type, 0, sizeof(*type));
     type->struct_size = sizeof(*type);
@@ -472,39 +522,12 @@ static ql_status build_type_inventory(
         current = next;
     }
 
-    end = subtree_end(nodes, node_count, owner);
-    for (current = owner + 1u; current < end; ++current) {
-        char *spelling;
-        int belongs_to_declarator = 0;
-        size_t ancestor;
-
-        if (strcmp(nodes[current].view.kind, "type_qualifier") != 0) {
-            continue;
-        }
-        if (nodes[current].parent == owner) {
-            belongs_to_declarator = 1;
-        } else if (declarator != SIZE_MAX) {
-            ancestor = nodes[current].parent;
-            while (ancestor != SIZE_MAX && ancestor != owner) {
-                if (ancestor == declarator) {
-                    belongs_to_declarator = 1;
-                    break;
-                }
-                ancestor = nodes[ancestor].parent;
-            }
-        }
-        if (belongs_to_declarator == 0) {
-            continue;
-        }
-        spelling = copy_source_range(allocator, source, source_size,
-                                     nodes[current].view.range, 1);
-        if (spelling == NULL) {
-            destroy_type(allocator, type);
-            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
-            return QL_STATUS_OUT_OF_MEMORY;
-        }
-        type->qualifiers |= qualifier_from_spelling(spelling);
-        allocator->deallocate(allocator->user_data, spelling);
+    status = collect_type_qualifiers(
+        allocator, source, source_size, nodes, node_count, owner, declarator,
+        SIZE_MAX, &type->qualifiers, error);
+    if (status != QL_STATUS_OK) {
+        destroy_type(allocator, type);
+        return status;
     }
     return QL_STATUS_OK;
 }
@@ -522,6 +545,17 @@ static ql_status build_return_type_inventory(
         declarator, type, error);
 
     if (status != QL_STATUS_OK) {
+        return status;
+    }
+    /* The definition's declarator contains its parameter list, but a
+       parameter's qualifiers are not qualifiers on the function return.
+       Recompute this field while excluding that subtree. */
+    type->qualifiers = 0u;
+    status = collect_type_qualifiers(
+        allocator, source, source_size, nodes, node_count, owner, declarator,
+        parameter_list, &type->qualifiers, error);
+    if (status != QL_STATUS_OK) {
+        destroy_type(allocator, type);
         return status;
     }
     while (current != SIZE_MAX) {

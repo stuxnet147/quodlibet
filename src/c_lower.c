@@ -3120,7 +3120,14 @@ static ql_status type_from_inventory(lower_context *context,
         "volatile and atomic objects require an observable-event lowering",
         error);
   }
-  if ((inventory->qualifiers & QL_C_TYPE_QUALIFIER_RESTRICT) != 0u) {
+  if ((inventory->qualifiers & QL_C_TYPE_QUALIFIER_RESTRICT) != 0u &&
+      inventory->pointer_depth == 0u &&
+      (inventory->shape & QL_C_TYPE_SHAPE_ARRAY) == 0u) {
+    /* `restrict` promises how an object pointer is used; it does not change
+       the pointer value or the pointed-to bytes. The current memory model
+       deliberately does not turn that promise into no-alias assumptions,
+       which is conservative for proof. Keep rejecting spellings where the
+       qualifier does not apply to a syntactic pointer or adjusted array. */
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
         "restrict-qualified declarations require pointer semantics", error);

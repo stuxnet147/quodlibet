@@ -89,6 +89,9 @@ QL_PTR_FUNCTION(distance, int ptr_distance(int *p, int i) {
 });
 QL_PTR_FUNCTION(named_pointer, typedef int *QL_PTR_INTP;
     int ptr_named(QL_PTR_INTP p, int i) { return p[i]; });
+extern "C" int ptr_restrict_reference(int *p, int i) { return p[i] + 3; }
+static const char restrict_pointer_source[] =
+    "int ptr_restrict(int * restrict p, int i) { return p[i] + 3; }\n";
 QL_PTR_FUNCTION(address_of_element, int ptr_address(int *p, int i) {
     int *slot = &p[i];
     return *slot + 1;
@@ -171,7 +174,15 @@ public:
         if (ql_c_lower_result_get_view(result_, &view, &error) !=
                 QL_STATUS_OK ||
             view.support != QL_C_LOWER_SUPPORTED) {
-            ADD_FAILURE() << "the lowering did not accept " << name;
+            ql_c_lower_diagnostic_view_v1 diagnostic{};
+            diagnostic.struct_size = sizeof(diagnostic);
+            if (view.diagnostic_count != 0u &&
+                ql_c_lower_result_diagnostic_at(result_, 0u, &diagnostic,
+                                                &error) == QL_STATUS_OK) {
+                ADD_FAILURE() << name << ": " << diagnostic.message;
+            } else {
+                ADD_FAILURE() << "the lowering did not accept " << name;
+            }
             return false;
         }
         if (ql_ir_open(nullptr, view.ir_artifact, &ir_, &error) !=
@@ -635,6 +646,10 @@ TEST(CLowerPointers, CarriesTheWiderPointerSurface) {
          [](int32_t *p, int32_t i) { return ptr_distance(p, i); }},
         {"typedef", named_pointer_source, "ptr_named",
          [](int32_t *p, int32_t i) { return ptr_named(p, i); }},
+        {"restrict", restrict_pointer_source, "ptr_restrict",
+         [](int32_t *p, int32_t i) {
+             return ptr_restrict_reference(p, i);
+         }},
         {"address", address_of_element_source, "ptr_address",
          [](int32_t *p, int32_t i) { return ptr_address(p, i); }},
         {"sizeof", sizeof_designators_source, "ptr_sizeof",
