@@ -1361,6 +1361,24 @@ ASM2C_GNU_V1의 plain `char`는 signed이므로 ordinary character constant는 8
 
 29,880개 train 행을 6개 프로세스로 다시 생성해 모든 행이 정확히 5열이고 verifier 실패와 status 실패가 0임을 확인했습니다. 이 측정으로 최신 9,192개 UNKNOWN의 첫 원인을 추정 없이 분류할 수 있습니다. 상위 메시지는 uninitialized address escape 1,972개, 지원하지 않는 record member 형태 967개, 알려지지 않은 type spelling 754개, function local 또는 다차원/동적 array 601개, record value 552개입니다.
 
+### 34. 값 반환 함수의 fallthrough를 explicit UB로 내린다
+
+커밋: (이 단위)
+
+`return` 값이 필요한 함수가 닫는 `}`에 도달하면 임의 값을 반환하거나 UNKNOWN으로 멈추지 않습니다. 반환 타입에 맞는 placeholder를 만든 뒤 항상 거짓인 `UB_GUARD`를 실행하고, verifier가 요구하는 well-formed return terminator를 그 뒤에 둡니다. placeholder는 UB 경로에서 관찰되지 않습니다. 명시적 `return`이 있는 다른 경로는 기존 값을 그대로 반환합니다.
+
+hosted C의 특별 규칙도 분리했습니다. 정확히 `int main(...)`인 함수가 끝에 도달하면 UB가 아니라 0을 반환합니다. pointer 반환형의 fallthrough도 typed null placeholder 뒤의 UB로 표현하므로 정수형으로 몰래 바꾸지 않습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 20,688 (69.24%) | **20,816 (69.67%)** |
+| 증가 | | **+128** |
+| `missing_return` | 128 | **0** |
+| verifier 통과 | 20,688 / 20,688 | **20,816 / 20,816** |
+| status 실패 | 0 | **0** |
+
+`tests/test_c_lower_locals.cpp`는 명시적 반환 분기, fallthrough UB 분기, `main`의 암시적 0을 interpreter로 실행합니다. lowering 단위 시험은 생성된 IR의 UB guard와 독립 verifier 통과를 확인합니다. 전체 검증은 Windows 531/531, Linux Clang 530/530, Linux ASan/UBSan 530/530입니다. `fuzz_c_lower`는 60초 동안 281,426회, crash 0으로 끝났습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1389,7 +1407,7 @@ ASM2C_GNU_V1의 plain `char`는 signed이므로 ordinary character constant는 8
 
 ## 다음에 할 것
 
-1. reaching `}`인 integer 함수는 관찰되는 반환값이 없으므로 explicit UB로 내려 128개 `missing_return`을 닫습니다.
-2. 남은 타입 철자와 선언 형태를 빈도순으로 닫고, uninitialized address escape는 외부 호출의 memory-write 계약을 먼저 고정합니다.
+1. 남은 타입 철자와 선언 형태를 실제 source spelling별로 다시 나눠 가장 큰 정식 타입 묶음을 닫습니다.
+2. uninitialized address escape는 외부 호출의 memory-write 계약을 먼저 고정합니다.
 3. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.
 4. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.

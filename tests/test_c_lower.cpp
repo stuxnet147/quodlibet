@@ -301,26 +301,26 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
   }
 }
 
-TEST(CLower, RejectsReachableMissingReturn) {
-  const UnsupportedCase cases[] = {
-      {"int partial(int x) { if (x) return 1; }", "partial",
-       QL_C_LOWER_DIAGNOSTIC_MISSING_RETURN, "compound_statement"},
-  };
+TEST(CLower, LowersReachableMissingReturnAsUndefined) {
+  constexpr char source[] = "int partial(int x) { if (x) return 1; }";
+  LoweredFunction lowered;
+  ql_error error{};
 
-  for (const UnsupportedCase &test_case : cases) {
-    SCOPED_TRACE(test_case.name);
-    LoweredFunction lowered;
-    ql_error error{};
-    ASSERT_EQ(QL_STATUS_OK,
-              lowered.Lower(test_case.source, test_case.name, &error))
-        << error.message;
-    const ql_c_lower_result_view_v1 result = ResultView(lowered.get());
-    ASSERT_EQ(QL_C_LOWER_UNKNOWN, result.support);
-    ASSERT_EQ(nullptr, result.ir_artifact);
-    const ql_c_lower_diagnostic_view_v1 diagnostic =
-        FirstDiagnostic(lowered.get());
-    EXPECT_EQ(test_case.code, diagnostic.code);
-  }
+  ASSERT_EQ(QL_STATUS_OK, lowered.Lower(source, "partial", &error))
+      << error.message;
+  const ql_c_lower_result_view_v1 result = ResultView(lowered.get());
+  ASSERT_EQ(QL_C_LOWER_SUPPORTED, result.support);
+  ASSERT_EQ(0u, result.diagnostic_count);
+  IrHandle opened;
+  ASSERT_EQ(QL_STATUS_OK,
+            ql_ir_open(nullptr, result.ir_artifact, opened.output(), &error))
+      << error.message;
+  ql_ir_view_v1 ir{};
+  ir.struct_size = sizeof(ir);
+  ASSERT_EQ(QL_STATUS_OK, ql_ir_get_view(opened.get(), &ir, &error));
+  EXPECT_GE(CountOpcode(opened.get(), ir.instruction_count,
+                        QL_IR_OPCODE_UB_GUARD),
+            1u);
 }
 
 TEST(CLower, EnforcesVersionedResultViews) {

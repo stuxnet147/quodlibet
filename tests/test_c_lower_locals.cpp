@@ -404,6 +404,30 @@ TEST(CLowerLocals, IndeterminateSsaAndCompoundReadsAreUndefined) {
               compound_run.result.outcome);
 }
 
+TEST(CLowerLocals, ValueFunctionFallthroughIsUndefinedExceptForMain) {
+    const char *partial_source =
+        "int partial(int take) { if (take) return 9; }";
+    Lowered partial;
+    std::vector<std::vector<uint8_t>> images;
+    ASSERT_TRUE(partial.Open(partial_source, "partial"));
+    const Outcome returned = Execute(partial.ir(), {Widen(1)}, {}, &images);
+    ASSERT_EQ(QL_STATUS_OK, returned.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, returned.result.outcome);
+    EXPECT_EQ(9, Returned(returned.result));
+    const Outcome fell_through =
+        Execute(partial.ir(), {Widen(0)}, {}, &images);
+    ASSERT_EQ(QL_STATUS_OK, fell_through.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+              fell_through.result.outcome);
+
+    Lowered main_function;
+    ASSERT_TRUE(main_function.Open("int main(void) { }", "main"));
+    const Outcome main_result = Execute(main_function.ir(), {}, {}, &images);
+    ASSERT_EQ(QL_STATUS_OK, main_result.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, main_result.result.outcome);
+    EXPECT_EQ(0, Returned(main_result.result));
+}
+
 TEST(CLowerLocals, RefusesShadowedAddressTakenNamesWithoutAStatusFailure) {
     const char *source =
         "int f(int a) { int v; { long long v = a; a += (int)v; } "

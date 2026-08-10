@@ -6594,6 +6594,31 @@ static ql_status aggregate_child_address(lower_context *context,
   return emit_pointer_of_address(context, address, pointer, output, error);
 }
 
+static ql_status make_zero_scalar(lower_context *context, lower_type type,
+                                  lower_value *output, ql_error *error) {
+  ql_status status;
+
+  memset(output, 0, sizeof(*output));
+  status = ensure_bool_constants(context, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  output->type = type;
+  output->defined = context->true_value;
+  if (type.kind == QL_C_SCALAR_POINTER) {
+    lower_value raw;
+    memset(&raw, 0, sizeof(raw));
+    raw.type = address_type();
+    raw.defined = context->true_value;
+    status = add_uint_constant(context, raw.type, 0u, &raw.value, error);
+    if (status == QL_STATUS_OK) {
+      status = emit_pointer_of_address(context, raw, type, output, error);
+    }
+    return status;
+  }
+  return add_uint_constant(context, type, 0u, &output->value, error);
+}
+
 static ql_status zero_initialize_object(lower_context *context, size_t node,
                                         lower_value address, lower_type type,
                                         ql_error *error) {
@@ -6653,25 +6678,7 @@ static ql_status zero_initialize_object(lower_context *context, size_t node,
   }
   {
     lower_value zero;
-    memset(&zero, 0, sizeof(zero));
-    status = ensure_bool_constants(context, error);
-    if (status != QL_STATUS_OK) {
-      return status;
-    }
-    zero.type = type;
-    zero.defined = context->true_value;
-    if (type.kind == QL_C_SCALAR_POINTER) {
-      lower_value raw;
-      memset(&raw, 0, sizeof(raw));
-      raw.type = address_type();
-      raw.defined = context->true_value;
-      status = add_uint_constant(context, raw.type, 0u, &raw.value, error);
-      if (status == QL_STATUS_OK) {
-        status = emit_pointer_of_address(context, raw, type, &zero, error);
-      }
-    } else {
-      status = add_uint_constant(context, type, 0u, &zero.value, error);
-    }
+    status = make_zero_scalar(context, type, &zero, error);
     if (status != QL_STATUS_OK) {
       return status;
     }
@@ -8648,12 +8655,52 @@ static ql_status terminate_void_return(lower_context *context,
   return status;
 }
 
+static ql_status terminate_value_return(lower_context *context,
+                                        ql_ir_value_id value,
+                                        ql_error *error) {
+  ql_ir_terminator_definition_v1 terminator;
+  ql_status status;
+
+  ql_ir_terminator_definition_init(&terminator, QL_IR_TERMINATOR_RETURN);
+  terminator.return_value = value;
+  terminator.memory = context->uses_memory != 0u ? context->memory_value
+                                                 : QL_IR_INVALID_VALUE_ID;
+  terminator.event_trace = context->makes_calls != 0u ? context->trace_value
+                                                      : QL_IR_INVALID_VALUE_ID;
+  status = ql_ir_builder_set_terminator(
+      context->builder, context->current_block, &terminator, error);
+  if (status == QL_STATUS_OK) {
+    context->current_terminated = 1u;
+  }
+  return status;
+}
+
+/* A value-returning function that reaches its closing brace has no return
+   value to observe. Keep the CFG well formed with a typed placeholder, but
+   make the path undefined before that placeholder can become an answer. */
+static ql_status terminate_undefined_return(lower_context *context,
+                                            ql_error *error) {
+  lower_value placeholder;
+  ql_status status =
+      make_zero_scalar(context, context->return_type, &placeholder, error);
+
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  placeholder.defined = context->false_value;
+  placeholder.may_ub = 1u;
+  status = emit_ub_guard(context, &placeholder, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  return terminate_value_return(context, placeholder.value, error);
+}
+
 static ql_status lower_return_statement(lower_context *context, size_t node,
                                         ql_error *error) {
   size_t value_node = first_named_child(context, node);
   lower_value value;
   lower_value converted;
-  ql_ir_terminator_definition_v1 terminator;
   ql_status status;
 
   if (context->return_type.kind == QL_C_SCALAR_VOID) {
@@ -8681,20 +8728,7 @@ static ql_status lower_return_statement(lower_context *context, size_t node,
   if (status != QL_STATUS_OK) {
     return status;
   }
-  ql_ir_terminator_definition_init(&terminator, QL_IR_TERMINATOR_RETURN);
-  terminator.return_value = converted.value;
-  /* Memory is observable, so a function that writes has to say what it
-     left behind. */
-  terminator.memory = context->uses_memory != 0u ? context->memory_value
-                                                 : QL_IR_INVALID_VALUE_ID;
-  terminator.event_trace = context->makes_calls != 0u ? context->trace_value
-                                                      : QL_IR_INVALID_VALUE_ID;
-  status = ql_ir_builder_set_terminator(
-      context->builder, context->current_block, &terminator, error);
-  if (status == QL_STATUS_OK) {
-    context->current_terminated = 1u;
-  }
-  return status;
+  return terminate_value_return(context, converted.value, error);
 }
 
 static ql_status lower_statement(lower_context *context, size_t node,
@@ -10239,12 +10273,17 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
       context.current_terminated == 0u) {
     if (context.return_type.kind == QL_C_SCALAR_VOID) {
       status = terminate_void_return(&context, error);
+    } else if (strcmp(canonical.name, "main") == 0 &&
+               context.return_type.kind == QL_C_SCALAR_INTEGER &&
+               context.return_type.width == 32u &&
+               context.return_type.is_signed != 0u) {
+      lower_value zero;
+      status = make_zero_scalar(&context, context.return_type, &zero, error);
+      if (status == QL_STATUS_OK) {
+        status = terminate_value_return(&context, zero.value, error);
+      }
     } else {
-      status = lower_unknown(
-          &context, QL_C_LOWER_DIAGNOSTIC_MISSING_RETURN, body_node,
-          "a reachable path leaves an integer function without "
-          "returning",
-          error);
+      status = terminate_undefined_return(&context, error);
     }
   }
   if (status == QL_STATUS_OK && context.unknown == 0u) {
