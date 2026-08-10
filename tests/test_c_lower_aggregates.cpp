@@ -114,6 +114,16 @@ QL_AGG_FUNCTION(static_const_array, int agg_static_const(int a) {
     static const int values[4] = {11, -3, 27, 5};
     return values[((unsigned)a) & 3u];
 });
+QL_AGG_FUNCTION(static_const_pointer_array,
+    int AGG_STATIC_FIRST;
+    int AGG_STATIC_SECOND;
+    int agg_static_const_pointer(int a) {
+        static int * const values[2] = {
+            &AGG_STATIC_FIRST, &AGG_STATIC_SECOND,
+        };
+        return (values[0] != values[1]) +
+               (values[((unsigned)a) & 1u] != 0);
+    });
 QL_AGG_FUNCTION(initialized_string, int agg_init_string(int i) {
     char text[] = "Az!";
     return (int)sizeof(text) * 100 + text[((unsigned)i) & 3u];
@@ -470,6 +480,23 @@ TEST(CLowerAggregates, InfersAndInitializesALocalCharacterArrayFromAString) {
         ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
             << ql_ir_interp_ub_reason_string(run.result.ub_reason);
         EXPECT_EQ(agg_init_string(i), Returned(run.result));
+    }
+}
+
+TEST(CLowerAggregates, InitializesAnImmutableStaticPointerArrayOnceInMeaning) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(static_const_pointer_array_source,
+                             "agg_static_const_pointer"));
+    for (int32_t a = -16; a <= 16; ++a) {
+        SCOPED_TRACE(a);
+        const Outcome run = Execute(lowered.ir(), {Widen(a)},
+                                    {sizeof(int *[2]), sizeof(int),
+                                     sizeof(int)},
+                                    nullptr);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(agg_static_const_pointer(a), Returned(run.result));
     }
 }
 

@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **22,117 / 29,880 (74.02%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 3,607, `uninitialized_read` 2,118, `unsupported_pointer` 648입니다. 구조화 루프 버킷은 0이고 잘못된 pointer-depth 전파 뒤의 `type_error`는 14개만 남았습니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,297 / 29,880 (77.97%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 2,324, `uninitialized_read` 2,270, `unsupported_pointer` 637입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1556,6 +1556,23 @@ IR 크기를 제한하기 위해 record 크기는 기존 bounded aggregate 상�
 
 192개의 첫 차단 가운데 130개가 성공했고 62개는 뒤의 기존 제한으로 이동했습니다. `tests/test_c_lower_aggregates.cpp`는 initializer와 assignment snapshot을 각각 같은 원문의 compiled 함수와 64개 입력에서 대조하고, 초기화되지 않은 record 복사는 interpreter의 UB로 고정합니다. `tests/test_c_lower_records.cpp`는 assignment expression 자체를 record 값으로 사용하는 경계를 계속 UNKNOWN으로 확인합니다. 영향 범위의 `CLower*` 시험 86/86과 전체 train의 함수별 비교가 통과했고 누락과 기존 성공 회귀가 없었습니다. 변경은 내부 C lowering의 record memory 경로에 한정되므로 전체 CTest는 반복하지 않았습니다.
 
+### 45. single-level const pointer static의 불변성을 보존한다
+
+`static const T *p`의 `const`는 pointee를 꾸미므로 pointer object `p` 자체는 mutable입니다. 반면 `static T * const p`와 `static T * const table[]`의 declarator 안 `const`는 pointer object 또는 배열 element를 불변으로 만듭니다. Tree-sitter의 단일 `pointer_declarator`에 직접 붙은 qualifier만 구분해 후자만 기존 immutable-static object 경로로 내립니다. 포인터 깊이가 둘 이상이면 각 별의 qualifier 위치를 `lower_type`이 아직 보존하지 않으므로 추측하지 않고 계속 UNKNOWN입니다.
+
+불변 pointer static은 호출 사이에 값이 변하지 않으므로 선택된 한 함수 실행 안에서는 기존 const scalar와 array처럼 initializer를 entry memory에 구체화해도 같은 관찰을 냅니다. mutable pointer static, mutable scalar static, local extern은 기존 persistent-state 진단을 유지합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,272 (77.88%) | **23,297 (77.97%)** |
+| 증가 | | **+25** |
+| 기존 성공 회귀 | | **0** |
+| persistent-static 첫 차단 | 331 | **301** |
+| verifier 통과 | 23,272 / 23,272 | **23,297 / 23,297** |
+| status 실패 | 0 | **0** |
+
+해당 선언 형태가 있는 31개를 먼저 좁게 측정해 25개 성공과 6개 후속 차단을 확인했습니다. 전체 train에서는 25개가 성공했고 5개가 뒤의 기존 제한으로 이동했으며, 나머지 1개는 같은 함수의 다른 mutable static이 다음 동일 진단이 되었습니다. `tests/test_c_lower_aggregates.cpp`는 서로 다른 두 전역 object 주소를 immutable static pointer array에 넣고 pointer load와 identity를 같은 원문의 compiled 함수와 대조합니다. `tests/test_c_lower_types.cpp`는 pointee만 const인 mutable static pointer를 계속 UNKNOWN으로 고정합니다. 영향 범위의 `CLower*` 시험 87/87과 전체 train 함수별 비교가 통과했습니다. 변경은 내부 local declaration qualifier 판정에 한정되므로 전체 CTest는 반복하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1564,10 +1581,10 @@ IR 크기를 제한하기 위해 record 크기는 기존 bounded aggregate 상�
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 2,354
-- `uninitialized_read` 2,269
+- `unsupported_type` 2,324
+- `uninitialized_read` 2,270
 - `unsupported_pointer` 637
-- `unsupported_control_flow` 531
+- `unsupported_control_flow` 535
 - `unsupported_call` 380
 
 ## 조율자에게 요청할 것
@@ -1584,8 +1601,8 @@ IR 크기를 제한하기 위해 record 크기는 기존 bounded aggregate 상�
 
 ## 다음에 할 것
 
-1. `static T * const`처럼 pointer object 자체가 const인 선언을 구문 트리에서 구분해 불변 static slice를 넓힙니다.
-2. 남은 타입 철자와 선언 형태를 실제 source spelling별로 다시 나누고, 부동소수점은 IR 타입과 연산 계약을 먼저 설계합니다.
+1. 남은 타입 철자와 선언 형태를 실제 source spelling별로 다시 나누고, 부동소수점은 IR 타입과 연산 계약을 먼저 설계합니다.
+2. runtime-bound local array는 object size와 loop access guard를 함께 표현하는 경우에만 수용합니다.
 3. uninitialized address escape는 외부 호출의 memory-write 계약을 먼저 고정합니다.
 4. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.
 5. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.

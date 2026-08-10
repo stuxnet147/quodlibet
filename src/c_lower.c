@@ -2191,6 +2191,49 @@ static size_t member_declarator_name(const lower_context *context,
   return SIZE_MAX;
 }
 
+/* In `const T *p`, the declaration-specifier const qualifies T. In
+   `T * const p`, the qualifier inside the sole pointer declarator qualifies
+   the pointer object itself. The latter is immutable static state and can use
+   the same per-invocation model as an immutable scalar or array. Multiple
+   pointer levels are left out until the qualifier at each level is retained
+   in lower_type rather than guessed from source order. */
+static int single_pointer_object_is_const(const lower_context *context,
+                                          size_t declarator,
+                                          uint32_t pointer_depth) {
+  size_t guard = 0u;
+
+  if (pointer_depth != 1u) {
+    return 0;
+  }
+  while (declarator != SIZE_MAX && guard++ < 64u) {
+    const char *kind = context->nodes[declarator].view.kind;
+    if (strcmp(kind, "pointer_declarator") == 0) {
+      size_t end = subtree_end(context, declarator);
+      size_t child;
+      for (child = declarator + 1u; child < end; ++child) {
+        const ql_source_range range = context->nodes[child].view.range;
+        if (context->nodes[child].parent != declarator ||
+            strcmp(context->nodes[child].view.kind, "type_qualifier") != 0) {
+          continue;
+        }
+        if ((size_t)range.end_byte - (size_t)range.start_byte == 5u &&
+            memcmp(context->source + range.start_byte, "const", 5u) == 0) {
+          return 1;
+        }
+      }
+      declarator = direct_field_child(context, declarator, "declarator");
+      continue;
+    }
+    if (strcmp(kind, "array_declarator") == 0 ||
+        strcmp(kind, "parenthesized_declarator") == 0) {
+      declarator = direct_field_child(context, declarator, "declarator");
+      continue;
+    }
+    break;
+  }
+  return 0;
+}
+
 /* A function-pointer member has a fixed pointer-sized representation. Recover
    the ordinary `T (*name)(...)` shape and the return stars outside its
    function declarator. Arrays and bare function members still have no layout
@@ -7472,6 +7515,7 @@ static ql_status lower_declaration(lower_context *context, size_t node,
       declarator = direct_field_child(context, declarator, "declarator");
     }
     {
+      size_t declarator_root = declarator;
       uint32_t pointer_depth = 0u;
       uint64_t array_length = 0u;
       int rejected = 0;
@@ -7495,12 +7539,12 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, named,
             "this slice carries at most two levels of indirection", error);
       }
-      /* A qualifier in the declaration specifiers qualifies the base
-         type. Once a declarator adds a pointer, `const T *p` makes T
-         const, not the pointer object p. Pointer-declarator qualifiers
-         are handled separately when that surface is admitted. */
+      /* A qualifier in the declaration specifiers qualifies the base type.
+         Once a declarator adds a pointer, only a const on the sole pointer
+         declarator makes this object immutable. */
       if (pointer_depth != 0u) {
-        object_is_const = 0u;
+        object_is_const = (uint32_t)single_pointer_object_is_const(
+            context, declarator_root, pointer_depth);
       }
       if (is_static != 0u && object_is_const == 0u) {
         return lower_unknown(
