@@ -9,6 +9,7 @@
 | `baseline.md` | 방법, 기준선, 적용한 최적화, 병렬성. 이 문서 |
 | `stages.md` | **판정 하나의 단계별 분해** (중앙값/p90, 표본, 재현). 이 문서가 "판정당 총량" 을 답하고 그 문서가 "그 안에서 어디로 가는가" 를 답한다 |
 | `parallel.md` | **병렬 처리량 천장.** occupancy 하락이 꼬리였다는 것, 꼬리를 뺀 스케일링 7.23배, 남은 비선형이 판정당 18MB 무결성 해시와 fork 2회라는 것 |
+| `solver-levers.md` | **solver 비용의 sound 지렛대. 미완성 문서다.** e-graph 는 판정 경로에 없음(지렛대 1), 질의 크기와 solve 시간 상관 0.836 이고 꼬리는 최대 miter(지렛대 2). Bitwuzla 옵션(지렛대 3)은 **스크리닝 도중 중단, 결과 없음** |
 | `concurrency.md` | 예산 마감과 solver 왕복 |
 | `hotspots-coverage-val.txt` | VTune hotspots 원본 리포트 (coverage over val). 생성 명령이 파일 머리에 있다 |
 

@@ -2242,6 +2242,11 @@ static ql_status QL_CALL bitwuzla_check(
     ql_status status;
     ql_status integrity_status;
     ql_error process_error;
+#if defined(QL_STAGE_TIMING)
+    char query_digest_hex[QL_DIGEST_HEX_SIZE];
+    size_t query_bytes = 0u;
+    uint64_t query_elapsed_ns = 0u;
+#endif
 
     buffer_init(&query, &state->allocator);
     result->backend_binary_digest = state->executable_digest;
@@ -2342,14 +2347,32 @@ static ql_status QL_CALL bitwuzla_check(
     limits.stderr_limit_bytes = (size_t)request->stderr_limit_bytes;
     limits.cancel_state = request->cancel_state;
     limits.is_cancelled = request->is_cancelled;
-    status = ql_process_run(&state->allocator, state->executable, arguments,
-                            argument_count, query.data, query.size, &limits,
-                            &output, error);
+    {
+        QL_STAGE_MARK(stage_query);
+        status = ql_process_run(&state->allocator, state->executable,
+                                arguments, argument_count, query.data,
+                                query.size, &limits, &output, error);
+#if defined(QL_STAGE_TIMING)
+        query_elapsed_ns = QL_STAGE_ELAPSED(stage_query);
+#endif
+    }
     if (error == NULL) {
         ql_error_clear(&process_error);
     } else {
         process_error = *error;
     }
+#if defined(QL_STAGE_TIMING)
+    /* The digest is taken over the same bytes the process was fed, and the
+       dump happens here because the buffer is released on the next line. The
+       answer is not known yet, so the log line is written once it is.
+
+       Explicitly conditional rather than macro-guarded: ql_digest_hex is a
+       real call and query.size a real load, and neither belongs on the
+       canonical path. */
+    ql_digest_hex(&result->query_digest, query_digest_hex);
+    query_bytes = query.size;
+    QL_STAGE_QUERY_DUMP(query_digest_hex, query.data, query.size);
+#endif
     buffer_dispose(&query);
     {
         QL_STAGE_MARK(stage_digest);
@@ -2397,6 +2420,10 @@ static ql_status QL_CALL bitwuzla_check(
         ql_process_result_dispose(&state->allocator, &output);
         return status;
     }
+    QL_STAGE_QUERY_LOG(query_digest_hex, query_bytes, query_elapsed_ns,
+                       result->kind == QL_SOLVER_CHECK_SAT     ? "sat"
+                       : result->kind == QL_SOLVER_CHECK_UNSAT ? "unsat"
+                                                               : "unknown");
     stdout_extra = output.stdout_text + result_remainder;
     stdout_extra_size = output.stdout_size - result_remainder;
 

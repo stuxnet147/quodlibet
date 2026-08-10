@@ -157,10 +157,68 @@ static inline void ql_stage_emit(void) {
     ql_stage_reset();
 }
 
+/* One line per check-sat, appended to QL_STAGE_QUERY_LOG, and optionally the
+   query text itself under QL_STAGE_QUERY_DIR named by its digest.
+
+   The per-judgement record above cannot answer what makes a query slow,
+   because a judgement runs two of them and reports their sum. This does:
+   size, wall time and answer per query, with the text kept so a slow one can
+   be replayed against the backend directly. Nothing is written when the
+   variables are unset. */
+static inline void ql_stage_query_dump(const char *digest_hex,
+                                       const void *text, size_t bytes) {
+    const char *dir = getenv("QL_STAGE_QUERY_DIR");
+    char path[512];
+    int written;
+    FILE *out;
+
+    if (dir == NULL || dir[0] == '\0' || text == NULL) {
+        return;
+    }
+    written = snprintf(path, sizeof(path), "%s/%s.smt2", dir, digest_hex);
+    if (written <= 0 || (size_t)written >= sizeof(path)) {
+        return;
+    }
+    out = fopen(path, "wb");
+    if (out != NULL) {
+        fwrite(text, 1u, bytes, out);
+        fclose(out);
+    }
+}
+
+static inline void ql_stage_query_log(const char *digest_hex, size_t bytes,
+                                      uint64_t elapsed_ns,
+                                      const char *answer) {
+    const char *log = getenv("QL_STAGE_QUERY_LOG");
+    char line[512];
+    int written;
+    FILE *out;
+
+    if (log == NULL || log[0] == '\0') {
+        return;
+    }
+    written = snprintf(line, sizeof(line), "%s\t%zu\t%llu\t%s\n",
+                       digest_hex, bytes, (unsigned long long)elapsed_ns,
+                       answer != NULL ? answer : "?");
+    if (written <= 0 || (size_t)written >= sizeof(line)) {
+        return;
+    }
+    out = fopen(log, "a");
+    if (out != NULL) {
+        fwrite(line, 1u, (size_t)written, out);
+        fclose(out);
+    }
+}
+
 #define QL_STAGE_MARK(name_) const uint64_t name_ = ql_stage_now_ns()
 #define QL_STAGE_ADD(slot_, name_) ql_stage_add((slot_), (name_))
 #define QL_STAGE_RESET() ql_stage_reset()
 #define QL_STAGE_EMIT() ql_stage_emit()
+#define QL_STAGE_QUERY_DUMP(digest_, text_, bytes_)                           \
+    ql_stage_query_dump((digest_), (text_), (bytes_))
+#define QL_STAGE_QUERY_LOG(digest_, bytes_, ns_, answer_)                     \
+    ql_stage_query_log((digest_), (bytes_), (ns_), (answer_))
+#define QL_STAGE_ELAPSED(name_) (ql_stage_now_ns() - (name_))
 
 #else /* !QL_STAGE_TIMING */
 
@@ -168,6 +226,9 @@ static inline void ql_stage_emit(void) {
 #define QL_STAGE_ADD(slot_, name_) ((void)0)
 #define QL_STAGE_RESET() ((void)0)
 #define QL_STAGE_EMIT() ((void)0)
+#define QL_STAGE_QUERY_DUMP(digest_, text_, bytes_) ((void)0)
+#define QL_STAGE_QUERY_LOG(digest_, bytes_, ns_, answer_) ((void)0)
+#define QL_STAGE_ELAPSED(name_) UINT64_C(0)
 
 #endif /* QL_STAGE_TIMING */
 

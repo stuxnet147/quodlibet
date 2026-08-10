@@ -4,7 +4,25 @@
 
 ## 지금 하는 것
 
+위임 6 튜닝(solver 비용의 sound 지렛대). **지렛대 1·2 는 잼, 지렛대 3(Bitwuzla 옵션)은 스크리닝 도중 사용자 지시로 중단.** `docs/perf/solver-levers.md` 에 미완성임을 명시해 두었습니다. 아래 WU20.
+
 위임 6 "병렬로 돌아야 하는 파트" . **규명 끝, 고침은 조율자 판단 대기.** `docs/perf/parallel.md` 입니다. 아래 WU19.
+
+### WU20. solver 지렛대 셋. 둘은 답이 나왔고 하나는 열린 채 닫습니다
+
+**미완성 단위입니다.** 사용자 지시로 중단했고, `docs/perf/solver-levers.md` 가 어디까지 됐고 재개하려면 무엇부터인지 적고 있습니다.
+
+**지렛대 1(e-graph): 잴 스위치가 없습니다.** `src/proof_smt.c`, `src/product.c`, `bindings/python/src/ql_check.c` 어디도 `ql_egraph_*` 를 부르지 않고 `check()` 가 등록하는 method 는 smt-product 하나입니다. `src/egraph_check.c` 는 단순화기가 아니라 e-graph 증명 checker 이고 파일 머리 주석이 "Nothing in this file calls the e-graph engine" 이라고 직접 적습니다. **on/off 로 가를 수 있는 것이 없으므로 재려면 먼저 miter 경로에 배선해야 하고, 그것은 측정이 아니라 설계 변경이며 제 lane 이 아닙니다.**
+
+**지렛대 2(질의 크기): 답이 나왔습니다.** 질의 단위 훅을 새로 넣어 1,118건을 모았습니다. **판정당 check-sat 는 정확히 2회**이고 답 분포가 unsat 560 / sat 558 로 위반 질의와 도메인 질의 한 쌍이라는 구조와 맞습니다. solve 시간 중앙값 4.37ms / p90 28.91 / p99 164.21 / 최대 3,388ms, 질의 크기 중앙값 14,495B / p90 69,017 / 최대 673,741B 입니다.
+
+**Pearson(bytes, ms) = 0.836.** 가장 느린 8건이 전부 673KB 대이고 이는 **중앙값의 46배**이며, 한 쌍의 질의 둘이 두 통과에서 반복된 것입니다. **즉 `parallel.md` 가 짚은 꼬리는 어려운 논리가 아니라 가장 큰 miter 입니다.** 코드측 이득은 miter 크기 축소에 있고 그것은 W1 소유라 손대지 않았습니다. 예상 이득 상한은 **모릅니다.** 0.836 은 코퍼스 상의 상관이지 그 특정 쌍을 더 작게 인코딩했을 때의 비용 모형이 아니므로, 받는 쪽이 그 쌍에서 다시 재야 합니다. 상관을 곱해 이득을 주장하지 않습니다.
+
+**지렛대 3(Bitwuzla 옵션): 열린 채입니다. 측정 결과가 하나도 없습니다.** 먼저 `--bv-solver prop`/`preprop` 은 국소 탐색이라 UNSAT 을 확립할 수 없어 재기 전에 제외했습니다. 판정의 절반이 UNSAT 을 원하는 위반 질의이므로 그것은 빨라지는 것이 아니라 증명이 멈추는 것입니다. 스크리닝 대상은 완전성을 유지하는 것들(SAT 엔진 kissat/cms/gimsatul, rewrite level, abstraction 계열, preprocessing pass 몇 개)이었고 하네스는 `scripts/perf/bench-solver-options.py` 입니다. **스크리닝 1회 통과가 출력 전에 중단되어 잠정 순위조차 없습니다.** 재개 절차는 문서에 적었습니다.
+
+**CTest 직렬.** windows-clang **507/507**. Linux 는 이번 중단 지시로 안 돌렸습니다.
+
+**계측 코드 검증.** `ql_digest_hex` 호출과 크기 대입이 처음에 플래그 밖에 있어 정본 경로를 바꾸고 있었습니다. `#if defined(QL_STAGE_TIMING)` 으로 감쌌고, 전처리로 확인했습니다. 플래그 없이 `src/solver.c` 를 전처리하면 `ql_stage_query` 참조가 **0개**입니다.
 
 W7 의 "parser/lowering/e-graph/solver 단계별 benchmark" 항목. **끝났습니다.** `docs/perf/stages.md` 에 판정 하나의 단계별 분해가 있습니다. 아래 WU18 이 방법과 결론입니다.
 
