@@ -57,6 +57,11 @@ typedef struct lower_type {
      loaded or stored whole, and every use of its name decays to a pointer
      to its first element. */
   uint64_t array_length;
+  /* Function pointers share the target ABI's pointer representation but not
+     data-pointer operations. Keeping that distinction here prevents an
+     opaque callback argument from becoming dereferenceable storage merely
+     because both are pointer-width IR values. */
+  uint32_t is_function_pointer;
   ql_ir_type_id ir_type;
 } lower_type;
 
@@ -138,6 +143,10 @@ typedef struct lower_value {
      target object is admitted only if an access actually follows, so merely
      comparing or returning those bits does not narrow the function domain. */
   uint32_t may_admit_object;
+  /* The deliberately narrow integer-constant-expression subset accepted as
+     a null pointer constant. It survives parentheses and scalar conversion
+     but ordinary arithmetic creates a fresh value and clears it. */
+  uint32_t is_null_pointer_constant;
 } lower_value;
 
 /* One `typedef` name and the type it stands for. `underlying` is the
@@ -671,6 +680,9 @@ static lower_type make_integer_type(uint32_t width, uint32_t rank,
 }
 
 static int type_same(lower_type left, lower_type right) {
+  if (left.is_function_pointer != right.is_function_pointer) {
+    return 0;
+  }
   if (!ql_c_scalar_same(scalar_of(left), scalar_of(right))) {
     return 0;
   }
@@ -740,6 +752,12 @@ static lower_type make_pointer_to(lower_type target) {
     return make_record_pointer_type(target.record);
   }
   return make_pointer_type(scalar_of(target));
+}
+
+static lower_type make_function_pointer_type(lower_type return_type) {
+  lower_type type = make_pointer_to(return_type);
+  type.is_function_pointer = 1u;
+  return type;
 }
 
 /* Adds every star a declarator contributes. Several type paths used to check
@@ -2414,8 +2432,19 @@ static ql_status ensure_record_layout(lower_context *context, size_t record,
         }
         is_function_pointer = 1u;
         member_array_length = 0u;
-        member_type =
-            make_integer_type(QL_C_POINTER_WIDTH, 4u, 0u);
+        if (function_return_pointer_depth == 0u) {
+          status = resolve_type_node_allowing_void(
+              context, type_node, 0u, &member_type, error);
+          if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+          }
+          member_type = make_function_pointer_type(member_type);
+        } else {
+          /* The current marker carries a scalar return type. Keep a callback
+             whose return is itself a pointer on the established opaque
+             address path until that nested type has a separate descriptor. */
+          member_type = make_integer_type(QL_C_POINTER_WIDTH, 4u, 0u);
+        }
       } else {
         status = resolve_type_node(context, type_node, pointer_depth,
                                    &member_type, error);
@@ -2618,9 +2647,24 @@ static ql_status type_from_inventory(lower_context *context,
         "restrict-qualified declarations require pointer semantics", error);
   }
   if ((inventory->shape & QL_C_TYPE_SHAPE_FUNCTION) != 0u) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-        "function-valued declarations are outside this lowering slice", error);
+    lower_type return_type;
+    ql_status status;
+    if ((inventory->shape & QL_C_TYPE_SHAPE_ARRAY) != 0u ||
+        inventory->pointer_depth > 1u ||
+        (allow_void != 0u && inventory->pointer_depth == 0u)) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+          "only one-level function pointer values are in this lowering "
+          "slice",
+          error);
+    }
+    status = parse_type_spelling(context, inventory->base_spelling, node, 1u,
+                                 &return_type, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    *output = make_function_pointer_type(return_type);
+    return QL_STATUS_OK;
   }
   if ((inventory->shape & QL_C_TYPE_SHAPE_ARRAY) != 0u) {
     /* A parameter declared `T a[]` or `T a[N]` is a `T *`. C adjusts it
@@ -2692,7 +2736,18 @@ static ql_status ensure_ir_type(lower_context *context, lower_type *type,
     return QL_STATUS_OK;
   }
   if (type->kind == QL_C_SCALAR_POINTER) {
-    lower_type target = pointer_target(*type);
+    lower_type target;
+    if (type->is_function_pointer != 0u) {
+      if (type->indirection > 1u) {
+        target = *type;
+        --target.indirection;
+        target.ir_type = QL_IR_INVALID_TYPE_ID;
+      } else {
+        target = make_integer_type(8u, 1u, 0u);
+      }
+    } else {
+      target = pointer_target(*type);
+    }
     if (target.kind == QL_C_SCALAR_RECORD) {
       /* A record has no IR type of its own under this profile: a
          pointer to one is an address into bytes, and every member
@@ -3139,9 +3194,17 @@ static ql_status require_pointer_object(lower_context *context, size_t node,
 
 static ql_status emit_load(lower_context *context, lower_value pointer,
                            lower_value *output, ql_error *error) {
-  lower_type pointee = pointer_target(pointer.type);
+  lower_type pointee;
   ql_ir_value_id operands[2];
   ql_status status;
+
+  if (pointer.type.is_function_pointer != 0u &&
+      pointer.type.indirection == 1u) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+                         "a function pointer does not designate data to load",
+                         error);
+  }
+  pointee = pointer_target(pointer.type);
 
   status = require_pointer_object(
       context, SIZE_MAX, &pointer,
@@ -3182,12 +3245,20 @@ static ql_status emit_load(lower_context *context, lower_value pointer,
 
 static ql_status emit_store(lower_context *context, lower_value pointer,
                             lower_value value, ql_error *error) {
-  lower_type pointee = pointer_target(pointer.type);
+  lower_type pointee;
   lower_value converted;
   ql_ir_value_id operands[3];
   ql_ir_value_id combined;
   uint32_t may_ub = pointer.may_ub | value.may_ub;
   ql_status status;
+
+  if (pointer.type.is_function_pointer != 0u &&
+      pointer.type.indirection == 1u) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+        "a function pointer does not designate data to store", error);
+  }
+  pointee = pointer_target(pointer.type);
 
   status = require_pointer_object(
       context, SIZE_MAX, &pointer,
@@ -3235,6 +3306,12 @@ static ql_status emit_pointer_offset(lower_context *context,
   ql_ir_value_id scaled;
   ql_ir_value_id operands[2];
   ql_status status;
+
+  if (pointer.type.is_function_pointer != 0u) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+                         "function pointer arithmetic is outside this slice",
+                         error);
+  }
 
   status = convert_value(context, offset, u64, &widened, error);
   if (status != QL_STATUS_OK) {
@@ -3695,6 +3772,7 @@ static ql_status lower_integer_literal(lower_context *context, size_t node,
   output->defined = context->true_value;
   output->type = selected;
   output->may_ub = 0u;
+  output->is_null_pointer_constant = value == 0u ? 1u : 0u;
   return QL_STATUS_OK;
 }
 
@@ -3838,6 +3916,47 @@ static ql_status convert_value(lower_context *context, lower_value input,
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
                          "a void expression cannot convert to an object value",
                          error);
+  }
+  if (input.type.is_function_pointer != 0u ||
+      target.is_function_pointer != 0u) {
+    if (input.type.is_function_pointer != 0u &&
+        target.is_function_pointer != 0u) {
+      if (type_same(input.type, target) == 0) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+            "function pointer conversion needs compatible return types",
+            error);
+      }
+      output->type = target;
+      return QL_STATUS_OK;
+    }
+    if (input.type.is_function_pointer != 0u &&
+        target.kind == QL_C_SCALAR_BOOL) {
+      lower_value address;
+      status = emit_address_of_pointer(context, input, &address, error);
+      if (status != QL_STATUS_OK) {
+        return status;
+      }
+      return convert_value(context, address, target, output, error);
+    }
+    if (target.is_function_pointer != 0u &&
+        input.is_null_pointer_constant != 0u) {
+      lower_value address;
+      if (input.type.kind == QL_C_SCALAR_POINTER) {
+        status = emit_address_of_pointer(context, input, &address, error);
+      } else {
+        status = convert_value(context, input, address_type(), &address,
+                               error);
+      }
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+      return emit_pointer_of_address(context, address, target, output, error);
+    }
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+        "function pointers do not convert to data pointers or integers",
+        error);
   }
   if (type_same(input.type, target) != 0) {
     output->type = target;
@@ -4632,6 +4751,80 @@ static ql_status lower_logical_expression(lower_context *context,
   return convert_value(context, bool_result, int_type, output, error);
 }
 
+static ql_status lower_function_pointer_comparison(
+    lower_context *context, const char *operator_text, size_t node,
+    lower_value left, lower_value right, lower_value *output,
+    ql_error *error) {
+  lower_value left_address;
+  lower_value right_address;
+  lower_value boolean;
+  lower_type result_type = make_integer_type(32u, 3u, 1u);
+  ql_status status;
+
+  if (strcmp(operator_text, "==") != 0 && strcmp(operator_text, "!=") != 0) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+        "function pointers support equality and null tests, not arithmetic "
+        "or ordering",
+        error);
+  }
+  if (left.type.is_function_pointer != 0u &&
+      right.type.is_function_pointer != 0u &&
+      type_same(left.type, right.type) == 0) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+        "function pointer comparison needs compatible return types", error);
+  }
+  if (left.type.is_function_pointer == 0u &&
+      left.is_null_pointer_constant == 0u) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                         "a function pointer compares only with another "
+                         "function pointer or null",
+                         error);
+  }
+  if (right.type.is_function_pointer == 0u &&
+      right.is_null_pointer_constant == 0u) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                         "a function pointer compares only with another "
+                         "function pointer or null",
+                         error);
+  }
+  if (left.type.kind == QL_C_SCALAR_POINTER) {
+    status = emit_address_of_pointer(context, left, &left_address, error);
+  } else {
+    status = convert_value(context, left, address_type(), &left_address,
+                           error);
+  }
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  if (right.type.kind == QL_C_SCALAR_POINTER) {
+    status = emit_address_of_pointer(context, right, &right_address, error);
+  } else {
+    status = convert_value(context, right, address_type(), &right_address,
+                           error);
+  }
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  memset(&boolean, 0, sizeof(boolean));
+  boolean.type = make_bool_type();
+  status = combine_defined(context, &left, &right, &boolean.defined, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  boolean.may_ub = left.may_ub | right.may_ub;
+  status = emit_compare(context,
+                        strcmp(operator_text, "==") == 0 ? QL_IR_OPCODE_EQ
+                                                          : QL_IR_OPCODE_NE,
+                        left_address.value, right_address.value,
+                        &boolean.value, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  return convert_value(context, boolean, result_type, output, error);
+}
+
 /* Comparison and arithmetic where at least one side is a pointer. Under this
    profile the comparison is on addresses, so operands in different objects
    compare rather than being undefined; ARCHITECTURE.md records that the
@@ -4647,6 +4840,12 @@ static ql_status lower_pointer_binary(lower_context *context,
   lower_value comparison;
   ql_ir_opcode opcode;
   ql_status status;
+
+  if (left.type.is_function_pointer != 0u ||
+      right.type.is_function_pointer != 0u) {
+    return lower_function_pointer_comparison(
+        context, operator_text, node, left, right, output, error);
+  }
 
   if (strcmp(operator_text, "+") == 0 || strcmp(operator_text, "-") == 0) {
     const int subtract = strcmp(operator_text, "-") == 0;
@@ -5946,6 +6145,37 @@ static ql_status lower_designator_load(lower_context *context, size_t node,
 /* Resolves a prototype's return and parameter types. Done at the first call
    rather than at collection so that a prototype naming something this slice
    cannot carry costs only the bodies that call it. */
+static void declarator_spine_shape(const lower_context *context,
+                                   size_t declarator,
+                                   uint32_t *pointer_depth,
+                                   uint32_t *has_function) {
+  size_t guard = 0u;
+
+  *pointer_depth = 0u;
+  *has_function = 0u;
+  while (declarator != SIZE_MAX && guard++ < 64u) {
+    const char *kind = context->nodes[declarator].view.kind;
+    size_t next;
+    if (strcmp(kind, "pointer_declarator") == 0 ||
+        strcmp(kind, "abstract_pointer_declarator") == 0) {
+      ++(*pointer_depth);
+    } else if (strcmp(kind, "function_declarator") == 0 ||
+               strcmp(kind, "abstract_function_declarator") == 0) {
+      *has_function = 1u;
+    } else if (strcmp(kind, "identifier") == 0 ||
+               strcmp(kind, "type_identifier") == 0) {
+      break;
+    }
+    next = direct_field_child(context, declarator, "declarator");
+    if (next == SIZE_MAX &&
+        (strcmp(kind, "parenthesized_declarator") == 0 ||
+         strcmp(kind, "abstract_parenthesized_declarator") == 0)) {
+      next = first_named_child(context, declarator);
+    }
+    declarator = next;
+  }
+}
+
 static ql_status resolve_callee(lower_context *context, lower_callee *callee,
                                 size_t node, ql_error *error) {
   size_t parameters_node;
@@ -5987,9 +6217,9 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
   for (child = parameters_node + 1u; child < end; ++child) {
     lower_type parameter;
     size_t parameter_type;
-    size_t declarator_end;
-    size_t inner;
+    size_t parameter_declarator;
     uint32_t depth = 0u;
+    uint32_t has_function = 0u;
 
     if (context->nodes[child].parent != parameters_node) {
       continue;
@@ -6007,29 +6237,13 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
                            node, "a callee parameter has no declared type",
                            error);
     }
-    /* A prototype's parameters are often unnamed, so the stars are
-       counted off the abstract declarator instead of a name. */
-    declarator_end = subtree_end(context, child);
-    for (inner = child + 1u; inner < declarator_end; ++inner) {
-      const char *kind = context->nodes[inner].view.kind;
-      if (context->nodes[inner].parent != child) {
-        continue;
-      }
-      if (strcmp(kind, "abstract_pointer_declarator") == 0 ||
-          strcmp(kind, "pointer_declarator") == 0) {
-        size_t cursor = inner;
-        while (cursor != SIZE_MAX) {
-          const char *inner_kind = context->nodes[cursor].view.kind;
-          if (strcmp(inner_kind, "abstract_pointer_declarator") != 0 &&
-              strcmp(inner_kind, "pointer_declarator") != 0) {
-            break;
-          }
-          ++depth;
-          cursor = direct_field_child(context, cursor, "declarator");
-        }
-      }
-    }
-    if (depth == 0u) {
+    /* A prototype's parameters are often unnamed. Follow the declarator
+       spine so a callback's pointer and function layers are counted without
+       entering that callback's own parameter list. */
+    parameter_declarator = direct_field_child(context, child, "declarator");
+    declarator_spine_shape(context, parameter_declarator, &depth,
+                           &has_function);
+    if (depth == 0u && has_function == 0u) {
       /* `f(void)` declares no parameters at all, so this has to be
          recognised before the type is resolved: at parameter position
          `void` is not an object type, and asking for one reports a type
@@ -6046,8 +6260,22 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
         continue;
       }
     }
-    status =
-        resolve_type_node(context, parameter_type, depth, &parameter, error);
+    if (has_function != 0u) {
+      if (depth > 1u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
+            "only one-level callback parameters are in this call slice",
+            error);
+      }
+      status = resolve_type_node_allowing_void(
+          context, parameter_type, 0u, &parameter, error);
+      if (status == QL_STATUS_OK && context->unknown == 0u) {
+        parameter = make_function_pointer_type(parameter);
+      }
+    } else {
+      status =
+          resolve_type_node(context, parameter_type, depth, &parameter, error);
+    }
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
@@ -6109,13 +6337,20 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
       return QL_STATUS_OUT_OF_MEMORY;
     }
     callee = find_callee(context, name);
-    context->allocator->deallocate(context->allocator->user_data, name);
     if (callee == NULL) {
+      lower_variable *variable = find_variable(context, name, strlen(name));
+      context->allocator->deallocate(context->allocator->user_data, name);
+      if (variable != NULL && variable->type.is_function_pointer != 0u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+            "calling a function-pointer value is outside this slice", error);
+      }
       return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL,
                            node,
                            "the callee has no declaration in this unit",
                            error);
     }
+    context->allocator->deallocate(context->allocator->user_data, name);
     symbol = callee->name;
     operand_count = 2u;
   } else if (strcmp(context->nodes[function_node].view.kind,

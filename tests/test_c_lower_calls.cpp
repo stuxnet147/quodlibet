@@ -109,6 +109,15 @@ QL_CALL_FUNCTION(indirect, struct CALL_VTABLE {
     int call_indirect_pointer(struct CALL_VTABLE *table) {
         return table->pointer_callback() == 0;
     });
+static const char callback_argument_source[] =
+    "int CALLEE_accept(int (*)(int), int);\n"
+    "int pass_callback(int (*callback)(int), int value) {\n"
+    "  return CALLEE_accept(callback, value) + (callback != 0);\n"
+    "}\n"
+    "int select_callback(int (*left)(int), int (*right)(int), int choose) {\n"
+    "  if (choose) left = right; else left = 0;\n"
+    "  return left != 0;\n"
+    "}\n";
 
 namespace {
 
@@ -269,7 +278,16 @@ public:
         if (ql_c_lower_result_get_view(result_, &view, &error) !=
                 QL_STATUS_OK ||
             view.support != QL_C_LOWER_SUPPORTED) {
-            ADD_FAILURE() << "the lowering did not accept " << name;
+            ql_c_lower_diagnostic_view_v1 diagnostic{};
+            diagnostic.struct_size = sizeof(diagnostic);
+            if (view.diagnostic_count != 0u &&
+                ql_c_lower_result_diagnostic_at(result_, 0u, &diagnostic,
+                                                &error) == QL_STATUS_OK) {
+                ADD_FAILURE() << "the lowering did not accept " << name
+                              << ": " << diagnostic.message;
+            } else {
+                ADD_FAILURE() << "the lowering did not accept " << name;
+            }
             return false;
         }
         if (ql_ir_open(nullptr, view.ir_artifact, &ir_, &error) !=
@@ -588,6 +606,14 @@ TEST(CLowerCalls, AnIndirectCallCarriesItsTargetAndMatchesCompiledC) {
               pointer_log.symbols);
 }
 
+TEST(CLowerCalls, CarriesAFunctionPointerAsAnOpaqueExternalArgument) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(callback_argument_source, "pass_callback"));
+
+    Lowered assigned;
+    ASSERT_TRUE(assigned.Open(callback_argument_source, "select_callback"));
+}
+
 TEST(CLowerCalls, TakesOnlyTheCallsTheBranchActuallyRan) {
     Lowered lowered;
     ASSERT_TRUE(lowered.Open(branching_source, "call_branch"));
@@ -664,6 +690,14 @@ TEST(CLowerCalls, RefusesCallsItCannotCheckAgainstADeclaration) {
            object memory semantics. */
         {"int f(int a) { extern int CALLEE_double(int), external_value; "
          "return CALLEE_double(a) + external_value; }",
+         "f"},
+        /* Function pointers are opaque values in this slice. They may be
+           transferred and null-tested, but not used as data addresses. */
+        {"int f(int (*callback)(int)) { return callback + 1 != 0; }", "f"},
+        /* Direct callback invocation is the next slice, not an undeclared
+           external call accidentally accepted under the callback's name. */
+        {"int f(int (*callback)(int), int value) "
+         "{ return callback(value); }",
          "f"},
     };
     for (const Case &item : cases) {

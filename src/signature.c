@@ -1043,10 +1043,28 @@ static ql_status type_from_inventory(const ql_c_type_inventory_v1 *inventory,
     ql_source_type_init(output, QL_SOURCE_TYPE_VOID);
     output->qualifiers =
         inventory->qualifiers & (uint32_t)QL_SOURCE_TYPE_QUALIFIER_ALL;
-    if ((inventory->shape & QL_C_TYPE_SHAPE_FUNCTION) != 0u ||
-        (inventory->shape & QL_C_TYPE_SHAPE_ARRAY) != 0u) {
+    if ((inventory->shape & QL_C_TYPE_SHAPE_FUNCTION) != 0u) {
+        if ((inventory->shape & QL_C_TYPE_SHAPE_ARRAY) != 0u ||
+            inventory->pointer_depth > 1u ||
+            (strcmp(role, "return type") == 0 &&
+             inventory->pointer_depth == 0u)) {
+            ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                         "%s has a function type outside the one-level pointer ABI slice",
+                         role);
+            return QL_STATUS_TYPE_MISMATCH;
+        }
+        /* Schema v1 records the source ABI shape, not the pointee grammar.
+           A one-level function pointer therefore has the same pointer-width
+           carrier as a data pointer. The lowering retains the semantic
+           distinction internally and refuses data access through it. */
+        output->kind = QL_SOURCE_TYPE_POINTER;
+        output->bit_width = pointer_width;
+        output->pointer_depth = 1u;
+        return QL_STATUS_OK;
+    }
+    if ((inventory->shape & QL_C_TYPE_SHAPE_ARRAY) != 0u) {
         ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                     "%s has an array or function type outside source-signature schema v1",
+                     "%s has an array type outside source-signature schema v1",
                      role);
         return QL_STATUS_TYPE_MISMATCH;
     }

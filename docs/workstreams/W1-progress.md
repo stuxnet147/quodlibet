@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,482 / 29,880 (78.59%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,304, `unsupported_type` 2,089, `unsupported_pointer` 726입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,515 / 29,880 (78.70%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,305, `unsupported_type` 2,095, `unsupported_pointer` 663입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1709,6 +1709,25 @@ initializer list를 재귀적으로 벗기되 각 단계에 named positional 값
 
 `tests/test_c_frontend.cpp`는 callback 매개변수가 있는 보통 함수의 이름과 세 매개변수, 함수 포인터 반환 정의의 실제 이름을 고정합니다. `CFrontend.*` 9/9, `CLower*` 90/90, `CReuse.*`와 `SourceSignature.*` 19/19가 통과했습니다. 이 변경은 공개 함수 inventory를 바꾸고 source signature, proof 입력, Python binding, fuzz harness가 함께 소비하므로 전체 Windows configure와 build 뒤 CTest 547/547도 실행해 통과했습니다.
 
+### 54. 한 단계 function pointer 값을 object pointer와 구분해 전달한다
+
+선택된 함수의 callback 매개변수와 외부 callee 원형의 callback 매개변수를 pointer-width IR 값으로 내리되 data pointer와 별도 타입으로 추적합니다. 같은 반환형의 function pointer끼리 전달하고 대입하며 null과 비교할 수 있습니다. 외부 호출 인자로 넘길 때도 source signature v1에는 ABI pointer carrier로 기록되어 lowered IR과 binding됩니다.
+
+function pointer에는 data object authority를 주지 않습니다. 역참조, pointer 산술, data pointer나 정수로의 변환은 구체적인 type error로 남습니다. callback 값을 직접 호출하는 경로도 아직 이 단위에 포함하지 않고 별도 `unsupported_call`로 분류합니다. record member callback 중 scalar 반환형은 같은 표지를 사용해 외부 callback 인자로 전달할 수 있고, pointer 반환형 member는 중첩 반환 타입 descriptor가 생길 때까지 기존 opaque 주소와 간접 호출 경로를 유지합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,482 (78.59%) | **23,515 (78.70%)** |
+| 증가 | | **+33** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_pointer` | 726 | **663** |
+| verifier 통과 | 23,482 / 23,482 | **23,515 / 23,515** |
+| status 실패 | 0 | **0** |
+
+프런트엔드 수정으로 실제 정의에 귀속된 callback 관련 78개를 먼저 재측정해 성공이 1개에서 34개로 늘었습니다. 첫 전수 비교에서 기존 record callback member를 외부 callback 매개변수로 넘기는 성공 6개가 타입 표지 불일치로 회귀한 것을 발견했고, member의 기존 opaque storage 표현을 보존하면서 scalar 반환형에만 표지를 연결해 회귀를 제거했습니다. 최종 전수 함수별 비교는 새 성공 33개, 기존 성공 회귀 0개, 누락과 추가 행 0개입니다.
+
+`tests/test_c_lower_calls.cpp`는 callback의 외부 전달과 null 비교, data pointer 산술 거부, 직접 callback 호출의 별도 거부를 고정합니다. `tests/test_signature.cpp`는 callback 매개변수가 pointer ABI로 직렬화되고 lowered IR에 binding되는지 확인합니다. 영향 범위인 `CLower*`, `CReuse*`, `SourceSignature.*` 111/111이 통과했습니다. 변경은 function-shaped inventory와 function pointer 변환 분기에 한정되므로 solver, transport, plugin까지 포함한 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 G9 수용률과 기존 성공 회귀를 확인하는 필수 측정으로 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1717,11 +1736,11 @@ initializer list를 재귀적으로 벗기되 각 단계에 named positional 값
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `uninitialized_read` 2,304
-- `unsupported_type` 2,089
-- `unsupported_pointer` 726
-- `unsupported_control_flow` 544
-- `unsupported_call` 396
+- `uninitialized_read` 2,305
+- `unsupported_type` 2,095
+- `unsupported_pointer` 663
+- `unsupported_control_flow` 547
+- `unsupported_call` 404
 
 ## 조율자에게 요청할 것
 

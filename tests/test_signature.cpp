@@ -190,6 +190,37 @@ TEST(SourceSignature, BindsToTheLoweredIrAndRejectsAMismatchedFunction) {
     ql_ir_release(second_ir);
 }
 
+TEST(SourceSignature, BindsAnOpaqueFunctionPointerParameter) {
+    w2::CFunction function;
+    SignatureHandle signature;
+    ql_source_type_v1 argument{};
+    ql_ir *ir = nullptr;
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(
+        &function,
+        "int callback_present(int (*callback)(int))"
+        "{ return callback != 0; }",
+        "callback_present"));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_source_signature_open(nullptr, function.signature_artifact(),
+                                       signature.output(), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, ql_source_signature_argument_at(
+                                signature.get(), 0u, &argument, &error))
+        << error.message;
+    EXPECT_EQ(QL_SOURCE_TYPE_POINTER, argument.kind);
+    EXPECT_EQ(64u, argument.bit_width);
+    EXPECT_EQ(1u, argument.pointer_depth);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_ir_open(nullptr, function.ir_artifact(), &ir, &error))
+        << error.message;
+    EXPECT_EQ(QL_STATUS_OK,
+              ql_source_signature_bind_ir(signature.get(), ir, &error))
+        << error.message;
+    ql_ir_release(ir);
+}
+
 TEST(SourceSignature, RejectsWidthDisagreementBetweenSignatureAndIr) {
     w2::CFunction function;
     SignatureHandle signature;
