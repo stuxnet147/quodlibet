@@ -968,7 +968,7 @@ violation 이 SAT 이면 반례 후보이고, 확정하려면 replay 가 IR 을 
 
 ### 17. signature 표의 `scalar_t__`, 그리고 포인터로의 cast
 
-커밋: `PENDING`
+커밋: `382d85a`
 
 #### 사실은 한 벌만 둔다
 
