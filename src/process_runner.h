@@ -120,6 +120,47 @@ void ql_process_snapshot_dispose(ql_process_snapshot *snapshot);
 ql_status ql_process_executable_digest(const char *path, ql_digest *digest,
                                        ql_error *error);
 
+/* A private directory for the files a run needs on disk.
+
+   Not every tool reads a pipe. CaDiCaL takes a DIMACS path and writes its LRAT
+   proof to a second path, and the checker then reads both. Those files must
+   live somewhere no other run can see, must be opened with the same
+   close-on-exec discipline as everything else here, and must not outlive the
+   run that made them. That is the same problem the snapshot solves, so it is
+   solved in the same place rather than a second time in a method. */
+typedef struct ql_process_scratch {
+    ql_allocator allocator;
+    char *directory;
+} ql_process_scratch;
+
+/* Longest path this module will build for a scratch file. */
+#define QL_PROCESS_SCRATCH_PATH_CAPACITY 32768u
+
+ql_status ql_process_scratch_create(const ql_allocator *allocator,
+                                    const char *name,
+                                    ql_process_scratch *scratch,
+                                    ql_error *error);
+/* Removes every file directly inside the directory and then the directory.
+   Safe on a zeroed or failed scratch. */
+void ql_process_scratch_dispose(ql_process_scratch *scratch);
+
+/* The absolute path a file with this base name would have. `name` may not
+   contain a path separator, so a caller cannot address anything outside. */
+ql_status ql_process_scratch_path(const ql_process_scratch *scratch,
+                                  const char *name, char *path,
+                                  size_t capacity, ql_error *error);
+/* Writes `bytes` to that path, replacing anything there. */
+ql_status ql_process_scratch_write(const ql_process_scratch *scratch,
+                                   const char *name, const void *bytes,
+                                   size_t size, ql_error *error);
+/* Reads it back, terminated and with the terminator uncounted, up to
+   `limit` bytes. A file above the limit is a reported failure, never a
+   silent prefix. The caller frees `text` with the same allocator. */
+ql_status ql_process_scratch_read(const ql_process_scratch *scratch,
+                                  const char *name, size_t limit,
+                                  char **text, size_t *size,
+                                  ql_error *error);
+
 /* Non-zero when `path` can be opened for reading under the same close-on-exec
    and shared-read discipline every other open in this module uses. A caller
    probing candidate executables must not open them any other way: a descriptor

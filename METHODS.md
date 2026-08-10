@@ -478,6 +478,56 @@ that folded to a constant is reported as trivially true or trivially false
 rather than sent to a solver; a trivial answer is still an answer this encoding
 produced and never a checked proof.
 
+#### The method
+
+`src/proof_aigsat.c` carries `prove.aig-sat` beside the blaster. It consumes
+the same `quodlibet.problem` schema v2 artifact as `prove.smt-product`, lowers
+both sides the same way, and builds the same `ql_product_query`. From there it
+blasts, solves, and refuses to believe anybody.
+
+The flow has exactly five gates, and `checked_proof: true` is on the far side
+of all of them.
+
+1. The violation query is blasted from the product query's own bytes and
+   Tseitin-encoded. A root the folding collapsed to a constant is reported as
+   trivially true or trivially false and never dressed up as a solver result.
+2. CaDiCaL runs on the DIMACS with `--lrat --no-binary`. A binary certificate
+   would defeat the point of a checker small enough to audit.
+3. `s SATISFIABLE` goes to the replay path. The DIMACS assignment becomes a
+   `quodlibet.solver-model` artifact and passes through `ql_replay_decode_model`
+   and `ql_replay_execute` -- the same decoder and evaluator a Bitwuzla model
+   passes through. Only a replay that reproduces the violation yields
+   `COUNTEREXAMPLE`. A solver that says satisfiable and a replay that says
+   otherwise is an encoding defect, logged as one, and reported as `UNKNOWN`.
+4. `s UNSATISFIABLE` goes to `lrat-check` over the original CNF. The approval
+   must be a whole line: `NOT VERIFIED` contains `VERIFIED`, and a substring
+   search there would read a refusal as an approval.
+5. A verified certificate still proves nothing about an empty domain, so the
+   `[prefix, domain]` query is blasted and solved too, and its satisfying
+   assignment is **evaluated against the domain circuit by this process**
+   rather than believed. That inhabitance claim has no replay behind it, so it
+   is the one place where a SAT answer would otherwise be taken on trust.
+   Finally `ql_problem_require_proof_binding` must hold.
+
+Only then does the outcome carry `PROVED_*`, `QL_EVIDENCE_PROOF`, and
+`checked_proof: true`. The trusted computing base is `lrat-check.c` plus this
+repository's own encoder and evaluator. CaDiCaL is not in it: a wrong UNSAT is
+caught by the checker, and a wrong SAT is caught by the replay.
+
+A folded-false root is deliberately **not** promoted. It is this process's own
+arithmetic with no certificate behind it, and believing it would be believing
+exactly the thing the method was built to stop believing.
+
+The envelope records both executable digests, the CNF digest, the certificate
+digest, and the same `prefix`, `violation`, and `domain` digests the SMT path
+records for the same problem. Two backends, one question, and the envelope says
+so rather than leaving a reader to take it on faith.
+
+`tests/test_proof_aigsat.cpp` pins the agreement between the two backends over
+a small corpus. A disagreement is not resolved by majority -- there is no
+majority of two -- and it fails the test loudly, because it is evidence of a
+defect in one backend or in the blaster.
+
 ### Bounded symbolic execution
 
 Recommended method name: `search.bounded-symbolic`.

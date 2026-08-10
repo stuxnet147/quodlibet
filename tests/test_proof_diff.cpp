@@ -1,3 +1,4 @@
+#include "quodlibet/proof_aigsat.h"
 #include "quodlibet/proof_diff.h"
 
 #include <cstddef>
@@ -120,7 +121,11 @@ TEST(ConcreteDifferential, IsRegisteredBesideTheSmtMethodAsABuiltin) {
     EXPECT_NE(nullptr, ql_registry_find(registry.get(), QL_DIFF_METHOD_NAME));
     EXPECT_NE(nullptr,
               ql_registry_find(registry.get(), QL_SMT_PRODUCT_METHOD_NAME));
-    EXPECT_EQ(2u, ql_registry_proof_method_count(registry.get()));
+    /* The AIG/SAT prover joined them; the count is pinned so a method that
+       appears without anyone noticing fails here. */
+    EXPECT_NE(nullptr,
+              ql_registry_find(registry.get(), QL_AIG_SAT_METHOD_NAME));
+    EXPECT_EQ(3u, ql_registry_proof_method_count(registry.get()));
 }
 
 TEST(ConcreteDifferential, NeverAdvertisesProofOrBoundedSoundness) {

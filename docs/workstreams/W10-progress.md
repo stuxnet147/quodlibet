@@ -5,9 +5,36 @@
 
 ## 지금 하는 것
 
-러너 추출을 끝냈습니다(아래 11번). 게이트가 열렸으므로 다음은 `prove.aig-sat` method 본체입니다.
+`checked_proof=true` 첫 판정이 나왔습니다(아래 12번). 남은 것은 다듬기입니다.
 
 ## 끝난 작업 단위
+
+### 12. `prove.aig-sat` method 본체 (3, 4단계) 와 두 backend 일치 시험
+
+`src/proof_aigsat.c` 에 method 를 붙였습니다. blaster 와 같은 파일입니다(W10.md 가 소유 파일로 지정한 이름입니다). `include/quodlibet/proof_aigsat.h` 에 outcome view 와 등록 함수를 더했고 `src/builtins.c` 에 등록 한 줄을 더했습니다. CTest 480/480 통과입니다.
+
+**`AProvedEquivalenceCarriesACheckedProof` 가 통과합니다.** `int add(int x,int y){return x+y;}` 대 `int sum(int a,int b){return b+a;}` 가 `PROVED_EQUIVALENT` + `QL_EVIDENCE_PROOF` + `checked_proof=1` 을 냅니다. 이 저장소에서 backend 의 말이 아니라 검증된 certificate 에 기대는 첫 판정입니다.
+
+관문은 다섯이고 `checked_proof=true` 는 다섯 개 전부의 바깥에 있습니다.
+
+1. violation query 를 product query 자신의 bytes 에서 blast 하고 Tseitin. 상수로 folding 된 root 는 `trivially-true`/`trivially-false` 로 보고하고 solver 결과인 척하지 않습니다
+2. CaDiCaL `--lrat --no-binary -q <cnf> <lrat>`. binary proof 는 감사 가능한 checker 라는 전제를 깹니다
+3. `s SATISFIABLE`(코드 10)은 replay 로 갑니다. DIMACS 배정 -> `quodlibet.solver-model` -> `ql_replay_decode_model` -> `ql_replay_execute`. 재현될 때만 `COUNTEREXAMPLE`
+4. `s UNSATISFIABLE`(코드 20)은 원본 CNF 와 함께 `lrat-check` 로 갑니다. 승인은 **줄 전체 일치**입니다. `NOT VERIFIED` 가 `VERIFIED` 를 부분 문자열로 담으므로 substring 검색은 거부를 승인으로 읽습니다. 이 파일이 저지를 수 있는 최악의 실수라 줄 단위로 비교합니다
+5. domain query 를 같은 방식으로 blast 해서 SAT 여야 하고, **그 배정을 이 프로세스가 `ql_aig_evaluate` 로 직접 회로에 넣어 확인합니다.** inhabitance 주장에는 replay 가 붙지 않으므로 여기가 SAT 답을 그냥 믿게 되는 유일한 자리였습니다. 마지막으로 `ql_problem_require_proof_binding`
+
+TCB 는 `lrat-check.c` 와 이 저장소의 encoder/evaluator 입니다. CaDiCaL 은 들어 있지 않습니다. 틀린 UNSAT 은 checker 가 잡고 틀린 SAT 은 replay 가 잡습니다.
+
+**folded-false 는 승격하지 않습니다.** certificate 없는 자기 산술이고, 그것을 믿는 것이 이 method 가 안 믿으려고 만들어진 바로 그 대상입니다. `UNKNOWN` 으로 냅니다.
+
+capability 는 memory 축과 external-call 축을 **주장하지 않습니다.** blaster 가 scalar 이므로 `ignore` 밖에 못 하는데, 축만 켜고 mode 는 `ignore` 뿐이면 `ql_proof_method_capability_validate` 가 거부하고, 통과시켰다면 없는 coverage 를 광고하는 것입니다.
+
+시험 7개입니다. 등록/capability, option 거부(상대 경로 포함), checked proof, query digest 동일, replay 를 지난 counterexample, **checker 를 Bitwuzla 로 바꿔치기하면 UNSAT 이 승격되지 않는다**, 그리고 조건 e 의 **Bitwuzla 대 CaDiCaL 일치 시험**입니다.
+
+일치 시험에서 `x*2` 대 `x+x` 는 AIG 쪽이 `trivially-false` 를 냅니다. 구조 해싱이 solver 를 부르기 전에 miter 를 상수로 접은 것이고 SMT 의 UNSAT 과 같은 결론입니다. certificate 만 없습니다. 그래서 시험은 `unsat`/`trivially-false` 를 같은 편으로, `sat`/`trivially-true` 를 같은 편으로 봅니다. 불일치는 다수결하지 않고 크게 실패합니다. 둘 중 하나가 틀렸다는 증거이고, 둘밖에 없으면 다수결이 성립하지 않습니다.
+
+러너에 scratch file 지원을 더했습니다. CaDiCaL 은 pipe 가 아니라 DIMACS 경로를 받고 LRAT 를 두 번째 경로에 씁니다. `ql_process_scratch_create/dispose/path/write/read` 입니다. snapshot 과 같은 문제라 같은 자리에서 풀었고 private directory 생성은 둘이 공유합니다.
+
 
 ### 11. 프로세스 실행기 추출 (`src/process_runner.c`)
 

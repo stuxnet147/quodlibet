@@ -11,6 +11,9 @@ QL_EXTERN_C_BEGIN
 
 #define QL_AIG_SAT_METHOD_NAME "prove.aig-sat"
 #define QL_AIG_SAT_METHOD_VERSION "1"
+#define QL_AIG_SAT_OUTCOME_SCHEMA_VERSION 1u
+
+#define QL_AIG_SAT_DEFAULT_TIMEOUT_MS UINT64_C(60000)
 
 /* Bit-blasting of the SMT-LIB text `ql_smt2_builder` produces.
 
@@ -103,6 +106,79 @@ QL_API ql_status QL_CALL ql_aig_blast_symbol_by_name(
 QL_API ql_status QL_CALL ql_aig_blast_model_artifact_create(
     const ql_allocator *allocator, const ql_aig_blast *blast,
     const ql_aig_cnf *cnf, const int32_t *assignment, size_t assignment_count,
+    ql_artifact **output, ql_error *error);
+
+/* --- The method ----------------------------------------------------------- */
+
+/* What a SAT query returned. `trivially-*` are answers the encoding produced
+   by folding, without a solver and without a certificate. */
+typedef enum ql_aig_sat_answer {
+    QL_AIG_SAT_ANSWER_NOT_QUERIED = 0,
+    QL_AIG_SAT_ANSWER_SAT = 1,
+    QL_AIG_SAT_ANSWER_UNSAT = 2,
+    QL_AIG_SAT_ANSWER_UNKNOWN = 3,
+    QL_AIG_SAT_ANSWER_TRIVIALLY_TRUE = 4,
+    QL_AIG_SAT_ANSWER_TRIVIALLY_FALSE = 5
+} ql_aig_sat_answer;
+
+typedef struct ql_aig_sat_outcome_view_v1 {
+    size_t struct_size;
+    uint32_t schema_version;
+    ql_verdict verdict;
+    ql_evidence_class evidence_class;
+    /* One only when the LRAT certificate for this exact CNF passed the
+       checker, the comparison domain was shown inhabited, and the problem
+       carries a proof binding. This is the field the whole workstream is
+       for; nothing else in the outcome may be read as standing in for it. */
+    uint32_t checked_proof;
+    uint32_t replay_confirmed;
+    ql_aig_sat_answer violation_answer;
+    ql_aig_sat_answer domain_answer;
+    uint64_t cnf_variable_count;
+    uint64_t cnf_clause_count;
+    ql_digest problem_digest;
+    ql_digest cache_key;
+    /* The same values the SMT path records for the same problem: both
+       backends are asked the same question, and the envelope says so. */
+    ql_digest prefix_digest;
+    ql_digest violation_digest;
+    ql_digest domain_digest;
+    /* The bytes that actually ran, not the paths they were read from. */
+    ql_digest solver_binary_digest;
+    ql_digest checker_binary_digest;
+    /* The DIMACS handed to the solver and the LRAT it produced. */
+    ql_digest cnf_digest;
+    ql_digest proof_digest;
+    ql_digest counterexample_digest;
+    char diagnostic[QL_ERROR_MESSAGE_CAPACITY];
+    uint64_t reserved[4];
+} ql_aig_sat_outcome_view_v1;
+
+/* Method options, all optional:
+
+     {"timeout_ms":60000,
+      "memory_limit_mb":0,
+      "solver_executable":"/abs/path/to/cadical",
+      "checker_executable":"/abs/path/to/lrat-check"}
+
+   The two executable paths exist because the checker is a replaceable
+   boundary: a stronger checker can be substituted without touching this
+   method, and the outcome records which one ran. Both default to the pinned
+   binaries this build vendored. An unknown key or a relative path is refused
+   before the run starts. */
+QL_API const ql_method_v1 *QL_CALL ql_aig_sat_method(void);
+QL_API const ql_proof_method_v1 *QL_CALL ql_aig_sat_proof_method(void);
+QL_API ql_status QL_CALL ql_aig_sat_register_method(ql_registry *registry,
+                                                    ql_error *error);
+/* Non-zero when this build vendored a SAT backend and a checker. Without both
+   the method is registered but every run answers UNKNOWN. */
+QL_API uint32_t QL_CALL ql_aig_sat_available(void);
+
+QL_API ql_status QL_CALL ql_aig_sat_outcome_read(
+    const ql_artifact *artifact, ql_aig_sat_outcome_view_v1 *view,
+    ql_error *error);
+QL_API ql_status QL_CALL ql_aig_sat_outcome_counterexample(
+    const ql_allocator *allocator, const ql_artifact *artifact,
     ql_artifact **output, ql_error *error);
 
 QL_EXTERN_C_END

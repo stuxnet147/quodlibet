@@ -7,7 +7,9 @@
 
 #include <gtest/gtest.h>
 
+#include "quodlibet/pipeline.h"
 #include "quodlibet/product.h"
+#include "quodlibet/proof_smt.h"
 #include "quodlibet/replay.h"
 #include "quodlibet/solver.h"
 #include "fuzz/fuzz_blaster_target.h"
@@ -738,3 +740,381 @@ TEST(AigBlastFuzz, MutatedQueriesNeverCrashAndAlwaysRefuseOrBlastCleanly) {
 }
 
 }  // namespace
+
+/* ==========================================================================
+ * The method: prove.aig-sat
+ *
+ * The claim these tests exist to hold is narrow and total: checked_proof is
+ * one only when an independent checker verified an LRAT certificate for this
+ * exact CNF. Every other path -- a folded constant, a certificate that did not
+ * check, a checker that is not one -- must leave it zero, and the tests below
+ * take each of those paths deliberately.
+ * ========================================================================== */
+
+namespace {
+
+class MethodRegistry {
+public:
+    MethodRegistry() = default;
+    MethodRegistry(const MethodRegistry &) = delete;
+    MethodRegistry &operator=(const MethodRegistry &) = delete;
+    ~MethodRegistry() { ql_registry_destroy(registry_); }
+
+    ql_registry **output() { return &registry_; }
+    ql_registry *get() const { return registry_; }
+
+private:
+    ql_registry *registry_ = nullptr;
+};
+
+/* One run of a proof method over one problem, kept together with the outcome
+   it produced so a test can read the envelope. */
+class MethodRun {
+public:
+    explicit MethodRun(const ql_method_v1 *method) : method_(method) {}
+    MethodRun(const MethodRun &) = delete;
+    MethodRun &operator=(const MethodRun &) = delete;
+
+    ~MethodRun() {
+        ql_artifact_release(outcome_);
+        if (instance_ != nullptr) {
+            method_->destroy(instance_);
+        }
+    }
+
+    ql_status Run(const w2::Pair &pair, const char *options_json,
+                  ql_error *error) {
+        ql_run_context_v1 context{};
+        ql_artifact *input = pair.artifact();
+        ql_status status = method_->create(ql_default_host(), options_json,
+                                           &instance_, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        status = method_->validate(instance_, &input, 1u, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        context.struct_size = sizeof(context);
+        context.abi_version = QL_ABI_VERSION;
+        context.host = ql_default_host();
+        return method_->run(instance_, &context, &input, 1u, &outcome_,
+                            error);
+    }
+
+    ql_artifact *outcome() const { return outcome_; }
+
+private:
+    const ql_method_v1 *method_;
+    void *instance_ = nullptr;
+    ql_artifact *outcome_ = nullptr;
+};
+
+ql_aig_sat_outcome_view_v1 ReadAigSatOutcome(ql_artifact *outcome) {
+    ql_aig_sat_outcome_view_v1 view{};
+    ql_error error{};
+    view.struct_size = sizeof(view);
+    EXPECT_EQ(QL_STATUS_OK, ql_aig_sat_outcome_read(outcome, &view, &error))
+        << error.message;
+    return view;
+}
+
+bool DigestIsZero(const ql_digest &digest) {
+    for (std::size_t index = 0u; index < QL_DIGEST_SIZE; ++index) {
+        if (digest.bytes[index] != 0u) {
+            return false;
+        }
+    }
+    return true;
+}
+
+constexpr char kAdd[] = "int add(int x, int y){ return x + y; }";
+constexpr char kSum[] = "int sum(int a, int b){ return b + a; }";
+constexpr char kIdentity[] = "int f(int x){ return x; }";
+constexpr char kZeroQuirk[] =
+    "int g(int x){ if (x == 0) return 1; return x; }";
+
+/* A run needs an actual solver and checker. Everything below skips rather
+   than passing vacuously when this build vendored neither. */
+#define SKIP_WITHOUT_SAT()                                                    \
+    do {                                                                      \
+        if (ql_aig_sat_available() == 0u) {                                   \
+            GTEST_SKIP() << "this build vendored no SAT backend or checker";  \
+        }                                                                     \
+    } while (0)
+
+}  // namespace
+
+TEST(AigSatMethod, RegistersAsAProofProducerInTheAigSatFamily) {
+    MethodRegistry registry;
+    ql_proof_method_capability_v1 capability{};
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_registry_create(nullptr, registry.output(), &error));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_aig_sat_register_method(registry.get(), &error))
+        << error.message;
+
+    const ql_method_v1 *method =
+        ql_registry_find(registry.get(), QL_AIG_SAT_METHOD_NAME);
+    ASSERT_NE(nullptr, method);
+    EXPECT_STREQ(QL_ARTIFACT_KIND_OUTCOME, method->output_kind);
+    EXPECT_NE(0u, method->flags & QL_METHOD_PROOF_PRODUCER);
+    EXPECT_NE(0u, method->flags & QL_METHOD_COUNTEREXAMPLE_PRODUCER);
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_registry_query_proof_capability(registry.get(),
+                                                 QL_AIG_SAT_METHOD_NAME,
+                                                 nullptr, &capability,
+                                                 &error))
+        << error.message;
+    EXPECT_EQ(QL_PROOF_METHOD_FAMILY_AIG_SAT, capability.family);
+    EXPECT_NE(0u, capability.result_kinds & QL_PROOF_RESULT_COUNTEREXAMPLE);
+    /* A proof is offered exactly when there is something to check it with.
+       Without a checker this method is a refuter and says so. */
+    EXPECT_EQ(ql_aig_sat_available() != 0u,
+              (capability.result_kinds & QL_PROOF_RESULT_PROOF) != 0u);
+    /* The blaster is scalar. It claims neither the memory axis nor the
+       external-call axis, rather than claiming them with nothing behind. */
+    EXPECT_EQ(0u, capability.supported_observations & QL_OBSERVE_MEMORY);
+    EXPECT_EQ(0u,
+              capability.supported_observations & QL_OBSERVE_EXTERNAL_CALLS);
+    EXPECT_EQ(0u, capability.supported_memory_observations &
+                      QL_PROOF_MEMORY_MODE(QL_MEMORY_ORDERED_WRITES));
+}
+
+TEST(AigSatMethod, RejectsUnknownOptionsAndRelativeExecutablePaths) {
+    MethodRegistry registry;
+    ql_proof_method_capability_v1 capability{};
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_registry_create(nullptr, registry.output(), &error));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_aig_sat_register_method(registry.get(), &error));
+
+    EXPECT_EQ(QL_STATUS_INVALID_ARGUMENT,
+              ql_registry_query_proof_capability(
+                  registry.get(), QL_AIG_SAT_METHOD_NAME, "{\"rounds\":4}",
+                  &capability, &error));
+    EXPECT_EQ(QL_STATUS_INVALID_ARGUMENT,
+              ql_registry_query_proof_capability(
+                  registry.get(), QL_AIG_SAT_METHOD_NAME,
+                  "{\"timeout_ms\":\"soon\"}", &capability, &error));
+    /* A relative path would be resolved against a working directory this
+       process does not control, which is exactly the ambiguity the process
+       discipline exists to remove. */
+    EXPECT_EQ(QL_STATUS_INVALID_ARGUMENT,
+              ql_registry_query_proof_capability(
+                  registry.get(), QL_AIG_SAT_METHOD_NAME,
+                  "{\"checker_executable\":\"lrat-check\"}", &capability,
+                  &error));
+    EXPECT_EQ(QL_STATUS_PARSE_ERROR,
+              ql_registry_query_proof_capability(
+                  registry.get(), QL_AIG_SAT_METHOD_NAME, "[1]", &capability,
+                  &error));
+}
+
+/* The first verdict in this repository that rests on a checked certificate
+   rather than on a backend's word. */
+TEST(AigSatMethod, AProvedEquivalenceCarriesACheckedProof) {
+    SKIP_WITHOUT_SAT();
+    w2::Pair pair;
+    MethodRun run(ql_aig_sat_method());
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build(kAdd, "add", kSum, "sum", w2::DefaultContract(),
+                         &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, run.Run(pair, nullptr, &error)) << error.message;
+
+    const ql_aig_sat_outcome_view_v1 view = ReadAigSatOutcome(run.outcome());
+    EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, view.verdict)
+        << view.diagnostic;
+    EXPECT_EQ(QL_EVIDENCE_PROOF, view.evidence_class);
+    EXPECT_EQ(1u, view.checked_proof) << view.diagnostic;
+    /* A proof is not a counterexample; nothing was replayed. */
+    EXPECT_EQ(0u, view.replay_confirmed);
+    EXPECT_EQ(QL_AIG_SAT_ANSWER_UNSAT, view.violation_answer);
+    EXPECT_EQ(QL_AIG_SAT_ANSWER_SAT, view.domain_answer);
+    EXPECT_NE(0u, view.cnf_clause_count);
+    /* The envelope names the bytes that ran and the certificate that was
+       checked, not the paths they were read from. */
+    EXPECT_FALSE(DigestIsZero(view.solver_binary_digest));
+    EXPECT_FALSE(DigestIsZero(view.checker_binary_digest));
+    EXPECT_FALSE(DigestIsZero(view.cnf_digest));
+    EXPECT_FALSE(DigestIsZero(view.proof_digest));
+    EXPECT_TRUE(DigestIsZero(view.counterexample_digest));
+}
+
+/* Same question, same bytes. If the two paths ever asked different questions,
+   a checked proof from one would say nothing about the other. */
+TEST(AigSatMethod, TheEnvelopeRecordsTheQueryDigestsOfTheSharedProductQuery) {
+    SKIP_WITHOUT_SAT();
+    w2::Pair pair;
+    MethodRun run(ql_aig_sat_method());
+    ql_product_query *query = nullptr;
+    ql_product_query_view_v1 query_view{};
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build(kAdd, "add", kSum, "sum", w2::DefaultContract(),
+                         &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_product_query_build(nullptr, pair.problem(), pair.left_ir(),
+                                     pair.right_ir(), &query, &error))
+        << error.message;
+    query_view.struct_size = sizeof(query_view);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_product_query_get_view(query, &query_view, &error));
+    ASSERT_EQ(QL_STATUS_OK, run.Run(pair, nullptr, &error)) << error.message;
+
+    const ql_aig_sat_outcome_view_v1 view = ReadAigSatOutcome(run.outcome());
+    EXPECT_TRUE(ql_digest_equal(&query_view.prefix_digest,
+                                &view.prefix_digest));
+    EXPECT_TRUE(ql_digest_equal(&query_view.violation_digest,
+                                &view.violation_digest));
+    EXPECT_TRUE(ql_digest_equal(&query_view.domain_digest,
+                                &view.domain_digest));
+    ql_product_query_destroy(query);
+}
+
+/* A satisfying assignment is a claim. The counterexample is what survives the
+   concrete replay, through the same decoder the SMT path uses. */
+TEST(AigSatMethod, AMismatchBecomesACounterexampleOnlyThroughReplay) {
+    SKIP_WITHOUT_SAT();
+    w2::Pair pair;
+    MethodRun run(ql_aig_sat_method());
+    ql_artifact *counterexample = nullptr;
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build(kIdentity, "f", kZeroQuirk, "g",
+                         w2::DefaultContract(), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, run.Run(pair, nullptr, &error)) << error.message;
+
+    const ql_aig_sat_outcome_view_v1 view = ReadAigSatOutcome(run.outcome());
+    EXPECT_EQ(QL_VERDICT_COUNTEREXAMPLE, view.verdict) << view.diagnostic;
+    EXPECT_EQ(QL_EVIDENCE_COUNTEREXAMPLE, view.evidence_class);
+    EXPECT_EQ(1u, view.replay_confirmed);
+    /* Refuting is not proving. A counterexample never sets this. */
+    EXPECT_EQ(0u, view.checked_proof);
+    EXPECT_EQ(QL_AIG_SAT_ANSWER_SAT, view.violation_answer);
+    EXPECT_FALSE(DigestIsZero(view.counterexample_digest));
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_aig_sat_outcome_counterexample(nullptr, run.outcome(),
+                                                &counterexample, &error))
+        << error.message;
+    ASSERT_NE(nullptr, counterexample);
+    ql_artifact_release(counterexample);
+}
+
+/* Substituting something that is not a checker must not produce a proof.
+   The solver still answers UNSAT; without an approval from the checker that
+   UNSAT stays where it is. This is the failure mode the whole method is
+   built around, so it is exercised rather than argued. */
+TEST(AigSatMethod, AnUnsatWhoseCertificateDoesNotCheckIsNotPromoted) {
+    SKIP_WITHOUT_SAT();
+    w2::Pair pair;
+    MethodRun run(ql_aig_sat_method());
+    ql_error error{};
+    /* Bitwuzla is a perfectly good executable and a hopeless LRAT checker:
+       handed a CNF and a proof it will not print VERIFIED. Substituting it
+       is the cheapest way to ask whether the promotion really depends on the
+       checker's approval rather than on the solver's answer. */
+    const char *substitute = ql_bitwuzla_executable_path();
+    if (substitute == nullptr || substitute[0] == ' ') {
+        GTEST_SKIP() << "no second executable to stand in for the checker";
+    }
+    const std::string options = std::string("{\"checker_executable\":\"") +
+                                substitute + "\"}";
+
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build(kAdd, "add", kSum, "sum", w2::DefaultContract(),
+                         &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, run.Run(pair, options.c_str(), &error))
+        << error.message;
+
+    const ql_aig_sat_outcome_view_v1 view = ReadAigSatOutcome(run.outcome());
+    EXPECT_EQ(QL_AIG_SAT_ANSWER_UNSAT, view.violation_answer);
+    EXPECT_EQ(0u, view.checked_proof) << view.diagnostic;
+    EXPECT_EQ(QL_VERDICT_UNKNOWN, view.verdict) << view.diagnostic;
+    EXPECT_EQ(QL_EVIDENCE_UNKNOWN, view.evidence_class);
+}
+
+/* Two backends, one question. A disagreement is evidence of a defect in one
+   of them or in the blaster, and it is surfaced here rather than settled by
+   majority: there is no majority of two, and the right answer to "our two
+   encoders disagree" is never to pick one. */
+TEST(AigSatMethod, TheSatBackendAndTheSmtBackendAgreeOnTheSameQuery) {
+    SKIP_WITHOUT_SAT();
+    struct Case {
+        const char *left_source;
+        const char *left_name;
+        const char *right_source;
+        const char *right_name;
+    };
+    const Case cases[] = {
+        {kAdd, "add", kSum, "sum"},
+        {kIdentity, "f", kZeroQuirk, "g"},
+        {"int a(unsigned x){ return (int)(x * 2u); }", "a",
+         "int b(unsigned x){ return (int)(x + x); }", "b"},
+        {"int c(int x){ return x / 2; }", "c",
+         "int d(int x){ return x >> 1; }", "d"},
+    };
+
+    for (const Case &item : cases) {
+        w2::Pair pair;
+        MethodRun aig(ql_aig_sat_method());
+        MethodRun smt(ql_smt_product_method());
+        ql_smt_product_outcome_view_v1 smt_view{};
+        ql_error error{};
+
+        ASSERT_EQ(QL_STATUS_OK,
+                  pair.Build(item.left_source, item.left_name,
+                             item.right_source, item.right_name,
+                             w2::DefaultContract(), &error))
+            << error.message;
+        ASSERT_EQ(QL_STATUS_OK, aig.Run(pair, nullptr, &error))
+            << error.message;
+        ASSERT_EQ(QL_STATUS_OK, smt.Run(pair, nullptr, &error))
+            << error.message;
+
+        const ql_aig_sat_outcome_view_v1 aig_view =
+            ReadAigSatOutcome(aig.outcome());
+        smt_view.struct_size = sizeof(smt_view);
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_smt_product_outcome_read(smt.outcome(), &smt_view,
+                                              &error))
+            << error.message;
+
+        /* A root the structural hashing folded to a constant is the same
+           conclusion reached without a search: two functions that blast to
+           the same circuit collapse before the solver runs. It agrees with
+           the SMT answer; it just carries no certificate. */
+        const bool aig_satisfiable =
+            aig_view.violation_answer == QL_AIG_SAT_ANSWER_SAT ||
+            aig_view.violation_answer == QL_AIG_SAT_ANSWER_TRIVIALLY_TRUE;
+        const bool aig_unsatisfiable =
+            aig_view.violation_answer == QL_AIG_SAT_ANSWER_UNSAT ||
+            aig_view.violation_answer == QL_AIG_SAT_ANSWER_TRIVIALLY_FALSE;
+        if (smt_view.violation_answer == QL_SMT_PRODUCT_ANSWER_SAT) {
+            EXPECT_TRUE(aig_satisfiable)
+                << item.left_name << " vs " << item.right_name
+                << ": Bitwuzla found the miter satisfiable and the SAT path "
+                   "did not. One of the two encodings is wrong.";
+        } else if (smt_view.violation_answer ==
+                   QL_SMT_PRODUCT_ANSWER_UNSAT) {
+            EXPECT_TRUE(aig_unsatisfiable)
+                << item.left_name << " vs " << item.right_name
+                << ": Bitwuzla found the miter unsatisfiable and the SAT path "
+                   "did not. One of the two encodings is wrong.";
+        }
+    }
+}

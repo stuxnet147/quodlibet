@@ -1,5 +1,6 @@
 #include "quodlibet/registry.h"
 
+#include "quodlibet/proof_aigsat.h"
 #include "quodlibet/proof_diff.h"
 #include "quodlibet/proof_smt.h"
 
@@ -54,5 +55,13 @@ ql_status QL_CALL ql_register_builtin_methods(ql_registry *registry,
     /* The differential refuter is registered beside it rather than under it.
        It proves nothing and needs no solver, so a pipeline can run both
        against one problem and take whichever answers first. */
-    return ql_register_diff_method(registry, error);
+    status = ql_register_diff_method(registry, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    /* The AIG/SAT prover answers the same question as the SMT one and trusts
+       less to do it: its UNSAT is promoted only after an independent checker
+       verifies the certificate. It is registered beside both so a pipeline can
+       choose how much trust it is willing to spend. */
+    return ql_aig_sat_register_method(registry, error);
 }

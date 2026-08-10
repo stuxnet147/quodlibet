@@ -980,31 +980,23 @@ static ql_status snapshot_directory_stem(const char *name, char *stem,
     return QL_STATUS_OK;
 }
 
-ql_status ql_process_snapshot_create(const ql_allocator *allocator,
-                                     const char *source_executable,
-                                     const char *name,
-                                     ql_process_snapshot *snapshot,
-                                     ql_error *error) {
+/* Makes a fresh directory under the temporary root that only this process can
+   read, and hands back its path. Both the snapshot and the scratch area start
+   here, because a private directory is the same problem in both cases. */
+static ql_status create_private_directory(const ql_allocator *allocator,
+                                          const char *name, char **output,
+                                          ql_error *error) {
     char directory_stem[128];
     char temporary_directory[QL_PROCESS_PATH_CAPACITY];
     char directory_template[QL_PROCESS_PATH_CAPACITY];
-    char snapshot_path[QL_PROCESS_PATH_CAPACITY];
     size_t temporary_size = sizeof(temporary_directory);
-    char *directory = NULL;
-    char *executable = NULL;
+    char *directory;
     uv_fs_t request;
     int uv_status;
     int count;
     ql_status status;
 
-    if (allocator == NULL || !ql_allocator_is_valid(allocator) ||
-        source_executable == NULL || source_executable[0] == '\0' ||
-        snapshot == NULL) {
-        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
-                     "an executable snapshot requires an allocator, a source path, and a destination");
-        return QL_STATUS_INVALID_ARGUMENT;
-    }
-    memset(snapshot, 0, sizeof(*snapshot));
+    *output = NULL;
     status = snapshot_directory_stem(name, directory_stem,
                                      sizeof(directory_stem), error);
     if (status != QL_STATUS_OK) {
@@ -1014,7 +1006,7 @@ ql_status ql_process_snapshot_create(const ql_allocator *allocator,
     if (uv_status != 0 || temporary_size == 0u ||
         temporary_size >= sizeof(temporary_directory)) {
         ql_error_set(error, QL_STATUS_IO_ERROR,
-                     "could not locate a directory for the private executable snapshot");
+                     "could not locate a directory for the private working directory");
         return QL_STATUS_IO_ERROR;
     }
     temporary_directory[temporary_size] = '\0';
@@ -1027,13 +1019,13 @@ ql_status ql_process_snapshot_create(const ql_allocator *allocator,
         directory_stem);
     if (count <= 0 || (size_t)count >= sizeof(directory_template)) {
         ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
-                     "private executable snapshot path is too long");
+                     "private working directory path is too long");
         return QL_STATUS_INVALID_ARGUMENT;
     }
     uv_status = uv_fs_mkdtemp(NULL, &request, directory_template, NULL);
     if (uv_status < 0) {
         ql_error_set(error, QL_STATUS_IO_ERROR,
-                     "could not create private executable snapshot directory: %s",
+                     "could not create private working directory: %s",
                      uv_strerror(uv_status));
         uv_fs_req_cleanup(&request);
         return QL_STATUS_IO_ERROR;
@@ -1042,7 +1034,7 @@ ql_status ql_process_snapshot_create(const ql_allocator *allocator,
         (void)remove(request.path);
         uv_fs_req_cleanup(&request);
         ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
-                     "private executable snapshot directory path is too long");
+                     "private working directory path is too long");
         return QL_STATUS_INVALID_ARGUMENT;
     }
     memcpy(directory_template, request.path, strlen(request.path) + 1u);
@@ -1052,7 +1044,7 @@ ql_status ql_process_snapshot_create(const ql_allocator *allocator,
     if (directory == NULL) {
         cleanup_snapshot_paths(NULL, directory_template);
         ql_error_set(error, QL_STATUS_OUT_OF_MEMORY,
-                     "could not retain private executable snapshot directory");
+                     "could not retain the private working directory");
         return QL_STATUS_OUT_OF_MEMORY;
     }
 #if !defined(_WIN32)
@@ -1060,10 +1052,39 @@ ql_status ql_process_snapshot_create(const ql_allocator *allocator,
         cleanup_snapshot_paths(NULL, directory);
         allocator->deallocate(allocator->user_data, directory);
         ql_error_set(error, QL_STATUS_IO_ERROR,
-                     "could not make the executable snapshot directory private");
+                     "could not make the private working directory private");
         return QL_STATUS_IO_ERROR;
     }
 #endif
+    *output = directory;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+ql_status ql_process_snapshot_create(const ql_allocator *allocator,
+                                     const char *source_executable,
+                                     const char *name,
+                                     ql_process_snapshot *snapshot,
+                                     ql_error *error) {
+    char snapshot_path[QL_PROCESS_PATH_CAPACITY];
+    char *directory = NULL;
+    char *executable = NULL;
+    uv_fs_t request;
+    int count;
+    ql_status status;
+
+    if (allocator == NULL || !ql_allocator_is_valid(allocator) ||
+        source_executable == NULL || source_executable[0] == '\0' ||
+        snapshot == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "an executable snapshot requires an allocator, a source path, and a destination");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    status = create_private_directory(allocator, name, &directory, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
     count = snprintf(snapshot_path, sizeof(snapshot_path), "%s/%s",
                      directory, name);
     if (count <= 0 || (size_t)count >= sizeof(snapshot_path)) {
@@ -1137,6 +1158,185 @@ void ql_process_snapshot_dispose(ql_process_snapshot *snapshot) {
                                        snapshot->directory);
     }
     memset(snapshot, 0, sizeof(*snapshot));
+}
+
+/* --- Scratch files -------------------------------------------------------- */
+
+/* Defined with the digest helpers below, where the retry is explained. */
+static FILE *open_binary_read_retry(const char *path);
+
+ql_status ql_process_scratch_create(const ql_allocator *allocator,
+                                    const char *name,
+                                    ql_process_scratch *scratch,
+                                    ql_error *error) {
+    char *directory = NULL;
+    ql_status status;
+
+    if (allocator == NULL || !ql_allocator_is_valid(allocator) ||
+        scratch == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "a scratch directory requires an allocator and a destination");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    memset(scratch, 0, sizeof(*scratch));
+    status = create_private_directory(allocator, name, &directory, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    scratch->allocator = *allocator;
+    scratch->directory = directory;
+    return QL_STATUS_OK;
+}
+
+void ql_process_scratch_dispose(ql_process_scratch *scratch) {
+    uv_fs_t scan;
+    uv_dirent_t entry;
+    int count;
+
+    if (scratch == NULL || scratch->directory == NULL) {
+        return;
+    }
+    count = uv_fs_scandir(NULL, &scan, scratch->directory, 0, NULL);
+    if (count >= 0) {
+        while (uv_fs_scandir_next(&scan, &entry) != UV_EOF) {
+            char path[QL_PROCESS_SCRATCH_PATH_CAPACITY];
+            uv_fs_t unlink_request;
+            const int written = snprintf(path, sizeof(path), "%s/%s",
+                                         scratch->directory, entry.name);
+            if (written <= 0 || (size_t)written >= sizeof(path)) {
+                continue;
+            }
+            (void)uv_fs_unlink(NULL, &unlink_request, path, NULL);
+            uv_fs_req_cleanup(&unlink_request);
+        }
+    }
+    uv_fs_req_cleanup(&scan);
+    cleanup_snapshot_paths(NULL, scratch->directory);
+    if (ql_allocator_is_valid(&scratch->allocator)) {
+        scratch->allocator.deallocate(scratch->allocator.user_data,
+                                      scratch->directory);
+    }
+    memset(scratch, 0, sizeof(*scratch));
+}
+
+ql_status ql_process_scratch_path(const ql_process_scratch *scratch,
+                                  const char *name, char *path,
+                                  size_t capacity, ql_error *error) {
+    size_t index;
+    int written;
+
+    if (scratch == NULL || scratch->directory == NULL || path == NULL ||
+        capacity == 0u || name == NULL || name[0] == '\0') {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "a scratch path requires a live scratch directory and a base name");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    for (index = 0u; name[index] != '\0'; ++index) {
+        if (name[index] == '/' || name[index] == '\\' ||
+            name[index] == ':') {
+            ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                         "a scratch file name must not contain a path separator");
+            return QL_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    written = snprintf(path, capacity, "%s/%s", scratch->directory, name);
+    if (written <= 0 || (size_t)written >= capacity) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "scratch file path is too long");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+ql_status ql_process_scratch_write(const ql_process_scratch *scratch,
+                                   const char *name, const void *bytes,
+                                   size_t size, ql_error *error) {
+    char path[QL_PROCESS_SCRATCH_PATH_CAPACITY];
+    FILE *file;
+    ql_status status = ql_process_scratch_path(scratch, name, path,
+                                               sizeof(path), error);
+
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    if (size != 0u && bytes == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "a non-empty scratch write requires bytes");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    file = open_binary_write(path);
+    if (file == NULL) {
+        ql_error_set(error, QL_STATUS_IO_ERROR,
+                     "could not create the scratch file '%s'", name);
+        return QL_STATUS_IO_ERROR;
+    }
+    if (size != 0u && fwrite(bytes, 1u, size, file) != size) {
+        fclose(file);
+        ql_error_set(error, QL_STATUS_IO_ERROR,
+                     "could not write the scratch file '%s'", name);
+        return QL_STATUS_IO_ERROR;
+    }
+    if (fclose(file) != 0) {
+        ql_error_set(error, QL_STATUS_IO_ERROR,
+                     "could not finalize the scratch file '%s'", name);
+        return QL_STATUS_IO_ERROR;
+    }
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
+ql_status ql_process_scratch_read(const ql_process_scratch *scratch,
+                                  const char *name, size_t limit,
+                                  char **text, size_t *size,
+                                  ql_error *error) {
+    char path[QL_PROCESS_SCRATCH_PATH_CAPACITY];
+    ql_process_buffer buffer;
+    FILE *file;
+    char chunk[65536];
+    size_t count;
+    ql_status status;
+
+    if (text == NULL || size == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "a scratch read requires an output");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    *text = NULL;
+    *size = 0u;
+    status = ql_process_scratch_path(scratch, name, path, sizeof(path),
+                                     error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    file = open_binary_read_retry(path);
+    if (file == NULL) {
+        ql_error_set(error, QL_STATUS_NOT_FOUND,
+                     "could not open the scratch file '%s'", name);
+        return QL_STATUS_NOT_FOUND;
+    }
+    process_buffer_init(&buffer, &scratch->allocator);
+    while (status == QL_STATUS_OK &&
+           (count = fread(chunk, 1u, sizeof(chunk), file)) != 0u) {
+        status = process_buffer_append_limited(
+            &buffer, chunk, count,
+            limit == 0u ? (uint64_t)QL_PROCESS_DEFAULT_OUTPUT_LIMIT
+                        : (uint64_t)limit,
+            name, error);
+    }
+    if (status == QL_STATUS_OK && ferror(file)) {
+        ql_error_set(error, QL_STATUS_IO_ERROR,
+                     "could not read the scratch file '%s'", name);
+        status = QL_STATUS_IO_ERROR;
+    }
+    (void)fclose(file);
+    if (status == QL_STATUS_OK) {
+        status = process_buffer_release(&buffer, text, size, error);
+    }
+    if (status != QL_STATUS_OK) {
+        process_buffer_dispose(&buffer);
+    }
+    return status;
 }
 
 /* A snapshot written moments ago can still be unopenable: on Windows an
