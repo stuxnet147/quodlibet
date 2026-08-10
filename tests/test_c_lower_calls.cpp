@@ -60,6 +60,18 @@ double CALLEE_variadic_float(int tag, ...) {
     va_end(arguments);
     return (double)tag + value;
 }
+struct CALL_RECORD {
+    int left;
+    short right;
+    unsigned char tag;
+};
+int CALLEE_record(struct CALL_RECORD value) {
+    return value.left + value.right * 3 + value.tag * 11;
+}
+int call_record_reference(int left, int right) {
+    struct CALL_RECORD value = {left, static_cast<short>(right), 7u};
+    return CALLEE_record(value) + 5;
+}
 }
 
 QL_CALL_FUNCTION(single, int CALLEE_double(int);
@@ -123,6 +135,13 @@ QL_CALL_FUNCTION(variadic_float, double CALLEE_variadic_float(int, ...);
     double call_variadic_float(float value) {
         return CALLEE_variadic_float(2, value);
     });
+static const char record_argument_source[] =
+    "struct CALL_RECORD { int left; short right; unsigned char tag; };\n"
+    "int CALLEE_record(struct CALL_RECORD);\n"
+    "int call_record(int left, int right) {\n"
+    "  struct CALL_RECORD value = {left, (short)right, 7};\n"
+    "  return CALLEE_record(value) + 5;\n"
+    "}\n";
 QL_CALL_FUNCTION(indirect, struct CALL_VTABLE {
         int (*callback)(int);
         char *(*pointer_callback)(void);
@@ -291,7 +310,17 @@ int QL_CALL Invoke(void *user_data, const char *symbol,
         log->arguments.push_back(seen);
         return 1;
     }
-    if (std::strcmp(symbol, "CALLEE_double") == 0 && argument_count == 1u) {
+    if (std::strcmp(symbol, "CALLEE_record") == 0 && argument_count == 1u) {
+        if (arguments[0].size != sizeof(uint64_t) ||
+            result_size != sizeof(int32_t)) {
+            ADD_FAILURE() << "record call image has the wrong packed width";
+            return 0;
+        }
+        CALL_RECORD record{};
+        std::memcpy(&record, arguments[0].data, sizeof(record));
+        value = CALLEE_record(record);
+    } else if (std::strcmp(symbol, "CALLEE_double") == 0 &&
+               argument_count == 1u) {
         value = CALLEE_double(seen[0]);
     } else if (std::strcmp(symbol, "CALLEE_sum") == 0 &&
                argument_count == 2u) {
@@ -661,6 +690,29 @@ TEST(CLowerCalls, CarriesFloatingArgumentsResultsAndVariadicPromotion) {
                   ReturnedDouble(variadic_run.result));
         EXPECT_EQ(std::vector<std::string>{"CALLEE_variadic_float"},
                   variadic_log.symbols);
+    }
+}
+
+TEST(CLowerCalls, PassesARecordByValueAsItsPackedObjectImage) {
+    Lowered lowered;
+    uint8_t initial[sizeof(CALL_RECORD)]{};
+    ql_ir_interp_object_v1 object{};
+    ql_ir_interp_object_init(&object);
+    object.base = QL_IR_INTERP_FIRST_OBJECT_ADDRESS;
+    object.size = sizeof(initial);
+    object.initial = initial;
+    ASSERT_TRUE(lowered.Open(record_argument_source, "call_record"));
+    for (int32_t left : {-91, 0, 37}) {
+        for (int32_t right : {-17, 0, 29}) {
+            CallLog log;
+            const Outcome run = Execute(
+                lowered.ir(), {Widen(left), Widen(right)}, &log, &object);
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            EXPECT_EQ(call_record_reference(left, right), Returned(run.result));
+            EXPECT_EQ(std::vector<std::string>{"CALLEE_record"}, log.symbols);
+        }
     }
 }
 

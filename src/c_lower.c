@@ -6989,9 +6989,10 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
       continue;
     }
     if (parameter.kind == QL_C_SCALAR_RECORD) {
-      return lower_unknown(
-          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
-          "a callee taking a record by value is outside this slice", error);
+      status = ensure_record_layout(context, parameter.record, child, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
     }
     status = grow_array(context->allocator, (void **)&callee->parameters,
                         &callee->parameter_capacity, sizeof(lower_type),
@@ -7076,6 +7077,99 @@ static ql_status direct_uninitialized_call_local(
 }
 
 #define LOWER_MAX_CALL_RESULTS 64u
+
+static ql_status aggregate_child_address(lower_context *context,
+                                         lower_value base, uint64_t offset,
+                                         lower_type child,
+                                         lower_value *output,
+                                         ql_error *error);
+
+/* A source-level record argument is a value copy, not the address of the
+   caller's object. Preserve its complete target-layout image, including union
+   representation and padding, as little-endian 64-bit CALL operands. The
+   final chunk is zero above the record's last byte. */
+static ql_status append_record_call_argument(
+    lower_context *context, size_t node, lower_value argument,
+    ql_ir_value_id *operands, size_t *operand_count, size_t operand_capacity,
+    ql_error *error) {
+  lower_type byte = make_integer_type(8u, 1u, 0u);
+  lower_type u64 = address_type();
+  lower_value source = argument;
+  uint64_t size;
+  uint64_t offset;
+  ql_status status;
+
+  status = ensure_record_layout(context, argument.type.record, node, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  size = record_size(context, argument.type.record);
+  if (*operand_count > operand_capacity ||
+      (size + 7u) / 8u > operand_capacity - *operand_count) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+        "the packed record arguments exceed the bounded CALL operand list",
+        error);
+  }
+  status = emit_ub_guard(context, &argument, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  source.type = make_pointer_to(argument.type);
+  source.defined = context->true_value;
+  source.may_ub = 0u;
+  for (offset = 0u; offset < size; offset += 8u) {
+    ql_ir_value_id packed;
+    uint64_t within;
+
+    status = add_uint_constant(context, u64, 0u, &packed, error);
+    for (within = 0u; status == QL_STATUS_OK && within < 8u &&
+                      offset + within < size;
+         ++within) {
+      lower_value address;
+      lower_value loaded;
+      lower_value widened;
+      ql_ir_value_id shifted = QL_IR_INVALID_VALUE_ID;
+      ql_ir_value_id pair[2];
+
+      status = aggregate_child_address(context, source, offset + within, byte,
+                                       &address, error);
+      if (status == QL_STATUS_OK) {
+        status = emit_load(context, address, &loaded, error);
+      }
+      if (status == QL_STATUS_OK) {
+        status = convert_value(context, loaded, u64, &widened, error);
+      }
+      if (status == QL_STATUS_OK) {
+        shifted = widened.value;
+      }
+      if (status == QL_STATUS_OK && within != 0u) {
+        ql_ir_value_id scale;
+        status = add_uint_constant(context, u64,
+                                   UINT64_C(1) << (within * 8u), &scale,
+                                   error);
+        if (status == QL_STATUS_OK) {
+          pair[0] = widened.value;
+          pair[1] = scale;
+          status = emit_instruction(context, QL_IR_OPCODE_MUL, &u64, pair, 2u,
+                                    NULL, 0u, QL_IR_EFFECT_NONE, &shifted,
+                                    error);
+        }
+      }
+      if (status == QL_STATUS_OK) {
+        pair[0] = packed;
+        pair[1] = shifted;
+        status = emit_instruction(context, QL_IR_OPCODE_BV_OR, &u64, pair, 2u,
+                                  NULL, 0u, QL_IR_EFFECT_NONE, &packed, error);
+      }
+    }
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    operands[(*operand_count)++] = packed;
+  }
+  return QL_STATUS_OK;
+}
 
 /* An external call is uninterpreted: it may read and write memory and it is
    itself observable, so it consumes and produces both the memory state and
@@ -7232,6 +7326,25 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     context->allow_uninitialized_call_address = saved_allow_uninitialized;
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
+    }
+    if (is_variadic_argument == 0 &&
+        callee->parameters[argument_index].kind == QL_C_SCALAR_RECORD) {
+      if (argument.type.kind != QL_C_SCALAR_RECORD ||
+          argument.type.array_length != 0u ||
+          !type_same(argument.type, callee->parameters[argument_index])) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, child,
+            "a record call argument needs the callee's declared record type",
+            error);
+      }
+      status = append_record_call_argument(
+          context, child, argument, operands, &operand_count,
+          sizeof(operands) / sizeof(operands[0]), error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+      ++argument_index;
+      continue;
     }
     if (is_variadic_argument != 0) {
       /* C's default argument promotions are the only type contract the

@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,203 / 29,880 (94.39%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 399, `unsupported_control_flow` 372, `unsupported_type` 369, `unsupported_pointer` 150입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,340 / 29,880 (94.85%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_control_flow` 374, `unsupported_type` 369, `unsupported_call` 259, `unsupported_pointer` 157입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1961,6 +1961,25 @@ loop subtree에서 직접 대입 또는 증감되는 visible SSA pointer를 head
 
 `tests/test_c_lower_pointers.cpp`는 실제 C linked list와 같은 layout의 연속 memory image를 만들고, 다음 node pointer가 반복마다 바뀌는 합계 함수를 compiled C와 interpreter에서 대조합니다. 변경은 loop pointer 접근과 동적 object inventory에 닿으므로 C lowering, pointer 및 record memory 실행, loop interpreter, compiled differential, verifier 영향 범위 141/141을 실행했습니다. cyclic CFG를 받지 않는 product proof와 plugin, EGraph를 포함한 전체 CTest는 실행하지 않았고, 전체 train coverage만 G9 성공률과 기존 성공 사례 회귀를 확인하기 위해 실행했습니다.
 
+### 67. 외부 callee의 record 인자를 object image 값으로 전달한다
+
+선언된 외부 함수에 record를 값으로 넘길 때 caller object의 주소를 전달하지 않습니다. target layout의 전체 object image를 padding과 union representation까지 포함해 읽고, 주소 순서대로 little-endian 64비트 `CALL` operand에 포장합니다. 마지막 operand에서 record 밖의 상위 바이트는 0입니다. 따라서 callee가 보는 값 복사본과 caller object의 저장 공간이 분리되고, concrete callback과 product-call congruence가 같은 ABI 값을 관찰합니다.
+
+인자는 callee 선언의 record type과 정확히 같아야 합니다. 전체 image의 definedness도 호출 전에 관찰하므로 초기화되지 않은 padding을 임의의 상수로 바꾸지 않습니다. 선택된 함수 자체의 record parameter 또는 return, 외부 callee의 record return은 source signature와 CALL result 계약이 아직 없어 계속 UNKNOWN입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 28,203 (94.39%) | **28,340 (94.85%)** |
+| 증가 | | **+137** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_call` | 399 | **259** |
+| verifier 통과 | 28,203 / 28,203 | **28,340 / 28,340** |
+| status 실패 | 0 | **0** |
+
+기존 record-argument 첫 차단 142개를 좁게 재측정해 137개가 성공했습니다. 나머지는 record return 2개, backward goto 2개, 동적 object 상한 1개라는 다음 제약으로 이동했습니다. 전체 train 순증도 137개였으며 기존 성공 회귀와 누락 또는 추가 행은 0개였습니다.
+
+`tests/test_c_lower_calls.cpp`는 padding이 있는 실제 C record를 같은 compiled callee와 interpreter callback에 전달해 반환값과 호출 event를 대조합니다. `tests/test_proof_smt_calls.cpp`는 같은 record image를 넘기는 두 호출이 packed value로 congruent함을 증명합니다. 변경은 외부 call argument와 aggregate memory read 경로에만 닿으므로 calls, aggregates, records, interpreter, verifier, call-product 영향 범위 73/73을 실행했습니다. 공용 IR 실행기, verifier, solver 또는 plugin 구현은 바꾸지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 G9 성공률과 기존 성공 사례 회귀를 확인하기 위한 필수 측정으로 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1969,10 +1988,10 @@ loop subtree에서 직접 대입 또는 증감되는 visible SSA pointer를 head
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_call` 399
-- `unsupported_control_flow` 372
+- `unsupported_control_flow` 374
 - `unsupported_type` 369
-- `unsupported_pointer` 150
+- `unsupported_call` 259
+- `unsupported_pointer` 157
 - `undeclared_identifier` 138
 
 ## 조율자에게 요청할 것
@@ -1989,7 +2008,7 @@ loop subtree에서 직접 대입 또는 증감되는 visible SSA pointer를 head
 
 ## 다음에 할 것
 
-1. record by-value argument와 return은 source signature, CALL result, object copy 계약을 함께 정한 뒤 수용합니다.
+1. 선택된 함수 또는 외부 callee의 record return은 source signature와 CALL result의 object-copy 계약을 함께 정한 뒤 수용합니다.
 2. 선언 없는 callee와 identifier는 추출 context에서 복구 가능한 근거가 있는지 먼저 분리합니다.
 3. 남은 nested 및 backward goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 확장합니다.
 4. 세 단계 pointer와 address-of는 실제 접근에 필요한 indirection depth를 별도로 계산해 확장합니다.

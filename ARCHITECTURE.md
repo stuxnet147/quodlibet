@@ -223,6 +223,21 @@ supplied value only on that predicate and carries the local's definedness as
 `old_defined || wrote`, so a callee that does not write still makes a later
 read undefined. Arbitrary pointer escape remains refused.
 
+#### Record arguments to external calls are packed values
+
+A record passed by value to a declared external callee is represented by its
+complete target-layout object image, including padding bytes and the active
+union representation. The lowering reads that image in address order and
+packs it into little-endian 64-bit `CALL` operands. Unused high bytes of the
+final operand are zero. It does not pass the caller's object address, so the
+callee cannot mutate that object through a by-value argument.
+
+The packed operands are ordinary call values. Concrete callbacks receive the
+same byte image, and product-call congruence can cancel calls only when these
+values and the other observed call components match. Record-valued returns
+and record parameters or returns on the selected source function remain
+outside the current source-signature and IR result contracts.
+
 #### Corpus globals carry no promised initial value
 
 A file-scope object with no initialiser is, in ISO C, a tentative definition
