@@ -3643,6 +3643,57 @@ static ql_status lower_integer_literal(lower_context *context, size_t node,
   return QL_STATUS_OK;
 }
 
+/* C permits an integer constant expression with value zero wherever a null
+   pointer constant is required. This deliberately recognizes only the
+   literal-and-parentheses subset: accepting an arbitrary integer expression
+   merely because it happens to evaluate to zero at run time would change the
+   conditional's C type. */
+static int is_literal_null_pointer_constant(lower_context *context,
+                                            size_t node) {
+  const char *kind;
+  char *text;
+  char *end;
+  char suffix[4];
+  size_t suffix_size = 0u;
+  unsigned long long value;
+  int valid_suffix;
+
+  if (node == SIZE_MAX || node >= context->node_count) {
+    return 0;
+  }
+  kind = context->nodes[node].view.kind;
+  if (strcmp(kind, "parenthesized_expression") == 0) {
+    return is_literal_null_pointer_constant(context,
+                                            first_named_child(context, node));
+  }
+  if (strcmp(kind, "number_literal") != 0) {
+    return 0;
+  }
+  text = copy_node_text(context, node);
+  if (text == NULL) {
+    return 0;
+  }
+  value = strtoull(text, &end, 0);
+  if (end == text) {
+    context->allocator->deallocate(context->allocator->user_data, text);
+    return 0;
+  }
+  while (*end != '\0' && suffix_size + 1u < sizeof(suffix) &&
+         (*end == 'u' || *end == 'U' || *end == 'l' || *end == 'L')) {
+    char ch = *end++;
+    suffix[suffix_size++] =
+        (char)((ch >= 'A' && ch <= 'Z') ? ch + ('a' - 'A') : ch);
+  }
+  suffix[suffix_size] = '\0';
+  valid_suffix = *end == '\0' &&
+                 (strcmp(suffix, "") == 0 || strcmp(suffix, "u") == 0 ||
+                  strcmp(suffix, "l") == 0 || strcmp(suffix, "ul") == 0 ||
+                  strcmp(suffix, "lu") == 0 || strcmp(suffix, "ll") == 0 ||
+                  strcmp(suffix, "ull") == 0 || strcmp(suffix, "llu") == 0);
+  context->allocator->deallocate(context->allocator->user_data, text);
+  return valid_suffix != 0 && value == 0u;
+}
+
 static ql_status convert_value(lower_context *context, lower_value input,
                                lower_type target, lower_value *output,
                                ql_error *error);
@@ -6164,13 +6215,37 @@ static ql_status lower_conditional_expression(lower_context *context,
   if (consequence.type.kind == QL_C_SCALAR_POINTER ||
       alternative.type.kind == QL_C_SCALAR_POINTER) {
     if (consequence.type.kind != alternative.type.kind) {
-      return lower_unknown(
-          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-          "a conditional mixing a pointer and an integer is outside "
-          "this slice",
-          error);
-    }
-    if (type_same(consequence.type, alternative.type)) {
+      if (consequence.type.kind == QL_C_SCALAR_POINTER &&
+          is_literal_null_pointer_constant(context, alternative_node)) {
+        common = consequence.type;
+        left = consequence;
+        status = convert_value(context, alternative, common, &right, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          return status;
+        }
+        /* Null names no object, so every object it could access is already in
+           the table vacuously. If the other arm names an object, selecting
+           between it and null does not introduce another authority. */
+        right.has_object = 1u;
+        right.may_admit_object = 0u;
+      } else if (alternative.type.kind == QL_C_SCALAR_POINTER &&
+                 is_literal_null_pointer_constant(context, consequence_node)) {
+        common = alternative.type;
+        right = alternative;
+        status = convert_value(context, consequence, common, &left, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          return status;
+        }
+        left.has_object = 1u;
+        left.may_admit_object = 0u;
+      } else {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+            "a conditional mixing a pointer and a non-null integer is "
+            "outside this slice",
+            error);
+      }
+    } else if (type_same(consequence.type, alternative.type)) {
       common = consequence.type;
       left = consequence;
       right = alternative;
@@ -6248,11 +6323,11 @@ static ql_status lower_conditional_expression(lower_context *context,
   output->may_ub = 1u;
   if (common.kind == QL_C_SCALAR_POINTER) {
     const uint32_t consequence_accessible =
-        consequence.has_object | consequence.may_admit_object;
+        left.has_object | left.may_admit_object;
     const uint32_t alternative_accessible =
-        alternative.has_object | alternative.may_admit_object;
+        right.has_object | right.may_admit_object;
     output->has_object =
-        consequence.has_object != 0u && alternative.has_object != 0u ? 1u : 0u;
+        left.has_object != 0u && right.has_object != 0u ? 1u : 0u;
     output->may_admit_object = output->has_object == 0u &&
                                        consequence_accessible != 0u &&
                                        alternative_accessible != 0u

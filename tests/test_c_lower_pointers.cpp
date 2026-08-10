@@ -57,6 +57,18 @@ QL_PTR_FUNCTION(step, int ptr_step(int *p, int i) {
     return old * 3 + p[i];
 });
 QL_PTR_FUNCTION(nullness, int ptr_null(int *p) { return p == 0; });
+QL_PTR_FUNCTION(conditional_null_right,
+    int ptr_conditional_null_right(int *p, int choose) {
+        return (choose ? p : 0) == 0;
+    });
+QL_PTR_FUNCTION(conditional_null_left,
+    int ptr_conditional_null_left(int *p, int choose) {
+        return (choose ? 0 : p) == 0;
+    });
+QL_PTR_FUNCTION(conditional_null_dereference,
+    int ptr_conditional_null_dereference(int *p, int choose) {
+        return *(choose ? p : 0);
+    });
 QL_PTR_FUNCTION(narrow_load, int ptr_short(short *p, int i) {
     return p[i];
 });
@@ -353,6 +365,57 @@ TEST(CLowerPointers, ComparesPointersAgainstNull) {
                                   reinterpret_cast<const uint8_t *>(data),
                                   nullptr)
                               .result));
+}
+
+TEST(CLowerPointers, SelectsBetweenAPointerAndANullPointerConstant) {
+    struct Case {
+        const char *source;
+        const char *function;
+        int32_t (*reference)(int32_t *, int32_t);
+    };
+    const Case cases[] = {
+        {conditional_null_right_source, "ptr_conditional_null_right",
+         ptr_conditional_null_right},
+        {conditional_null_left_source, "ptr_conditional_null_left",
+         ptr_conditional_null_left},
+    };
+    int32_t data[kElements] = {1, 2, 3, 4};
+    for (const Case &item : cases) {
+        Lowered lowered;
+        SCOPED_TRACE(item.function);
+        ASSERT_TRUE(lowered.Open(item.source, item.function));
+        for (int32_t choose : {0, 1}) {
+            const Outcome run =
+                Execute(lowered.ir(), kBase,
+                        {static_cast<uint64_t>(choose)}, kBase, sizeof(data),
+                        reinterpret_cast<const uint8_t *>(data), nullptr);
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
+            EXPECT_EQ(item.reference(data, choose), Returned(run.result));
+        }
+    }
+}
+
+TEST(CLowerPointers, KeepsPointerAuthorityAcrossANullConditional) {
+    Lowered lowered;
+    int32_t data[kElements] = {17, 2, 3, 4};
+    ASSERT_TRUE(lowered.Open(conditional_null_dereference_source,
+                             "ptr_conditional_null_dereference"));
+    const Outcome selected =
+        Execute(lowered.ir(), kBase, {1u}, kBase, sizeof(data),
+                reinterpret_cast<const uint8_t *>(data), nullptr);
+    ASSERT_EQ(QL_STATUS_OK, selected.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, selected.result.outcome);
+    EXPECT_EQ(ptr_conditional_null_dereference(data, 1),
+              Returned(selected.result));
+
+    const Outcome null_selected =
+        Execute(lowered.ir(), kBase, {0u}, kBase, sizeof(data),
+                reinterpret_cast<const uint8_t *>(data), nullptr);
+    ASSERT_EQ(QL_STATUS_OK, null_selected.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+              null_selected.result.outcome);
+    EXPECT_EQ(QL_IR_INTERP_UB_GUARD_FAILED, null_selected.result.ub_reason);
 }
 
 /* The comparison against real execution. Every input here is in range, so the

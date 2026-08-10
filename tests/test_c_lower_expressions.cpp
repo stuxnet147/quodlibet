@@ -475,6 +475,10 @@ TEST(CLowerExpressions, RefusesWhatItCannotState) {
         {"struct S { int x; };\n"
          "int f(int a, struct S *p, struct S *q) { return (a ? *p : *q).x; }",
          "f", -1},
+        /* Only an integer constant expression equal to zero is a null pointer
+           constant. A non-zero integer arm does not acquire pointer type. */
+        {"int f(int a, int *p) { return (a ? p : 1) != 0; }", "f",
+         QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER},
         /* `sizeof(expression)` must not lower its operand. A future static
            type query may accept this without ever evaluating `1 / a`. */
         {"unsigned long f(int a) { return sizeof(1 / a); }", "f",

@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,297 / 29,880 (77.97%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 2,324, `uninitialized_read` 2,270, `unsupported_pointer` 637입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,306 / 29,880 (78.00%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 2,324, `uninitialized_read` 2,270, `unsupported_pointer` 628입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1573,6 +1573,23 @@ IR 크기를 제한하기 위해 record 크기는 기존 bounded aggregate 상�
 
 해당 선언 형태가 있는 31개를 먼저 좁게 측정해 25개 성공과 6개 후속 차단을 확인했습니다. 전체 train에서는 25개가 성공했고 5개가 뒤의 기존 제한으로 이동했으며, 나머지 1개는 같은 함수의 다른 mutable static이 다음 동일 진단이 되었습니다. `tests/test_c_lower_aggregates.cpp`는 서로 다른 두 전역 object 주소를 immutable static pointer array에 넣고 pointer load와 identity를 같은 원문의 compiled 함수와 대조합니다. `tests/test_c_lower_types.cpp`는 pointee만 const인 mutable static pointer를 계속 UNKNOWN으로 고정합니다. 영향 범위의 `CLower*` 시험 87/87과 전체 train 함수별 비교가 통과했습니다. 변경은 내부 local declaration qualifier 판정에 한정되므로 전체 CTest는 반복하지 않았습니다.
 
+### 46. 포인터 조건식에서 literal null pointer constant를 보존한다
+
+`condition ? pointer : 0`과 `condition ? 0 : pointer`에서 괄호로 감싼 정수 리터럴 0을 null pointer constant로 인식해 반대쪽 포인터 타입으로 변환합니다. 임의 정수 식이 실행 중 우연히 0이 되는 경우는 C의 조건식 타입을 바꾸지 않으므로 수용하지 않으며, 0이 아닌 정수 리터럴도 구체적인 `unsupported_pointer` 진단과 함께 계속 UNKNOWN입니다.
+
+null은 새 object authority를 요구하지 않습니다. 따라서 다른 arm이 가리킬 수 있는 object table을 그대로 보존하고, 포인터 arm이 선택되면 이후 역참조가 그 object를 사용할 수 있게 합니다. null arm이 선택된 뒤 역참조하면 기존 access guard가 address 0을 거부해 UB가 됩니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,297 (77.97%) | **23,306 (78.00%)** |
+| 증가 | | **+9** |
+| 기존 성공 회귀 | | **0** |
+| pointer/integer conditional 첫 차단 | 9 | **0** |
+| verifier 통과 | 23,297 / 23,297 | **23,306 / 23,306** |
+| status 실패 | 0 | **0** |
+
+해당 첫 차단 9개를 먼저 좁게 측정해 모두 성공하는 것을 확인했습니다. `tests/test_c_lower_pointers.cpp`는 null이 양쪽 arm에 있는 조건식의 결과를 compiled 함수와 대조하고, 포인터 선택 뒤 역참조와 null 선택 뒤 UB를 각각 확인합니다. `tests/test_c_lower_expressions.cpp`는 0이 아닌 정수 arm을 계속 UNKNOWN으로 고정합니다. 영향 범위의 `CLower*` 시험 89/89와 전체 train 함수별 비교가 통과했고 누락, 예상 밖 행, 기존 성공 회귀가 없었습니다. 변경은 내부 conditional expression의 pointer/integer arm 판정에 한정되므로 전체 CTest는 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1583,7 +1600,7 @@ IR 크기를 제한하기 위해 record 크기는 기존 bounded aggregate 상�
 
 - `unsupported_type` 2,324
 - `uninitialized_read` 2,270
-- `unsupported_pointer` 637
+- `unsupported_pointer` 628
 - `unsupported_control_flow` 535
 - `unsupported_call` 380
 
