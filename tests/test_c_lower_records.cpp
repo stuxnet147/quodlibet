@@ -57,6 +57,12 @@ QL_REC_FUNCTION(overlap,
 QL_REC_FUNCTION(labels,
     enum REC_E { REC_ZERO, REC_ONE, REC_TEN = 10, REC_ELEVEN };
     int rec_enum(int a) { return a + REC_TEN + REC_ELEVEN + REC_ONE; });
+QL_REC_FUNCTION(sizeof_members,
+    struct REC_SIZE { char tag; int values[3]; };
+    int rec_size(struct REC_SIZE *p) {
+        return (int)(sizeof(p->tag) + sizeof(p->values) +
+                     sizeof((*p).values[0]));
+    });
 
 namespace {
 
@@ -300,6 +306,13 @@ TEST(CLowerRecords, ReadsUnionMembersOverTheSameBytes) {
         overlap_source, "rec_union",
         [](union REC_U *p) { return rec_union(p); },
         UINT64_C(0x1a6f9c25d374e8b0));
+}
+
+TEST(CLowerRecords, QueriesMemberTypesWithoutReadingTheObject) {
+    CompareOverRandomRecords<struct REC_SIZE>(
+        sizeof_members_source, "rec_size",
+        [](struct REC_SIZE *p) { return rec_size(p); },
+        UINT64_C(0x8b4f21d6a3509ce7));
 }
 
 TEST(CLowerRecords, StoresIntoAMemberAndLeavesItVisible) {

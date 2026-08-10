@@ -71,6 +71,12 @@ QL_PTR_FUNCTION(address_of_element, int ptr_address(int *p, int i) {
     int *slot = &p[i];
     return *slot + 1;
 });
+/* None of these designators is evaluated. In particular the far-out index
+   must not emit an access guard or read memory. */
+QL_PTR_FUNCTION(sizeof_designators, int ptr_sizeof(int *p, int i) {
+    return (int)(sizeof(*p) + sizeof(p[i]) + sizeof(p[1000000]) +
+                 sizeof(&p[i]) + sizeof(p));
+});
 
 QL_PTR_FUNCTION(cast_through_void, int ptr_cast(int *p, int i) {
     void *raw = (void *)p;
@@ -444,6 +450,8 @@ TEST(CLowerPointers, CarriesTheWiderPointerSurface) {
          [](int32_t *p, int32_t i) { return ptr_named(p, i); }},
         {"address", address_of_element_source, "ptr_address",
          [](int32_t *p, int32_t i) { return ptr_address(p, i); }},
+        {"sizeof", sizeof_designators_source, "ptr_sizeof",
+         [](int32_t *p, int32_t i) { return ptr_sizeof(p, i); }},
     };
     uint64_t state = UINT64_C(0x4b7e2c9013fa65d8);
     for (const Case &item : cases) {

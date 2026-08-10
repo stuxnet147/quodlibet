@@ -1149,6 +1149,23 @@ Windows에서는 native CTest 510/510과 Python binding 37/37을 각각 통과�
 
 `tests/test_c_lower_locals.cpp`는 직접 대입과 양쪽 분기 초기화를 실제 컴파일된 C와 대조합니다. 무초기화 주소 노출, 한쪽 분기만 초기화, shadow 충돌은 각각 UNKNOWN인지 검사합니다.
 
+### 22. `sizeof(expression)`은 피연산자를 내리지 않고 타입만 묻는다
+
+커밋: (이 단위)
+
+`sizeof(type)`만 받던 경로에 unevaluated designator 전용 정적 타입 질의를 추가했습니다. 식별자와 열거자, 문자열과 문자 리터럴, 괄호, 역참조와 주소 연산, 배열 원소, `.`와 `->` 멤버의 선언 타입을 재귀적으로 구합니다. 값이나 주소를 만들지 않고 load, store, call, UB guard도 내지 않습니다.
+
+이 구분은 정확성 조건입니다. `sizeof(p[1000000])`은 포인터가 작은 object를 가리켜도 유효하고 `p`나 index를 읽지 않습니다. 평범한 로어링을 재사용하면 존재하지 않는 C UB를 만들게 됩니다. 지원하지 않는 식은 평가해 추측하지 않고 계속 UNKNOWN입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 9,263 (31.00%) | **9,551 (31.96%)** |
+| `unsupported_expression` | 1,722 | **811** |
+| verifier 통과 | 9,263 / 9,263 | **9,551 / 9,551** |
+| status 실패 | 0 | **0** |
+
+`tests/test_c_lower_pointers.cpp`는 범위를 크게 벗어난 subscript도 평가하지 않는지 확인하고, `tests/test_c_lower_records.cpp`는 스칼라와 배열 멤버 크기를 실제 컴파일된 C와 대조합니다.
+
 ## 막힌 것
 
 - 없음

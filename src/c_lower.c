@@ -4500,6 +4500,212 @@ static int abstract_pointer_depth(const lower_context *context,
     return declarator == SIZE_MAX;
 }
 
+static const lower_member *find_member(const lower_record *record,
+                                       const char *name);
+
+/* Determines the declared type of an unevaluated designator. This is kept
+   separate from lower_expression because sizeof must not emit a load, call,
+   store, UB guard, or any other effect from its operand. */
+static ql_status query_designator_type(lower_context *context, size_t node,
+                                       lower_type *output,
+                                       ql_error *error) {
+    const char *kind = context->nodes[node].view.kind;
+
+    if (strcmp(kind, "parenthesized_expression") == 0) {
+        size_t inner = first_named_child(context, node);
+        if (inner == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "an unevaluated parenthesized expression is empty", error);
+        }
+        return query_designator_type(context, inner, output, error);
+    }
+    if (strcmp(kind, "identifier") == 0) {
+        char *name = copy_node_text(context, node);
+        lower_variable *variable;
+        if (name == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        variable = find_variable(context, name, strlen(name));
+        if (variable != NULL) {
+            *output = variable->type;
+            context->allocator->deallocate(context->allocator->user_data,
+                                           name);
+            return QL_STATUS_OK;
+        }
+        if (find_enumerator(context, name) != NULL) {
+            *output = make_integer_type(32u, 3u, 1u);
+            context->allocator->deallocate(context->allocator->user_data,
+                                           name);
+            return QL_STATUS_OK;
+        }
+        context->allocator->deallocate(context->allocator->user_data, name);
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNDECLARED_IDENTIFIER, node,
+            "sizeof names no visible object or enumerator", error);
+    }
+    if (strcmp(kind, "char_literal") == 0) {
+        *output = make_integer_type(32u, 3u, 1u);
+        return QL_STATUS_OK;
+    }
+    if (strcmp(kind, "string_literal") == 0) {
+        lower_string *literal = find_string(context, node);
+        if (literal == NULL) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "the string literal encoding is outside this sizeof query",
+                error);
+        }
+        *output = make_array_of(make_integer_type(8u, 1u, 1u),
+                                (uint64_t)literal->size);
+        return QL_STATUS_OK;
+    }
+    if (strcmp(kind, "pointer_expression") == 0) {
+        size_t operator_node = direct_field_child(context, node, "operator");
+        size_t argument_node = direct_field_child(context, node, "argument");
+        char *operator_text;
+        lower_type argument;
+        ql_status status;
+        if (operator_node == SIZE_MAX || argument_node == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "an unevaluated pointer expression is incomplete", error);
+        }
+        operator_text = copy_node_text(context, operator_node);
+        if (operator_text == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        status = query_designator_type(context, argument_node, &argument,
+                                       error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           operator_text);
+            return status;
+        }
+        if (strcmp(operator_text, "*") == 0) {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           operator_text);
+            if (argument.kind != QL_C_SCALAR_POINTER) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                    "sizeof dereference requires a pointer operand", error);
+            }
+            *output = pointer_target(argument);
+            return QL_STATUS_OK;
+        }
+        if (strcmp(operator_text, "&") == 0) {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           operator_text);
+            *output = make_pointer_to(argument);
+            return QL_STATUS_OK;
+        }
+        context->allocator->deallocate(context->allocator->user_data,
+                                       operator_text);
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "the unevaluated pointer operator is outside this type query",
+            error);
+    }
+    if (strcmp(kind, "subscript_expression") == 0) {
+        size_t base_node = direct_field_child(context, node, "argument");
+        lower_type base;
+        ql_status status;
+        if (base_node == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "an unevaluated subscript has no base", error);
+        }
+        status = query_designator_type(context, base_node, &base, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        if (base.array_length != 0u) {
+            *output = array_element(base);
+            return QL_STATUS_OK;
+        }
+        if (base.kind == QL_C_SCALAR_POINTER) {
+            *output = pointer_target(base);
+            return QL_STATUS_OK;
+        }
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+            "sizeof subscript requires an array or pointer base", error);
+    }
+    if (strcmp(kind, "field_expression") == 0) {
+        size_t argument_node = direct_field_child(context, node, "argument");
+        size_t field_node = direct_field_child(context, node, "field");
+        size_t operator_node = direct_field_child(context, node, "operator");
+        lower_type base;
+        const lower_member *member;
+        char *operator_text;
+        char *field_name;
+        size_t record;
+        int through_pointer;
+        ql_status status;
+
+        if (argument_node == SIZE_MAX || field_node == SIZE_MAX ||
+            operator_node == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "an unevaluated member expression is incomplete", error);
+        }
+        status = query_designator_type(context, argument_node, &base, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        operator_text = copy_node_text(context, operator_node);
+        if (operator_text == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        through_pointer = strcmp(operator_text, "->") == 0;
+        context->allocator->deallocate(context->allocator->user_data,
+                                       operator_text);
+        if (through_pointer) {
+            if (base.kind != QL_C_SCALAR_POINTER ||
+                base.indirection != 1u ||
+                base.pointee.kind != QL_C_SCALAR_RECORD) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                    "sizeof -> requires a pointer to a record", error);
+            }
+            record = base.record;
+        } else {
+            if (base.kind != QL_C_SCALAR_RECORD) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                    "sizeof . requires a record object", error);
+            }
+            record = base.record;
+        }
+        status = ensure_record_layout(context, record, node, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        field_name = copy_node_text(context, field_node);
+        if (field_name == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        member = find_member(&context->records[record], field_name);
+        context->allocator->deallocate(context->allocator->user_data,
+                                       field_name);
+        if (member == NULL) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNDECLARED_IDENTIFIER,
+                field_node, "the record has no such member", error);
+        }
+        *output = member->type;
+        return QL_STATUS_OK;
+    }
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+        "sizeof(expression) cannot determine this operand type without "
+        "evaluating it", error);
+}
+
 /* Resolves the type descriptor carried by `sizeof(type)`. The expression
    form deliberately does not come through here: asking for its type must not
    lower and therefore evaluate it. That needs a separate static type query. */
@@ -4551,14 +4757,20 @@ static ql_status lower_sizeof_type(lower_context *context, size_t node,
             if (status != QL_STATUS_OK || context->unknown != 0u) {
                 return status;
             }
+        } else if (value_node != SIZE_MAX) {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           name);
+            status = query_designator_type(context, value_node, &measured,
+                                           error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
         } else {
             context->allocator->deallocate(context->allocator->user_data,
                                            name);
             return lower_unknown(
-                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION,
-                value_node != SIZE_MAX ? value_node : node,
-                "sizeof(expression) needs a static type query; its operand "
-                "is not evaluated", error);
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "sizeof has no type or expression operand", error);
         }
     } else {
         type_node = direct_field_child(context, descriptor, "type");
