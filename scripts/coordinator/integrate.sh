@@ -44,7 +44,9 @@ git merge --ff-only integ-tmp
 git branch -q -D integ-tmp
 
 echo "== building ($preset)"
-warnings="$(cmake --build --preset "$preset" --parallel 2>&1 | grep -cE 'error|warning' || true)"
+# Count only our own diagnostics; vendored third_party code (libuv etc.) is
+# checksum-pinned and we do not patch its pre-existing warnings.
+warnings="$(cmake --build --preset "$preset" --parallel 2>&1 | grep -E 'error|warning' | grep -vc 'third_party' || true)"
 echo "   warnings/errors: $warnings"
 
 echo "== testing ($preset)"
