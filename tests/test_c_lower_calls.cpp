@@ -1206,6 +1206,14 @@ TEST(CLowerCalls, StopsWhenNobodySaysWhatTheCalleeDoes) {
     EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNSUPPORTED, result.outcome);
 }
 
+TEST(CLowerCalls, SupportsAPrototypeAndExternObjectInOneBlockDeclaration) {
+    static const char source[] =
+        "int f(int a) { extern int CALLEE_double(int), external_value; "
+        "return CALLEE_double(a) + external_value; }";
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(source, "f"));
+}
+
 TEST(CLowerCalls, RefusesCallsItCannotCheckAgainstADeclaration) {
     struct Case {
         const char *source;
@@ -1216,11 +1224,6 @@ TEST(CLowerCalls, RefusesCallsItCannotCheckAgainstADeclaration) {
         {"int f(int a) { return missing(a); }", "f"},
         /* The wrong number of arguments is a mistake, not a semantics. */
         {"int CALLEE_sum(int, int);\nint f(int a) { return CALLEE_sum(a); }",
-         "f"},
-        /* A real extern object mixed with a prototype still needs external
-           object memory semantics. */
-        {"int f(int a) { extern int CALLEE_double(int), external_value; "
-         "return CALLEE_double(a) + external_value; }",
          "f"},
         /* Function pointers are opaque values in this slice. They may be
            transferred and null-tested, but not used as data addresses. */
@@ -1298,6 +1301,27 @@ TEST(CLowerCalls, ANestedCallThreadsItsStateIntoTheOuterCall) {
     ASSERT_LE(2u, calls[1].operand_count);
     EXPECT_EQ(calls[0].results[0], calls[1].operands[0]);
     EXPECT_EQ(calls[0].results[1], calls[1].operands[1]);
+}
+
+TEST(CLowerCalls, CarriesSixtyFiveScalarArguments) {
+    std::string source = "int CALLEE_many(";
+    for (std::size_t index = 0u; index < 65u; ++index) {
+        if (index != 0u) {
+            source += ", ";
+        }
+        source += "int";
+    }
+    source += ");\nint call_many(void) { return CALLEE_many(";
+    for (std::size_t index = 0u; index < 65u; ++index) {
+        if (index != 0u) {
+            source += ", ";
+        }
+        source += std::to_string(index);
+    }
+    source += "); }\n";
+
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(source.c_str(), "call_many"));
 }
 
 }  // namespace

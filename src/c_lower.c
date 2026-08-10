@@ -3745,7 +3745,7 @@ static lower_value stack_address(const lower_context *context,
                                  const lower_variable *variable);
 static ql_status add_dynamic_object(lower_context *context, ql_error *error);
 
-#define LOWER_MAX_DYNAMIC_OBJECTS 128u
+#define LOWER_MAX_DYNAMIC_OBJECTS 320u
 
 static ql_status admit_loaded_pointer(lower_context *context, size_t node,
                                       lower_value *pointer, ql_error *error) {
@@ -7398,6 +7398,7 @@ static ql_status direct_uninitialized_call_local(
   return QL_STATUS_OK;
 }
 
+#define LOWER_MAX_CALL_OPERANDS 128u
 #define LOWER_MAX_CALL_RESULTS 64u
 
 static ql_status aggregate_child_address(lower_context *context,
@@ -7728,7 +7729,7 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
   lower_value indirect_target;
   const char *symbol = NULL;
   char *name;
-  ql_ir_value_id operands[32];
+  ql_ir_value_id operands[LOWER_MAX_CALL_OPERANDS];
   ql_ir_type_id result_types[LOWER_MAX_CALL_RESULTS];
   ql_ir_value_id results[LOWER_MAX_CALL_RESULTS];
   lower_variable *out_variables[30];

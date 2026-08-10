@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,135 / 29,880 (97.51%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 227, `unsupported_control_flow` 123, `unsupported_type` 78, `undeclared_identifier` 68입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,150 / 29,880 (97.56%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 224, `unsupported_control_flow` 123, `unsupported_type` 78, `undeclared_identifier` 68입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -2221,6 +2221,26 @@ goto와 label 사이의 선언을 실제로 건너뛰는 경우와 바깥에서 
 
 `tests/test_c_lower_aggregates.cpp`는 1024-byte 배열의 0 초기화, 한 byte 수정, 반환값과 최종 object image를 compiled C와 대조합니다. aggregate와 parser reuse 영향 범위 17/17이 통과했습니다. 공용 IR, interpreter, solver, plugin, EGraph, public API는 바뀌지 않았고 영향 집합이 13개로 닫혀 있어 전체 CTest와 전체 train은 실행하지 않았습니다.
 
+### 81. 큰 call operand와 외부 pointer authority 목록을 운반한다
+
+CALL operand 배열은 event trace와 memory 뒤에 인자를 보존하지만 32개 고정 배열 때문에 인자 65개인 선언된 호출 3개를 거부하고 있었습니다. IR 형식은 operand 수를 동적으로 보존하므로 C lowering의 자원 경계만 128개로 올렸습니다. call result의 별도 64개 상한과 uninitialised out-local 30개 상한은 바꾸지 않았습니다.
+
+메모리나 call result에서 읽은 pointer를 실제 접근할 때 추가하는 authority region도 128개에서 거부되었습니다. 상한을 임시 계측한 결과 해당 12개 함수가 요구한 수는 140, 157, 173, 296개였고 최대 296개였습니다. 무제한으로 열지 않고 320개 자원 경계를 유지합니다. descriptor의 non-empty, no-wrap, exact-alias 또는 disjoint 가정은 기존과 동일하게 전부 생성합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 29,135 (97.51%) | **29,150 (97.56%)** |
+| 증가 | | **+15** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_call` | 227 | **224** |
+| `unsupported_pointer` | 59 | **47** |
+| verifier 통과 | 29,135 / 29,135 | **29,150 / 29,150** |
+| status 실패 | 0 | **0** |
+
+기존 첫 차단 진단의 정확한 집합인 call 3개와 pointer 12개를 재측정해 15개가 모두 성공했고 전부 verifier를 통과했습니다. 두 변경은 각각 기존 32개와 128개 거부 검사 뒤만 열기 때문에 기존 성공 입력은 새 분기를 타지 않습니다. 15개 측정은 3.9초였습니다.
+
+`tests/test_c_lower_calls.cpp`는 scalar 인자 65개인 선언된 호출을 verifier까지 확인합니다. 같은 파일에서 앞선 block-scope extern 지원으로 이미 성공하게 된 혼합 선언의 낡은 UNKNOWN 기대를 positive 검증으로 고쳤습니다. `tests/test_c_lower_pointers.cpp`는 독립 pointer-load site 300개를 낮추고 검증합니다. call과 pointer 영향 범위 38/38이 통과했습니다. 공용 IR, interpreter, solver, plugin, EGraph, public API는 바뀌지 않았고 정확한 신규 경로 15개를 측정했으므로 전체 CTest와 전체 train은 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -2229,11 +2249,11 @@ goto와 label 사이의 선언을 실제로 건너뛰는 경우와 바깥에서 
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_call` 227
+- `unsupported_call` 224
 - `unsupported_control_flow` 123
 - `unsupported_type` 78
 - `undeclared_identifier` 68
-- `unsupported_pointer` 59
+- `unsupported_pointer` 47
 - `duplicate_declaration` 58
 - `unsupported_volatile_or_atomic` 50
 - `unsupported_expression` 10

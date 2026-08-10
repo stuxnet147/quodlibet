@@ -797,12 +797,12 @@ TEST(CLowerPointers, CarriesAChangingPointerThroughALoopAuthorityRegion) {
     }
 }
 
-/* A finite object table is still a resource boundary, but 32 entries rejected
-   ordinary acyclic corpus bodies. Keep enough independent pointer-load sites
-   here to catch both that old boundary and an accidental reduction to 64. */
-TEST(CLowerPointers, CarriesMoreThanSixtyFourDynamicObjects) {
+/* A finite object table is still a resource boundary. Large acyclic corpus
+   bodies need up to 296 independent pointer-load sites, so keep 300 here to
+   catch a return to the old 128-entry boundary. */
+TEST(CLowerPointers, CarriesThreeHundredDynamicObjects) {
     std::string source = "int deref_many(int **p) { int sum = 0;\n";
-    for (std::size_t index = 0u; index < 65u; ++index) {
+    for (std::size_t index = 0u; index < 300u; ++index) {
         source += "sum += *p[" + std::to_string(index) + "];\n";
     }
     source += "return sum; }\n";
