@@ -224,6 +224,46 @@ static size_t declarator_identifier(const ql_c_syntax_record *nodes,
     return SIZE_MAX;
 }
 
+/* A function definition can contain other function declarators inside its
+   parameter list, as in a callback parameter. Those are not candidates for
+   the definition's own name or parameter list. Follow only the definition's
+   declarator spine and keep its deepest function layer: for an ordinary
+   definition that is the outer layer, while `int (*f(void))(int)` reaches the
+   inner `f(void)` layer after walking through the returned pointer. */
+static size_t definition_function_declarator(
+    const ql_c_syntax_record *nodes, size_t node_count, size_t declarator) {
+    size_t current = declarator;
+    size_t selected = SIZE_MAX;
+    size_t guard = 0u;
+
+    while (current != SIZE_MAX && guard++ < node_count) {
+        const char *kind = nodes[current].view.kind;
+        size_t next;
+        if (strcmp(kind, "function_declarator") == 0) {
+            size_t candidate = direct_field_child(
+                nodes, node_count, current, "declarator");
+            if (candidate != SIZE_MAX &&
+                declarator_identifier(nodes, node_count, candidate) !=
+                    SIZE_MAX) {
+                selected = current;
+            }
+        }
+        if (strcmp(kind, "identifier") == 0 ||
+            strcmp(kind, "field_identifier") == 0) {
+            break;
+        }
+        next = direct_field_child(nodes, node_count, current, "declarator");
+        if (next == SIZE_MAX) {
+            next = first_direct_declarator_child(nodes, node_count, current);
+        }
+        if (next == current) {
+            break;
+        }
+        current = next;
+    }
+    return selected;
+}
+
 static char *copy_source_range(const ql_allocator *allocator,
                                const char *source, size_t source_size,
                                ql_source_range range, int trim) {
@@ -795,24 +835,8 @@ static ql_status analyze_function(
     function->support = QL_C_FUNCTION_SUPPORTED;
     ++unit->function_count;
 
-    if (declarator != SIZE_MAX) {
-        size_t declarator_end = subtree_end(nodes, node_count, declarator);
-        for (index = declarator; index < declarator_end; ++index) {
-            if (strcmp(nodes[index].view.kind, "function_declarator") == 0) {
-                size_t candidate_declarator = direct_field_child(
-                    nodes, node_count, index, "declarator");
-                if (candidate_declarator != SIZE_MAX &&
-                    declarator_identifier(nodes, node_count,
-                                          candidate_declarator) != SIZE_MAX) {
-                    /* The deepest function declarator is the definition's
-                       input signature. Outer layers belong to its return
-                       declarator, as in a function returning a function
-                       pointer. */
-                    function_declarator = index;
-                }
-            }
-        }
-    }
+    function_declarator = definition_function_declarator(
+        nodes, node_count, declarator);
     if (function_declarator != SIZE_MAX) {
         name_declarator = direct_field_child(
             nodes, node_count, function_declarator, "declarator");

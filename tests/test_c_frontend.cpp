@@ -107,6 +107,63 @@ TEST(CFrontend, InventoriesDefinitionsTypesAndSelectsByName) {
     EXPECT_EQ(QL_C_TYPE_BASE_VOID, function.return_type.base_kind);
 }
 
+TEST(CFrontend, SelectsDefinitionDeclaratorOutsideCallbackParameters) {
+    constexpr char source[] =
+        "struct item { int value; };\n"
+        "int apply(struct item *item, int (*callback)(int), void *context) {\n"
+        "  return callback(item->value) + (context != 0);\n"
+        "}\n"
+        "int identity(int value) { return value; }\n"
+        "int (*select_callback(int use_identity))(int) {\n"
+        "  return use_identity ? identity : 0;\n"
+        "}\n";
+    CFrontendUnit analyzed;
+    ql_c_function_view function{};
+    ql_c_parameter_view parameter{};
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_analyze(nullptr, source, sizeof(source) - 1u,
+                                    analyzed.output(), &error))
+        << error.message;
+
+    function.struct_size = sizeof(function);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_select_function(analyzed.get(), "apply", 5u,
+                                            &function, &error))
+        << error.message;
+    EXPECT_STREQ("apply", function.name);
+    EXPECT_EQ(3u, function.parameter_count);
+
+    parameter.struct_size = sizeof(parameter);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_parameter_at(analyzed.get(), function.index, 0u,
+                                         &parameter, &error));
+    EXPECT_STREQ("item", parameter.name);
+    EXPECT_EQ(QL_C_TYPE_BASE_STRUCT, parameter.type.base_kind);
+    EXPECT_EQ(1u, parameter.type.pointer_depth);
+
+    parameter = {};
+    parameter.struct_size = sizeof(parameter);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_parameter_at(analyzed.get(), function.index, 1u,
+                                         &parameter, &error));
+    EXPECT_STREQ("callback", parameter.name);
+    EXPECT_EQ(1u, parameter.type.pointer_depth);
+    EXPECT_NE(0u, parameter.type.shape & QL_C_TYPE_SHAPE_FUNCTION);
+
+    function = {};
+    function.struct_size = sizeof(function);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_select_function(analyzed.get(),
+                                            "select_callback", 15u,
+                                            &function, &error))
+        << error.message;
+    EXPECT_STREQ("select_callback", function.name);
+    EXPECT_EQ(1u, function.parameter_count);
+    EXPECT_NE(0u, function.return_type.shape & QL_C_TYPE_SHAPE_FUNCTION);
+}
+
 TEST(CFrontend, ClassifiesVariadicDefinitionAsUnsupported) {
     constexpr char source[] =
         "int emit(const char *format, ...) { return format != 0; }";

@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,482 / 29,880 (78.59%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,304, `unsupported_type` 2,089, `unsupported_pointer` 634입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,482 / 29,880 (78.59%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,304, `unsupported_type` 2,089, `unsupported_pointer` 726입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1690,6 +1690,25 @@ initializer list를 재귀적으로 벗기되 각 단계에 named positional 값
 
 해당 첫 차단 7개를 좁게 재측정해 4개가 성공했고 pointer initializer 중복 3개는 뒤의 기존 uninitialized address escape로 이동했습니다. `tests/test_c_lower_locals.cpp`는 brace로 초기화한 int와 null pointer를 compiled 함수와 대조하고, 두 값을 넣은 scalar initializer는 계속 UNKNOWN으로 고정합니다. 영향 범위의 `CLowerLocals.*` 8/8과 `CLower*` 90/90이 통과했고 전체 train 함수별 비교에서 누락과 기존 성공 회귀가 없었습니다. 변경은 지역 scalar 선언 초기화에 한정되므로 전체 CTest는 실행하지 않았습니다.
 
+### 53. callback 매개변수를 함수 정의의 서명으로 오인하지 않는다
+
+프런트엔드의 `analyze_function()`은 함수 정의의 전체 하위 트리에서 마지막 `function_declarator`를 골랐습니다. 따라서 `int FUN_0(int ARG_0, int (*ARG_1)(int))`처럼 callback 매개변수가 있으면 바깥 `FUN_0(...)`이 아니라 안쪽 `ARG_1(int)`을 정의의 서명으로 기록했습니다. 실제 함수 이름이 `ARG_1`이나 `VAR_0`으로 바뀌고, 바깥 매개변수는 inventory에서 사라지며, callback 안의 unnamed parameter가 선택된 함수의 프런트엔드 진단으로 잘못 귀속될 수 있었습니다.
+
+이제 함수 정의가 소유한 declarator spine만 따라가고 그 경로의 가장 안쪽 function layer를 선택합니다. callback의 parameter list 하위에는 들어가지 않습니다. `int (*select_callback(int))(int)`처럼 함수 포인터를 반환하는 정의는 같은 spine 안의 `select_callback(int)`을 계속 선택하므로 기존 반환 declarator 계약도 유지합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 프런트엔드 수용 (29,880) | 29,822 (99.81%) | **29,877 (99.99%)** |
+| `frontend_unsupported` | 58 | **3** |
+| train IR 로어링 (29,880) | 23,482 (78.59%) | **23,482 (78.59%)** |
+| 기존 성공 회귀 | | **0** |
+| verifier 통과 | 23,482 / 23,482 | **23,482 / 23,482** |
+| status 실패 | 0 | **0** |
+
+기존 상세 행에서 함수 이름이 `FUN_0`이 아니던 78개를 좁게 재측정하자 전부 올바른 바깥 정의로 inventory됐습니다. 전체 train 비교에서는 74개의 첫 진단이 이동했고 성공과 UNKNOWN의 경계는 바뀌지 않았습니다. 그중 73개는 이제 실제 다음 공백인 `function-valued declarations are outside this lowering slice`로 분류됩니다. 따라서 `unsupported_pointer`가 634에서 726으로 늘어난 것은 회귀가 아니라 가려져 있던 첫 차단의 정정입니다.
+
+`tests/test_c_frontend.cpp`는 callback 매개변수가 있는 보통 함수의 이름과 세 매개변수, 함수 포인터 반환 정의의 실제 이름을 고정합니다. `CFrontend.*` 9/9, `CLower*` 90/90, `CReuse.*`와 `SourceSignature.*` 19/19가 통과했습니다. 이 변경은 공개 함수 inventory를 바꾸고 source signature, proof 입력, Python binding, fuzz harness가 함께 소비하므로 전체 Windows configure와 build 뒤 CTest 547/547도 실행해 통과했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1700,9 +1719,9 @@ initializer list를 재귀적으로 벗기되 각 단계에 named positional 값
 
 - `uninitialized_read` 2,304
 - `unsupported_type` 2,089
-- `unsupported_pointer` 634
-- `unsupported_control_flow` 545
-- `unsupported_call` 397
+- `unsupported_pointer` 726
+- `unsupported_control_flow` 544
+- `unsupported_call` 396
 
 ## 조율자에게 요청할 것
 
