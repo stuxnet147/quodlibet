@@ -60,72 +60,72 @@
 
 ## W2: 첫 exact backend
 
-- [ ] versioned source-signature artifact (signedness, width, pointer/address-space, ABI 보존)
-- [ ] problem schema v2 에 좌우 signature digest, 인자 대응, typed-precondition digest 결합
-- [ ] problem v1 의 non-null precondition 으로는 `PROVED_*` 를 낼 수 없도록 gate 추가
-- [ ] 좌우 loop-free scalar IR 을 결합하는 product program 또는 SMT miter
-- [ ] relation 방향, UB policy, return/termination/trap 관찰을 SMT query 에 정확히 반영
-- [ ] Bitwuzla SAT model 을 typed input 과 observable witness 로 decode
-- [ ] SAT witness 를 별도 concrete semantic replay 로 검증한 뒤에만 `COUNTEREXAMPLE` 발행
-- [ ] UNSAT 승격 경계를 checker 또는 명시적 trusted-backend policy 로 확정하고 코드가 강제
-- [ ] `PROVED_*`, `COUNTEREXAMPLE`, `UNKNOWN` end-to-end 통합 시험
-- [ ] proof method 를 registry 에 실제로 등록해서 `quodlibet methods` 에 나오게 한다
+- [x] versioned source-signature artifact (signedness, width, pointer/address-space, ABI 보존) (증거: `src/signature.c` 의 `quodlibet.source-signature` v1, `tests/test_signature.cpp`)
+- [x] problem schema v2 에 좌우 signature digest, 인자 대응, typed-precondition digest 결합 (증거: `ql_problem_artifact_create_v2` in `src/problem.c`, `tests/test_problem.cpp:308`)
+- [x] problem v1 의 non-null precondition 으로는 `PROVED_*` 를 낼 수 없도록 gate 추가 (증거: `ql_problem_require_proof_binding`, `tests/test_problem.cpp:339`, `SmtProductMethod.RefusesASchemaV1ProblemBeforeExecuting`)
+- [x] 좌우 loop-free scalar IR 을 결합하는 product program 또는 SMT miter (증거: `src/product.c`, `tests/test_product.cpp`. GOAL.md G5 의 한정대로 loop-free 슬라이스 위에서이고, 메모리 확장은 `tests/test_proof_smt_memory.cpp`. 루프는 여전히 `UNKNOWN`)
+- [x] relation 방향, UB policy, return/termination/trap 관찰을 SMT query 에 정확히 반영 (증거: `ProductMiter.UndefinedBehaviourDomainsSeparateTheTwoRefinementDirections`, `TrapAxisAloneDecidesADifferentTrapCode`, `TerminationAxisAloneDecidesADivergingSide`, `SmtProductMethod.DischargesRefinementDirectionsSeparately`)
+- [x] Bitwuzla SAT model 을 typed input 과 observable witness 로 decode (증거: `src/replay.c` 의 `ql_replay_decode_model`, `Replay.DecodesASolverModelAndConfirmsTheViolation`)
+- [x] SAT witness 를 별도 concrete semantic replay 로 검증한 뒤에만 `COUNTEREXAMPLE` 발행 (증거: `SmtProductMethod.EmitsAReplayedCounterexample`, `Replay.AModelThatDoesNotReproduceIsNotACounterexample`, GOAL.md G5)
+- [x] UNSAT 승격 경계를 checker 또는 명시적 trusted-backend policy 로 확정하고 코드가 강제 (증거: `src/proof_smt.c` 의 여섯 조건과 항상 기록되는 `checked_proof=false`, `SmtProductMethod.ProvesEquivalenceOnlyUnderTheRecordedTrustPolicy`, `AdvertisesProofOnlyWhenTheTrustPolicyIsSelected`, `METHODS.md`)
+- [x] `PROVED_*`, `COUNTEREXAMPLE`, `UNKNOWN` end-to-end 통합 시험 (증거: `tests/test_proof_smt.cpp` 9개, `AVacuousDomainNeverBecomesAProof`, `RunsThroughAPipelineSelectedByName`)
+- [x] proof method 를 registry 에 실제로 등록해서 `quodlibet methods` 에 나오게 한다 (증거: `src/builtins.c:51` 의 `ql_register_smt_product_method`, `cli/main.c:198` 의 `methods`, `SmtProductMethod.RegistersAsANamedProofMethod`)
 
 ## W3: 런타임 서비스
 
-- [ ] 외부 로깅 라이브러리 선정, 벤더링, SHA-256 고정, `DEPENDENCIES.md` 근거
-- [ ] 공개 로깅 C API: 레벨, 상세도, 싱크, 카테고리
-- [ ] 비활성 레벨 호출 오버헤드 측정과 기록
-- [ ] 실행 예산: 전체 wall-clock, 노드별, solver 호출별
-- [ ] 메모리 예산: 상한과 할당자 계측, 초과 시 결정적 실패
-- [ ] 예산 초과가 논리 판정으로 새지 않도록 gate 와 시험
-- [ ] 판정 정책 JSON 스키마와 파서
-- [ ] 정책이 건전성 규율을 약화시킬 수 없도록 거부 규칙
-- [ ] 사용자 정의 결과 직렬화와 왕복 시험
+- [x] 외부 로깅 라이브러리 선정, 벤더링, SHA-256 고정, `DEPENDENCIES.md` 근거 (증거: zf_log 0.4.1, `scripts/vendor.sh:148` SHA-256 pin, `third_party/zf_log`, `DEPENDENCIES.md:43`, GOAL.md G1)
+- [x] 공개 로깅 C API: 레벨, 상세도, 싱크, 카테고리 (증거: `include/quodlibet/log.h`, `src/log.c`, `EveryVerbosityAxisIsIndependent`, `ConcurrentWritersNeverInterleaveALine`)
+- [x] 비활성 레벨 호출 오버헤드 측정과 기록 (증거: 0.071 ns/호출, `docs/runtime-services/logging.md`, `tests/test_log_overhead.cpp`, GOAL.md G1)
+- [x] 실행 예산: 전체 wall-clock, 노드별, solver 호출별 (증거: `src/budget.c`, `TotalWallClockAxisExpiresOnItsOwn`, `NodeAndSolverAxesAreSetSeparately`)
+- [x] 메모리 예산: 상한과 할당자 계측, 초과 시 결정적 실패 (증거: `MemoryLimitFailsDeterministicallyAtTheSameAllocation`, `tests/test_budget.cpp` 21개, GOAL.md G2)
+- [x] 예산 초과가 논리 판정으로 새지 않도록 gate 와 시험 (증거: `ql_budget_guard_outcome` 이 `PROVED_*`/`COUNTEREXAMPLE`/`BOUNDED_CLEAN` 을 `UNKNOWN` 으로 회수, `PipelineBudgetLeak`, GOAL.md G2)
+- [x] 판정 정책 JSON 스키마와 파서 (증거: `include/quodlibet/policy.h` schema v1, `src/policy.c`, `tests/test_policy.cpp` 22개)
+- [x] 정책이 건전성 규율을 약화시킬 수 없도록 거부 규칙 (증거: 파서의 네 문법 거부와 `ql_policy_evaluate` 의 증거 재강제, `tests/test_policy.cpp:298` 부근, `tests/test_fuzz_contracts.cpp` policy target, GOAL.md G3)
+- [x] 사용자 정의 결과 직렬화와 왕복 시험 (증거: `PolicySerializationRoundTrips`, `ResultSerializationRoundTrips`, `GatedResultSerializationRoundTrips`, `tests/test_policy_canonical.cpp` 고정점 시험)
 
 ## W4: 파이썬 바인딩과 커버리지
 
-- [ ] 커버리지 측정 도구: 코퍼스를 걸어 파서/로어링 수용률과 진단 분포를 낸다
-- [ ] 측정 결과를 `docs/coverage/` 에 재현 명령과 함께 기록
-- [ ] CPython C 확장 모듈 (`Py_LIMITED_API` abi3)
-- [ ] solver 대기 중 GIL 해제
-- [ ] 예산, 판정 정책, 결과의 파이썬 노출
-- [ ] `pip install .` 과 Windows/Linux import 시험
-- [ ] 강화학습기에서 부를 배치 API
+- [x] 커버리지 측정 도구: 코퍼스를 걸어 파서/로어링 수용률과 진단 분포를 낸다 (증거: `cli/coverage.c` 와 `cli/main.c:178` 의 `quodlibet coverage`, `tools/corpus/extract.py`)
+- [x] 측정 결과를 `docs/coverage/` 에 재현 명령과 함께 기록 (증거: `docs/coverage/baseline-20260810.md` 의 결과표와 "재현" 절 명령. 수용률 자체는 G9 의 종료 조건이고 아직 열려 있습니다)
+- [x] CPython C 확장 모듈 (`Py_LIMITED_API` abi3) (증거: `bindings/python/src/quodlibet_module.c`, `Py_LIMITED_API=0x030B0000`, `tests/test_extension.py::test_it_is_built_against_the_stable_abi`, GOAL.md G4)
+- [x] solver 대기 중 GIL 해제 (증거: 판정 전체가 `Py_BEGIN_ALLOW_THREADS` 안, `tests/test_concurrency.py::test_two_checks_are_in_flight_at_the_same_instant`, GOAL.md G4)
+- [x] 예산, 판정 정책, 결과의 파이썬 노출 (증거: `budget=` 다섯 축, `policy_json=`, `result.verdict/.status/.evidence/.counterexample/.policy`, `bindings/python/tests/test_budget_and_policy.py`)
+- [x] `pip install .` 과 Windows/Linux import 시험 (증거: `pip install ./bindings/python` abi3 wheel, Windows 3.11/3.13 과 WSL Ubuntu 24.04, CTest 항목 `quodlibet.python_bindings`, GOAL.md G4)
+- [x] 강화학습기에서 부를 배치 API (증거: `bindings/python/quodlibet/__init__.py:489` 의 `check_batch` 와 워커별 `SolverSession`, `tests/test_concurrency.py:100`, VM 채점기 경로 측정 `docs/vm/asm2c-03-plan-20260810.md`)
 
 ## W0: 조율, 프로파일링, VM
 
-- [ ] VTune hotspots 와 threading 프로파일, `docs/perf/`
-- [ ] 프로파일 근거 최적화와 before/after 수치
-- [ ] 성능 기준선 `docs/perf/baseline.md`
-- [ ] asm2c-03 VM 에서 vendor/build/CTest 통과
-- [ ] 채점기 경로 확인(쌍당 지연 수치)
-- [ ] 강화학습기 경로 스모크(장시간 금지)
-- [ ] VM 기록과 비용 `docs/vm/`
+- [ ] VTune hotspots 와 threading 프로파일, `docs/perf/` (hotspots 는 `docs/perf/hotspots-coverage-val.txt` 로 있으나 **threading 리포트 산출물이 없습니다.** 세 환경 모두 수집 실패로 `docs/perf/baseline.md` "아직 없는 것" 과 GOAL.md G7 이 미달성으로 기록. G6 은 사용자가 2026-08-10 에 "의도 충족" 으로 인정해 닫혔으므로, 남은 것은 작업이 아니라 이 항목을 그 판단대로 접을지의 결정입니다)
+- [x] 프로파일 근거 최적화와 before/after 수치 (증거: GOAL.md G6, `docs/perf/baseline.md` "적용한 최적화" 여섯 건 - 중복 파스 -27%, BLAKE3 어셈블리 -52%, 세션 재사용 -55.6%, 트리 이전, 예산 마감 양자화, lseek -1.09%)
+- [x] 성능 기준선 `docs/perf/baseline.md` (증거: 파일 존재, 측정 환경/기준선/회귀 관문 `scripts/perf/bench-coverage.sh` 와 재현 절 포함)
+- [x] asm2c-03 VM 에서 vendor/build/CTest 통과 (증거: GOAL.md G7, `docs/vm/asm2c-03-plan-20260810.md` 재시도 결과 - ubuntu-2404 에서 ctest 266/266, pytest 28 passed)
+- [x] 채점기 경로 확인(쌍당 지연 수치) (증거: GOAL.md G7 - 쌍당 median 4ms / p90 7ms, 219.6 pairs/s at workers=8, error 0, 100쌍. 근거는 `docs/vm/scorer_bench.py` 와 계획서 "정본 수치" 절)
+- [x] 강화학습기 경로 스모크(장시간 금지) (증거: GOAL.md G7 - 8 GPU 전부하 병행 `check_batch` 완주. 단 CUDA context + workers=8 의 uv_spawn SEGV 는 재현표와 함께 기록되어 solver 쪽 별건으로 이관됨, `docs/vm/rl_smoke.py`)
+- [x] VM 기록과 비용 `docs/vm/` (증거: `docs/vm/asm2c-03-plan-20260810.md` 의 생성/확인/삭제와 대여 시간 기록, 두 대여 모두 상한 안에 `instances delete` 확인, asm2c-01/02 불간섭)
 
 ## W6: 증거와 method 파이프라인 (2026-08-10 범위 복귀)
 
 사용자 지시로 이 문서의 전 항목이 GOAL 닫힘의 조건입니다. 아래는 원래 "뒤로 미룬 것"이었다가 복귀한 것입니다.
 
-- [ ] e-graph merge log 의 독립 replay checker
-- [ ] rewrite rule 별 soundness 조건과 side condition 을 versioned evidence 에 기록
-- [ ] AIG/SAT backend 와 certificate checker
-- [ ] concrete differential refutation method (등록되는 method 로)
-- [ ] 여러 method 의 병렬 실행을 투표가 아니라 증거 우선 규칙으로 결합
-- [ ] persistent artifact/evidence cache 저장소
-- [ ] method/backend version, option, semantic contract 가 cache key 에 빠지지 않는지 통합 검증
-- [ ] CHC/PDR 또는 loop invariant 연결 (루프 판정. W1 의 루프 로어링 뒤)
+- [x] e-graph merge log 의 독립 replay checker (증거: `src/egraph_check.c` 가 엔진을 부르지 않고 자체 union-find 로 재생, `tests/test_egraph_check.cpp` 15개, `JustifiesEveryMergeAWideSaturationProduces`, `ReportsEveryRejectionNotOnlyTheFirst`)
+- [x] rewrite rule 별 soundness 조건과 side condition 을 versioned evidence 에 기록 (증거: `ql_egraph_rule_descriptor_v1` 과 36개 rule catalogue, `QL_EGRAPH_RULE_CATALOGUE_DIGEST_HEX`, `tests/test_egraph_rules.cpp` 13개, `DescribesEveryRewriteTheEngineRecords`)
+- [x] AIG/SAT backend 와 certificate checker (증거: `src/aig.c`, `src/proof_aigsat.c`, CaDiCaL `--lrat` + `third_party/drat-trim` 의 `lrat-check`, `tests/test_proof_aigsat.cpp` 의 `AProvedEquivalenceCarriesACheckedProof` 가 이 저장소 첫 `checked_proof=true` 를 고정. folded-false 는 승격하지 않고 `UNKNOWN`)
+- [x] concrete differential refutation method (등록되는 method 로) (증거: `src/proof_diff.c` 의 `refute.concrete-differential`, `src/builtins.c:58` 등록, `tests/test_proof_diff.cpp` 13개. 아무것도 못 찾으면 `BOUNDED_CLEAN` 이 아니라 `UNKNOWN`)
+- [x] 여러 method 의 병렬 실행을 투표가 아니라 증거 우선 규칙으로 결합 (증거: `src/combine.c`, `tests/test_combine.cpp` 24개, `ThreeAgreeingUncheckedProofsStillDecideNothing`, `OneCheckedProofOutweighsAnyNumberOfUncheckedDisagreements`)
+- [x] persistent artifact/evidence cache 저장소 (증거: `src/cache.c` 의 BLAKE3 key 저장소, load 마다 두 digest 재검증, 검증 실패는 miss 가 아니라 거부, `tests/test_cache.cpp`)
+- [x] method/backend version, option, semantic contract 가 cache key 에 빠지지 않는지 통합 검증 (증거: `tests/test_cache_key.cpp` 16개가 축을 하나씩 변주. backend 를 아무 데도 적지 않으면 두 빌드가 충돌한다는 것까지 고정)
+- [ ] CHC/PDR 또는 loop invariant 연결 (루프 판정. W1 의 루프 로어링 뒤) (구현이 없습니다. `include/quodlibet/proof_method.h:19` 의 family 상수와 `METHODS.md:625` 의 권고 절만 있고 `prove.chc-pdr` method 도 시험도 없습니다. `src/c_lower.c:6135` 대로 루프는 아직 로어링되지 않습니다)
 
 ## W7: 성능, 안정성, 배포 (2026-08-10 범위 복귀)
 
-- [ ] parser/lowering/e-graph/solver 단계별 benchmark 와 전체 latency 기준선 (일부는 docs/perf/baseline.md 에 있음)
-- [ ] 병렬 worker 수, solver 동시성, cancellation overhead 측정
-- [ ] artifact decoder 와 precondition 파서 퍼징 (파서/로어링/IR 디코더는 완료)
-- [ ] solver crash, timeout, pipe 상속, corrupt model fault-injection 확대
-- [ ] Windows 와 Linux 설치 패키지, relocatable Bitwuzla 탐색
-- [ ] public ABI compatibility 시험과 plugin SDK 예제
-- [ ] 지원 compiler/target matrix 를 asm2c dataset manifest 에서 자동 검증
-- [ ] 원격 CI 재설계와 활성화 (**사용자 승인 필요.** 원문이 승인 조건부라 마지막에 여쭙는다)
+- [ ] parser/lowering/e-graph/solver 단계별 benchmark 와 전체 latency 기준선 (일부는 docs/perf/baseline.md 에 있음) (파스+프런트엔드+로어링 총량과 배치 latency 는 `scripts/perf/bench-coverage.sh` 와 `bench-batch.py` 로 있으나 **e-graph 단계와 prove 경로의 단계 분해가 없습니다.** `docs/perf/baseline.md` "아직 없는 것" 이 판정당 87ms 가 프런트엔드/로어링/miter/SMT-LIB 직렬화/solver 중 어디로 가는지 못 쟀다고 적고 있습니다)
+- [x] 병렬 worker 수, solver 동시성, cancellation overhead 측정 (증거: `docs/perf/concurrency.md` 와 `scripts/perf/bench-concurrency.py` 의 취소 지연표, `docs/perf/baseline.md` "확장이 어디서 멈추는지" 의 worker 사다리. 취소 지연이 마감이 아니라 단계 경계로 양자화된다는 결과 포함)
+- [x] artifact decoder 와 precondition 파서 퍼징 (파서/로어링/IR 디코더는 완료) (증거: `tests/fuzz/fuzz_precondition.c`, `fuzz_problem_decoder.c`, `fuzz_signature_decoder.c`, `fuzz_policy.c`, `fuzz_policy_result.c`, `tests/fuzz/fuzz_contract_targets.h`, 매 ctest 에서 도는 `tests/test_fuzz_contracts.cpp` 6개)
+- [x] solver crash, timeout, pipe 상속, corrupt model fault-injection 확대 (증거: `tests/test_fault_injection.cpp` - 거짓말하는 backend 16가지와 프로세스 고장 9가지, 할당 계수기로 오류 경로 누수까지 고정)
+- [x] Windows 와 Linux 설치 패키지, relocatable Bitwuzla 탐색 (증거: `scripts/check-install.sh` 9개 검사가 Windows 와 WSL Ubuntu 24.04 양쪽 통과, `cmake/quodlibet-config.cmake.in` 의 `find_package(quodlibet)`, `docs/deploy/packaging.md`. 이동 후 탐색은 음성 검사로 확정)
+- [x] public ABI compatibility 시험과 plugin SDK 예제 (증거: `tests/test_abi_compat.cpp` 6개가 옛 헤더 caller 수용/작은 prefix 거부/필드 순서 `static_assert` 를 고정, `examples/plugin/` 과 `tests/test_example_plugin.cpp` 5개)
+- [x] 지원 compiler/target matrix 를 asm2c dataset manifest 에서 자동 검증 (증거: `tests/test_target_matrix.cpp` 가 manifest 와 `ql_semantic_contract_init` 의 선언을 대조하고 drift 를 양방향으로 보고. 데이터셋이 없으면 통과가 아니라 skip)
+- [ ] 원격 CI 재설계와 활성화 (**사용자 승인 필요.** 원문이 승인 조건부라 마지막에 여쭙는다) (승인 기록이 없습니다. `.github/` 도 CI 설정도 저장소에 없고 W7 지시서가 명시적으로 범위 밖으로 두었습니다. 작업이 아니라 사용자 결정 대기 항목입니다)
 
 scheduler 고도화와 plugin SDK "확장" 중 위 목록에 없는 것은 여전히 범위 밖입니다(G5 의 동결 원칙).
 
