@@ -559,7 +559,7 @@ TEST(CLowerRecords, LowersEnumeratorsAsTheConstantsTheyName) {
     }
 }
 
-TEST(CLowerRecords, RefusesWholeRecordValues) {
+TEST(CLowerRecords, RefusesRemainingWholeRecordValues) {
     struct Case {
         const char *source;
         const char *name;
@@ -567,10 +567,10 @@ TEST(CLowerRecords, RefusesWholeRecordValues) {
     const Case cases[] = {
         {"struct S { int a; };\nint by_value(struct S s) { return s.a; }",
          "by_value"},
-        /* A record local is storage now, but the record still has no value:
-           copying one whole is a memory operation this slice does not do. */
+        /* A discarded assignment is a byte snapshot, but using the assignment
+           expression as a record value still needs an IR record value. */
         {"struct S { int a; };\nint whole(int a) "
-         "{ struct S s; struct S t; t = s; return t.a + a; }",
+         "{ struct S s = {a}; struct S t = {0}; return (t = s).a; }",
          "whole"},
         /* A record that contains itself has no layout, and Tree-sitter
            accepts the declaration, so this has to be refused. */

@@ -4306,11 +4306,11 @@ static ql_status lower_identifier(lower_context *context, size_t node,
     return QL_STATUS_OK;
   }
   if (variable->type.kind == QL_C_SCALAR_RECORD) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
-        "a struct or union value is outside this slice; only its members "
-        "are",
-        error);
+    *output = stack_address(context, variable);
+    output->type = variable->type;
+    output->defined = variable->defined;
+    output->may_ub = variable->initialized == 0u;
+    return QL_STATUS_OK;
   }
   if (variable->is_stack != 0u) {
     status = emit_load(context, stack_address(context, variable), output,
@@ -5541,7 +5541,8 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
                            node, "this local lives in a value, not in storage",
                            error);
     }
-    if (variable->initialized == 0u) {
+    if (variable->initialized == 0u &&
+        variable->type.kind != QL_C_SCALAR_RECORD) {
       /* A plain assignment to the local reaches its stack address
          through resolve_assignment_target instead of this path. Any
          other address use can escape to a read before the lowering has
@@ -5560,6 +5561,72 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
                        node, "expression does not designate an object", error);
 }
 
+/* A record-valued member rooted in a local record is no more initialized than
+   that complete local object. Member reads keep their existing coarse storage
+   contract, but a whole-record read must carry this predicate into the byte
+   snapshot. A pointer-rooted member names caller-visible memory and therefore
+   has no local variable state to inherit here. */
+static ql_status inherit_record_source_definedness(lower_context *context,
+                                                    size_t node,
+                                                    lower_value *address,
+                                                    ql_error *error) {
+  const char *kind = context->nodes[node].view.kind;
+
+  if (strcmp(kind, "parenthesized_expression") == 0) {
+    size_t inner = first_named_child(context, node);
+    if (inner != SIZE_MAX) {
+      return inherit_record_source_definedness(context, inner, address,
+                                               error);
+    }
+    return QL_STATUS_OK;
+  }
+  if (strcmp(kind, "field_expression") == 0) {
+    size_t argument = direct_field_child(context, node, "argument");
+    size_t operator_node = direct_field_child(context, node, "operator");
+    char *operator_text;
+    int through_pointer;
+
+    if (argument == SIZE_MAX || operator_node == SIZE_MAX) {
+      return QL_STATUS_OK;
+    }
+    operator_text = copy_node_text(context, operator_node);
+    if (operator_text == NULL) {
+      ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+      return QL_STATUS_OUT_OF_MEMORY;
+    }
+    through_pointer = strcmp(operator_text, "->") == 0;
+    context->allocator->deallocate(context->allocator->user_data,
+                                   operator_text);
+    if (through_pointer == 0) {
+      return inherit_record_source_definedness(context, argument, address,
+                                               error);
+    }
+    return QL_STATUS_OK;
+  }
+  if (strcmp(kind, "identifier") == 0) {
+    char *name = copy_node_text(context, node);
+    lower_variable *variable;
+    ql_status status;
+
+    if (name == NULL) {
+      ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+      return QL_STATUS_OUT_OF_MEMORY;
+    }
+    variable = find_variable(context, name, strlen(name));
+    context->allocator->deallocate(context->allocator->user_data, name);
+    if (variable == NULL || variable->type.kind != QL_C_SCALAR_RECORD) {
+      return QL_STATUS_OK;
+    }
+    status = ensure_variable_value(context, variable, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    address->defined = variable->defined;
+    address->may_ub = variable->initialized == 0u;
+  }
+  return QL_STATUS_OK;
+}
+
 /* Reads the object an address names, at its declared type. Split out of the
    designator path because a compound assignment reaches the same read from an
    address it has already computed and must not compute twice. */
@@ -5576,11 +5643,16 @@ static ql_status load_at_address(lower_context *context, size_t node,
     return QL_STATUS_OK;
   }
   if (declared.kind == QL_C_SCALAR_RECORD) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
-        "a struct or union value is outside this slice; only its members "
-        "are",
-        error);
+    status = inherit_record_source_definedness(context, node, &address, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    /* Keep the object address as the carrier. No IR value has record type,
+       but a discarded whole-record assignment can consume this address
+       without exposing it to scalar operators. */
+    *output = address;
+    output->type = declared;
+    return QL_STATUS_OK;
   }
   status = emit_load(context, address, &loaded, error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
@@ -5976,6 +6048,13 @@ static ql_status lower_assignment_value(lower_context *context, size_t node,
                                         lower_value *output, ql_error *error);
 static ql_status lower_update_expression(lower_context *context, size_t node,
                                          lower_value *output, ql_error *error);
+static ql_status initialize_record_copy(lower_context *context, size_t node,
+                                        lower_value destination,
+                                        lower_type type, ql_error *error);
+static ql_status copy_record_bytes(lower_context *context, size_t node,
+                                   lower_value source,
+                                   lower_value destination, lower_type type,
+                                   ql_error *error);
 
 /* `c ? a : b`. The value is selected, but the definedness short-circuits the
    way `&&` already does: only the arm the condition chooses has to be defined.
@@ -6416,9 +6495,33 @@ static ql_status write_assignment_target(lower_context *context, size_t node,
   ql_status status;
 
   if (target->declared.kind == QL_C_SCALAR_RECORD) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
-        "assigning a whole struct or union is outside this slice", error);
+    lower_value source = value;
+    if (stored != NULL) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+          "using a whole-record assignment as a value is outside this slice",
+          error);
+    }
+    if (target->address.type.kind != QL_C_SCALAR_POINTER ||
+        value.type.array_length != 0u ||
+        value.type.kind != QL_C_SCALAR_RECORD ||
+        !type_same(target->declared, value.type)) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+          "whole-record assignment needs matching record objects", error);
+    }
+    /* load_at_address kept the pointer IR value but exposed the declared
+       record type so scalar users reject it. Restore its pointer type only
+       for the bounded byte-copy operation that understands this carrier. */
+    source.type = make_pointer_to(value.type);
+    status = copy_record_bytes(context, node, source, target->address,
+                               target->declared, error);
+    if (status == QL_STATUS_OK && context->unknown == 0u &&
+        target->stack_variable != NULL) {
+      target->stack_variable->initialized = 1u;
+      target->stack_variable->defined = context->true_value;
+    }
+    return status;
   }
   if (target->declared.kind == QL_C_SCALAR_VOID ||
       target->declared.array_length != 0u) {
@@ -6923,36 +7026,28 @@ static ql_status aggregate_child_address(lower_context *context,
   return emit_pointer_of_address(context, address, pointer, output, error);
 }
 
-/* A top-level record initializer may copy another lvalue of the same record
-   type. Copy bytes rather than just named members: a union's active
-   representation and the target ABI's padding are part of the object image
-   that later character-pointer access can observe. */
-static ql_status initialize_record_copy(lower_context *context, size_t node,
-                                        lower_value destination,
-                                        lower_type type, ql_error *error) {
-  lower_value source;
-  lower_type source_type;
+/* Copy bytes rather than just named members: a union's active representation
+   and the target ABI's padding are part of the object image that later
+   character-pointer access can observe. */
+static ql_status copy_record_bytes(lower_context *context, size_t node,
+                                   lower_value source,
+                                   lower_value destination, lower_type type,
+                                   ql_error *error) {
   lower_type byte = make_integer_type(8u, 1u, 0u);
   uint64_t size;
   uint64_t index;
   ql_status status;
 
-  status = lower_designator_address(context, node, &source, &source_type,
-                                    error);
-  if (status != QL_STATUS_OK || context->unknown != 0u) {
-    return status;
-  }
-  if (source_type.array_length != 0u ||
-      source_type.kind != QL_C_SCALAR_RECORD || !type_same(type, source_type)) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
-        "record copy initializer needs an lvalue of the same record type",
-        error);
-  }
   status = ensure_record_layout(context, type.record, node, error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
   }
+  status = emit_ub_guard(context, &source, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  source.defined = context->true_value;
+  source.may_ub = 0u;
   size = record_size(context, type.record);
   if (size > LOWER_MAX_INITIALIZER_ELEMENTS) {
     return lower_unknown(
@@ -6981,6 +7076,33 @@ static ql_status initialize_record_copy(lower_context *context, size_t node,
     }
   }
   return QL_STATUS_OK;
+}
+
+/* A top-level record initializer may copy another lvalue of the same record
+   type. Resolve its address once, then use the common object snapshot. */
+static ql_status initialize_record_copy(lower_context *context, size_t node,
+                                        lower_value destination,
+                                        lower_type type, ql_error *error) {
+  lower_value source;
+  lower_type source_type;
+  ql_status status = lower_designator_address(context, node, &source,
+                                              &source_type, error);
+
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  status = inherit_record_source_definedness(context, node, &source, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  if (source_type.array_length != 0u ||
+      source_type.kind != QL_C_SCALAR_RECORD || !type_same(type, source_type)) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+        "record copy initializer needs an lvalue of the same record type",
+        error);
+  }
+  return copy_record_bytes(context, node, source, destination, type, error);
 }
 
 static ql_status make_zero_scalar(lower_context *context, lower_type type,
@@ -7297,7 +7419,8 @@ static ql_status initialize_object(lower_context *context, size_t node,
                                        &child_address, error);
       if (status == QL_STATUS_OK) {
         status = initialize_object(context, initializer, child_address,
-                                   child_type, 1u, error);
+                                   child_type,
+                                   is_field_designated != 0 ? 0u : 1u, error);
       }
       if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
@@ -7450,13 +7573,19 @@ static ql_status lower_declaration(lower_context *context, size_t node,
           return status;
         }
       }
-      /* An aggregate without an explicit initializer has indeterminate
-         bytes, but members may still be written before they are read.
-         The current member model has no per-subobject initialization
-         bits, so preserve the previous storage contract for that case.
-         Explicit initialization is fully written above. */
-      variable->initialized = 1u;
-      variable->defined = context->true_value;
+      /* Member accesses keep the existing coarse storage contract because
+         there are no per-subobject initialization bits. For a record, this
+         bit separately gates observations of the complete object: only an
+         explicit initializer or a later whole-record assignment establishes
+         every byte. Arrays have no whole-value read and retain the previous
+         storage state. */
+      variable->initialized = declarator_type.kind != QL_C_SCALAR_RECORD ||
+                                      value_node != SIZE_MAX
+                                  ? 1u
+                                  : 0u;
+      variable->defined = variable->initialized != 0u
+                              ? context->true_value
+                              : context->false_value;
       continue;
     }
     if (value_node != SIZE_MAX) {

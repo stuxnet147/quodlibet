@@ -1,11 +1,11 @@
 /* Arrays and record locals, against real compiled execution.
 
-   Both are storage rather than values. An array decays to a pointer to its
-   first element wherever it is named, a record is reached only through its
-   members, and neither is ever loaded or stored whole. So both become
-   objects in the flat memory model, on the same footing as a caller's
-   pointer region: the size is pinned, every access carries a guard, and the
-   final image is what a contract observes.
+   Both are storage rather than scalar IR values. An array decays to a pointer
+   to its first element wherever it is named. A whole-record initializer or
+   discarded assignment snapshots its bounded object bytes without inventing
+   an IR record value. Both therefore become objects in the flat memory model,
+   on the same footing as a caller's pointer region: the size is pinned, every
+   access carries a guard, and the final image is what a contract observes.
 
    Two things are compared here. The returned value is compared against the
    compiled function, which is the only thing that can say whether the member
@@ -137,6 +137,25 @@ QL_AGG_FUNCTION(copied_record,
         source.value = 0;
         source.slots[0] = 0;
         return target.tag + target.value + target.slots[0] + target.slots[1];
+    });
+QL_AGG_FUNCTION(assigned_record,
+    struct AGG_ASSIGNED { char tag; int value; short slots[2]; };
+    int agg_assign(int a, int b) {
+        struct AGG_ASSIGNED source = {(char)a, b, {3, 4}};
+        struct AGG_ASSIGNED target = {0};
+        target = source;
+        source.tag = 0;
+        source.value = 0;
+        source.slots[0] = 0;
+        return target.tag + target.value + target.slots[0] + target.slots[1];
+    });
+QL_AGG_FUNCTION(indeterminate_record,
+    struct AGG_INDETERMINATE { int value; };
+    int agg_assign_indeterminate(void) {
+        struct AGG_INDETERMINATE source;
+        struct AGG_INDETERMINATE target = {0};
+        target = source;
+        return target.value;
     });
 static const char string_alias_source[] =
     "const char STR_0[] = \"Az!\";\n"
@@ -455,24 +474,55 @@ TEST(CLowerAggregates, InfersAndInitializesALocalCharacterArrayFromAString) {
 }
 
 TEST(CLowerAggregates, CopiesARecordObjectBeforeTheSourceChanges) {
-    Lowered lowered;
-    ASSERT_TRUE(lowered.Open(copied_record_source, "agg_copy"));
+    struct Case {
+        const char *label;
+        const char *source;
+        const char *function;
+        std::size_t size;
+        int32_t (*reference)(int32_t, int32_t);
+    };
+    const Case cases[] = {
+        {"initializer", copied_record_source, "agg_copy",
+         sizeof(struct AGG_COPY),
+         [](int32_t a, int32_t b) { return agg_copy(a, b); }},
+        {"assignment", assigned_record_source, "agg_assign",
+         sizeof(struct AGG_ASSIGNED),
+         [](int32_t a, int32_t b) { return agg_assign(a, b); }},
+    };
     uint64_t state = UINT64_C(0x5d8fc271b304a69e);
-    for (std::size_t round = 0u; round < 64u; ++round) {
-        const int32_t a =
-            static_cast<int32_t>(NextRandom(&state) % 100u) - 50;
-        const int32_t b =
-            static_cast<int32_t>(NextRandom(&state) % 100u) - 50;
-        SCOPED_TRACE(round);
-        const Outcome run =
-            Execute(lowered.ir(), {Widen(a), Widen(b)},
-                    {sizeof(struct AGG_COPY), sizeof(struct AGG_COPY)},
-                    nullptr);
-        ASSERT_EQ(QL_STATUS_OK, run.status);
-        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
-            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
-        EXPECT_EQ(agg_copy(a, b), Returned(run.result));
+    for (const Case &item : cases) {
+        Lowered lowered;
+        SCOPED_TRACE(item.label);
+        ASSERT_TRUE(lowered.Open(item.source, item.function));
+        for (std::size_t round = 0u; round < 64u; ++round) {
+            const int32_t a =
+                static_cast<int32_t>(NextRandom(&state) % 100u) - 50;
+            const int32_t b =
+                static_cast<int32_t>(NextRandom(&state) % 100u) - 50;
+            SCOPED_TRACE(round);
+            const Outcome run =
+                Execute(lowered.ir(), {Widen(a), Widen(b)},
+                        {item.size, item.size}, nullptr);
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            EXPECT_EQ(item.reference(a, b), Returned(run.result));
+        }
     }
+}
+
+TEST(CLowerAggregates, CopyingAnIndeterminateRecordIsUndefined) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(indeterminate_record_source,
+                             "agg_assign_indeterminate"));
+    const Outcome run = Execute(
+        lowered.ir(), {},
+        {sizeof(struct AGG_INDETERMINATE),
+         sizeof(struct AGG_INDETERMINATE)},
+        nullptr);
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR, run.result.outcome);
+    EXPECT_EQ(QL_IR_INTERP_UB_GUARD_FAILED, run.result.ub_reason);
 }
 
 TEST(CLowerAggregates, CopiesACorpusStringAliasIntoAnInferredLocalArray) {

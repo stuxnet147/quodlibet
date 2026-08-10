@@ -1539,6 +1539,23 @@ IR 크기를 제한하기 위해 record 크기는 기존 bounded aggregate 상�
 
 221개의 첫 차단 가운데 111개가 성공했고 110개는 뒤의 기존 제한으로 이동했습니다. 후속 제한에는 uninitialized address escape 43개와 record-return call 33개가 포함됩니다. `tests/test_c_lower_aggregates.cpp`는 두 record object의 크기를 compiler `sizeof`로 고정하고, copy 뒤 source를 수정해도 destination snapshot이 유지되는지 같은 원문의 compiled 함수와 64개 입력에서 대조합니다. 영향 범위의 `CLower*` 시험 85/85와 전체 train 비교가 통과했습니다. 변경은 내부 record 초기화에 한정되므로 전체 CTest는 반복하지 않았습니다.
 
+### 44. 버린 whole-record assignment를 object snapshot으로 내린다
+
+같은 record type의 lvalue끼리 하는 대입문은 RHS 주소를 record carrier로 유지하고 destination에 최대 256 byte의 object representation을 복사합니다. scalar IR record 값을 만들지 않으므로 identifier, dereference, member, subscript source를 기존 memory 경로에서 처리하면서 union representation과 padding도 그대로 보존합니다. source와 destination의 type이 다르거나 대입식의 record 값을 다시 사용하는 경우, record를 pass 또는 return by value하는 경우는 계속 UNKNOWN입니다.
+
+지역 record의 기존 멤버 단위 초기화 근사는 바꾸지 않았습니다. 대신 전체 object를 읽는 carrier에만 경로 민감 초기화 predicate를 붙였습니다. 명시적 initializer나 앞선 whole-record assignment가 없는 local을 통째로 복사하면 임의 byte를 정상 값으로 답하지 않고 IR의 UB guard가 실패합니다. field-designated record member initializer도 brace-elision으로 잘못 분해하지 않고 같은 record-copy 경로를 사용합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,142 (77.45%) | **23,272 (77.88%)** |
+| 증가 | | **+130** |
+| 기존 성공 회귀 | | **0** |
+| 첫 record-value 차단 | 192 | **0** |
+| verifier 통과 | 23,142 / 23,142 | **23,272 / 23,272** |
+| status 실패 | 0 | **0** |
+
+192개의 첫 차단 가운데 130개가 성공했고 62개는 뒤의 기존 제한으로 이동했습니다. `tests/test_c_lower_aggregates.cpp`는 initializer와 assignment snapshot을 각각 같은 원문의 compiled 함수와 64개 입력에서 대조하고, 초기화되지 않은 record 복사는 interpreter의 UB로 고정합니다. `tests/test_c_lower_records.cpp`는 assignment expression 자체를 record 값으로 사용하는 경계를 계속 UNKNOWN으로 확인합니다. 영향 범위의 `CLower*` 시험 86/86과 전체 train의 함수별 비교가 통과했고 누락과 기존 성공 회귀가 없었습니다. 변경은 내부 C lowering의 record memory 경로에 한정되므로 전체 CTest는 반복하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1547,11 +1564,11 @@ IR 크기를 제한하기 위해 record 크기는 기존 bounded aggregate 상�
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 2,544
-- `uninitialized_read` 2,268
-- `unsupported_pointer` 581
-- `unsupported_control_flow` 530
-- `unsupported_call` 378
+- `unsupported_type` 2,354
+- `uninitialized_read` 2,269
+- `unsupported_pointer` 637
+- `unsupported_control_flow` 531
+- `unsupported_call` 380
 
 ## 조율자에게 요청할 것
 
