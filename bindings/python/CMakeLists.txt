@@ -75,11 +75,30 @@ foreach(configuration IN LISTS CMAKE_CONFIGURATION_TYPES)
             "${CMAKE_CURRENT_BINARY_DIR}/package/quodlibet")
 endforeach()
 
-add_custom_command(TARGET _quodlibet POST_BUILD
+# The packaged __init__.py is an output that depends on the source file, not
+# something that rides along when the extension happens to relink.
+#
+# As a POST_BUILD command on _quodlibet it only ran when the extension was
+# rebuilt, and __init__.py is not one of its inputs. Editing only Python left
+# the built package holding the previous file, `ninja` reported no work to do,
+# and the binding tests then ran against code that was not the source. A test
+# suite that can silently test a stale copy is worse than one that fails: it
+# passes for the wrong reason. Measured on this tree before the change.
+set(ql_python_package_init
+    "${CMAKE_CURRENT_BINARY_DIR}/package/quodlibet/__init__.py")
+add_custom_command(
+    OUTPUT "${ql_python_package_init}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/quodlibet/__init__.py"
-        "${CMAKE_CURRENT_BINARY_DIR}/package/quodlibet/__init__.py"
+        "${ql_python_package_init}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/quodlibet/__init__.py"
+    COMMENT "Staging the quodlibet Python package"
     VERBATIM)
+add_custom_target(ql_python_package ALL
+    DEPENDS "${ql_python_package_init}")
+# The package is only usable with the extension beside it, so building one
+# builds the other.
+add_dependencies(ql_python_package _quodlibet)
 
 if(MSVC)
     target_compile_options(_quodlibet PRIVATE /W4)
