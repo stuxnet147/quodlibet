@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-항목 5. 설치 패키지. Windows 와 Linux 에서 `cmake --install` 결과가 자기완결인지, 실행 파일 옆 relocatable Bitwuzla 탐색이 실제로 작동하는지.
+항목 6. 지원 compiler/target matrix 자동 검증. `D:/projects/machine-model/datasets/records-local/summary.json` 의 compilers/optimizations 를 읽어 `ASM2C_GNU_V1` 프로파일의 provenance 표와 대조하는 시험.
 
 ## 착수 시 조사한 것 (2026-08-10)
 
@@ -157,6 +157,22 @@ CMake 변경이 필요 없었습니다. 6개 시험 전부 통과.
 
 CTest 435/435 통과.
 
+### 7. 설치 패키지와 relocatable Bitwuzla 탐색 (`scripts/check-install.sh`, `docs/deploy/packaging.md`)
+
+읽어서 판단하지 않고 **실제로 설치하고 옮겨서 돌려 보는** 스크립트를 만들었습니다. PASS/FAIL 로 찍고 하나라도 실패하면 exit 이 0 이 아닙니다.
+
+**통과: relocatable Bitwuzla 탐색.** prefix 전체를 다른 경로로 옮겨도 실행 파일 옆에서 Bitwuzla 를 찾습니다. 이 확인에는 함정이 있습니다. 개발 기계에는 빌드 시점 절대 경로가 살아 있어 옆을 안 보고 그리로 되돌아가도 성공처럼 보입니다. 그래서 **음성 검사**를 넣었습니다. 옆의 복사본을 Bitwuzla 가 아닌 것으로 바꾸면 실행이 실패해야 하고, 실제로 실패했으므로 옆의 것을 쓴 것이 확정됩니다.
+
+**실패 1: 설치된 산출물만으로 소비자가 링크할 수 없습니다.** 설치된 `quodlibet_static` 은 Quodlibet 자기 오브젝트 38개만 담고 libuv, yyjson, tree-sitter, BLAKE3, xxHash 가 `lib/` 에 없습니다. `install(EXPORT)` 나 `quodlibet-config.cmake` 도 없어 `find_package(quodlibet)` 자체가 존재하지 않습니다. `AGENTS.MD` 는 `cmake/` 를 package 지원 모듈 자리로 적고 있지만 그 디렉터리가 저장소에 없습니다.
+
+플러그인 작성자는 막히지 않습니다. 플러그인은 헤더 include 와 심볼 하나 export 로 충분하고 host 가 적재 시점에 호출을 해결합니다. 막히는 것은 Quodlibet 을 라이브러리로 링크하려는 소비자입니다. **제가 쓴 `examples/plugin/README.md` 가 `find_package(quodlibet REQUIRED)` 를 예시로 적고 있었는데 그것이 동작하지 않으므로 사실대로 고쳤습니다.** 예제가 거짓말하는 것이 예제가 낡은 것보다 나쁩니다.
+
+고치는 방법 셋(package config + 아카이브 동반 설치 / 벤더 오브젝트를 하나로 합치기 / 공유 라이브러리를 설치 기본으로)을 문서에 적었고 **루트 `CMakeLists.txt` 가 조율자 소유라 고르지 않았습니다.**
+
+**실패 2: prefix 뿌리에 `quodlibet/` 디렉터리가 생깁니다.** 파이썬 확장이 `<prefix>/quodlibet/_quodlibet.pyd` 로 설치되어 다른 패키지와 공유하는 prefix 의 뿌리에 이름을 차지합니다. `bindings/python` 은 W4 소유입니다.
+
+**아직 재지 않은 것: Linux.** 스크립트는 `linux-clang` 을 그대로 받지만 표는 Windows 실측입니다. Linux 는 rpath 가 추가 축이라 별도로 재야 합니다.
+
 ## 내린 설계 결정
 
 - **새 target 을 `fuzz_targets.h` 가 아니라 별도 `fuzz_contract_targets.h` 에 둡니다.** 근거: `fuzz_targets.h` 와 `tests/test_fuzz.cpp` 는 W1 이 소유하는 표면(파서/로어링/IR)의 기록이고, W7 이 더하는 것은 계약 표면이라 소유가 다릅니다. `QL_FUZZ_REQUIRE`/`QL_FUZZ_REACHED` 규약은 그대로 따라서 두 헤더가 같은 규율 아래 있습니다.
@@ -244,5 +260,5 @@ campaign 은 그동안 두 번째 serialize 부터의 고정점을 검사합니�
 2. (완료) solver fault-injection 확대. in-process 와 process transport 양쪽
 3. (완료) 동시성 측정 -> `docs/perf/concurrency.md`
 4. (완료) ABI 호환 시험과 plugin SDK 예제
-5. (진행 중) 설치 패키지와 relocatable Bitwuzla 탐색
-6. compiler/target matrix 자동 검증 (`D:/projects/machine-model/datasets/records-local/summary.json`)
+5. (부분 완료) 설치 패키지. 측정과 문서화는 끝났고 relocatable 탐색은 통과. 남은 두 결함은 루트 `CMakeLists.txt`(조율자)와 `bindings/python`(W4) 소유라 판단 대기
+6. (진행 중) compiler/target matrix 자동 검증 (`D:/projects/machine-model/datasets/records-local/summary.json`)

@@ -53,10 +53,9 @@ cmake --build --preset windows-clang --parallel
 The module lands next to the other build outputs as
 `ql_example_plugin.dll` on Windows and `ql_example_plugin.so` elsewhere.
 
-Out of tree, against an installed Quodlibet, the whole build is:
+In tree, against this repository, the whole build is:
 
 ```cmake
-find_package(quodlibet REQUIRED)
 add_library(my_plugin MODULE my_plugin.c)
 target_link_libraries(my_plugin PRIVATE quodlibet::quodlibet)
 set_target_properties(my_plugin PROPERTIES PREFIX "" C_VISIBILITY_PRESET hidden)
@@ -65,6 +64,16 @@ set_target_properties(my_plugin PROPERTIES PREFIX "" C_VISIBILITY_PRESET hidden)
 Hidden visibility matters: `QL_PLUGIN_EXPORT` marks the one symbol the host
 looks up, and hiding the rest keeps a plugin from accidentally exporting names
 that collide with the host's.
+
+**Out of tree, against an installed Quodlibet, this does not work yet.**
+`cmake --install` writes the headers and the library but no package
+configuration, so there is no `find_package(quodlibet)` to call, and the
+installed archive does not carry the vendored dependencies it needs. A plugin
+only has to include `quodlibet/plugin.h` and export one symbol, so it can be
+compiled against the installed headers without linking Quodlibet at all - the
+host resolves the calls at load time. What is missing is the packaging, not
+the plugin interface. `scripts/check-install.sh` measures exactly this and
+`docs/deploy/packaging.md` records where it stands.
 
 ## Loading it
 
