@@ -109,6 +109,16 @@ QL_PTR_FUNCTION(cast_to_bytes, int ptr_bytes(int *p, int i) {
 QL_PTR_FUNCTION(cast_from_bits, int ptr_from_bits(unsigned long long address) {
     return ((int *)address)[0];
 });
+QL_PTR_FUNCTION(linked_walk,
+    struct PTR_NODE { int value; struct PTR_NODE *next; };
+    int ptr_linked_walk(struct PTR_NODE *node, int limit) {
+        int sum = 0;
+        while (node != 0 && limit-- > 0) {
+            sum += node->value;
+            node = node->next;
+        }
+        return sum;
+    });
 static const char void_arithmetic_source[] =
     "long ptr_void_distance(void *p, int i) {\n"
     "    void *q = p + i;\n"
@@ -597,6 +607,39 @@ TEST(CLowerPointers, LowersADoubleIndirectionWithoutAStatusFailure) {
         "}\n";
     Lowered lowered;
     ASSERT_TRUE(lowered.Open(source, "deref_twice"));
+}
+
+TEST(CLowerPointers, CarriesAChangingPointerThroughALoopAuthorityRegion) {
+    Lowered lowered;
+    PTR_NODE reference[3]{};
+    std::vector<uint8_t> image(sizeof(reference), 0u);
+
+    for (std::size_t index = 0u; index < 3u; ++index) {
+        const int32_t value = static_cast<int32_t>(7u + index * 5u);
+        const uint64_t next =
+            index + 1u < 3u ? kBase + (index + 1u) * sizeof(PTR_NODE) : 0u;
+        reference[index].value = value;
+        reference[index].next =
+            index + 1u < 3u ? &reference[index + 1u] : nullptr;
+        std::memcpy(image.data() + index * sizeof(PTR_NODE) +
+                        offsetof(PTR_NODE, value),
+                    &value, sizeof(value));
+        std::memcpy(image.data() + index * sizeof(PTR_NODE) +
+                        offsetof(PTR_NODE, next),
+                    &next, sizeof(next));
+    }
+
+    ASSERT_TRUE(lowered.Open(linked_walk_source, "ptr_linked_walk"));
+    for (int32_t limit : {0, 1, 2, 3, 5}) {
+        const Outcome run =
+            Execute(lowered.ir(), kBase,
+                    {static_cast<uint64_t>(static_cast<uint32_t>(limit))},
+                    kBase, image.size(), image.data(), nullptr);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(ptr_linked_walk(reference, limit), Returned(run.result));
+    }
 }
 
 /* A finite object table is still a resource boundary, but 32 entries rejected

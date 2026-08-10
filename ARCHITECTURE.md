@@ -295,9 +295,12 @@ Pointer arguments, globals, strings, and local storage introduce descriptors
 before the body. An access through pointer bits read from memory, returned by
 a call, or cast from an integer introduces one auxiliary descriptor at that
 syntactic access site, because the source signature cannot name its target
-object. This inventory is finite even when the CFG is cyclic; a loop-carried
-pointer must keep the same object authority across its backedge. The lowering
-admits at most 128 descriptors and reports `UNKNOWN` above that explicit bound.
+object. This inventory is finite even when the CFG is cyclic. A pointer that
+is assigned by a loop is widened before its header PHI; every access through
+that PHI receives one fixed auxiliary authority region whose contiguous span
+must contain every address reached at that syntax site across all iterations.
+It is not a fresh descriptor per iteration. The lowering admits at most 128
+descriptors and reports `UNKNOWN` above that explicit bound.
 An auxiliary descriptor may exactly alias an earlier descriptor. This covers
 a derived pointer back into an existing object without admitting partial
 overlaps. Loading, comparing, or returning pointer bits without accessing

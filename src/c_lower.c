@@ -3531,8 +3531,8 @@ static ql_status admit_loaded_pointer(lower_context *context, size_t node,
   if (context->dynamic_object_count >= LOWER_MAX_DYNAMIC_OBJECTS) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-        "this acyclic body accesses more external pointer objects than the "
-        "bounded object table carries",
+        "this function accesses more external pointer authority regions than "
+        "the bounded object table carries",
         error);
   }
   status = add_dynamic_object(context, error);
@@ -10346,9 +10346,16 @@ append_loop_backedge(lower_context *context, const lower_loop_phis *phis,
     if (context->variables[index].type.kind == QL_C_SCALAR_POINTER &&
         (entry->has_object[index] != backedge->has_object[index] ||
          entry->may_admit_object[index] != backedge->may_admit_object[index])) {
-      return lower_unknown(
-          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-          "loop-carried pointer changes its object authority", error);
+      /* A pointer identified as loop-carried before the body was lowered uses
+         one conservative authority region at every access site. Its concrete
+         producer on the backedge may still be a parameter, a loaded pointer,
+         or null without changing that header contract. */
+      if (entry->has_object[index] != 0u ||
+          entry->may_admit_object[index] == 0u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+            "loop-carried pointer changes its object authority", error);
+      }
     }
     status = ql_ir_builder_append_phi_incoming(
         context->builder, phis->variables[index], backedge->values[index],
@@ -10382,6 +10389,57 @@ static ql_status lower_discarded_expression(lower_context *context, size_t node,
     return status;
   }
   return emit_ub_guard(context, &value, error);
+}
+
+/* A pointer assigned by a loop can name a different address on its next
+   iteration. Mark only such visible SSA variables before creating the header
+   PHIs, so every access through the PHI admits a fixed authority region large
+   enough to contain all addresses that syntactic access reaches. Stack-backed
+   pointer variables travel through the memory PHI and do not need this scalar
+   sidecar fixed point. */
+static void widen_loop_pointer_authority(lower_context *context, size_t node,
+                                         size_t variable_count) {
+  size_t end = subtree_end(context, node);
+  size_t at;
+
+  for (at = node + 1u; at < end; ++at) {
+    const char *kind = context->nodes[at].view.kind;
+    size_t target;
+    size_t guard = 0u;
+    ql_source_range range;
+    size_t index;
+
+    if (strcmp(kind, "assignment_expression") == 0) {
+      target = direct_field_child(context, at, "left");
+    } else if (strcmp(kind, "update_expression") == 0) {
+      target = direct_field_child(context, at, "argument");
+    } else {
+      continue;
+    }
+    while (target != SIZE_MAX && guard++ < 64u &&
+           strcmp(context->nodes[target].view.kind,
+                  "parenthesized_expression") == 0) {
+      target = first_named_child(context, target);
+    }
+    if (target == SIZE_MAX ||
+        strcmp(context->nodes[target].view.kind, "identifier") != 0) {
+      continue;
+    }
+    range = context->nodes[target].view.range;
+    for (index = variable_count; index != 0u; --index) {
+      lower_variable *variable = &context->variables[index - 1u];
+      if (variable->type.kind != QL_C_SCALAR_POINTER ||
+          variable->is_stack != 0u ||
+          variable->name_size != range.end_byte - range.start_byte ||
+          memcmp(variable->name, context->source + range.start_byte,
+                 variable->name_size) != 0) {
+        continue;
+      }
+      variable->has_object = 0u;
+      variable->may_admit_object = 1u;
+      break;
+    }
+  }
 }
 
 static ql_status
@@ -10478,6 +10536,7 @@ static ql_status lower_pretest_loop(lower_context *context, size_t node,
     }
   }
   variable_count = context->variable_count;
+  widen_loop_pointer_authority(context, node, variable_count);
   breaks.parent = parent_break;
   breaks.variable_count = variable_count;
   continues.variable_count = variable_count;
@@ -10662,6 +10721,7 @@ static ql_status lower_do_loop(lower_context *context, size_t node,
   breaks.parent = parent_break;
   breaks.variable_count = variable_count;
   continues.variable_count = variable_count;
+  widen_loop_pointer_authority(context, node, variable_count);
   status = save_state(context, variable_count, &entry_state, error);
   if (status == QL_STATUS_OK) {
     status =
@@ -11686,14 +11746,15 @@ static ql_status add_object(lower_context *context, const char *label,
 }
 
 /* Pointer bits read from memory, returned by a call, or cast from an integer
-   may name a live object that is not one of the function's pointer arguments,
-   globals, strings, or local slots. In an acyclic body each access through
-   such a pointer can contribute at most one distinct object to an execution,
-   so one symbolic object per access is a complete finite table up to
-   LOWER_MAX_DYNAMIC_OBJECTS. Merely comparing or returning the bits does not
-   add an object. The object is added after ordinary IR values already exist,
-   through the private builder path; the artifact and verifier allow that,
-   while the public builder retains its parameters-first contract. */
+   may name storage that is not one of the function's pointer arguments,
+   globals, strings, or local slots. Each syntactic access through such a
+   pointer receives one fixed authority region. In a loop that region must be
+   large enough to contain every address the access reaches across iterations;
+   it is not a fresh descriptor per iteration. Merely comparing or returning
+   the bits does not add a region. The descriptor is added after ordinary IR
+   values already exist, through the private builder path; the artifact and
+   verifier allow that, while the public builder retains its parameters-first
+   contract. */
 static ql_status add_dynamic_object(lower_context *context, ql_error *error) {
   lower_type u64 = address_type();
   lower_object *object;

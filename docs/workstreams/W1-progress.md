@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **27,907 / 29,880 (93.40%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_pointer` 447, `unsupported_call` 398, `unsupported_control_flow` 372, `unsupported_type` 369입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,203 / 29,880 (94.39%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 399, `unsupported_control_flow` 372, `unsupported_type` 369, `unsupported_pointer` 150입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1942,6 +1942,25 @@ source signature에는 별도 `FLOAT` kind와 32/64 bit width를 기록하고 lo
 
 `tests/test_ir_differential.cpp`는 `for`, `while`, `do`에서 뒤쪽 label로 빠지는 함수를 실제 컴파일된 C와 edge 및 random 입력에서 대조합니다. `tests/test_c_lower.cpp`는 loop 안 nested label을 계속 UNKNOWN으로 고정합니다. 변경은 loop CFG와 goto 상태 합류에 닿으므로 C lowering, parser reuse, interpreter, compiled differential, verifier와 기존 forward-goto product 시험 141/141을 실행했습니다. solver, plugin, EGraph를 포함한 전체 CTest는 실행하지 않았고, 전체 train coverage만 G9 성공률과 기존 성공 사례 회귀를 확인하기 위해 실행했습니다.
 
+### 66. loop-carried pointer에 반복 전체의 authority region을 준다
+
+pointer 값은 SSA PHI로 loop backedge를 이미 통과했지만, 접근을 정당화하는 object authority sidecar가 parameter pointer의 known object에서 memory load 또는 call 결과의 auxiliary object로 바뀌면 거부했습니다. 이 sidecar는 IR 값이 아니므로 body를 한 번 내린 뒤 header 의미를 바꿀 수 없습니다.
+
+loop subtree에서 직접 대입 또는 증감되는 visible SSA pointer를 header PHI 전에 찾고, 해당 pointer만 보수적인 dynamic authority로 넓힙니다. 그 pointer를 dereference하는 각 syntactic access는 반복마다 descriptor를 새로 만들지 않고 고정된 auxiliary region 하나를 사용합니다. caller가 제공하는 그 contiguous region은 해당 접근이 모든 반복에서 도달하는 주소를 포함해야 합니다. null과 region 밖 접근은 기존 `UB_GUARD`가 막고, pointer bits를 비교하거나 반환만 하면 region을 추가하지 않습니다. stack-backed pointer는 memory PHI를 지나므로 이 scalar fixed-point 대상이 아닙니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 27,907 (93.40%) | **28,203 (94.39%)** |
+| 증가 | | **+296** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_pointer` | 447 | **150** |
+| verifier 통과 | 27,907 / 27,907 | **28,203 / 28,203** |
+| status 실패 | 0 | **0** |
+
+기존 loop authority 첫 차단 297개를 먼저 재측정해 296개가 성공했고, 1개는 선언 없는 callee라는 다음 제한으로 이동했습니다. 전체 train 순증도 296개였으며 기존 성공 회귀와 누락 또는 추가 행은 0개였습니다.
+
+`tests/test_c_lower_pointers.cpp`는 실제 C linked list와 같은 layout의 연속 memory image를 만들고, 다음 node pointer가 반복마다 바뀌는 합계 함수를 compiled C와 interpreter에서 대조합니다. 변경은 loop pointer 접근과 동적 object inventory에 닿으므로 C lowering, pointer 및 record memory 실행, loop interpreter, compiled differential, verifier 영향 범위 141/141을 실행했습니다. cyclic CFG를 받지 않는 product proof와 plugin, EGraph를 포함한 전체 CTest는 실행하지 않았고, 전체 train coverage만 G9 성공률과 기존 성공 사례 회귀를 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1950,10 +1969,10 @@ source signature에는 별도 `FLOAT` kind와 32/64 bit width를 기록하고 lo
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_pointer` 447
-- `unsupported_call` 398
+- `unsupported_call` 399
 - `unsupported_control_flow` 372
 - `unsupported_type` 369
+- `unsupported_pointer` 150
 - `undeclared_identifier` 138
 
 ## 조율자에게 요청할 것
@@ -1970,8 +1989,8 @@ source signature에는 별도 `FLOAT` kind와 32/64 bit width를 기록하고 lo
 
 ## 다음에 할 것
 
-1. loop-carried pointer authority는 PHI가 object identity와 admission 상태를 보존하도록 만든 뒤 수용합니다.
-2. record by-value argument와 return은 source signature, CALL result, object copy 계약을 함께 정한 뒤 수용합니다.
-3. 선언 없는 callee와 identifier는 추출 context에서 복구 가능한 근거가 있는지 먼저 분리합니다.
-4. 남은 nested 및 backward goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 확장합니다.
+1. record by-value argument와 return은 source signature, CALL result, object copy 계약을 함께 정한 뒤 수용합니다.
+2. 선언 없는 callee와 identifier는 추출 context에서 복구 가능한 근거가 있는지 먼저 분리합니다.
+3. 남은 nested 및 backward goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 확장합니다.
+4. 세 단계 pointer와 address-of는 실제 접근에 필요한 indirection depth를 별도로 계산해 확장합니다.
 5. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.
