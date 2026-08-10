@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,446 / 29,880 (78.47%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,296, `unsupported_type` 2,125, `unsupported_pointer` 634입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,453 / 29,880 (78.49%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,296, `unsupported_type` 2,118, `unsupported_pointer` 634입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1605,6 +1605,23 @@ null은 새 object authority를 요구하지 않습니다. 따라서 다른 arm�
 
 첫 차단 202개는 전부 `enum_specifier`였고, 좁은 subset에서 140개가 성공했습니다. 나머지 62개는 uninitialized address escape 26개, call 17개, control flow 10개, pointer 6개, 다른 type 제한 3개로 이동했습니다. `tests/test_c_lower_expressions.cpp`는 음수와 양수 enumerator 중 하나로 지역 enum을 초기화하고 compiled 함수와 무작위 입력 512개에서 대조합니다. 영향 범위의 `CLower*` 시험 89/89와 전체 train 함수별 비교가 통과했고 누락, 예상 밖 행, 기존 성공 회귀가 없었습니다. 변경은 지역 enum type 관문에만 한정되므로 전체 CTest는 실행하지 않았습니다.
 
+### 48. 블록 범위 함수 원형을 지역 객체와 구분한다
+
+함수 본문 안의 `extern int callee(int);`와 `int callee(int);`는 실행 시 저장 공간을 만드는 지역 객체가 아니라 함수 원형입니다. 기존 callee 수집 단계가 이 선언을 이미 직접 호출의 타입 계약으로 기록했지만, 이후 지역 선언 lowering이 같은 구문을 다시 객체로 해석해 storage 또는 function-local 진단으로 거부하고 있었습니다.
+
+지역 선언의 모든 직접 declarator가 callee 수집 단계에서 확인한 함수 원형이고 storage class가 없거나 `extern`일 때만 객체 lowering을 건너뜁니다. 함수 원형과 실제 `extern` 객체가 섞인 선언, 함수 포인터 객체, 다른 storage class는 기존 경로에 남겨 외부 객체 memory semantics를 추측하지 않습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,446 (78.47%) | **23,453 (78.49%)** |
+| 증가 | | **+7** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_type` | 2,125 | **2,118** |
+| verifier 통과 | 23,446 / 23,446 | **23,453 / 23,453** |
+| status 실패 | 0 | **0** |
+
+`extern` 원형 진단 4개를 좁게 재측정해 모두 성공한 뒤 전체 train을 비교했습니다. 전체 비교에서 저장 지정자가 없는 블록 범위 원형 3개도 추가로 성공했으며 원문이 실제 prototype임을 확인했습니다. `tests/test_c_lower_calls.cpp`는 두 형태를 compiled 실행과 대조하고, 함수 원형과 실제 `extern` 객체가 섞인 선언은 계속 UNKNOWN으로 고정합니다. 영향 범위의 `CLowerCalls.*` 9/9와 `CLower*` 89/89가 통과했고 전체 train 함수별 비교에서 누락, 예상 밖 진단 변경, 기존 성공 회귀가 없었습니다. 변경은 C 지역 선언과 callee 수집의 접점에 한정되므로 전체 CTest는 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1614,7 +1631,7 @@ null은 새 object authority를 요구하지 않습니다. 따라서 다른 arm�
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
 - `uninitialized_read` 2,296
-- `unsupported_type` 2,125
+- `unsupported_type` 2,118
 - `unsupported_pointer` 634
 - `unsupported_control_flow` 545
 - `unsupported_call` 397

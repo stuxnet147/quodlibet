@@ -77,6 +77,16 @@ QL_CALL_FUNCTION(discarded, int CALLEE_double(int);
     });
 QL_CALL_FUNCTION(widening, int CALLEE_double(int);
     int call_widen(short a) { return CALLEE_double(a); });
+QL_CALL_FUNCTION(block_scope_prototype,
+    int call_block_scope_prototype(int a) {
+        extern int CALLEE_double(int);
+        return CALLEE_double(a) + 3;
+    });
+QL_CALL_FUNCTION(block_scope_plain_prototype,
+    int call_block_scope_plain_prototype(int a) {
+        int CALLEE_double(int);
+        return CALLEE_double(a) - 4;
+    });
 QL_CALL_FUNCTION(variadic, int CALLEE_variadic(int, ...);
     int call_variadic(short a, unsigned char b) {
         return CALLEE_variadic(3, a, b);
@@ -427,6 +437,16 @@ TEST(CLowerCalls, MatchesCompiledExecutionIncludingTheCallSequence) {
              return call_widen(static_cast<short>(a));
          },
          {"CALLEE_double"}},
+        {"block-scope-prototype", block_scope_prototype_source,
+         "call_block_scope_prototype", 1,
+         [](int32_t a, int32_t) { return call_block_scope_prototype(a); },
+         {"CALLEE_double"}},
+        {"block-scope-plain-prototype", block_scope_plain_prototype_source,
+         "call_block_scope_plain_prototype", 1,
+         [](int32_t a, int32_t) {
+             return call_block_scope_plain_prototype(a);
+         },
+         {"CALLEE_double"}},
         {"variadic", variadic_source, "call_variadic", 2,
          [](int32_t a, int32_t b) {
              return call_variadic(static_cast<short>(a),
@@ -639,6 +659,11 @@ TEST(CLowerCalls, RefusesCallsItCannotCheckAgainstADeclaration) {
         {"int f(int a) { return missing(a); }", "f"},
         /* The wrong number of arguments is a mistake, not a semantics. */
         {"int CALLEE_sum(int, int);\nint f(int a) { return CALLEE_sum(a); }",
+         "f"},
+        /* A real extern object mixed with a prototype still needs external
+           object memory semantics. */
+        {"int f(int a) { extern int CALLEE_double(int), external_value; "
+         "return CALLEE_double(a) + external_value; }",
          "f"},
     };
     for (const Case &item : cases) {

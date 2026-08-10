@@ -7550,6 +7550,53 @@ static ql_status initialize_object(lower_context *context, size_t node,
   return QL_STATUS_OK;
 }
 
+/* A block-scope function declaration introduces no run-time object. Callee
+   collection has already identified each direct function declarator, so only
+   skip the declaration when every declarator is one of those prototypes.
+   This deliberately leaves mixed declarations and function-pointer objects
+   on the ordinary local-object path. */
+static ql_status declaration_is_only_function_prototypes(
+    lower_context *context, size_t node, uint32_t *output, ql_error *error) {
+  size_t end = subtree_end(context, node);
+  size_t index;
+  size_t declarator_count = 0u;
+  size_t callee_count = 0u;
+
+  *output = 0u;
+  for (index = node + 1u; index < end; ++index) {
+    const char *kind;
+    char *text;
+
+    if (context->nodes[index].parent != node) {
+      continue;
+    }
+    kind = context->nodes[index].view.kind;
+    if (strcmp(kind, "storage_class_specifier") == 0) {
+      text = copy_node_text(context, index);
+      if (text == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+      }
+      if (strcmp(text, "extern") != 0) {
+        context->allocator->deallocate(context->allocator->user_data, text);
+        return QL_STATUS_OK;
+      }
+      context->allocator->deallocate(context->allocator->user_data, text);
+    }
+    if (context->nodes[index].view.field_name != NULL &&
+        strcmp(context->nodes[index].view.field_name, "declarator") == 0) {
+      ++declarator_count;
+    }
+  }
+  for (index = 0u; index < context->callee_count; ++index) {
+    if (context->callees[index].declaration_node == node) {
+      ++callee_count;
+    }
+  }
+  *output = declarator_count != 0u && declarator_count == callee_count;
+  return QL_STATUS_OK;
+}
+
 static ql_status lower_declaration(lower_context *context, size_t node,
                                    ql_error *error) {
   size_t type_node = direct_field_child(context, node, "type");
@@ -7559,9 +7606,15 @@ static ql_status lower_declaration(lower_context *context, size_t node,
   lower_type declarator_type;
   uint32_t is_const;
   uint32_t is_static;
+  uint32_t only_function_prototypes;
   size_t declarator_count = 0u;
   ql_status status;
 
+  status = declaration_is_only_function_prototypes(
+      context, node, &only_function_prototypes, error);
+  if (status != QL_STATUS_OK || only_function_prototypes != 0u) {
+    return status;
+  }
   if (type_node == SIZE_MAX) {
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION,
                          node, "local declaration has no type", error);
