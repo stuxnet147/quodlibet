@@ -1060,8 +1060,9 @@ static int literal_hex_digit(char character, unsigned *value) {
    letter and the octal and hex forms are decoded; anything else is refused
    rather than passed through as its own text, because a literal whose bytes
    are wrong is a wrong object, not a missing one. */
-static int decode_string_literal(const char *text, size_t size,
-                                 unsigned char *out, size_t *out_size) {
+static int decode_quoted_literal(const char *text, size_t size,
+                                 char delimiter, unsigned char *out,
+                                 size_t *out_size) {
   size_t index = 0u;
   size_t written = 0u;
 
@@ -1072,12 +1073,12 @@ static int decode_string_literal(const char *text, size_t size,
     if (c == 'L' || c == 'u' || c == 'U') {
       return 0;
     }
-    if (c != '"') {
+    if (c != delimiter) {
       ++index;
       continue;
     }
     ++index;
-    while (index < size && text[index] != '"') {
+    while (index < size && text[index] != delimiter) {
       unsigned char value;
       if (written >= LOWER_MAX_STRING_BYTES) {
         return 0;
@@ -1174,6 +1175,11 @@ static int decode_string_literal(const char *text, size_t size,
   out[written] = 0u;
   *out_size = written + 1u;
   return 1;
+}
+
+static int decode_string_literal(const char *text, size_t size,
+                                 unsigned char *out, size_t *out_size) {
+  return decode_quoted_literal(text, size, '"', out, out_size);
 }
 
 static ql_status collect_string_literals(lower_context *context,
@@ -6891,31 +6897,54 @@ static ql_status lower_expression(lower_context *context, size_t node,
     unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
     size_t decoded_size = 0u;
     char *text = copy_node_text(context, node);
+    size_t character_count;
+    uint32_t value = 0u;
+    int is_wide = 0;
     ql_status status;
     int ok;
     if (text == NULL) {
       ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
       return QL_STATUS_OUT_OF_MEMORY;
     }
-    /* A character constant has type int in C, and its value is the
-       character's. The same decoder reads it, with the quotes swapped. */
+    /* ASM2C_GNU_V1 fixes the ordinary multi-character convention used by
+       GCC and Clang on the target: one through four decoded bytes are packed
+       from left to right, most significant first. A narrow single byte still
+       follows signed plain-char promotion. The corpus's wide constants are
+       single-byte ASCII or escapes; x86-64 Linux wchar_t is signed 32-bit,
+       so those code values already have the result type below. */
     {
       size_t length = strlen(text);
-      size_t at;
-      for (at = 0u; at < length; ++at) {
-        if (text[at] == '\'') {
-          text[at] = '"';
-        }
+      if (length >= 2u && text[0] == 'L' && text[1] == '\'') {
+        is_wide = 1;
+        memmove(text, text + 1u, length);
+        --length;
+      } else if (length != 0u &&
+                 (text[0] == 'u' || text[0] == 'U')) {
+        ok = 0;
+        goto decoded_character;
       }
-      ok = decode_string_literal(text, length, decoded, &decoded_size);
+      ok = decode_quoted_literal(text, length, '\'', decoded, &decoded_size);
     }
+  decoded_character:
     context->allocator->deallocate(context->allocator->user_data, text);
-    if (!ok || decoded_size != 2u) {
+    character_count = decoded_size == 0u ? 0u : decoded_size - 1u;
+    if (!ok || character_count == 0u || character_count > 4u ||
+        (is_wide != 0 && character_count != 1u)) {
       return lower_unknown(
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
-          "a multi-character or wide character constant is outside "
-          "this slice",
+          "a prefixed character outside the wide ASCII slice or a character "
+          "constant longer than four bytes is outside this slice",
           error);
+    }
+    if (is_wide != 0) {
+      value = decoded[0];
+    } else if (character_count == 1u) {
+      value = (uint32_t)(int32_t)(int8_t)decoded[0];
+    } else {
+      size_t at;
+      for (at = 0u; at < character_count; ++at) {
+        value = (value << 8u) | decoded[at];
+      }
     }
     memset(output, 0, sizeof(*output));
     output->type = make_integer_type(32u, 3u, 1u);
@@ -6924,12 +6953,8 @@ static ql_status lower_expression(lower_context *context, size_t node,
       return status;
     }
     output->defined = context->true_value;
-    /* ASM2C_GNU_V1 has signed plain char. Clang and GCC therefore sign-extend
-       an ordinary one-byte character constant into its C `int` type. String
-       literals keep the decoded byte unchanged in memory. */
-    return add_uint_constant(context, output->type,
-                             (uint64_t)(int64_t)(int8_t)decoded[0],
-                             &output->value, error);
+    return add_uint_constant(context, output->type, value, &output->value,
+                             error);
   }
   if (strcmp(kind, "conditional_expression") == 0) {
     return lower_conditional_expression(context, node, output, error);

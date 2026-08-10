@@ -138,6 +138,22 @@ QL_EXPR_FUNCTION(unsigned_negative_literal,
 QL_EXPR_FUNCTION(character_escapes, int expr_character_escapes(int a, int b) {
     return a + b + '\xc0' + '\101' + '\n';
 });
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wmultichar"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmultichar"
+#endif
+QL_EXPR_FUNCTION(character_constants,
+    int expr_character_constants(int a, int b) {
+        return a + b + 'MUL' + L'9';
+    });
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 QL_EXPR_FUNCTION(void_assignment, int expr_void_assignment(int a, int b) {
     (void)(a = b);
     return a;
@@ -383,6 +399,10 @@ const Case kCases[] = {
      &Always},
     {"character-escapes", character_escapes_source, "expr_character_escapes",
      [](int32_t a, int32_t b) { return expr_character_escapes(a, b); },
+     &Always},
+    {"character-constants", character_constants_source,
+     "expr_character_constants",
+     [](int32_t a, int32_t b) { return expr_character_constants(a, b); },
      &Always},
     {"void-assignment", void_assignment_source, "expr_void_assignment",
      [](int32_t a, int32_t b) { return expr_void_assignment(a, b); },

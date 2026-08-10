@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,530 / 29,880 (78.75%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,305, `unsupported_type` 2,095, `unsupported_pointer` 663입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,573 / 29,880 (78.89%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,308, `unsupported_type` 2,100, `unsupported_pointer` 663입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1747,6 +1747,25 @@ callback 관련 78개 subset에서 성공은 34개에서 49개로 늘었습니�
 
 `tests/test_c_lower_calls.cpp`는 실제 `CALLEE_double` 주소를 callback parameter로 주고 compiled C와 interpreter의 반환값 및 간접-call event를 대조하며, null target이 event 없이 UB가 되는 것도 고정합니다. 변경은 C variable 수명과 call lowering에 닿으므로 `CLower*`와 `CReuse*` 98/98을 실행했습니다. source-signature, solver, transport, plugin은 바뀌지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 G9 수용률과 기존 성공 회귀를 확인하기 위해 실행했습니다.
 
+### 56. wide ASCII와 최대 4-byte character constant 값을 고정한다
+
+ASM2C_GNU_V1의 ordinary multi-character constant는 x86-64 Linux의 GCC와 Clang 규칙대로 1개부터 4개의 decoded byte를 왼쪽부터 most-significant 순서로 32비트 `int`에 pack합니다. 한 byte ordinary constant는 기존처럼 signed plain `char`에서 `int`로 승격합니다. `L'X'`와 `L'\\0'`처럼 한 decoded ASCII byte인 wide constant는 target의 signed 32-bit `wchar_t` 값으로 내립니다. `u`와 `U` prefix, wide non-ASCII, 4 byte를 넘는 constant는 계속 UNKNOWN입니다.
+
+string과 character literal은 escape 문법을 공유하지만 delimiter가 다릅니다. 기존 구현은 character의 모든 작은따옴표를 큰따옴표로 바꾸어 `'"'` 같은 값이 delimiter로 오인될 수 있었습니다. decoder가 실제 delimiter를 인자로 받게 해 `'"'`, `'\\''`, octal, hex, single-letter escape를 같은 byte 규칙으로 정확히 읽도록 했습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,530 (78.75%) | **23,573 (78.89%)** |
+| 증가 | | **+43** |
+| 기존 성공 회귀 | | **0** |
+| 첫 character-constant 차단 | 64 | **0** |
+| verifier 통과 | 23,530 / 23,530 | **23,573 / 23,573** |
+| status 실패 | 0 | **0** |
+
+첫 차단 64개를 좁게 재측정해 43개가 성공했고 21개는 기존 call, static, loop, uninitialized 제한으로 이동했습니다. 전수 함수별 비교는 새 성공 43개, 기존 성공 회귀 0개, 변경 행 64개, 누락과 추가 행 0개입니다.
+
+`tests/test_c_lower_expressions.cpp`는 `'MUL'`과 `L'9'`를 같은 원문의 compiled 함수와 대조하고 기존 signed-byte escape도 함께 고정합니다. `tests/test_c_lower.cpp`는 5-byte constant를 계속 UNKNOWN으로 확인합니다. 공용 literal decoder가 string initializer에도 쓰이므로 영향 범위인 `CLower*` 92/92를 실행했습니다. 다른 subsystem은 바뀌지 않아 전체 CTest는 실행하지 않았고, 전체 train coverage는 G9 수용률과 기존 성공 회귀를 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1755,11 +1774,11 @@ callback 관련 78개 subset에서 성공은 34개에서 49개로 늘었습니�
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `uninitialized_read` 2,305
-- `unsupported_type` 2,095
+- `uninitialized_read` 2,308
+- `unsupported_type` 2,100
 - `unsupported_pointer` 663
-- `unsupported_control_flow` 547
-- `unsupported_call` 388
+- `unsupported_control_flow` 550
+- `unsupported_call` 395
 
 ## 조율자에게 요청할 것
 
