@@ -827,6 +827,10 @@ static size_t typedef_declarator_name(const lower_context *context,
    and easier to reason about. */
 static const lower_typedef *find_typedef(const lower_context *context,
                                          const char *name);
+static ql_status parse_type_spelling(lower_context *context,
+                                     const char *spelling, size_t node,
+                                     uint32_t allow_void,
+                                     lower_type *output, ql_error *error);
 static size_t member_declarator_name(const lower_context *context,
                                      size_t declarator,
                                      uint32_t *pointer_depth,
@@ -892,13 +896,20 @@ static ql_status collect_storage_locals(lower_context *context,
             strcmp(context->nodes[type_node].view.kind,
                    "type_identifier") == 0) {
             char *spelling = copy_node_text(context, type_node);
-            if (spelling != NULL) {
-                const lower_typedef *named = find_typedef(context, spelling);
-                base_is_record = named != NULL && named->is_aggregate != 0u &&
-                                 named->pointer_depth == 0u;
-                context->allocator->deallocate(context->allocator->user_data,
-                                               spelling);
+            lower_type resolved;
+            ql_status status;
+            if (spelling == NULL) {
+                ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                return QL_STATUS_OUT_OF_MEMORY;
             }
+            status = parse_type_spelling(context, spelling, type_node, 1u,
+                                         &resolved, error);
+            context->allocator->deallocate(context->allocator->user_data,
+                                           spelling);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+            base_is_record = resolved.kind == QL_C_SCALAR_RECORD;
         }
         declaration_end = subtree_end(context, index);
         for (child = index + 1u; child < declaration_end; ++child) {
@@ -1857,6 +1868,39 @@ static ql_status resolve_type_node(lower_context *context, size_t type_node,
    An array or function declarator inside a record is not laid out here. */
 /* `T a[]` said an array but not how long. */
 #define LOWER_ARRAY_BOUND_FROM_INITIALIZER UINT64_MAX
+#define LOWER_MAX_INITIALIZER_ELEMENTS UINT64_C(256)
+
+/* Counts positional elements without interpreting them. Designators need a
+   member/index map rather than a count and are left for their own work unit. */
+static int positional_initializer_count(const lower_context *context,
+                                        size_t node, uint64_t *count) {
+    size_t end;
+    size_t child;
+
+    *count = 0u;
+    if (node == SIZE_MAX ||
+        strcmp(context->nodes[node].view.kind, "initializer_list") != 0) {
+        return 0;
+    }
+    end = subtree_end(context, node);
+    for (child = node + 1u; child < end; ++child) {
+        if (context->nodes[child].parent != node ||
+            (context->nodes[child].view.flags & QL_C_SYNTAX_NODE_NAMED) ==
+                0u ||
+            strcmp(context->nodes[child].view.kind, "comment") == 0) {
+            continue;
+        }
+        if (strcmp(context->nodes[child].view.kind, "initializer_pair") ==
+            0) {
+            return 0;
+        }
+        ++(*count);
+        if (*count > LOWER_MAX_INITIALIZER_ELEMENTS) {
+            return 0;
+        }
+    }
+    return 1;
+}
 
 /* An array bound has to be a constant this pass can read, because the
    object's size is what keeps an out-of-bounds access out of bounds. A bound
@@ -6440,6 +6484,283 @@ static ql_status parse_local_type(lower_context *context, size_t declaration,
     }
 }
 
+/* Produces an address at a byte offset inside local aggregate storage. Arrays
+   use a pointer to their element, because C array values never exist as IR
+   values; records and scalars use a pointer to the declared type. */
+static ql_status aggregate_child_address(lower_context *context,
+                                         lower_value base, uint64_t offset,
+                                         lower_type child,
+                                         lower_value *output,
+                                         ql_error *error) {
+    lower_type u64 = address_type();
+    lower_type pointer =
+        make_pointer_to(child.array_length != 0u ? array_element(child)
+                                                 : child);
+    lower_value address;
+    ql_ir_value_id amount;
+    ql_ir_value_id operands[2];
+    ql_status status = emit_address_of_pointer(context, base, &address,
+                                               error);
+
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = add_uint_constant(context, u64, offset, &amount, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    operands[0] = address.value;
+    operands[1] = amount;
+    status = emit_instruction(context, QL_IR_OPCODE_ADD, &u64, operands, 2u,
+                              NULL, 0u, QL_IR_EFFECT_NONE, &address.value,
+                              error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    return emit_pointer_of_address(context, address, pointer, output, error);
+}
+
+static ql_status zero_initialize_object(lower_context *context, size_t node,
+                                        lower_value address, lower_type type,
+                                        ql_error *error) {
+    ql_status status;
+
+    if (type.array_length != 0u) {
+        lower_type element = array_element(type);
+        uint64_t width = type_byte_width(context, element);
+        uint64_t index;
+        if (type.array_length > LOWER_MAX_INITIALIZER_ELEMENTS ||
+            width == 0u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                "zero-initializing this local array would exceed the "
+                "bounded aggregate slice", error);
+        }
+        for (index = 0u; index < type.array_length; ++index) {
+            lower_value element_address;
+            status = aggregate_child_address(context, address, index * width,
+                                             element, &element_address,
+                                             error);
+            if (status == QL_STATUS_OK) {
+                status = zero_initialize_object(context, node,
+                                                element_address, element,
+                                                error);
+            }
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+        }
+        return QL_STATUS_OK;
+    }
+    if (type.kind == QL_C_SCALAR_RECORD) {
+        lower_record *record;
+        size_t count;
+        size_t index;
+        status = ensure_record_layout(context, type.record, node, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        record = &context->records[type.record];
+        count = record->is_union != 0u && record->member_count != 0u
+                    ? 1u
+                    : record->member_count;
+        for (index = 0u; index < count; ++index) {
+            lower_value member_address;
+            const lower_member *member = &record->members[index];
+            status = aggregate_child_address(context, address, member->offset,
+                                             member->type, &member_address,
+                                             error);
+            if (status == QL_STATUS_OK) {
+                status = zero_initialize_object(context, node,
+                                                member_address, member->type,
+                                                error);
+            }
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+        }
+        return QL_STATUS_OK;
+    }
+    {
+        lower_value zero;
+        memset(&zero, 0, sizeof(zero));
+        status = ensure_bool_constants(context, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        zero.type = type;
+        zero.defined = context->true_value;
+        if (type.kind == QL_C_SCALAR_POINTER) {
+            lower_value raw;
+            memset(&raw, 0, sizeof(raw));
+            raw.type = address_type();
+            raw.defined = context->true_value;
+            status = add_uint_constant(context, raw.type, 0u, &raw.value,
+                                       error);
+            if (status == QL_STATUS_OK) {
+                status = emit_pointer_of_address(context, raw, type, &zero,
+                                                 error);
+            }
+        } else {
+            status = add_uint_constant(context, type, 0u, &zero.value, error);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        return emit_store(context, address, zero, error);
+    }
+}
+
+static ql_status initialize_object(lower_context *context, size_t node,
+                                   lower_value address, lower_type type,
+                                   uint32_t brace_elided,
+                                   ql_error *error) {
+    const int is_list =
+        strcmp(context->nodes[node].view.kind, "initializer_list") == 0;
+    ql_status status;
+
+    if (type.array_length == 0u && type.kind != QL_C_SCALAR_RECORD) {
+        size_t value_node = node;
+        lower_value value;
+        if (is_list) {
+            size_t end = subtree_end(context, node);
+            size_t child;
+            value_node = SIZE_MAX;
+            for (child = node + 1u; child < end; ++child) {
+                if (context->nodes[child].parent != node ||
+                    (context->nodes[child].view.flags &
+                     QL_C_SYNTAX_NODE_NAMED) == 0u ||
+                    strcmp(context->nodes[child].view.kind, "comment") == 0) {
+                    continue;
+                }
+                if (value_node != SIZE_MAX ||
+                    strcmp(context->nodes[child].view.kind,
+                           "initializer_pair") == 0) {
+                    return lower_unknown(
+                        context,
+                        QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, child,
+                        "a scalar initializer needs one positional value",
+                        error);
+                }
+                value_node = child;
+            }
+            if (value_node == SIZE_MAX) {
+                return zero_initialize_object(context, node, address, type,
+                                              error);
+            }
+        }
+        status = lower_expression(context, value_node, &value, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        return emit_store(context, address, value, error);
+    }
+
+    if (is_list) {
+        uint64_t count;
+        if (!positional_initializer_count(context, node, &count)) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "designated or oversized aggregate initialization needs a "
+                "member or index map", error);
+        }
+    }
+    status = zero_initialize_object(context, node, address, type, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    if (!is_list) {
+        /* C brace elision lets `{0}` initialize the first nested subobject.
+           Recursing once captures that case without pretending to implement
+           the full flattened positional stream. */
+        lower_value first_address;
+        lower_type first_type;
+        uint64_t first_offset = 0u;
+        if (brace_elided == 0u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                "copying an array or record value needs aggregate value "
+                "semantics", error);
+        }
+        if (type.array_length != 0u) {
+            first_type = array_element(type);
+        } else {
+            lower_record *record = &context->records[type.record];
+            if (record->member_count == 0u) {
+                return QL_STATUS_OK;
+            }
+            first_type = record->members[0].type;
+            first_offset = record->members[0].offset;
+        }
+        status = aggregate_child_address(context, address, first_offset,
+                                         first_type, &first_address, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        return initialize_object(context, node, first_address, first_type,
+                                 1u, error);
+    }
+    {
+        size_t end = subtree_end(context, node);
+        size_t child;
+        size_t ordinal = 0u;
+        for (child = node + 1u; child < end; ++child) {
+            lower_type child_type;
+            uint64_t offset;
+            lower_value child_address;
+            if (context->nodes[child].parent != node ||
+                (context->nodes[child].view.flags &
+                 QL_C_SYNTAX_NODE_NAMED) == 0u ||
+                strcmp(context->nodes[child].view.kind, "comment") == 0) {
+                continue;
+            }
+            if (strcmp(context->nodes[child].view.kind,
+                       "initializer_pair") == 0) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION,
+                    child,
+                    "designated aggregate initialization needs a member or "
+                    "index map", error);
+            }
+            if (type.array_length != 0u) {
+                if ((uint64_t)ordinal >= type.array_length) {
+                    return lower_unknown(
+                        context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, child,
+                        "too many positional array initializers", error);
+                }
+                child_type = array_element(type);
+                offset = (uint64_t)ordinal *
+                         type_byte_width(context, child_type);
+            } else {
+                lower_record *record = &context->records[type.record];
+                size_t limit = record->is_union != 0u &&
+                                       record->member_count != 0u
+                                   ? 1u
+                                   : record->member_count;
+                if (ordinal >= limit) {
+                    return lower_unknown(
+                        context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, child,
+                        "too many positional record initializers", error);
+                }
+                child_type = record->members[ordinal].type;
+                offset = record->members[ordinal].offset;
+            }
+            status = aggregate_child_address(context, address, offset,
+                                             child_type, &child_address,
+                                             error);
+            if (status == QL_STATUS_OK) {
+                status = initialize_object(context, child, child_address,
+                                           child_type, 1u, error);
+            }
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+            ++ordinal;
+        }
+    }
+    return QL_STATUS_OK;
+}
+
 static ql_status lower_declaration(lower_context *context, size_t node,
                                    ql_error *error) {
     size_t type_node = direct_field_child(context, node, "type");
@@ -6517,6 +6838,15 @@ static ql_status lower_declaration(lower_context *context, size_t node,
                     "void is not an object type here", error);
             }
             if (array_length != 0u) {
+                if (array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER &&
+                    !positional_initializer_count(context, value_node,
+                                                  &array_length)) {
+                    return lower_unknown(
+                        context,
+                        QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION, named,
+                        "an inferred local array bound needs a small "
+                        "positional initializer list", error);
+                }
                 declarator_type = make_array_of(declarator_type,
                                                 array_length);
             }
@@ -6555,17 +6885,20 @@ static ql_status lower_declaration(lower_context *context, size_t node,
         variable = &context->variables[context->variable_count - 1u];
         if (declarator_type.array_length != 0u ||
             declarator_type.kind == QL_C_SCALAR_RECORD) {
-            /* Storage this slice never reads whole. Its bytes come from the
-               object's initial image exactly as a caller's region does, so
-               there is no value to demand up front and none to invent. */
-            variable->initialized = 1u;
             if (value_node != SIZE_MAX) {
-                return lower_unknown(
-                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION,
-                    value_node,
-                    "an initialiser for an array or record local is outside "
-                    "this slice", error);
+                status = initialize_object(
+                    context, value_node, stack_address(context, variable),
+                    declarator_type, 0u, error);
+                if (status != QL_STATUS_OK || context->unknown != 0u) {
+                    return status;
+                }
             }
+            /* An aggregate without an explicit initializer has indeterminate
+               bytes, but members may still be written before they are read.
+               The current member model has no per-subobject initialization
+               bits, so preserve the previous storage contract for that case.
+               Explicit initialization is fully written above. */
+            variable->initialized = 1u;
             continue;
         }
         if (value_node != SIZE_MAX) {
@@ -7151,6 +7484,7 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
         declaration_end = subtree_end(context, index);
         for (child = index + 1u; child < declaration_end; ++child) {
             size_t declarator = child;
+            size_t initializer = SIZE_MAX;
             uint32_t pointer_depth;
             uint64_t array_length;
             int rejected;
@@ -7166,6 +7500,8 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
             }
             if (strcmp(context->nodes[declarator].view.kind,
                        "init_declarator") == 0) {
+                initializer = direct_field_child(context, declarator,
+                                                 "value");
                 declarator = direct_field_child(context, declarator,
                                                 "declarator");
             }
@@ -7205,6 +7541,15 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
                 *output = make_pointer_to(*output);
             }
             if (array_length != 0u) {
+                if (array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER &&
+                    !positional_initializer_count(context, initializer,
+                                                  &array_length)) {
+                    return lower_unknown(
+                        context,
+                        QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION, named,
+                        "an inferred local array bound needs a small "
+                        "positional initializer list", error);
+                }
                 *output = make_array_of(*output, array_length);
             }
             return QL_STATUS_OK;

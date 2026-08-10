@@ -1181,6 +1181,25 @@ Windows에서는 native CTest 510/510과 Python binding 37/37을 각각 통과�
 
 `tests/test_c_lower_expressions.cpp`는 `(void)(a = b)`의 부작용을 컴파일된 C와 대조하고, `(void)(a / b)`가 0 나눗셈과 signed division overflow를 계속 UB로 보고하는지 확인합니다.
 
+### 24. 작은 위치 기반 aggregate initializer를 저장한다
+
+커밋: (이 단위)
+
+최대 256개 원소의 배열과 레코드 지역에 위치 기반 initializer list를 내립니다. 각 scalar leaf를 object offset에 store하고, 생략된 하위 객체는 0으로 초기화합니다. 중첩 brace와 `{0}`, initializer에서 길이가 정해지는 `T a[] = {...}`도 같은 경로를 씁니다. 포인터 leaf의 0은 정수 store가 아니라 null pointer를 만들어 저장합니다.
+
+지정 initializer는 member/index map이 필요하고, 다른 aggregate를 값으로 복사하는 초기화는 aggregate value 또는 `memcpy` 의미가 필요합니다. 둘 다 이번 범위에서 먼저 store를 내지 않고 UNKNOWN입니다. 위치 목록의 상한도 명시적이며, 상한을 넘기면 부분 초기화하지 않습니다.
+
+이 과정에서 typedef가 두 단계 이상 record를 가리키면 storage pre-pass가 즉시 `is_aggregate` 표지만 보고 지역 object를 놓치는 기존 결함을 찾았습니다. pre-pass도 정식 typedef 해석을 사용하게 바꾸어, 값 ID 0을 포인터처럼 변환하던 status 실패를 막았습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 9,681 (32.40%) | **9,751 (32.63%)** |
+| `unsupported_expression` | 584 | **119** |
+| verifier 통과 | 9,681 / 9,681 | **9,751 / 9,751** |
+| status 실패 | 0 | **0** |
+
+`tests/test_c_lower_aggregates.cpp`는 inferred array, 중첩 record/array, `{0}`, null pointer member, 두 단계 typedef record를 실제 컴파일된 C와 대조합니다.
+
 ## 막힌 것
 
 - 없음

@@ -84,6 +84,32 @@ QL_AGG_FUNCTION(address, int agg_address(int a) {
 QL_AGG_FUNCTION(param, int agg_param(int a[], int n) {
     return a[0] + a[n];
 });
+QL_AGG_FUNCTION(initialized_array, int agg_init_array(int a, int b) {
+    int values[] = {a, b, 7};
+    return values[0] + values[1] + values[2];
+});
+QL_AGG_FUNCTION(initialized_record,
+    struct AGG_INIT { int head; short tag; int values[2]; };
+    typedef struct AGG_INIT AGG_INIT_1;
+    typedef AGG_INIT_1 AGG_INIT_2;
+    int agg_init_record(int a, int b) {
+        AGG_INIT_2 value = {a, (short)b, {3, 4}};
+        return value.head + value.tag + value.values[0] + value.values[1];
+    });
+QL_AGG_FUNCTION(zero_record,
+    struct AGG_ZERO_INNER { int x; int y; };
+    struct AGG_ZERO { struct AGG_ZERO_INNER inner; int tail; };
+    int agg_zero_record(int a, int b) {
+        struct AGG_ZERO value = {0};
+        return value.inner.x + value.inner.y + value.tail + (a - a) +
+               (b - b);
+    });
+QL_AGG_FUNCTION(zero_pointer_member,
+    struct AGG_ZERO_POINTER { int *pointer; int value; };
+    int agg_zero_pointer(int a, int b) {
+        struct AGG_ZERO_POINTER value = {0};
+        return (value.pointer == 0) + value.value + (a - a) + (b - b);
+    });
 
 namespace {
 
@@ -326,6 +352,18 @@ TEST(CLowerAggregates, MatchesCompiledExecutionOnArraysAndRecords) {
            through that pointer is writing the array. */
         {"address", address_source, "agg_address", 1, sizeof(int[3]),
          [](int32_t a, int32_t) { return agg_address(a); }},
+        {"initialized-array", initialized_array_source, "agg_init_array", 2,
+         sizeof(int[3]),
+         [](int32_t a, int32_t b) { return agg_init_array(a, b); }},
+        {"initialized-record", initialized_record_source, "agg_init_record",
+         2, sizeof(struct AGG_INIT),
+         [](int32_t a, int32_t b) { return agg_init_record(a, b); }},
+        {"zero-record", zero_record_source, "agg_zero_record", 2,
+         sizeof(struct AGG_ZERO),
+         [](int32_t a, int32_t b) { return agg_zero_record(a, b); }},
+        {"zero-pointer", zero_pointer_member_source, "agg_zero_pointer", 2,
+         sizeof(struct AGG_ZERO_POINTER),
+         [](int32_t a, int32_t b) { return agg_zero_pointer(a, b); }},
     };
 
     uint64_t state = UINT64_C(0x71b3e0c95d24af86);
