@@ -160,6 +160,26 @@ typedef struct lower_callee {
     size_t parameter_capacity;
 } lower_callee;
 
+/* An object with static storage duration. It is an object in the flat
+   memory model exactly as a pointer parameter's region is, which is what puts
+   a write to it and a call in the same order: both thread the memory state.
+
+   Its initial contents are left unknown unless the declaration states them.
+   In this corpus `int GLB_0;` is a placeholder the extractor synthesised for
+   a global whose real definition lives elsewhere, not a tentative definition
+   of a zeroed object, so assuming zero would be assuming a value the program
+   never promised. */
+typedef struct lower_global {
+    char *name;
+    size_t declaration_node;
+    size_t declarator_node;
+    size_t initializer_node;
+    lower_type type;
+    size_t object;
+    ql_ir_value_id address;
+    uint32_t referenced;
+} lower_global;
+
 /* Storage for one address-taken name. `is_parameter` marks the ones whose
    incoming value has to be written into the slot on entry. */
 typedef struct lower_stack_slot {
@@ -235,6 +255,13 @@ typedef struct lower_context {
     lower_callee *callees;
     size_t callee_count;
     size_t callee_capacity;
+    lower_global *globals;
+    /* Set while a global's declaration is being read, which is what tells
+       parse_local_type that `static` and `extern` are the storage duration
+       this object already has rather than one it cannot model. */
+    uint32_t parsing_global;
+    size_t global_count;
+    size_t global_capacity;
     /* The observable order of external calls. Threaded like memory, and
        present only when the body actually calls something. */
     ql_ir_type_id trace_type;
@@ -821,6 +848,160 @@ static ql_status collect_address_taken(lower_context *context,
    the trace parameter have to exist before the body runs. */
 static lower_callee *find_callee(lower_context *context,
                                  const char *name);
+
+static size_t member_declarator_name(const lower_context *context,
+                                     size_t declarator,
+                                     uint32_t *pointer_depth, int *rejected);
+
+/* A file-scope declaration that names an object rather than a function. */
+static ql_status collect_globals(lower_context *context, ql_error *error) {
+    size_t index;
+
+    for (index = 0u; index < context->node_count; ++index) {
+        size_t end;
+        size_t child;
+
+        if (strcmp(context->nodes[index].view.kind, "declaration") != 0 ||
+            context->nodes[index].depth != 1u) {
+            continue;
+        }
+        end = subtree_end(context, index);
+        for (child = index + 1u; child < end; ++child) {
+            size_t declarator = child;
+            size_t initializer = SIZE_MAX;
+            size_t named;
+            uint32_t pointer_depth;
+            int rejected;
+            lower_global *entry;
+            ql_status status;
+
+            if (context->nodes[child].parent != index ||
+                context->nodes[child].view.field_name == NULL ||
+                strcmp(context->nodes[child].view.field_name,
+                       "declarator") != 0) {
+                continue;
+            }
+            if (strcmp(context->nodes[declarator].view.kind,
+                       "init_declarator") == 0) {
+                initializer = direct_field_child(context, declarator,
+                                                 "value");
+                declarator = direct_field_child(context, declarator,
+                                                "declarator");
+            }
+            if (declarator == SIZE_MAX ||
+                strcmp(context->nodes[declarator].view.kind,
+                       "function_declarator") == 0) {
+                continue;
+            }
+            named = member_declarator_name(context, declarator,
+                                           &pointer_depth, &rejected);
+            if (named == SIZE_MAX || rejected != 0) {
+                continue;
+            }
+            {
+                /* `extern int x;` followed by `int x = 3;` names one object,
+                   not two. Two entries would become two objects the model
+                   assumes are disjoint, which would make a write through one
+                   invisible to a read through the other. The declaration that
+                   states a value wins, since that is the definition. */
+                char *text = copy_node_text(context, named);
+                size_t existing;
+                int duplicate = 0;
+                if (text == NULL) {
+                    ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                    return QL_STATUS_OUT_OF_MEMORY;
+                }
+                for (existing = 0u; existing < context->global_count;
+                     ++existing) {
+                    if (strcmp(context->globals[existing].name, text) != 0) {
+                        continue;
+                    }
+                    duplicate = 1;
+                    if (initializer != SIZE_MAX) {
+                        context->globals[existing].declaration_node = index;
+                        context->globals[existing].declarator_node =
+                            declarator;
+                        context->globals[existing].initializer_node =
+                            initializer;
+                    }
+                    break;
+                }
+                context->allocator->deallocate(context->allocator->user_data,
+                                               text);
+                if (duplicate) {
+                    continue;
+                }
+            }
+            status = grow_array(context->allocator,
+                                (void **)&context->globals,
+                                &context->global_capacity,
+                                sizeof(*context->globals),
+                                context->global_count + 1u, error);
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+            entry = &context->globals[context->global_count];
+            memset(entry, 0, sizeof(*entry));
+            entry->name = copy_node_text(context, named);
+            if (entry->name == NULL) {
+                ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                return QL_STATUS_OUT_OF_MEMORY;
+            }
+            entry->declaration_node = index;
+            entry->declarator_node = declarator;
+            entry->initializer_node = initializer;
+            entry->object = SIZE_MAX;
+            entry->address = QL_IR_INVALID_VALUE_ID;
+            ++context->global_count;
+        }
+    }
+    return QL_STATUS_OK;
+}
+
+/* Only the globals the body names get an object. Creating one for every
+   declaration in the unit would add parameters and a quadratic pile of
+   disjointness assumptions for storage the function never touches. */
+static void collect_global_uses(lower_context *context, size_t body_node) {
+    size_t end = subtree_end(context, body_node);
+    size_t index;
+
+    for (index = body_node + 1u; index < end; ++index) {
+        char *name;
+        size_t global;
+
+        if (strcmp(context->nodes[index].view.kind, "identifier") != 0) {
+            continue;
+        }
+        name = copy_node_text(context, index);
+        if (name == NULL) {
+            continue;
+        }
+        for (global = 0u; global < context->global_count; ++global) {
+            if (strcmp(context->globals[global].name, name) != 0) {
+                continue;
+            }
+            if (context->globals[global].referenced == 0u) {
+                context->globals[global].referenced = 1u;
+                context->uses_memory = 1u;
+            }
+            break;
+        }
+        context->allocator->deallocate(context->allocator->user_data, name);
+    }
+}
+
+static void release_globals(lower_context *context) {
+    size_t index;
+    for (index = 0u; index < context->global_count; ++index) {
+        context->allocator->deallocate(context->allocator->user_data,
+                                       context->globals[index].name);
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   context->globals);
+    context->globals = NULL;
+    context->global_count = 0u;
+    context->global_capacity = 0u;
+}
 
 static void collect_calls(lower_context *context, size_t body_node) {
     size_t end = subtree_end(context, body_node);
@@ -4224,7 +4405,15 @@ static ql_status lower_designator_load(lower_context *context, size_t node,
     if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
     }
-    if (declared.kind != QL_C_SCALAR_POINTER) {
+    if (declared.kind != QL_C_SCALAR_POINTER ||
+        loaded.type.kind == QL_C_SCALAR_POINTER) {
+        /* A member of a record is addressed at its byte offset, so loading a
+           pointer member yields an address that still has to be read as a
+           pointer. Loading through a pointer-to-pointer does not: the IR type
+           of that load is already a pointer, and wrapping it again would be
+           converting a pointer as though it were an address, which the IR
+           rejects. Either way the value carries no object, which is what
+           makes a later dereference of it refuse rather than pretend. */
         *output = loaded;
         return QL_STATUS_OK;
     }
@@ -4756,13 +4945,20 @@ static ql_status parse_local_type(lower_context *context, size_t declaration,
                 ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
                 return QL_STATUS_OUT_OF_MEMORY;
             }
-            if (strcmp(text, "auto") != 0 && strcmp(text, "register") != 0) {
-                context->allocator->deallocate(
-                    context->allocator->user_data, text);
-                return lower_unknown(
-                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, index,
-                    "static, extern, and thread-local objects require memory semantics",
-                    error);
+            {
+                const int is_storage_duration =
+                    context->parsing_global != 0u &&
+                    (strcmp(text, "static") == 0 ||
+                     strcmp(text, "extern") == 0);
+                if (strcmp(text, "auto") != 0 &&
+                    strcmp(text, "register") != 0 && !is_storage_duration) {
+                    context->allocator->deallocate(
+                        context->allocator->user_data, text);
+                    return lower_unknown(
+                        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, index,
+                        "static, extern, and thread-local objects require "
+                        "memory semantics", error);
+                }
             }
             context->allocator->deallocate(context->allocator->user_data,
                                            text);
@@ -5588,12 +5784,26 @@ static ql_status add_stack_slot_objects(lower_context *context,
     for (index = 0u; index < context->address_taken_count; ++index) {
         const char *name = context->address_taken[index];
         lower_stack_slot *slot;
+        size_t global;
+        int is_global = 0;
         lower_type type;
         uint32_t is_parameter;
         char label[160];
         size_t object;
         ql_status status;
 
+        /* A global already has an object of its own, so taking its address
+           must yield that object rather than a second, disjoint copy. */
+        for (global = 0u; global < context->global_count; ++global) {
+            if (context->globals[global].referenced != 0u &&
+                strcmp(context->globals[global].name, name) == 0) {
+                is_global = 1;
+                break;
+            }
+        }
+        if (is_global) {
+            continue;
+        }
         status = stack_slot_type(context, name, &type, &is_parameter, error);
         if (status != QL_STATUS_OK || context->unknown != 0u) {
             return status;
@@ -5605,6 +5815,16 @@ static ql_status add_stack_slot_objects(lower_context *context,
                 context->body_node,
                 "storage for a record or void local is outside this slice",
                 error);
+        }
+        if (type.kind == QL_C_SCALAR_POINTER && type.indirection >= 2u) {
+            /* Its address is one level deeper than the name itself, so a
+               two-level pointer whose address is taken needs three, which is
+               past what this slice carries. */
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
+                context->body_node,
+                "taking the address of a two-level pointer needs a third "
+                "level of indirection", error);
         }
         if (snprintf(label, sizeof(label), "%s@%zu", name,
                      context->object_count) < 0) {
@@ -5636,6 +5856,92 @@ static ql_status add_stack_slot_objects(lower_context *context,
         slot->address = QL_IR_INVALID_VALUE_ID;
         slot->is_parameter = is_parameter;
         ++context->stack_slot_count;
+    }
+    return QL_STATUS_OK;
+}
+
+/* Storage with static storage duration becomes an object under exactly the
+   discipline a pointer parameter's region gets: a base and a size parameter,
+   the three standing model constraints, and a pinned size. Reads become loads
+   and writes become stores, which is what keeps a write to a global and a
+   call in the order the source wrote them: both thread the memory state. */
+static ql_status add_global_objects(lower_context *context, ql_error *error) {
+    size_t index;
+
+    for (index = 0u; index < context->global_count; ++index) {
+        lower_global *global = &context->globals[index];
+        size_t type_node;
+        uint32_t pointer_depth = 0u;
+        int rejected = 0;
+        uint32_t is_const = 0u;
+        lower_type type;
+        char label[160];
+        size_t object;
+        ql_status status;
+
+        if (global->referenced == 0u) {
+            continue;
+        }
+        if (find_variable(context, global->name, strlen(global->name)) !=
+            NULL) {
+            /* A parameter of the same name shadows the global throughout the
+               body, so the global is never reached and must not get an object
+               that would then shadow the parameter in the variable table. */
+            global->referenced = 0u;
+            continue;
+        }
+        type_node = direct_field_child(context, global->declaration_node,
+                                       "type");
+        if (type_node == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+                global->declaration_node,
+                "a global with no declared type has no size to give it",
+                error);
+        }
+        (void)member_declarator_name(context, global->declarator_node,
+                                     &pointer_depth, &rejected);
+        if (rejected != 0) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+                global->declaration_node,
+                "this global's declarator is outside this slice", error);
+        }
+        context->parsing_global = 1u;
+        status = parse_local_type(context, global->declaration_node, type_node,
+                                  &type, &is_const, error);
+        context->parsing_global = 0u;
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        if (pointer_depth > 2u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
+                global->declaration_node,
+                "this slice carries at most two levels of indirection", error);
+        }
+        while (pointer_depth-- > 0u) {
+            type = make_pointer_to(type);
+        }
+        if (type.kind == QL_C_SCALAR_RECORD || type.kind == QL_C_SCALAR_VOID) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+                global->declaration_node,
+                "storage for a record or void global is outside this slice",
+                error);
+        }
+        if (snprintf(label, sizeof(label), "%s@%zu", global->name,
+                     context->object_count) < 0) {
+            ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                         "global object label does not fit");
+            return QL_STATUS_INTERNAL_ERROR;
+        }
+        status = add_object(context, label, NULL, &object, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        global->type = type;
+        global->object = object;
     }
     return QL_STATUS_OK;
 }
@@ -5690,7 +5996,11 @@ static ql_status add_object_parameters(lower_context *context,
         (void)next;
     }
     context->parameter_object_count = context->object_count;
-    return add_stack_slot_objects(context, error);
+    status = add_stack_slot_objects(context, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    return add_global_objects(context, error);
 }
 
 static ql_status emit_assume(lower_context *context, ql_ir_value_id predicate,
@@ -5967,6 +6277,113 @@ static ql_status materialize_stack_slots(lower_context *context,
     return QL_STATUS_OK;
 }
 
+static ql_status materialize_globals(lower_context *context,
+                                     ql_error *error) {
+    size_t index;
+
+    for (index = 0u; index < context->global_count; ++index) {
+        lower_global *global = &context->globals[index];
+        lower_type pointer;
+        uint64_t size;
+        lower_value address;
+        lower_value pointer_value;
+        lower_variable *variable;
+        ql_ir_value_id expected;
+        ql_ir_value_id predicate;
+        ql_status status;
+
+        if (global->referenced == 0u || global->object == SIZE_MAX) {
+            continue;
+        }
+        pointer = make_pointer_to(global->type);
+        size = type_byte_width(context, global->type);
+        status = emit_assumptions_for_object(context, global->object, error);
+        if (status == QL_STATUS_OK) {
+            status = add_uint_constant(context, address_type(), size,
+                                       &expected, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_compare(context, QL_IR_OPCODE_EQ,
+                                  context->objects[global->object].size,
+                                  expected, &predicate, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_assume(context, predicate, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = ensure_bool_constants(context, error);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        memset(&address, 0, sizeof(address));
+        address.value = context->objects[global->object].base;
+        address.type = address_type();
+        address.defined = context->true_value;
+        address.has_object = 1u;
+        status = emit_pointer_of_address(context, address, pointer,
+                                         &pointer_value, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        global->address = pointer_value.value;
+
+        status = grow_array(context->allocator, (void **)&context->variables,
+                            &context->variable_capacity,
+                            sizeof(*context->variables),
+                            context->variable_count + 1u, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        variable = &context->variables[context->variable_count];
+        memset(variable, 0, sizeof(*variable));
+        variable->name = copy_text(context->allocator, global->name,
+                                   strlen(global->name));
+        if (variable->name == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        variable->name_size = strlen(global->name);
+        variable->type = global->type;
+        variable->is_stack = 1u;
+        variable->address = global->address;
+        variable->has_object = 1u;
+        variable->initialized = 1u;
+        /* File scope, so a local of the same name shadows it: find_variable
+           searches from the most recent entry backwards. */
+        variable->scope_depth = 0u;
+        ++context->variable_count;
+
+        /* A stated initial value is written before the body runs, so the
+           memory the body starts from is the one the declaration promised
+           rather than whatever the caller happened to supply. A declaration
+           that states nothing leaves the contents unknown; in this corpus
+           `int GLB_0;` is a placeholder for a definition that lives in
+           another translation unit, not a tentative definition of zero. */
+        if (global->initializer_node != SIZE_MAX) {
+            lower_value initial;
+            lower_value converted;
+            status = lower_expression(context, global->initializer_node,
+                                      &initial, error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+            status = convert_value(context, initial, global->type, &converted,
+                                   error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+            status = emit_store(context,
+                                stack_address(context, variable), converted,
+                                error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+        }
+    }
+    return QL_STATUS_OK;
+}
+
 /* The entry block states the assumptions for the objects the caller
    supplied. Objects the function makes for itself state their own where they
    are made, which is what lets one appear part-way through a body. */
@@ -6048,6 +6465,7 @@ static void cleanup_context(lower_context *context) {
     release_typedefs(context);
     release_address_taken(context);
     release_callees(context);
+    release_globals(context);
     for (index = 0u; index < context->stack_slot_count; ++index) {
         context->allocator->deallocate(context->allocator->user_data,
                                        context->stack_slots[index].name);
@@ -6188,6 +6606,9 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
         status = collect_callees(&context, error);
     }
     if (status == QL_STATUS_OK) {
+        status = collect_globals(&context, error);
+    }
+    if (status == QL_STATUS_OK) {
         status = collect_records(&context, error);
     }
     if (status == QL_STATUS_OK) {
@@ -6222,6 +6643,7 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
 
     context.body_node = body_node;
     collect_calls(&context, body_node);
+    collect_global_uses(&context, body_node);
     status = collect_address_taken(&context, body_node, error);
     if (status != QL_STATUS_OK) {
         cleanup_context(&context);
@@ -6263,6 +6685,9 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
         }
         if (status == QL_STATUS_OK) {
             status = materialize_stack_slots(&context, error);
+        }
+        if (status == QL_STATUS_OK && context.unknown == 0u) {
+            status = materialize_globals(&context, error);
         }
         if (status == QL_STATUS_OK && context.unknown == 0u) {
             status = lower_compound(&context, body_node, 0u, error);

@@ -176,6 +176,18 @@ spelling 3,998 times and no other spelling of it. A name absent from this
 table stays unresolved and is refused, and a unit that declares the name
 itself overrides the table.
 
+#### Corpus globals carry no promised initial value
+
+A file-scope object with no initialiser is, in ISO C, a tentative definition
+initialised to zero. The profile does not read the corpus that way. A raw
+AnghaBench source states its globals in a synthesised
+`/* Variables and functions */` section, one bare `int NAME ;` per global the
+extracted function names, standing in for a definition that lives in another
+translation unit. The value that definition gave it is not in the corpus, so
+the profile leaves such an object's initial contents unknown rather than
+assuming a zero the program never promised. A declaration that does state a
+value is honoured, and the lowering writes it before the body runs.
+
 #### Memory model
 
 `ASM2C_GNU_V1` gives memory a flat 64-bit address space. A pointer is an
