@@ -8,6 +8,14 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <gtest/gtest.h>
 
 namespace {
@@ -39,12 +47,29 @@ struct ArtifactDeleter {
 using CachePtr = std::unique_ptr<ql_cache, CacheDeleter>;
 using ArtifactPtr = std::unique_ptr<ql_artifact, ArtifactDeleter>;
 
+/* gtest_discover_tests runs every test in its own process, so a counter with
+   static storage duration restarts at one in each of them and every process
+   picks the same directory name. Under a parallel ctest one test's constructor
+   then deletes the store another test is in the middle of using, and the
+   failure surfaces as an unrelated cache miss in whichever test lost the race.
+   The process id is what actually distinguishes them; the counter only has to
+   separate roots inside one process. */
+unsigned long long current_process_id() {
+#if defined(_WIN32)
+    return static_cast<unsigned long long>(GetCurrentProcessId());
+#else
+    return static_cast<unsigned long long>(getpid());
+#endif
+}
+
 class ScopedRoot {
 public:
     ScopedRoot() {
         static int counter = 0;
         path_ = fs::temp_directory_path() /
-                ("quodlibet-cache-key-test-" + std::to_string(++counter));
+                ("quodlibet-cache-key-test-" +
+                 std::to_string(current_process_id()) + "-" +
+                 std::to_string(++counter));
         std::error_code ignored;
         fs::remove_all(path_, ignored);
     }
