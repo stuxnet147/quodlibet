@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,626 / 29,880 (79.07%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,309, `unsupported_type` 2,100, `unsupported_pointer` 666입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,662 / 29,880 (79.19%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,314, `unsupported_type` 2,061, `unsupported_pointer` 666입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1785,6 +1785,24 @@ C에서 `callback(value)`와 `(*callback)(value)`는 같은 function designator�
 
 `tests/test_c_lower_calls.cpp`는 callback parameter의 직접 표기와 `(*callback)(value)`, record member의 `(*table->callback)(value)`를 실제 compiled C와 interpreter의 반환값 및 간접-call event로 대조합니다. 변경은 call lowering과 호출 수집에 한정되지만 공용 C lower 경로이므로 `CLower*`와 `CReuse*`를 영향 범위 테스트로 삼았습니다. 다른 subsystem의 결과는 이 변경의 검증 근거로 삼지 않고, 전체 train coverage만 G9 수용률과 기존 성공 회귀를 확인하기 위해 실행했습니다.
 
+### 58. corpus의 긴 문자열과 GNU ESC escape를 memory image로 보존한다
+
+문자열 decoder의 기존 256-byte 상한은 과거에 byte마다 store를 만들던 비용을 제한한 값이었습니다. 지금 문자열과 초기화된 character array는 이미 전체 byte run을 `MEMORY_IMAGE` instruction 하나로 나타내므로 그 근거가 사라졌습니다. train에서 실제 최대 source literal은 약 2.1KB였습니다. artifact와 interpreter의 유한 경계는 유지하면서 NUL을 포함한 decoded image 상한을 4,096 byte로 올렸습니다. 내용만 4,096 byte 이상인 literal과 해석할 수 없는 encoding은 계속 UNKNOWN입니다.
+
+ASM2C_GNU_V1의 `\\e`는 GCC와 Clang의 GNU escape 규칙대로 byte 27로 decode합니다. 이것은 일반 C profile로 추측한 확장이 아니라 이미 고정된 GNU target 규칙입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,626 (79.07%) | **23,662 (79.19%)** |
+| 증가 | | **+36** |
+| 기존 성공 회귀 | | **0** |
+| verifier 통과 | 23,626 / 23,626 | **23,662 / 23,662** |
+| status 실패 | 0 | **0** |
+
+기존 unsized-string 진단 52개를 먼저 좁게 재측정해 36개가 성공했습니다. 나머지 16개는 기존 array bound, persistent static state, uninitialized read, scalar initializer 제한으로 이동했습니다. 전수 함수별 비교는 새 성공 36개, 기존 성공 회귀 0개, 변경 행 55개, 누락과 추가 행 0개입니다.
+
+`tests/test_c_lower_aggregates.cpp`는 320-byte 전역 문자열의 bound, memory image와 indexed byte를 compiled C와 대조하고 `\\e`의 실제 byte image도 확인합니다. 변경은 공용 literal decoder에 한정되어 `CLower*` 95/95를 영향 범위 테스트로 실행했습니다. parser reuse, public ABI, solver, plugin은 바뀌지 않아 전체 CTest는 필요하지 않았고, 전체 train coverage만 G9 수치와 기존 성공 회귀를 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1793,8 +1811,8 @@ C에서 `callback(value)`와 `(*callback)(value)`는 같은 function designator�
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `uninitialized_read` 2,309
-- `unsupported_type` 2,100
+- `uninitialized_read` 2,314
+- `unsupported_type` 2,061
 - `unsupported_pointer` 666
 - `unsupported_control_flow` 555
 - `unsupported_call` 333

@@ -1062,9 +1062,10 @@ static ql_status collect_storage_locals(lower_context *context,
   return QL_STATUS_OK;
 }
 
-/* The longest literal this slice writes out. Each byte becomes a store in
-   the entry block, so an unbounded literal would be an unbounded prologue. */
-#define LOWER_MAX_STRING_BYTES 256u
+/* The longest literal this slice writes out. MEMORY_IMAGE keeps the IR cost
+   to one instruction, but the artifact and interpreter still carry every
+   byte. Keep a finite bound that covers the corpus with measured headroom. */
+#define LOWER_MAX_STRING_BYTES 4096u
 
 static int literal_hex_digit(char character, unsigned *value) {
   if (character >= '0' && character <= '9') {
@@ -1171,6 +1172,10 @@ static int decode_quoted_literal(const char *text, size_t size,
         break;
       case 'v':
         value = 11u;
+        break;
+      case 'e':
+        /* ASM2C_GNU_V1 admits GCC/Clang's single-byte ESC extension. */
+        value = 27u;
         break;
       case '\\':
         value = 92u;

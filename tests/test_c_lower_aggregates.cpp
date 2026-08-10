@@ -182,6 +182,27 @@ static const char string_alias_source[] =
     "local[((unsigned)i) & 3u];\n"
     "}\n";
 
+#define QL_AGG_LONG_PAYLOAD                                                \
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-"       \
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-"       \
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-"       \
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-"       \
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-"
+extern "C" {
+const char AGG_LONG_TEXT[] = QL_AGG_LONG_PAYLOAD;
+int agg_long_text(int i) {
+    return static_cast<int>(sizeof(AGG_LONG_TEXT)) * 1000 +
+           AGG_LONG_TEXT[static_cast<unsigned>(i) % sizeof(AGG_LONG_TEXT)];
+}
+}
+static const char long_string_source[] =
+    "const char AGG_LONG_TEXT[] = \"" QL_AGG_LONG_PAYLOAD "\";\n"
+    "int agg_long_text(int i) {\n"
+    "    return (int)sizeof(AGG_LONG_TEXT) * 1000 +\n"
+    "           AGG_LONG_TEXT[(unsigned)i % sizeof(AGG_LONG_TEXT)];\n"
+    "}\n";
+#undef QL_AGG_LONG_PAYLOAD
+
 namespace {
 
 constexpr uint64_t kBase = UINT64_C(0x30000);
@@ -653,6 +674,40 @@ TEST(CLowerAggregates, AStringLiteralIsAnObjectHoldingItsOwnBytes) {
     const Outcome bad = Execute(lowered.ir(), {Widen(0)}, {3u}, wrong);
     ASSERT_EQ(QL_STATUS_OK, bad.status);
     EXPECT_EQ(QL_IR_INTERP_OUTCOME_ASSUMPTION_VIOLATED, bad.result.outcome);
+}
+
+TEST(CLowerAggregates, CarriesAStringLongerThanTheFormerByteLimit) {
+    static_assert(sizeof(AGG_LONG_TEXT) > 256u);
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(long_string_source, "agg_long_text"));
+    for (int32_t i : {-1, 0, 255, 319, 320}) {
+        SCOPED_TRACE(i);
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(i)}, {sizeof(AGG_LONG_TEXT)},
+                    AGG_LONG_TEXT);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(agg_long_text(i), Returned(run.result));
+    }
+}
+
+TEST(CLowerAggregates, DecodesTheGnuEscapeCharacter) {
+    static const char source[] =
+        "const char AGG_ESC[] = \"\\e[\";\n"
+        "int pick_escape(int i) { return AGG_ESC[i]; }\n";
+    const char expected[] = {27, '[', '\0'};
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(source, "pick_escape"));
+    for (int32_t i = 0; i < 3; ++i) {
+        SCOPED_TRACE(i);
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(i)}, {sizeof(expected)}, expected);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(static_cast<int32_t>(expected[i]), Returned(run.result));
+    }
 }
 
 }  // namespace
