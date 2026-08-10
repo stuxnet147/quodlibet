@@ -3383,7 +3383,7 @@ static lower_value stack_address(const lower_context *context,
                                  const lower_variable *variable);
 static ql_status add_dynamic_object(lower_context *context, ql_error *error);
 
-#define LOWER_MAX_DYNAMIC_OBJECTS 32u
+#define LOWER_MAX_DYNAMIC_OBJECTS 128u
 
 static ql_status admit_loaded_pointer(lower_context *context, size_t node,
                                       lower_value *pointer, ql_error *error) {

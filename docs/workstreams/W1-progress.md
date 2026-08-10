@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,695 / 29,880 (79.30%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,325, `unsupported_type` 1,989, `unsupported_pointer` 667입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,953 / 29,880 (80.16%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,339, `unsupported_type` 1,989, `unsupported_control_flow` 579입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1821,6 +1821,25 @@ generic unknown-type 진단 777개를 source spelling으로 나누면 704개가 
 
 `tests/test_c_lower_calls.cpp`는 typedef callback parameter의 직접 호출과 null UB를 compiled C 및 indirect-call event와 대조하고, 같은 typedef를 외부 callee 인자로 전달하는 prototype도 lower되는지 확인합니다. 변경은 typedef inventory와 parameter 초기화에 닿으므로 `CLower*`와 `CReuse*` 102/102를 영향 범위 테스트로 실행했습니다. public ABI와 다른 subsystem은 바뀌지 않아 전체 CTest는 필요하지 않았고, 전체 train coverage만 G9 수치와 기존 성공 회귀를 확인하기 위해 실행했습니다.
 
+### 60. 비순환 본문의 dynamic object 표를 train의 실제 크기까지 넓힌다
+
+메모리에서 읽거나 외부 호출이 반환한 포인터를 역참조하면 source signature에 없던 live object가 필요합니다. 하향기는 접근 지점마다 alias 가능한 auxiliary descriptor를 추가하지만, 기존 32개 상한은 유한한 일반 본문 292개를 첫 차단에서 거부했습니다. object 배열 자체는 이미 동적으로 자라고 public IR에도 개수 제한이 없으므로, 의미 표현의 부족이 아니라 하향기의 resource guard가 너무 작았습니다.
+
+상한을 없애지는 않았습니다. object 쌍마다 disjoint-or-same-region assumption을 만들기 때문에 비용은 제곱으로 증가합니다. 해당 292개만 재측정했을 때 64에서는 52개가 여전히 막혔고 128에서는 원래 진단이 모두 사라졌습니다. 따라서 train을 모두 덮는 가장 작은 2의 거듭제곱인 128로 고정해 생성 비용을 계속 유한하게 제한합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,695 (79.30%) | **23,953 (80.16%)** |
+| 증가 | | **+258** |
+| 기존 성공 회귀 | | **0** |
+| bounded-object-table 첫 차단 | 292 | **0** |
+| verifier 통과 | 23,695 / 23,695 | **23,953 / 23,953** |
+| status 실패 | 0 | **0** |
+
+292개 중 258개가 성공했고, 34개는 기존 uninitialized, control-flow, call 등의 다음 제약으로 이동했습니다. `tests/test_c_lower_pointers.cpp`는 서로 독립적인 pointer-load 접근 65개를 만든 본문으로 과거 32와 64 경계의 회귀를 막습니다. 기존 pointer-load, call-return pointer, integer-to-pointer 의미론 테스트도 그대로 통과했습니다. 영향 범위는 C 하향기의 dynamic object admission에 한정되므로 `CLowerPointers.*` 14/14와 관련 call/record 테스트 2개만 실행했습니다. solver, plugin, scheduler, public ABI에는 영향이 없어 전체 CTest는 필요하지 않았고, 전체 train coverage만 G9 수치와 기존 성공 회귀를 확인하기 위해 실행했습니다.
+
+수정 전에 `duplicate_declaration` 첫 차단 47개도 별도로 확인했습니다. `extern` 호환 재선언은 하나도 없었고, 같은 이름의 서로 다른 타입, 중복 initializer, 서로 다른 배열 크기 같은 실제 C 제약 위반이었습니다. 첫 선언을 덮어쓰면 원문 의미를 발명하게 되므로 이 범주는 수용하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1829,11 +1848,11 @@ generic unknown-type 진단 777개를 source spelling으로 나누면 704개가 
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `uninitialized_read` 2,325
+- `uninitialized_read` 2,339
 - `unsupported_type` 1,989
-- `unsupported_pointer` 667
-- `unsupported_control_flow` 566
-- `unsupported_call` 335
+- `unsupported_control_flow` 579
+- `unsupported_pointer` 358
+- `unsupported_call` 337
 
 ## 조율자에게 요청할 것
 

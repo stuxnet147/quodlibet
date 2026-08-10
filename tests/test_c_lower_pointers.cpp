@@ -574,6 +574,20 @@ TEST(CLowerPointers, LowersADoubleIndirectionWithoutAStatusFailure) {
     ASSERT_TRUE(lowered.Open(source, "deref_twice"));
 }
 
+/* A finite object table is still a resource boundary, but 32 entries rejected
+   ordinary acyclic corpus bodies. Keep enough independent pointer-load sites
+   here to catch both that old boundary and an accidental reduction to 64. */
+TEST(CLowerPointers, CarriesMoreThanSixtyFourDynamicObjects) {
+    std::string source = "int deref_many(int **p) { int sum = 0;\n";
+    for (std::size_t index = 0u; index < 65u; ++index) {
+        source += "sum += *p[" + std::to_string(index) + "];\n";
+    }
+    source += "return sum; }\n";
+
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(source.c_str(), "deref_many"));
+}
+
 TEST(CLowerPointers, IntegerAddressBitsCanNameADynamicObject) {
     Lowered lowered;
     const int32_t data = 91;
