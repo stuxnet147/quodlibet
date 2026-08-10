@@ -41,6 +41,18 @@ QL_PTR_FUNCTION(swap_first, int ptr_swap(int *p) {
     p[1] = t;
     return p[0];
 });
+/* A compound assignment and an increment through a pointer read, combine, and
+   write the same element, so the final image says whether the address was
+   computed once and used for both. */
+QL_PTR_FUNCTION(bump, int ptr_bump(int *p, int i) {
+    p[i] += 7;
+    return p[i] + p[0];
+});
+QL_PTR_FUNCTION(step, int ptr_step(int *p, int i) {
+    int old = p[i]++;
+    --p[0];
+    return old * 3 + p[i];
+});
 QL_PTR_FUNCTION(nullness, int ptr_null(int *p) { return p == 0; });
 QL_PTR_FUNCTION(narrow_load, int ptr_short(short *p, int i) {
     return p[i];
@@ -349,6 +361,10 @@ TEST(CLowerPointers, MatchesCompiledExecutionOnPointerFunctions) {
          [](int32_t *p, int32_t v) { return ptr_write(p, v); }},
         {"swap", swap_first_source, "ptr_swap", 0,
          [](int32_t *p, int32_t) { return ptr_swap(p); }},
+        {"bump", bump_source, "ptr_bump", 1,
+         [](int32_t *p, int32_t i) { return ptr_bump(p, i); }},
+        {"step", step_source, "ptr_step", 1,
+         [](int32_t *p, int32_t i) { return ptr_step(p, i); }},
     };
 
     uint64_t state = UINT64_C(0x39a1c4f70bd52e18);

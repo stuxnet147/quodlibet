@@ -4262,78 +4262,45 @@ static ql_status lower_pointer_binary(lower_context *context,
     return convert_value(context, comparison, result_type, output, error);
 }
 
-static ql_status lower_binary_expression(lower_context *context, size_t node,
-                                         lower_value *output,
-                                         ql_error *error) {
-    size_t left_node = direct_field_child(context, node, "left");
-    size_t right_node = direct_field_child(context, node, "right");
-    size_t operator_node = direct_field_child(context, node, "operator");
-    lower_value left;
-    lower_value right;
+/* Applies one C binary operator to two operands that are already lowered.
+   Compound assignment and the increment operators are defined in terms of the
+   same operators, so they call this rather than restating the conversion and
+   definedness rules a second time. `operator_text` is borrowed. */
+static ql_status apply_binary_operator(lower_context *context,
+                                       const char *operator_text, size_t node,
+                                       lower_value left, lower_value right,
+                                       lower_value *output, ql_error *error) {
     lower_value converted_left;
     lower_value converted_right;
     lower_type common;
-    char *operator_text;
     ql_ir_value_id inherited_defined;
     uint32_t inherited_may_ub;
     ql_status status;
 
-    if (left_node == SIZE_MAX || right_node == SIZE_MAX ||
-        operator_node == SIZE_MAX) {
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
-            "binary expression is missing an operand or operator", error);
-    }
-    status = lower_expression(context, left_node, &left, error);
-    if (status != QL_STATUS_OK || context->unknown != 0u) {
-        return status;
-    }
-    status = lower_expression(context, right_node, &right, error);
-    if (status != QL_STATUS_OK || context->unknown != 0u) {
-        return status;
-    }
-    operator_text = copy_node_text(context, operator_node);
-    if (operator_text == NULL) {
-        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
-        return QL_STATUS_OUT_OF_MEMORY;
-    }
     if (strcmp(operator_text, "&&") == 0 ||
         strcmp(operator_text, "||") == 0) {
-        status = lower_logical_expression(context, operator_text, left, right,
-                                          output, error);
-        context->allocator->deallocate(context->allocator->user_data,
-                                       operator_text);
-        return status;
+        return lower_logical_expression(context, operator_text, left, right,
+                                        output, error);
     }
     if (strcmp(operator_text, "<<") == 0 ||
         strcmp(operator_text, ">>") == 0) {
-        status = emit_shift_result(context, strcmp(operator_text, "<<") == 0,
-                                   left, right, output, error);
-        context->allocator->deallocate(context->allocator->user_data,
-                                       operator_text);
-        return status;
+        return emit_shift_result(context, strcmp(operator_text, "<<") == 0,
+                                 left, right, output, error);
     }
     if (left.type.kind == QL_C_SCALAR_POINTER ||
         right.type.kind == QL_C_SCALAR_POINTER) {
-        status = lower_pointer_binary(context, operator_text, node, left,
-                                      right, output, error);
-        context->allocator->deallocate(context->allocator->user_data,
-                                       operator_text);
-        return status;
+        return lower_pointer_binary(context, operator_text, node, left, right,
+                                    output, error);
     }
     status = usual_arithmetic_conversions(
         context, left, right, &converted_left, &converted_right, &common,
         error);
     if (status != QL_STATUS_OK) {
-        context->allocator->deallocate(context->allocator->user_data,
-                                       operator_text);
         return status;
     }
     status = combine_defined(context, &converted_left, &converted_right,
                              &inherited_defined, error);
     if (status != QL_STATUS_OK) {
-        context->allocator->deallocate(context->allocator->user_data,
-                                       operator_text);
         return status;
     }
     inherited_may_ub = converted_left.may_ub | converted_right.may_ub;
@@ -4419,6 +4386,41 @@ static ql_status lower_binary_expression(lower_context *context, size_t node,
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
             "binary operator is outside the integer lowering slice", error);
     }
+    return status;
+}
+
+static ql_status lower_binary_expression(lower_context *context, size_t node,
+                                         lower_value *output,
+                                         ql_error *error) {
+    size_t left_node = direct_field_child(context, node, "left");
+    size_t right_node = direct_field_child(context, node, "right");
+    size_t operator_node = direct_field_child(context, node, "operator");
+    lower_value left;
+    lower_value right;
+    char *operator_text;
+    ql_status status;
+
+    if (left_node == SIZE_MAX || right_node == SIZE_MAX ||
+        operator_node == SIZE_MAX) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "binary expression is missing an operand or operator", error);
+    }
+    status = lower_expression(context, left_node, &left, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    status = lower_expression(context, right_node, &right, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    operator_text = copy_node_text(context, operator_node);
+    if (operator_text == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    status = apply_binary_operator(context, operator_text, node, left, right,
+                                   output, error);
     context->allocator->deallocate(context->allocator->user_data,
                                    operator_text);
     return status;
@@ -4895,21 +4897,15 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
         "expression does not designate an object", error);
 }
 
-/* Reads whatever a designator names. A record-valued designator has no value
-   this slice can produce, and a pointer member arrives as a plain address
-   that has to be reinterpreted at its declared type. */
-static ql_status lower_designator_load(lower_context *context, size_t node,
-                                       lower_value *output,
-                                       ql_error *error) {
-    lower_value address;
+/* Reads the object an address names, at its declared type. Split out of the
+   designator path because a compound assignment reaches the same read from an
+   address it has already computed and must not compute twice. */
+static ql_status load_at_address(lower_context *context, size_t node,
+                                 lower_value address, lower_type declared,
+                                 lower_value *output, ql_error *error) {
     lower_value loaded;
-    lower_type declared;
-    ql_status status = lower_designator_address(context, node, &address,
-                                                &declared, error);
+    ql_status status;
 
-    if (status != QL_STATUS_OK || context->unknown != 0u) {
-        return status;
-    }
     if (declared.array_length != 0u) {
         /* Naming an array yields a pointer to its first element. There is no
            value of array type to load, here or anywhere. */
@@ -4939,6 +4935,23 @@ static ql_status lower_designator_load(lower_context *context, size_t node,
         return QL_STATUS_OK;
     }
     return emit_pointer_of_address(context, loaded, declared, output, error);
+}
+
+/* Reads whatever a designator names. A record-valued designator has no value
+   this slice can produce, and a pointer member arrives as a plain address
+   that has to be reinterpreted at its declared type. */
+static ql_status lower_designator_load(lower_context *context, size_t node,
+                                       lower_value *output,
+                                       ql_error *error) {
+    lower_value address;
+    lower_type declared;
+    ql_status status = lower_designator_address(context, node, &address,
+                                                &declared, error);
+
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    return load_at_address(context, node, address, declared, output, error);
 }
 
 /* Resolves a prototype's return and parameter types. Done at the first call
@@ -5228,6 +5241,190 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     return QL_STATUS_OK;
 }
 
+/* Defined below, next to the assignment they share a target model with. */
+static ql_status lower_assignment_value(lower_context *context, size_t node,
+                                        lower_value *output, ql_error *error);
+static ql_status lower_update_expression(lower_context *context, size_t node,
+                                         lower_value *output,
+                                         ql_error *error);
+
+/* `c ? a : b`. The value is selected, but the definedness short-circuits the
+   way `&&` already does: only the arm the condition chooses has to be defined.
+   Requiring both would invent undefined behaviour C does not have, exactly as
+   it would for the right operand of `&&`. */
+static ql_status lower_conditional_expression(lower_context *context,
+                                              size_t node,
+                                              lower_value *output,
+                                              ql_error *error) {
+    size_t condition_node = direct_field_child(context, node, "condition");
+    size_t consequence_node = direct_field_child(context, node, "consequence");
+    size_t alternative_node = direct_field_child(context, node, "alternative");
+    lower_value condition;
+    lower_value condition_bool;
+    lower_value consequence;
+    lower_value alternative;
+    lower_value left;
+    lower_value right;
+    lower_type common;
+    ql_ir_value_id operands[3];
+    ql_ir_value_id not_condition;
+    ql_ir_value_id then_safe;
+    ql_ir_value_id else_safe;
+    ql_ir_value_id arms_safe;
+    ql_ir_value_id condition_defined;
+    ql_ir_value_id consequence_defined;
+    ql_ir_value_id alternative_defined;
+    ql_status status;
+
+    if (condition_node == SIZE_MAX || consequence_node == SIZE_MAX ||
+        alternative_node == SIZE_MAX) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "conditional expression is missing one of its three operands",
+            error);
+    }
+    status = lower_expression(context, condition_node, &condition, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    status = lower_expression(context, consequence_node, &consequence, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    status = lower_expression(context, alternative_node, &alternative, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    status = convert_value(context, condition, make_bool_type(),
+                           &condition_bool, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    if (consequence.type.kind == QL_C_SCALAR_VOID ||
+        alternative.type.kind == QL_C_SCALAR_VOID ||
+        consequence.type.kind == QL_C_SCALAR_RECORD ||
+        alternative.type.kind == QL_C_SCALAR_RECORD ||
+        consequence.type.array_length != 0u ||
+        alternative.type.array_length != 0u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "a conditional whose arms are void, a record, or an array is "
+            "outside this slice", error);
+    }
+    if (consequence.type.kind == QL_C_SCALAR_POINTER ||
+        alternative.type.kind == QL_C_SCALAR_POINTER) {
+        /* Two addresses select to an address. The result carries no object,
+           because naming either arm's object for both would claim a
+           provenance the expression does not have. */
+        lower_type u64 = address_type();
+        if (consequence.type.kind != alternative.type.kind) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+                "a conditional mixing a pointer and an integer is outside "
+                "this slice", error);
+        }
+        status = convert_value(context, consequence, u64, &left, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        status = convert_value(context, alternative, u64, &right, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+        common = u64;
+    } else {
+        status = usual_arithmetic_conversions(context, consequence,
+                                              alternative, &left, &right,
+                                              &common, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+    }
+    status = ensure_bool_constants(context, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    memset(output, 0, sizeof(*output));
+    operands[0] = condition_bool.value;
+    operands[1] = left.value;
+    operands[2] = right.value;
+    status = emit_instruction(context, QL_IR_OPCODE_SELECT, &common, operands,
+                              3u, NULL, 0u, QL_IR_EFFECT_NONE, &output->value,
+                              error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    condition_defined =
+        condition.may_ub != 0u ? condition.defined : context->true_value;
+    consequence_defined =
+        consequence.may_ub != 0u ? consequence.defined : context->true_value;
+    alternative_defined =
+        alternative.may_ub != 0u ? alternative.defined : context->true_value;
+    status = emit_bool_not(context, condition_bool.value, &not_condition,
+                           error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = emit_bool_or(context, not_condition, consequence_defined,
+                          &then_safe, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = emit_bool_or(context, condition_bool.value, alternative_defined,
+                          &else_safe, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = emit_bool_and(context, then_safe, else_safe, &arms_safe, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = emit_bool_and(context, condition_defined, arms_safe,
+                           &output->defined, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    output->type = common;
+    output->may_ub = 1u;
+    if (common.kind == QL_C_SCALAR_POINTER) {
+        return QL_STATUS_OK;
+    }
+    return QL_STATUS_OK;
+}
+
+/* `a, b`. The left operand is evaluated for its effects and discarded, and
+   the expression's value is the right one's. */
+static ql_status lower_comma_expression(lower_context *context, size_t node,
+                                        lower_value *output,
+                                        ql_error *error) {
+    size_t left_node = direct_field_child(context, node, "left");
+    size_t right_node = direct_field_child(context, node, "right");
+    lower_value discarded;
+    ql_status status;
+
+    if (left_node == SIZE_MAX || right_node == SIZE_MAX) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "comma expression is missing an operand", error);
+    }
+    if (strcmp(context->nodes[left_node].view.kind,
+               "assignment_expression") == 0) {
+        status = lower_assignment_value(context, left_node, NULL, error);
+    } else {
+        status = lower_expression(context, left_node, &discarded, error);
+        if (status == QL_STATUS_OK && context->unknown == 0u) {
+            /* The discarded value is still observed: C sequences it before
+               the right operand, so undefined behaviour in it has happened
+               whether or not anybody reads the result. */
+            status = emit_ub_guard(context, &discarded, error);
+        }
+    }
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    return lower_expression(context, right_node, output, error);
+}
+
 static ql_status lower_expression(lower_context *context, size_t node,
                                   lower_value *output, ql_error *error) {
     const char *kind;
@@ -5376,6 +5573,18 @@ static ql_status lower_expression(lower_context *context, size_t node,
                                  (uint64_t)decoded[0], &output->value,
                                  error);
     }
+    if (strcmp(kind, "conditional_expression") == 0) {
+        return lower_conditional_expression(context, node, output, error);
+    }
+    if (strcmp(kind, "comma_expression") == 0) {
+        return lower_comma_expression(context, node, output, error);
+    }
+    if (strcmp(kind, "assignment_expression") == 0) {
+        return lower_assignment_value(context, node, output, error);
+    }
+    if (strcmp(kind, "update_expression") == 0) {
+        return lower_update_expression(context, node, output, error);
+    }
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
         "expression is outside the loop-free integer lowering slice", error);
@@ -5384,70 +5593,217 @@ static ql_status lower_expression(lower_context *context, size_t node,
 static ql_status lower_statement(lower_context *context, size_t node,
                                  ql_error *error);
 
-static ql_status lower_store_assignment(lower_context *context, size_t node,
-                                        size_t left_node, size_t right_node,
-                                        size_t operator_node,
-                                        ql_error *error) {
+/* Where an assignment, a compound assignment, or an increment writes. A
+   register target is a local the pre-pass left in an SSA value; every other
+   target is an address, computed once so that `a[i()] += 1` calls `i` once. */
+typedef struct lower_target {
+    lower_variable *variable; /* NULL when the target is an address */
     lower_value address;
-    lower_value value;
     lower_type declared;
-    char *operator_text = copy_node_text(context, operator_node);
+} lower_target;
+
+static ql_status resolve_assignment_target(lower_context *context,
+                                           size_t left_node,
+                                           lower_target *target,
+                                           ql_error *error) {
+    const char *kind = context->nodes[left_node].view.kind;
+
+    memset(target, 0, sizeof(*target));
+    if (strcmp(kind, "identifier") == 0) {
+        char *name = copy_node_text(context, left_node);
+        lower_variable *variable;
+        if (name == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        variable = find_variable(context, name, strlen(name));
+        context->allocator->deallocate(context->allocator->user_data, name);
+        if (variable == NULL) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNDECLARED_IDENTIFIER,
+                left_node, "assignment target is not a visible local or "
+                "parameter", error);
+        }
+        if (variable->is_const != 0u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, left_node,
+                "assignment modifies a const-qualified local", error);
+        }
+        target->declared = variable->type;
+        if (variable->is_stack == 0u) {
+            target->variable = variable;
+            return QL_STATUS_OK;
+        }
+        target->address = stack_address(context, variable);
+        return QL_STATUS_OK;
+    }
+    if (strcmp(kind, "pointer_expression") == 0 ||
+        strcmp(kind, "subscript_expression") == 0 ||
+        strcmp(kind, "field_expression") == 0 ||
+        strcmp(kind, "parenthesized_expression") == 0) {
+        return lower_designator_address(context, left_node, &target->address,
+                                        &target->declared, error);
+    }
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, left_node,
+        "only assignment to a scalar local, parameter, or dereference is "
+        "supported", error);
+}
+
+/* Writes `value` to a resolved target, converting it to the target's declared
+   type first. `stored` receives what the assignment expression's value is. */
+static ql_status write_assignment_target(lower_context *context, size_t node,
+                                         const lower_target *target,
+                                         lower_value value,
+                                         lower_value *stored,
+                                         ql_error *error) {
+    lower_value converted;
     ql_status status;
 
-    if (operator_text == NULL) {
-        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
-        return QL_STATUS_OUT_OF_MEMORY;
-    }
-    status = strcmp(operator_text, "=") == 0 ? QL_STATUS_OK
-                                             : QL_STATUS_INVALID_ARGUMENT;
-    context->allocator->deallocate(context->allocator->user_data,
-                                   operator_text);
-    if (status != QL_STATUS_OK) {
+    if (target->declared.kind == QL_C_SCALAR_RECORD) {
         return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
-            "compound assignment is not in the first semantic lowering slice",
-            error);
-    }
-    /* The value is evaluated before the store so that a partial operation in
-       it is already guarded when the address is written. */
-    status = lower_expression(context, right_node, &value, error);
-    if (status != QL_STATUS_OK || context->unknown != 0u) {
-        return status;
-    }
-    status = lower_designator_address(context, left_node, &address,
-                                      &declared, error);
-    if (status != QL_STATUS_OK || context->unknown != 0u) {
-        return status;
-    }
-    if (declared.kind == QL_C_SCALAR_RECORD) {
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, left_node,
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
             "assigning a whole struct or union is outside this slice", error);
     }
-    if (declared.kind == QL_C_SCALAR_POINTER) {
-        lower_value converted;
-        status = convert_value(context, value, declared, &converted, error);
-        if (status != QL_STATUS_OK || context->unknown != 0u) {
-            return status;
-        }
-        status = emit_address_of_pointer(context, converted, &value, error);
+    if (target->declared.kind == QL_C_SCALAR_VOID ||
+        target->declared.array_length != 0u) {
+        /* `*p = v` through a `void *`, and an array name, are not objects an
+           assignment can write. Converting to the type first would ask the IR
+           for a value of a type no value can have. */
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+            "assignment target is not an object type this slice can write",
+            error);
+    }
+    status = convert_value(context, value, target->declared, &converted,
+                           error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    if (stored != NULL) {
+        *stored = converted;
+    }
+    if (target->variable != NULL) {
+        status = emit_ub_guard(context, &converted, error);
         if (status != QL_STATUS_OK) {
             return status;
         }
+        target->variable->value = converted.value;
+        target->variable->initialized = 1u;
+        target->variable->has_object = converted.has_object;
+        if (stored != NULL) {
+            *stored = converted;
+        }
+        return QL_STATUS_OK;
     }
-    return emit_store(context, address, value, error);
+    if (target->declared.kind == QL_C_SCALAR_POINTER) {
+        /* Storage holds an address, so a pointer value is written as one. */
+        lower_value address;
+        status = emit_address_of_pointer(context, converted, &address, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        return emit_store(context, target->address, address, error);
+    }
+    return emit_store(context, target->address, converted, error);
 }
 
-static ql_status lower_assignment(lower_context *context, size_t node,
-                                  ql_error *error) {
+/* `x = v`, `x op= v`, `++x` and `x++` all read, combine, and write the same
+   object, so they share one implementation rather than three that could drift.
+   `operator_text` is NULL for a plain assignment and otherwise the binary
+   operator the compound form stands for; C defines `x op= v` as `x = x op v`
+   with `x` evaluated once, which is what resolving the target first buys.
+   `output` receives the expression's value and may be NULL when it is
+   discarded; `yields_old_value` selects the postfix reading. */
+static ql_status lower_read_modify_write(lower_context *context, size_t node,
+                                         size_t left_node,
+                                         const char *operator_text,
+                                         lower_value operand,
+                                         int yields_old_value,
+                                         lower_value *output,
+                                         ql_error *error) {
+    lower_target target;
+    lower_value old;
+    lower_value combined;
+    ql_status status = resolve_assignment_target(context, left_node, &target,
+                                                 error);
+
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    if (operator_text == NULL) {
+        return write_assignment_target(context, node, &target, operand,
+                                       output, error);
+    }
+    if (target.variable != NULL) {
+        if (target.variable->initialized == 0u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, left_node,
+                "a compound assignment reads its target before writing it",
+                error);
+        }
+        memset(&old, 0, sizeof(old));
+        old.value = target.variable->value;
+        old.type = target.variable->type;
+        old.has_object = target.variable->has_object;
+        status = ensure_bool_constants(context, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        old.defined = context->true_value;
+    } else {
+        status = load_at_address(context, left_node, target.address,
+                                 target.declared, &old, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+    }
+    status = apply_binary_operator(context, operator_text, node, old, operand,
+                                   &combined, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    status = write_assignment_target(context, node, &target, combined,
+                                     yields_old_value ? NULL : output, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    if (yields_old_value != 0 && output != NULL) {
+        *output = old;
+    }
+    return QL_STATUS_OK;
+}
+
+/* The compound operators, each paired with the binary operator it stands for.
+   `>>=` and `<<=` are here too: the shift's own definedness rules apply
+   unchanged, which is exactly what reusing the binary path gives. */
+static const char *compound_binary_operator(const char *assignment) {
+    static const struct {
+        const char *assignment;
+        const char *binary;
+    } table[] = {
+        {"+=", "+"},  {"-=", "-"},  {"*=", "*"},   {"/=", "/"},
+        {"%=", "%"},  {"&=", "&"},  {"|=", "|"},   {"^=", "^"},
+        {"<<=", "<<"}, {">>=", ">>"}
+    };
+    size_t index;
+    for (index = 0u; index < sizeof(table) / sizeof(table[0]); ++index) {
+        if (strcmp(assignment, table[index].assignment) == 0) {
+            return table[index].binary;
+        }
+    }
+    return NULL;
+}
+
+static ql_status lower_assignment_value(lower_context *context, size_t node,
+                                        lower_value *output,
+                                        ql_error *error) {
     size_t left_node = direct_field_child(context, node, "left");
     size_t right_node = direct_field_child(context, node, "right");
     size_t operator_node = direct_field_child(context, node, "operator");
-    char *name;
+    const char *binary = NULL;
     char *operator_text;
-    lower_variable *variable;
     lower_value value;
-    lower_value converted;
     ql_status status;
 
     if (left_node == SIZE_MAX || right_node == SIZE_MAX ||
@@ -5456,75 +5812,90 @@ static ql_status lower_assignment(lower_context *context, size_t node,
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
             "assignment is missing a target, a value, or an operator", error);
     }
-    if (strcmp(context->nodes[left_node].view.kind, "pointer_expression") ==
-            0 ||
-        strcmp(context->nodes[left_node].view.kind,
-               "subscript_expression") == 0 ||
-        strcmp(context->nodes[left_node].view.kind,
-               "field_expression") == 0) {
-        return lower_store_assignment(context, node, left_node, right_node,
-                                      operator_node, error);
-    }
-    if (strcmp(context->nodes[left_node].view.kind, "identifier") != 0) {
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
-            "only assignment to a scalar local, parameter, or dereference is "
-            "supported", error);
-    }
     operator_text = copy_node_text(context, operator_node);
     if (operator_text == NULL) {
         ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
         return QL_STATUS_OUT_OF_MEMORY;
     }
     if (strcmp(operator_text, "=") != 0) {
-        context->allocator->deallocate(context->allocator->user_data,
-                                       operator_text);
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
-            "compound assignment is not in the first semantic lowering slice",
-            error);
+        binary = compound_binary_operator(operator_text);
+        if (binary == NULL) {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           operator_text);
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "assignment operator is outside this slice", error);
+        }
     }
     context->allocator->deallocate(context->allocator->user_data,
                                    operator_text);
-    name = copy_node_text(context, left_node);
-    if (name == NULL) {
-        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
-        return QL_STATUS_OUT_OF_MEMORY;
-    }
-    variable = find_variable(context, name, strlen(name));
-    context->allocator->deallocate(context->allocator->user_data, name);
-    if (variable == NULL) {
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNDECLARED_IDENTIFIER, left_node,
-            "assignment target is not a visible local or parameter", error);
-    }
-    if (variable->is_const != 0u) {
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, left_node,
-            "assignment modifies a const-qualified local", error);
-    }
+    /* The right operand is evaluated before the target is written, so a
+       partial operation inside it is already guarded when the store happens. */
     status = lower_expression(context, right_node, &value, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
     }
-    status = convert_value(context, value, variable->type, &converted, error);
+    return lower_read_modify_write(context, node, left_node, binary, value, 0,
+                                   output, error);
+}
+
+static ql_status lower_assignment(lower_context *context, size_t node,
+                                  ql_error *error) {
+    return lower_assignment_value(context, node, NULL, error);
+}
+
+/* `++x` and `x--`. C defines these as adding or subtracting one, and on a
+   pointer that is one element rather than one byte, which the binary path
+   already knows. */
+static ql_status lower_update_expression(lower_context *context, size_t node,
+                                         lower_value *output,
+                                         ql_error *error) {
+    size_t argument_node = direct_field_child(context, node, "argument");
+    size_t operator_node = direct_field_child(context, node, "operator");
+    lower_value one;
+    char *operator_text;
+    const char *binary;
+    int is_postfix;
+    ql_status status;
+
+    if (argument_node == SIZE_MAX || operator_node == SIZE_MAX) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "increment is missing its operand or operator", error);
+    }
+    operator_text = copy_node_text(context, operator_node);
+    if (operator_text == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    binary = strcmp(operator_text, "++") == 0
+                 ? "+"
+                 : (strcmp(operator_text, "--") == 0 ? "-" : NULL);
+    context->allocator->deallocate(context->allocator->user_data,
+                                   operator_text);
+    if (binary == NULL) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+            "update operator is outside this slice", error);
+    }
+    /* Tree-sitter puts the operator before the argument for a prefix update
+       and after it for a postfix one, and only the postfix form has the
+       object's old value. */
+    is_postfix = context->nodes[operator_node].view.range.start_byte >
+                 context->nodes[argument_node].view.range.start_byte;
+    memset(&one, 0, sizeof(one));
+    one.type = make_integer_type(32u, 3u, 1u);
+    status = ensure_bool_constants(context, error);
     if (status != QL_STATUS_OK) {
         return status;
     }
-    status = emit_ub_guard(context, &converted, error);
+    one.defined = context->true_value;
+    status = add_uint_constant(context, one.type, 1u, &one.value, error);
     if (status != QL_STATUS_OK) {
         return status;
     }
-    if (variable->is_stack != 0u) {
-        /* The value lives in storage, so writing it is a store and the
-           variable record holds nothing to update. */
-        return emit_store(context, stack_address(context, variable),
-                          converted, error);
-    }
-    variable->value = converted.value;
-    variable->initialized = 1u;
-    variable->has_object = converted.has_object;
-    return QL_STATUS_OK;
+    return lower_read_modify_write(context, node, argument_node, binary, one,
+                                   is_postfix, output, error);
 }
 
 static ql_status parse_local_type(lower_context *context, size_t declaration,
