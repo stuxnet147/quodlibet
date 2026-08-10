@@ -224,7 +224,7 @@ before the body. An access through pointer bits read from memory, returned by
 a call, or cast from an integer introduces one auxiliary descriptor at that
 access site, because the source signature cannot name its target object.
 Schema v1 control flow is acyclic, so one descriptor per such site is finite;
-the lowering admits at most 32 and reports `UNKNOWN` above that explicit bound.
+the lowering admits at most 128 and reports `UNKNOWN` above that explicit bound.
 An auxiliary descriptor may exactly alias an earlier descriptor. This covers
 a derived pointer back into an existing object without admitting partial
 overlaps. Loading, comparing, or returning pointer bits without accessing
