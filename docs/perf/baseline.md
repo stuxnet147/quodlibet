@@ -503,6 +503,8 @@ digest 가 같으므로 이 변경은 결과 중립이고 비교는 유효하다
 
 예측한 대로다. 스냅샷 쓰기가 판정당에서 워커당으로 바뀌면 **창의 개수 자체가 배치 크기만큼 줄어든다.** 재시도를 넣지 않고 기다린 것이 옳았다. 재시도를 먼저 넣었다면 이 0 을 재시도의 공으로 잘못 읽었을 것이다.
 
+**건전성.** windows-clang 430/430, linux-clang 429/429 (둘 다 직렬). **sanitizer 는 못 돌렸다.** `third_party/drat-trim/lrat-check.c` 가 `getClause`/`setClause` 를 C99 파일 범위 `inline` 으로만 정의해 sanitizer 빌드에서 링크가 깨지고, `quodlibet_tests` 가 그 타깃에 의존해 `-k 0` 으로도 안 만들어진다. 벤더 파일이고 W8 소유가 아니라 보고만 했다. **그 타깃이 고쳐지면 이 변경도 sanitizer 로 다시 확인해야 한다.**
+
 ## 아직 없는 것
 
 - **threading 리포트.** 워크로드는 준비됐다(`scripts/perf/bench-batch.py`). **WSL 에서 VTune 수집은 자식 프로세스를 띄우는 워크로드에서 걸린다.** 2026-08-10 에 두 번째 확인을 얻었다: 인수 시에는 threading 수집만 걸린다고 알려져 있었는데, **hotspots 수집도 같은 배치 워크로드에서 똑같이 매달렸다**(무출력, 결과 디렉터리는 생기지만 리포트가 안 나옴, 손으로 `pkill` 해야 끝남). 반면 자식을 안 띄우는 coverage 워크로드는 hotspots 가 정상이다. **가르는 것은 수집 종류가 아니라 자식 프로세스다.** threading 리포트는 G7 의 실제 Linux VM 에서 뜬다.

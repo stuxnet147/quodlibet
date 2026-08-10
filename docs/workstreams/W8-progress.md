@@ -44,6 +44,8 @@ WU12. (B) solver 세션 객체. 조율자가 W7 대기 조건을 완화해 착�
 
 **예상 3~4ms 였는데 12.3ms 가 나온 이유.** 예상은 복사와 생성 해시만 셌는데 세션은 **버전 프로브 서브프로세스**도 지웁니다. 모형에 없던 항목입니다. BLAKE3 때와 같은 방향의 오차이고 같은 교훈입니다. 모형은 하한입니다.
 
+**건전성.** windows-clang 430/430, linux-clang 429/429 (둘 다 직렬). **sanitizer 는 못 돌렸습니다.** `third_party/drat-trim/lrat-check.c` 의 C99 파일 범위 `inline` 때문에 sanitizer 빌드가 링크에서 깨지고 `quodlibet_tests` 가 그 타깃에 의존해 `-k 0` 으로도 안 만들어집니다. escalation 으로 올렸고, 고쳐지면 이 변경을 sanitizer 로 다시 확인해야 합니다.
+
 ## 이 디스패치에서 닫지 못한 것 (인계)
 
 | 항목 | 막은 것 | 필요한 것 |
