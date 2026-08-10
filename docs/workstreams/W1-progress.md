@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,418 / 29,880 (95.11%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_control_flow` 382, `unsupported_type` 370, `unsupported_call` 262, `undeclared_identifier` 140입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,487 / 29,880 (95.34%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 370, `unsupported_control_flow` 308, `unsupported_call` 263, `undeclared_identifier` 144입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1927,7 +1927,7 @@ source signature에는 별도 `FLOAT` kind와 32/64 bit width를 기록하고 lo
 
 기존 loop lowering은 순환 CFG와 header PHI, `break` 및 `continue` 상태 합류를 이미 표현했습니다. 함수 본문에 직접 놓인 뒤쪽 label도 미리 수집하고 goto edge의 SSA와 memory 상태를 label 시점까지 보존합니다. 그런데 loop 안에 goto 또는 ordinary label이 하나라도 있으면 이 두 경로가 만나기 전에 함수 전체를 거부하는 사전 검사가 있었습니다.
 
-그 일괄 차단을 제거해 `for`, `while`, `do` 안에서 함수 본문의 뒤쪽 직접 label로 나가는 goto를 기존 pending-state 경로로 내립니다. goto가 loop 안쪽 지역의 scope를 빠져나가면 function-scope 상태만 label에 전달하고, loop의 다른 경로는 기존 backedge PHI를 유지합니다. 함수 본문 앞쪽 label로 돌아가는 backward goto, loop나 조건문 안에 중첩된 label, 선언 초기화를 건너뛰는 goto는 각각 기존 진단으로 계속 UNKNOWN입니다.
+그 일괄 차단을 제거해 `for`, `while`, `do` 안에서 함수 본문의 뒤쪽 직접 label로 나가는 goto를 기존 pending-state 경로로 내립니다. goto가 loop 안쪽 지역의 scope를 빠져나가면 function-scope 상태만 label에 전달하고, loop의 다른 경로는 기존 backedge PHI를 유지합니다. 함수 본문 앞쪽 label로 돌아가는 backward goto와 선언 초기화를 건너뛰는 goto는 기존 진단으로 계속 UNKNOWN입니다. 이 단위에서는 loop나 조건문 안에 중첩된 label도 거부했으며, 뒤의 69번 단위에서 function-scope 상태만 필요한 안전한 forward subset을 확장했습니다.
 
 | | 이전 | 이후 |
 |---|---:|---:|
@@ -1999,6 +1999,25 @@ IR pointer type은 element type을 재귀적으로 가리키므로 3단계 point
 
 `tests/test_c_lower_pointers.cpp`는 세 개의 서로 다른 object image에 `int ***`를 연결하고, 실제 compiled C와 concrete interpreter의 3중 역참조 결과를 비교합니다. 2단계 local의 주소를 3단계 pointer로 보존하는 stack-object 경로도 실행합니다. `tests/test_c_lower_types.cpp`는 typedef와 표면 별표의 합산 및 새 4단계 거부 경계를 고정합니다. 변경은 pointer type 해석과 주소 취하기 경로에 국한되므로 pointer, record, type, interpreter, verifier 영향 범위 78/78을 실행했습니다. 공용 IR, interpreter, solver 또는 plugin 구현은 바꾸지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 G9 성공률과 기존 성공 사례 회귀를 확인하기 위해 실행했습니다.
 
+### 69. 구조화 제어 흐름 안의 안전한 forward label을 합류시킨다
+
+C label은 함수 scope이므로 조건문이나 compound 안에 적혀 있어도 앞쪽 goto의 target이 될 수 있습니다. label 수집을 함수 본문 전체로 넓히고, 기존 pending state가 function-scope scalar, definedness, memory, call trace를 label block에서 합치도록 연결했습니다. goto나 return으로 종료된 nested compound도 뒤쪽 live label까지 건너뛰며, incoming edge가 없는 바깥 label 뒤에 live inner label이 연속된 경우도 inner label을 계속 처리합니다.
+
+현재 pending state는 nested automatic variable을 운반하지 않습니다. 따라서 target을 포함하는 nested compound에 label보다 앞선 local 선언이 있거나, goto가 바깥에서 loop 또는 switch의 구조화 entry를 건너뛰면 계속 UNKNOWN입니다. 함수 scope 선언 초기화를 건너뛰는 경우와 backward goto도 기존 경계를 유지합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 28,418 (95.11%) | **28,487 (95.34%)** |
+| 증가 | | **+69** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_control_flow` | 382 | **308** |
+| verifier 통과 | 28,418 / 28,418 | **28,487 / 28,487** |
+| status 실패 | 0 | **0** |
+
+기존 nested-target 첫 차단 150개를 좁게 재측정해 69개가 성공했습니다. 나머지는 backward goto 36개, nested 또는 function-scope 선언 상태 34개, 구조화 loop 또는 switch entry 6개 등 정확한 다음 제약으로 이동했습니다. 전체 train에서도 순증은 69개였고 기존 성공 회귀와 누락 또는 추가 행은 0개였습니다.
+
+`tests/test_ir_differential.cpp`는 앞쪽 분기에서 조건문 내부 label로 들어가는 함수를 실제 compiled C와 edge 및 random 입력에서 대조합니다. 기존 nested backward label은 계속 UNKNOWN으로 고정합니다. 변경은 label 수집, 조건문과 loop의 pending CFG 상태, 종료된 compound 탐색에 닿으므로 C lowering, parser reuse, interpreter, compiled differential, verifier 영향 범위 40/40을 실행했습니다. solver, plugin, EGraph를 포함한 전체 CTest는 실행하지 않았고, 전체 train coverage만 G9 성공률과 기존 성공 사례 회귀를 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -2007,10 +2026,10 @@ IR pointer type은 element type을 재귀적으로 가리키므로 3단계 point
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_control_flow` 382
 - `unsupported_type` 370
-- `unsupported_call` 262
-- `undeclared_identifier` 140
+- `unsupported_control_flow` 308
+- `unsupported_call` 263
+- `undeclared_identifier` 144
 - `unsupported_expression` 73
 - `unsupported_pointer` 61
 

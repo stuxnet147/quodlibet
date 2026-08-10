@@ -1798,11 +1798,10 @@ static const lower_enumerator *find_enumerator(const lower_context *context,
   return NULL;
 }
 
-/* Labels have function scope in C. The acyclic v1 lowering admits direct
-   labels in the function body and forward jumps to them; nested labels and
-   backward edges remain outside this pass. Recording the nodes before body
-   lowering lets a goto resolve its target without creating an unreachable IR
-   block prematurely. */
+/* Labels have function scope in C. Recording every label before body lowering
+   lets a forward goto resolve a target nested in structured control flow
+   without creating an unreachable IR block prematurely. Backward edges remain
+   a separate cyclic-CFG problem. */
 static ql_status collect_labels(lower_context *context, size_t body,
                                 ql_error *error) {
   size_t end = subtree_end(context, body);
@@ -1816,8 +1815,7 @@ static ql_status collect_labels(lower_context *context, size_t body,
     lower_label *entry;
     ql_status status;
 
-    if (context->nodes[node].parent != body ||
-        strcmp(context->nodes[node].view.kind, "labeled_statement") != 0) {
+    if (strcmp(context->nodes[node].view.kind, "labeled_statement") != 0) {
       continue;
     }
     label_node = direct_field_child(context, node, "label");
@@ -9467,10 +9465,7 @@ static ql_status lower_compound(lower_context *context, size_t node,
       continue;
     }
     if (context->current_terminated != 0u) {
-      if (node != context->body_node) {
-        break;
-      }
-      /* A forward goto can make a later direct label live even though
+      /* A forward goto can make a later label live even though
          ordinary fallthrough is dead. Skip intervening statements and
          let the label restore its pending predecessor states. */
       if (strcmp(context->nodes[index].view.kind, "labeled_statement") != 0) {
@@ -10959,6 +10954,17 @@ static size_t function_scope_variable_count(const lower_context *context) {
   return count;
 }
 
+static int node_contains(const lower_context *context, size_t ancestor,
+                         size_t node) {
+  while (node != SIZE_MAX) {
+    if (node == ancestor) {
+      return 1;
+    }
+    node = context->nodes[node].parent;
+  }
+  return 0;
+}
+
 static int goto_skips_declaration(const lower_context *context,
                                   size_t goto_node, size_t label_node) {
   size_t end = subtree_end(context, context->body_node);
@@ -10968,14 +10974,44 @@ static int goto_skips_declaration(const lower_context *context,
 
   for (node = context->body_node + 1u; node < end; ++node) {
     uint32_t at;
-    if (context->nodes[node].parent != context->body_node ||
-        strcmp(context->nodes[node].view.kind, "declaration") != 0) {
+    size_t scope;
+    if (strcmp(context->nodes[node].view.kind, "declaration") != 0) {
       continue;
     }
     at = context->nodes[node].view.range.start_byte;
-    if (at > begin && at < finish) {
+    scope = context->nodes[node].parent;
+    if (scope != SIZE_MAX &&
+        strcmp(context->nodes[scope].view.kind, "compound_statement") == 0 &&
+        node_contains(context, scope, label_node)) {
+      if (scope != context->body_node && at < finish) {
+        /* Pending goto states currently carry function-scope variables.
+           Entering a nested scope with a live automatic would require a
+           second lexical state map even when the declaration precedes the
+           goto, so keep that case explicit UNKNOWN. */
+        return 1;
+      }
+      if (at > begin && at < finish) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static int goto_enters_structured_region(const lower_context *context,
+                                         size_t goto_node,
+                                         size_t label_node) {
+  size_t ancestor = context->nodes[label_node].parent;
+  while (ancestor != SIZE_MAX && ancestor != context->body_node) {
+    const char *kind = context->nodes[ancestor].view.kind;
+    if ((strcmp(kind, "for_statement") == 0 ||
+         strcmp(kind, "while_statement") == 0 ||
+         strcmp(kind, "do_statement") == 0 ||
+         strcmp(kind, "switch_statement") == 0) &&
+        !node_contains(context, ancestor, goto_node)) {
       return 1;
     }
+    ancestor = context->nodes[ancestor].parent;
   }
   return 0;
 }
@@ -11005,7 +11041,7 @@ static ql_status lower_goto_statement(lower_context *context, size_t node,
   if (label == NULL) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, label_node,
-        "goto target must be a direct label in the function body", error);
+        "goto target has no label in the function", error);
   }
   if (label->lowered != 0u ||
       context->nodes[label->node].view.range.start_byte <=
@@ -11017,8 +11053,13 @@ static ql_status lower_goto_statement(lower_context *context, size_t node,
   if (goto_skips_declaration(context, node, label->node)) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
-        "goto across a function-scope declaration needs bypassed "
-        "initialization state",
+        "goto needs bypassed initialization or nested automatic state",
+        error);
+  }
+  if (goto_enters_structured_region(context, node, label->node)) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+        "goto into a loop or switch needs an explicit structured entry edge",
         error);
   }
   variable_count = function_scope_variable_count(context);
@@ -11060,7 +11101,7 @@ static ql_status lower_labeled_statement(lower_context *context, size_t node,
   if (label == NULL) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
-        "nested labels are outside the direct forward-goto slice", error);
+        "label was not collected in the function scope", error);
   }
   label->lowered = 1u;
   if (context->current_terminated == 0u) {
@@ -11079,6 +11120,10 @@ static ql_status lower_labeled_statement(lower_context *context, size_t node,
     /* No syntactic CFG edge reaches this label. Its body is unreachable
        too, and no IR block should be created for it. */
     context->current_terminated = 1u;
+    if (strcmp(context->nodes[label->body_node].view.kind,
+               "labeled_statement") == 0) {
+      return lower_statement(context, label->body_node, error);
+    }
     return QL_STATUS_OK;
   }
   status = add_block(context, "goto.label", &block, error);

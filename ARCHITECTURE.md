@@ -287,9 +287,13 @@ only the function-scope state visible at its target, while the loop's other
 paths continue through their ordinary backedge PHIs. At the label, those exit
 states merge with any live lexical fallthrough.
 
-Nested labels and backward gotos remain outside the lowering. A forward goto
-that bypasses a function-scope declaration is also refused until the skipped
-initialization and definedness state can be represented explicitly.
+A forward label nested in structured control flow is also admitted when its
+pending edges need only function-scope state. A terminated compound keeps
+scanning for such a live label, including a chain of adjacent labels. Entering
+a nested scope with live automatic declarations, entering a loop or switch
+from outside its structured entry, and bypassing a function-scope declaration
+remain explicit UNKNOWN cases. Backward gotos likewise remain outside the
+lowering.
 
 #### Data pointers retain up to three levels of indirection
 

@@ -281,7 +281,7 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
       {"int nested_label(int x) { while (x-- > 0) { again: if (x) goto "
        "again; } return x; }",
        "nested_label", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
-       "labeled_statement"},
+       "goto_statement"},
       {"int bypass(int x) { goto done; int y = x; done: return x; }", "bypass",
        QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, "goto_statement"},
       {"int multidimensional(void) { int values[2][3]; values[0][0] = 1; "
