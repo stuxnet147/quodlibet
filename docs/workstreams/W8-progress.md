@@ -4,7 +4,7 @@
 
 ## 지금 하는 것
 
-G8(퍼징 크래시-0). 캠페인은 돌렸고 **크래시-0 이 아닙니다.** 아홉 타깃 중 일곱이 깨끗하고 둘이 `src/policy.c` 의 같은 결함 하나로 죽습니다. 그 파일은 W8 소유가 아니라 조율자에게 라우팅을 올렸고, 회귀 시드와 기록은 아래 WU17 대로 넣었습니다. G8 은 그 두 줄이 고쳐지고 캠페인을 다시 돌린 뒤에 닫힙니다.
+G8(퍼징 크래시-0). **닫혔습니다.** 캠페인이 찾은 크래시 둘은 `src/policy.c` 의 같은 결함 하나였고, 조율자가 수정을 W8 에 라우팅해서 고쳤습니다. 전 타깃 캠페인을 다시 돌려 **9/9 크래시-0** 을 실측했습니다. 자세한 것은 아래 WU17 과 `docs/fuzz/campaign-20260810.md` 입니다.
 
 G6 쪽은 W8 이 혼자 닫을 수 있는 항목이 전부 닫혀 있습니다. 남은 것은 W9 의 threading 결과 소화이고, 다음 최적화 후보는 아래 WU13 이 짚은 `emit_store` 와 `ql_ir_builder_destroy` 입니다(W1 소유).
 
@@ -28,13 +28,36 @@ ASan heap-buffer-overflow, READ of size 2, strlen 안
 
 두 함수 모두 `if (json_size == 0u) { json_size = strlen(json); }` 라는 **문서화되지 않은 sentinel** 을 가지고 있습니다. 포인터+길이 계약대로 길이 0 인 non-NUL-terminated 슬라이스를 주면 할당 밖을 읽습니다. `include/quodlibet/policy.h` 에는 이 편의 규약이 한 줄도 적혀 있지 않고, `ql_precondition_parse`, `ql_problem_open`, `ql_source_signature_open` 은 길이를 준 대로 씁니다. **나머지 일곱 타깃이 같은 빈 입력에서 멀쩡한 이유가 그것입니다.** 저장소 전체에서 이 패턴은 `src/policy.c` 의 이 두 곳뿐입니다.
 
-**입력 최소화는 할 것이 없습니다. 빈 입력이 곧 최소입니다.** 한 바이트도 필요 없습니다.
+**입력 최소화는 할 것이 없습니다. 빈 입력이 곧 최소입니다.** 한 바이트도 필요 없습니다. libFuzzer 가 입력을 정확히 그 크기로 할당하므로 변이도 조작된 바이트도 필요 없이 첫 실행에서 죽습니다.
 
-**고치지 않았습니다.** `src/policy.c` 는 W8 소유가 아니고 브리프도 크래시를 스스로 고치지 말라고 했습니다. 조율자에게 위치, 원인, 재현, 두 가지 수정 선택지(길이 0 을 빈 문서로 보고 거절 / sentinel 을 공개 헤더에 명시)를 status 로 올렸습니다. 헤더의 다른 계약이 전부 포인터+길이이므로 전자를 권했습니다.
+**처음에는 고치지 않고 status 로 올렸습니다.** `src/policy.c` 가 W8 소유가 아니었기 때문입니다. **조율자가 수정을 W8 에 라우팅했습니다**(W3 정리, W1 은 로어링이라 충돌 없음). 아래가 그 수정입니다.
 
-**회귀 시드**를 `tests/fuzz/corpus/policy/empty-input` 와 `tests/fuzz/corpus/policy_result/empty-input` 에 넣었습니다. 코퍼스 디렉터리를 드라이버에 넘기면 재현됩니다.
+#### 수정: sentinel 을 지웠습니다. 호출자가 그렇게 정했습니다
 
-**`tests/test_fuzz_contracts.cpp` 의 결정적 시드 목록에는 일부러 넣지 않았습니다.** 그 목록은 매 ctest 마다 도는데, W8 이 고칠 수 없는 결함으로 관문을 빨갛게 만드는 것은 다른 워크스트림의 검증을 막습니다. 이유를 `tests/fuzz/corpus/README.md` 에 적었고, `src/policy.c` 를 고치는 쪽이 같은 변경에서 두 시드를 그 목록에 넣으면 됩니다.
+취향이 아니라 **호출자 실측**으로 갈랐습니다. 두 함수의 모든 사용처를 훑으면 이렇습니다.
+
+- **유일한 프로덕션 호출자 `bindings/python/src/ql_check.c:390` 은 sentinel 에 안 기댑니다.** `quodlibet_module.c` 가 `s#` 로 포인터와 길이를 같이 받아 `spec->policy_json_size` 에 넣습니다. sentinel 에 닿는 유일한 경우인 `policy_json=""` 은 길이 0 이고 `strlen` 도 0 이라 **전에도 파스 오류였고 지금도 파스 오류입니다.** 동작이 안 바뀝니다.
+- `tests/test_fuzz_contracts.cpp` 는 `std::strlen` 을 명시합니다.
+- `tests/test_policy.cpp` 의 네 곳만 리터럴에 `0u` 를 넘겼습니다. 그 넷을 `std::strlen` 으로 고쳤습니다.
+
+**아무도 그 편의에 기대지 않으니 남길 이유가 공개 헤더에 함정을 문서화하는 것뿐입니다.** 그래서 지웠습니다. `include/quodlibet/policy.h` 에 이 파서들이 원래 `ql_precondition_parse` 및 artifact 디코더와 공유하던 규칙을 명시했습니다. `json_size` 는 읽을 바이트 수이고, 그 너머는 안 읽고, 길이 0 은 빈 문서라 `QL_STATUS_PARSE_ERROR` 로 거절합니다.
+
+**빈 입력을 유효한 정책으로 승격하지 않습니다.** 거절이고, 수정 전에도 거절이었습니다. 바뀐 것은 그 답에 도달하는 길에 있던 OOB read 가 사라진 것과, **NUL 종단이 없는 버퍼에서도 그 답이 성립하게 된 것**입니다.
+
+**회귀 고정 넷.**
+
+- 시드 `tests/fuzz/corpus/policy/empty-input`, `tests/fuzz/corpus/policy_result/empty-input`.
+- `FuzzContracts.PolicyTargetsSurviveAnEmptyInput` 이 두 시드를 libFuzzer 드라이버와 **같은 타깃 본문**으로 리플레이합니다. 매 ctest 마다 돕니다.
+- `Policy.ParserRejectsAnEmptyDocumentWithoutReadingThePointer` 와 그 result 짝. **NUL 이 하나도 없는 1바이트 힙 버퍼**를 넘겨서, 길이 너머를 읽으면 sanitizer 가 잡는 heap overflow 가 되게 했습니다. 이 형태가 아니면 시험이 조용히 통과합니다.
+- `Policy.ParsersStopAtTheLengthTheyWereGiven`. 유효한 문서 뒤에 쓰레기를 붙이고 종단을 안 붙입니다. 파서가 길이 대신 포인터를 재면 깨집니다.
+
+**처음 커밋(`b4d3243`)에서는 이 시드들을 결정적 캠페인 목록에 일부러 넣지 않았습니다.** 고칠 권한이 없는 결함으로 ctest 관문을 빨갛게 만들면 다른 워크스트림의 검증을 막기 때문입니다. 수정을 라우팅받은 지금은 넣는 것이 맞아서 넣었습니다.
+
+**시험이 실제로 결함을 잡는지 확인했습니다.** sentinel 을 도로 넣고 다시 빌드하니 넷 중 **셋이 실패**합니다(`PolicyTargetsSurviveAnEmptyInput`, 두 `EmptyDocument` 시험). 되돌리니 넷 다 통과합니다. **`ParsersStopAtTheLengthTheyWereGiven` 은 양쪽에서 통과합니다.** 길이가 0 이 아닐 때 파서가 길이를 지키는 것은 원래 성립하던 성질이라, 이 시험은 결함 재현이 아니라 계약을 못질하는 것입니다. 재현하지 않는 시험을 재현한다고 적지 않습니다.
+
+**재캠페인 결과: 9/9 크래시-0.** 전 타깃이 `DONE` 에 도달했고 `ERROR:`/`SUMMARY:` 줄이 하나도 없으며 `crash-*` 산출물도 남지 않았습니다. 타깃별 수치는 `docs/fuzz/campaign-20260810.md` 표에 있습니다.
+
+**CTest 직렬.** windows-clang **501/501**, linux-fuzz(ASan+UBSan+libFuzzer) **500/500**. 개수 차이는 Windows 에만 등록되는 파이썬 바인딩 시험 하나입니다(WSL 사본에 pytest 가 없어 그쪽에서 미등록).
 
 **부수 관찰(고치지 않음, `scripts/coordinator/` 는 W8 소유가 아닙니다).** `fuzz-campaign.sh` 9행의 `code=$?` 는 `tail` 로 끝나는 파이프라인의 종료코드를 읽습니다. 그래서 **이번 크래시 둘도 로그에 `exit=0` 으로 찍혔습니다.** 크래시 판정을 종료코드로 하면 안 되고 `ERROR:`/`SUMMARY:` 줄로 해야 합니다. 이것 자체가 "크래시-0 을 실측했다" 는 주장을 조용히 위조할 수 있는 자리라 조율자에게 같이 올렸습니다.
 

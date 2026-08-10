@@ -91,8 +91,9 @@ class PolicyHandle {
 public:
     explicit PolicyHandle(const char *json) {
         ql_error error{};
-        EXPECT_EQ(QL_STATUS_OK,
-                  ql_policy_parse(nullptr, json, 0u, &policy_, &error))
+        EXPECT_EQ(QL_STATUS_OK, ql_policy_parse(nullptr, json,
+                                                std::strlen(json), &policy_,
+                                                &error))
             << error.message;
     }
     ~PolicyHandle() { ql_policy_destroy(policy_); }
@@ -176,7 +177,8 @@ void expect_rejected(const char *json, const char *location,
     ql_policy *policy = nullptr;
     ql_error error{};
 
-    EXPECT_EQ(expected, ql_policy_parse(nullptr, json, 0u, &policy, &error))
+    EXPECT_EQ(expected, ql_policy_parse(nullptr, json, std::strlen(json),
+                                        &policy, &error))
         << json;
     EXPECT_EQ(nullptr, policy);
     EXPECT_NE(nullptr, std::strstr(error.message, location))
@@ -366,10 +368,59 @@ TEST(Policy, ReportsAByteOffsetForMalformedJson) {
     ql_policy *policy = nullptr;
     ql_error error{};
 
+    static const char kMalformed[] = "{\"schema_version\": 1,,}";
     EXPECT_EQ(QL_STATUS_PARSE_ERROR,
-              ql_policy_parse(nullptr, "{\"schema_version\": 1,,}", 0u,
+              ql_policy_parse(nullptr, kMalformed, std::strlen(kMalformed),
                               &policy, &error));
     EXPECT_NE(nullptr, std::strstr(error.message, "at byte"));
+}
+
+/* Both parsers take a pointer and a length. `json_size` is never a request to
+   measure the pointer, so neither may read a byte past it. These pass buffers
+   with no NUL anywhere in them, which is what turns a read past the length
+   into a heap overflow the sanitizer sees rather than a silent one. */
+TEST(Policy, ParserRejectsAnEmptyDocumentWithoutReadingThePointer) {
+    /* Exactly one byte, no terminator: strlen() on this would run off the
+       allocation. This is the input the 2026-08-10 fuzz campaign crashed on. */
+    std::vector<char> unterminated(1u, '{');
+    ql_policy *policy = nullptr;
+    ql_error error{};
+
+    EXPECT_EQ(QL_STATUS_PARSE_ERROR,
+              ql_policy_parse(nullptr, unterminated.data(), 0u, &policy,
+                              &error));
+    EXPECT_EQ(nullptr, policy);
+    EXPECT_NE(nullptr, std::strstr(error.message, "empty"));
+}
+
+TEST(Policy, ResultParserRejectsAnEmptyDocumentWithoutReadingThePointer) {
+    std::vector<char> unterminated(1u, '{');
+    ql_policy_result_v1 parsed{};
+    ql_policy_result_init(&parsed);
+    ql_error error{};
+
+    EXPECT_EQ(QL_STATUS_PARSE_ERROR,
+              ql_policy_result_parse(unterminated.data(), 0u, &parsed,
+                                     &error));
+    EXPECT_NE(nullptr, std::strstr(error.message, "empty"));
+}
+
+TEST(Policy, ParsersStopAtTheLengthTheyWereGiven) {
+    /* The valid document, followed by trailing garbage and no terminator. A
+       parser that measured the pointer instead of honouring the length would
+       either read the garbage or run off the end. */
+    const std::string policy_json(kStrictPolicy);
+    std::vector<char> buffer(policy_json.begin(), policy_json.end());
+    const std::size_t length = buffer.size();
+    buffer.insert(buffer.end(), 64u, '!');
+
+    ql_policy *policy = nullptr;
+    ql_error error{};
+    ASSERT_EQ(QL_STATUS_OK, ql_policy_parse(nullptr, buffer.data(), length,
+                                            &policy, &error))
+        << error.message;
+    EXPECT_NE(nullptr, policy);
+    ql_policy_destroy(policy);
 }
 
 TEST(Policy, ClassifiesTheSameVerdictDifferentlyUnderTwoPolicies) {
@@ -612,9 +663,10 @@ TEST(Policy, ResultParserRejectsAWrongSchemaVersion) {
     ql_policy_result_init(&parsed);
     ql_error error{};
 
+    static const char kWrongSchema[] = "{\"schema_version\":9}";
     EXPECT_EQ(QL_STATUS_SCHEMA_MISMATCH,
-              ql_policy_result_parse("{\"schema_version\":9}", 0u, &parsed,
-                                     &error));
+              ql_policy_result_parse(kWrongSchema, std::strlen(kWrongSchema),
+                                     &parsed, &error));
     EXPECT_NE(nullptr, std::strstr(error.message, "/schema_version"));
 }
 

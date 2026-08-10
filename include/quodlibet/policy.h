@@ -144,7 +144,15 @@ QL_API ql_status QL_CALL ql_policy_verdict_parse(const char *text,
      - a class listing a proved_* verdict without "proof_trust", and a
        "proof_trust": "trusted_backend" with no entry in
        trust.trusted_backends, which is how a raw solver UNSAT would become a
-       proof with neither a checker nor a stated trusted backend. */
+       proof with neither a checker nor a stated trusted backend.
+
+   Both parsers here take the JSON as a pointer and a length, the same way
+   ql_precondition_parse and the artifact decoders do. `json_size` is always
+   the number of bytes to read: it is never a request to measure the pointer,
+   the bytes need not be NUL-terminated, and nothing past `json_size` is read.
+   A zero length is an empty document and is rejected with
+   QL_STATUS_PARSE_ERROR rather than promoted to a policy. A caller holding a
+   C string passes strlen() explicitly. */
 QL_API ql_status QL_CALL ql_policy_parse(const ql_allocator *allocator,
                                          const char *json, size_t json_size,
                                          ql_policy **output, ql_error *error);

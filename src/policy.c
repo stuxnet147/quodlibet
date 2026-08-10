@@ -646,8 +646,15 @@ ql_status QL_CALL ql_policy_parse(const ql_allocator *allocator,
         return QL_STATUS_INVALID_ARGUMENT;
     }
     *output = NULL;
+    /* `json_size` is the length, never a request to measure the pointer. This
+       once called strlen() when it was zero, which read past the end of any
+       caller that handed over a zero-length slice of a buffer that is not
+       NUL-terminated. No decoder in this API takes such a sentinel, and a
+       policy that no byte string states is not a policy, so an empty document
+       is a parse error like any other. */
     if (json_size == 0u) {
-        json_size = strlen(json);
+        ql_error_set(error, QL_STATUS_PARSE_ERROR, "policy json is empty");
+        return QL_STATUS_PARSE_ERROR;
     }
     policy = selected->allocate(selected->user_data, sizeof(*policy));
     if (policy == NULL) {
@@ -1192,8 +1199,11 @@ ql_status QL_CALL ql_policy_result_parse(const char *json, size_t json_size,
                      "policy result json and a result v1 output are required");
         return QL_STATUS_INVALID_ARGUMENT;
     }
+    /* The same rule as ql_policy_parse: a length, not a sentinel. */
     if (json_size == 0u) {
-        json_size = strlen(json);
+        ql_error_set(error, QL_STATUS_PARSE_ERROR,
+                     "policy result json is empty");
+        return QL_STATUS_PARSE_ERROR;
     }
     json_owner = *ql_default_allocator();
     json_allocator = make_json_allocator(&json_owner);

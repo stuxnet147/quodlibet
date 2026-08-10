@@ -546,6 +546,21 @@ TEST(FuzzContracts, SignatureDecoderSurvivesMutatedArtifacts) {
     EXPECT_GT(ExpectNoViolation().signature, 0u);
 }
 
+/* tests/fuzz/corpus/policy/empty-input and its policy_result twin, replayed
+   here so the crash they found stays found. The 2026-08-10 campaign died on
+   both targets at the first execution: the parsers read json_size == 0 as a
+   request to call strlen() on a buffer libFuzzer had allocated to the exact
+   input size, with no terminator. The vector is one byte with no NUL in it,
+   which is what makes a read past the length a heap overflow the sanitizer
+   catches rather than a silent walk into whatever follows. */
+TEST(FuzzContracts, PolicyTargetsSurviveAnEmptyInput) {
+    std::vector<char> unterminated(1u, '{');
+
+    RunTarget(ql_fuzz_policy, unterminated.data(), 0u);
+    RunTarget(ql_fuzz_policy_result, unterminated.data(), 0u);
+    ExpectNoViolation();
+}
+
 TEST(FuzzContracts, PolicyParserNeverAcceptsAPromotingPolicy) {
     uint64_t state = UINT64_C(0x74e2af106b3d5c98);
     for (std::size_t round = 0u; round < 120000u; ++round) {

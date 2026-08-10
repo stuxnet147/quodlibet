@@ -23,21 +23,21 @@ both.
   the next write produced `0`, so the canonical form was not a fixed point of
   one round trip. Fixed in `src/policy.c` by collapsing both zeros; the
   property is held by `tests/test_policy_canonical.cpp`.
-- `empty-input` - zero bytes. `ql_policy_parse` reads `json_size == 0` as a
-  request to call `strlen` on the pointer (`src/policy.c:650`), so a
-  zero-length slice of a buffer that is not NUL-terminated reads past the
-  allocation. Found by the 2026-08-10 campaign
-  (`docs/fuzz/campaign-20260810.md`) and **not yet fixed**.
+- `empty-input` - zero bytes. `ql_policy_parse` read `json_size == 0` as a
+  request to call `strlen` on the pointer, so a zero-length slice of a buffer
+  that is not NUL-terminated read past the allocation. Found by the 2026-08-10
+  campaign (`docs/fuzz/campaign-20260810.md`). Fixed in `src/policy.c` by
+  deleting the sentinel and rejecting an empty document; the property is held
+  by `Policy.ParserRejectsAnEmptyDocumentWithoutReadingThePointer` and
+  `Policy.ParsersStopAtTheLengthTheyWereGiven` in `tests/test_policy.cpp`.
 
 ## policy_result/
 
-- `empty-input` - zero bytes. The same undocumented sentinel at
-  `src/policy.c:1196` in `ql_policy_result_parse`. **Not yet fixed.**
+- `empty-input` - zero bytes. The same sentinel in `ql_policy_result_parse`,
+  fixed in the same change; the property is held by
+  `Policy.ResultParserRejectsAnEmptyDocumentWithoutReadingThePointer`.
 
-The two `empty-input` seeds are the exception to the rule above: they are
-kept while the defect is open, so neither seed has a named test holding its
-property yet. They are deliberately absent from the seed list in
-`tests/test_fuzz_contracts.cpp`, because adding a live crash to the
-deterministic campaign would turn ctest red on a defect the fuzzing
-workstream does not own. Whoever fixes `src/policy.c` should add both to that
-list in the same change.
+Both seeds are also replayed through the fuzz target bodies themselves by
+`FuzzContracts.PolicyTargetsSurviveAnEmptyInput` in
+`tests/test_fuzz_contracts.cpp`, so the crash they found is re-run on every
+ctest and not only when someone runs libFuzzer.
