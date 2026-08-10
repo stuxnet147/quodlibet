@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-항목 4 의 남은 절반. plugin SDK 예제(`examples/plugin/`)와 그것이 실제로 빌드되고 로드되는지 고정하는 시험.
+항목 5. 설치 패키지. Windows 와 Linux 에서 `cmake --install` 결과가 자기완결인지, 실행 파일 옆 relocatable Bitwuzla 탐색이 실제로 작동하는지.
 
 ## 착수 시 조사한 것 (2026-08-10)
 
@@ -140,6 +140,23 @@ worker 수별 처리량은 8 worker 4.31x 로 `baseline.md` 의 4.67x 와 같은
 
 CMake 변경이 필요 없었습니다. 6개 시험 전부 통과.
 
+### 6. plugin SDK 예제 (`examples/plugin/`, `tests/test_example_plugin.cpp`)
+
+**예제를 저장소가 직접 빌드하고 시험이 로드합니다.** 조용히 컴파일이 깨진 예제, 또는 컴파일은 되지만 README 가 말하는 대로 동작하지 않는 예제는 없느니만 못합니다. 읽는 사람에게 디버깅 한 세션을 물리기 때문입니다. 조율자가 `596489f` 로 `examples/CMakeLists.txt` 가 있으면 빌드에 들어가는 훅을 루트에 넣어 주었습니다.
+
+`normalize_plugin.c` 는 여전히 진짜인 최소 플러그인입니다. 하는 일(ASCII 공백 축약)은 일부러 지루하고, 보여 주는 것은 플러그인이 반드시 맞춰야 하는 네 가지이며 소스에 각각 번호로 표시했습니다.
+
+1. **진입점이 ABI 악수 전부입니다.** `host->abi_version` 을 확인하고 아니면 `QL_STATUS_ABI_MISMATCH` 입니다.
+2. **모든 구조체가 자기 크기와 세대를 말합니다.** 컴파일한 헤더의 `sizeof` 와 `QL_ABI_VERSION` 을 채웁니다.
+3. **메모리는 host 를 통해서만 경계를 넘습니다.** host 와 플러그인이 서로 다른 CRT 에 링크될 수 있으므로 한쪽이 할당한 블록을 다른 쪽이 해제할 수 없습니다. 입력 artifact 는 빌린 것이고 `*output` 에 쓴 것은 caller 에게 넘어갑니다.
+4. **감당할 수 있는 것만 선언합니다.** `QL_METHOD_PROOF_PRODUCER` 같은 flag 는 힌트가 아니라 건전성 주장입니다. 이 예제는 실제로 참인 `DETERMINISTIC` 과 `CACHEABLE` 만 답니다.
+
+시험 5개가 README 의 약속을 그 순서대로 고정합니다. 마지막 것은 **`ql_plugin_load` 를 거치지 않고 플랫폼 로더로 모듈을 열어 진입점을 직접 부릅니다.** host 를 통해서는 이 빌드의 host 하나만 제시할 수 있어 거부 경로에 닿지 못하기 때문입니다. 다른 세대의 host, 너무 작은 host, null host 세 가지를 각각 다른 status 로 거부하는 것을 고정합니다.
+
+모듈은 시험 실행 파일 옆에 떨어뜨려 시험이 자기 경로에서 찾습니다. `examples/` 가 `tests/` 보다 먼저 add 되어 `quodlibet_tests` 타깃이 아직 없으므로 의존을 걸 수 없고, 전체 빌드는 어차피 둘 다 만듭니다. 모듈이 없으면 시험은 skip 하지 않고 **무엇이 빌드되지 않았는지 말하며 실패합니다.**
+
+CTest 435/435 통과.
+
 ## 내린 설계 결정
 
 - **새 target 을 `fuzz_targets.h` 가 아니라 별도 `fuzz_contract_targets.h` 에 둡니다.** 근거: `fuzz_targets.h` 와 `tests/test_fuzz.cpp` 는 W1 이 소유하는 표면(파서/로어링/IR)의 기록이고, W7 이 더하는 것은 계약 표면이라 소유가 다릅니다. `QL_FUZZ_REQUIRE`/`QL_FUZZ_REACHED` 규약은 그대로 따라서 두 헤더가 같은 규율 아래 있습니다.
@@ -150,6 +167,22 @@ CMake 변경이 필요 없었습니다. 6개 시험 전부 통과.
 - **불변식 위반 시 입력 byte 열을 escape 해서 같이 보고합니다.** 문장만 보고하면 다음 사람이 campaign 전체를 다시 돌려야 어떤 입력이었는지 알 수 있습니다.
 
 ## 조율자에게 보고할 것
+
+### 병렬 CTest 에서 cache key 시험이 깨집니다 (`tests/test_cache_key.cpp`, W6 소유)
+
+`ScopedRoot` 가 임시 디렉터리 이름을 **프로세스별 static counter** 로 만듭니다.
+
+```cpp
+static int counter = 0;
+path_ = fs::temp_directory_path() /
+        ("quodlibet-cache-key-test-" + std::to_string(++counter));
+```
+
+그런데 `gtest_discover_tests` 는 시험마다 **별도 프로세스**를 띄웁니다. 그래서 모든 프로세스가 counter 1 에서 시작해 전부 `quodlibet-cache-key-test-1` 을 씁니다. 병렬 CTest 에서 한 프로세스의 생성자가 다른 프로세스가 쓰는 중인 디렉터리를 `remove_all` 하고 소멸자가 또 지웁니다. 결과는 `ql_cache_load_artifact` 의 `QL_STATUS_NOT_FOUND` 이고 **매 실행마다 다른 시험이 깨집니다**.
+
+기계가 한산하면 겹치는 창이 좁아 재현되지 않습니다. 부하가 걸린 상태에서 `ctest -R CacheKey` 를 세 번 돌려 세 번 모두 서로 다른 시험이 깨지는 것을 확인했고, 한산할 때는 세 번 모두 통과했습니다. 조율자의 통합 실행이 바쁜 기계에서 돌면 물립니다.
+
+`tests/test_cache_key.cpp` 는 W6 소유라 고치지 않았습니다. 디렉터리 이름에 pid 를 넣으면 됩니다. `tests/test_solver.cpp` 의 snapshot prefix 가 이미 그 방식입니다.
 
 ### result header 를 덮어쓴 backend 에서의 누수 (`src/solver.c`, W2 소유)
 
@@ -188,6 +221,6 @@ campaign 은 그동안 두 번째 serialize 부터의 고정점을 검사합니�
 1. (완료) 퍼저 확대
 2. (완료) solver fault-injection 확대. in-process 와 process transport 양쪽
 3. (완료) 동시성 측정 -> `docs/perf/concurrency.md`
-4. (진행 중) ABI 호환 시험 완료. 남은 것은 plugin SDK 예제. 조율자가 `596489f` 로 루트에 `examples/` 훅을 넣어 주었으므로 `examples/CMakeLists.txt` 와 `examples/plugin/` 을 만들면 빌드에 들어갑니다
-5. 설치 패키지와 relocatable Bitwuzla 탐색
+4. (완료) ABI 호환 시험과 plugin SDK 예제
+5. (진행 중) 설치 패키지와 relocatable Bitwuzla 탐색
 6. compiler/target matrix 자동 검증 (`D:/projects/machine-model/datasets/records-local/summary.json`)
