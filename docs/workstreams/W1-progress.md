@@ -1471,6 +1471,21 @@ function pointer member의 64비트 표현은 object pointer가 아닌 opaque �
 
 253개의 첫 차단이 제거됐고 36개는 뒤의 기존 한계로 이동했습니다. `tests/test_c_lower_records.cpp`는 유효한 callback 주소와 null을 실제 struct image에 넣고 compiled C의 비교 결과와 대조합니다. 간접 호출 시험을 포함한 `CLower*` 82/82와 전체 train 비교가 통과했습니다. 변경은 내부 member value 분류에 한정되므로 전체 CTest는 반복하지 않았습니다.
 
+### 40. GNU void pointer 산술을 byte 단위로 보존한다
+
+ASM2C_GNU_V1에서 `void *`의 덧셈과 뺄셈은 GNU C 규칙대로 pointee 크기를 1 byte로 사용합니다. 따라서 `p + n`은 주소를 `n` byte 이동하고 두 `void *`의 차이는 byte 수를 반환합니다. `void` object를 읽거나 쓰는 연산은 여전히 값의 타입과 크기가 없으므로 기존 type error로 남깁니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 22,788 (76.27%) | **22,872 (76.55%)** |
+| 증가 | | **+84** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_pointer` | 664 | **574** |
+| verifier 통과 | 22,788 / 22,788 | **22,872 / 22,872** |
+| status 실패 | 0 | **0** |
+
+106개의 첫 `void *` 산술 차단 가운데 84개가 성공했고 22개는 뒤의 기존 제한으로 이동했습니다. 후속 제한은 pointer authority 또는 bounded object table 16개, uninitialized address escape 4개, record value 2개입니다. `tests/test_c_lower_pointers.cpp`는 GNU C 원문을 lowering하고 byte 단위 주소 차이를 64개 입력에서 interpreter로 확인합니다. 시험 실행 파일은 C++로 빌드되므로 참조 함수는 원문 `void *` 산술 대신 동치인 `char *` 산술을 사용하며, 이를 같은 C 원문의 compiled differential이라고 주장하지 않습니다. 영향 범위의 `CLower*` 시험 82/82와 전체 train 비교가 통과했습니다. 변경은 내부 C lowering의 pointee 크기 계산에 한정되므로 전체 CTest는 반복하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1479,9 +1494,9 @@ function pointer member의 64비트 표현은 object pointer가 아닌 opaque �
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 2,707
-- `uninitialized_read` 2,207
-- `unsupported_pointer` 664
+- `unsupported_type` 2,709
+- `uninitialized_read` 2,211
+- `unsupported_pointer` 574
 - `unsupported_control_flow` 525
 - `unsupported_call` 369
 

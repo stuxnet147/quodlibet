@@ -7,7 +7,10 @@
    address: only the loaded and stored data crosses the comparison.
 
    These tests also check the object-parameter layout the lowering commits to,
-   because W2 builds the miter's memory half against it. */
+   because W2 builds the miter's memory half against it. The GNU-C-only void
+   pointer arithmetic case cannot be compiled verbatim in this C++ test
+   translation unit, so its reference uses the equivalent char-pointer byte
+   arithmetic while the lowered source retains the GNU C spelling. */
 
 #include "quodlibet/c_lower.h"
 #include "quodlibet/ir_interp.h"
@@ -90,6 +93,11 @@ QL_PTR_FUNCTION(cast_to_bytes, int ptr_bytes(int *p, int i) {
 QL_PTR_FUNCTION(cast_from_bits, int ptr_from_bits(unsigned long long address) {
     return ((int *)address)[0];
 });
+static const char void_arithmetic_source[] =
+    "long ptr_void_distance(void *p, int i) {\n"
+    "    void *q = p + i;\n"
+    "    return q - p;\n"
+    "}\n";
 
 namespace {
 
@@ -455,6 +463,11 @@ TEST(CLowerPointers, CarriesTheWiderPointerSurface) {
          [](int32_t *p, int32_t i) { return ptr_address(p, i); }},
         {"sizeof", sizeof_designators_source, "ptr_sizeof",
          [](int32_t *p, int32_t i) { return ptr_sizeof(p, i); }},
+        {"void-arithmetic", void_arithmetic_source, "ptr_void_distance",
+         [](int32_t *p, int32_t i) {
+             char *bytes = reinterpret_cast<char *>(p);
+             return static_cast<int32_t>((bytes + i) - bytes);
+         }},
     };
     uint64_t state = UINT64_C(0x4b7e2c9013fa65d8);
     for (const Case &item : cases) {

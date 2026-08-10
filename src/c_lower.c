@@ -784,6 +784,11 @@ static uint64_t pointee_byte_width(const lower_context *context,
   if (pointer.pointee.kind == QL_C_SCALAR_RECORD) {
     return record_size(context, pointer.record);
   }
+  if (pointer.pointee.kind == QL_C_SCALAR_VOID) {
+    /* ASM2C_GNU_V1 follows GNU C: arithmetic on void pointers advances one
+       byte. Loading or storing a void object remains a type error. */
+    return 1u;
+  }
   bits = pointer.pointee.kind == QL_C_SCALAR_BOOL ? 8u : pointer.pointee.width;
   return (bits + 7u) / 8u;
 }
@@ -3133,12 +3138,6 @@ static ql_status emit_pointer_offset(lower_context *context,
   ql_ir_value_id operands[2];
   ql_status status;
 
-  if (pointer.type.indirection == 1u &&
-      pointer.type.pointee.kind == QL_C_SCALAR_VOID) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, SIZE_MAX,
-        "arithmetic on a pointer to void has no element size", error);
-  }
   status = convert_value(context, offset, u64, &widened, error);
   if (status != QL_STATUS_OK) {
     return status;
