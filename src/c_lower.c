@@ -6923,6 +6923,66 @@ static ql_status aggregate_child_address(lower_context *context,
   return emit_pointer_of_address(context, address, pointer, output, error);
 }
 
+/* A top-level record initializer may copy another lvalue of the same record
+   type. Copy bytes rather than just named members: a union's active
+   representation and the target ABI's padding are part of the object image
+   that later character-pointer access can observe. */
+static ql_status initialize_record_copy(lower_context *context, size_t node,
+                                        lower_value destination,
+                                        lower_type type, ql_error *error) {
+  lower_value source;
+  lower_type source_type;
+  lower_type byte = make_integer_type(8u, 1u, 0u);
+  uint64_t size;
+  uint64_t index;
+  ql_status status;
+
+  status = lower_designator_address(context, node, &source, &source_type,
+                                    error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  if (source_type.array_length != 0u ||
+      source_type.kind != QL_C_SCALAR_RECORD || !type_same(type, source_type)) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+        "record copy initializer needs an lvalue of the same record type",
+        error);
+  }
+  status = ensure_record_layout(context, type.record, node, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  size = record_size(context, type.record);
+  if (size > LOWER_MAX_INITIALIZER_ELEMENTS) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+        "record copy exceeds the bounded aggregate initialization slice",
+        error);
+  }
+  for (index = 0u; index < size; ++index) {
+    lower_value source_byte;
+    lower_value destination_byte;
+    lower_value value;
+    status = aggregate_child_address(context, source, index, byte,
+                                     &source_byte, error);
+    if (status == QL_STATUS_OK) {
+      status = aggregate_child_address(context, destination, index, byte,
+                                       &destination_byte, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = emit_load(context, source_byte, &value, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = emit_store(context, destination_byte, value, error);
+    }
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+  }
+  return QL_STATUS_OK;
+}
+
 static ql_status make_zero_scalar(lower_context *context, lower_type type,
                                   lower_value *output, ql_error *error) {
   ql_status status;
@@ -7103,6 +7163,10 @@ static ql_status initialize_object(lower_context *context, size_t node,
       }
       return QL_STATUS_OK;
     }
+  }
+
+  if (!is_list && type.kind == QL_C_SCALAR_RECORD && brace_elided == 0u) {
+    return initialize_record_copy(context, node, address, type, error);
   }
 
   if (is_list) {

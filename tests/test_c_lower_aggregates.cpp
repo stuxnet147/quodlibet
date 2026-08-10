@@ -128,6 +128,16 @@ QL_AGG_FUNCTION(designated_record,
         return value.head + value.skipped + value.values[0] +
                value.values[1] + value.values[2];
     });
+QL_AGG_FUNCTION(copied_record,
+    struct AGG_COPY { char tag; int value; short slots[2]; };
+    int agg_copy(int a, int b) {
+        struct AGG_COPY source = {(char)a, b, {3, 4}};
+        struct AGG_COPY target = source;
+        source.tag = 0;
+        source.value = 0;
+        source.slots[0] = 0;
+        return target.tag + target.value + target.slots[0] + target.slots[1];
+    });
 static const char string_alias_source[] =
     "const char STR_0[] = \"Az!\";\n"
     "int agg_string_alias(int i) {\n"
@@ -441,6 +451,27 @@ TEST(CLowerAggregates, InfersAndInitializesALocalCharacterArrayFromAString) {
         ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
             << ql_ir_interp_ub_reason_string(run.result.ub_reason);
         EXPECT_EQ(agg_init_string(i), Returned(run.result));
+    }
+}
+
+TEST(CLowerAggregates, CopiesARecordObjectBeforeTheSourceChanges) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(copied_record_source, "agg_copy"));
+    uint64_t state = UINT64_C(0x5d8fc271b304a69e);
+    for (std::size_t round = 0u; round < 64u; ++round) {
+        const int32_t a =
+            static_cast<int32_t>(NextRandom(&state) % 100u) - 50;
+        const int32_t b =
+            static_cast<int32_t>(NextRandom(&state) % 100u) - 50;
+        SCOPED_TRACE(round);
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(a), Widen(b)},
+                    {sizeof(struct AGG_COPY), sizeof(struct AGG_COPY)},
+                    nullptr);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(agg_copy(a, b), Returned(run.result));
     }
 }
 

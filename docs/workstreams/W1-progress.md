@@ -1522,6 +1522,23 @@ record의 `.member = value` 목록은 선언 순서가 아니라 지정한 membe
 
 121개의 첫 차단 가운데 85개가 성공했고 36개는 뒤의 기존 제한으로 이동했습니다. `tests/test_c_lower_aggregates.cpp`는 생략한 scalar member의 zero-fill, 중첩 array member, target layout offset을 같은 원문의 compiled 함수와 64개 입력에서 대조합니다. 영향 범위의 `CLower*` 시험 84/84와 전체 train 비교가 통과했습니다. 변경은 내부 aggregate 초기화에 한정되므로 전체 CTest는 반복하지 않았습니다.
 
+### 43. 같은 record type의 lvalue initializer를 object snapshot으로 복사한다
+
+top-level 지역 record initializer가 같은 record type의 identifier, dereference, member, subscript lvalue이면 source 주소를 한 번 계산하고 destination에 object byte를 복사합니다. named member만 복사하지 않고 target layout의 전체 크기를 복사하므로 union representation과 padding도 source snapshot대로 유지됩니다. character-pointer로 나중에 object representation을 관찰해도 copy 전후가 갈라지지 않습니다.
+
+IR 크기를 제한하기 위해 record 크기는 기존 bounded aggregate 상한과 같은 256 byte 이하만 수용합니다. record를 반환하는 call expression, 타입이 다른 lvalue, whole-record assignment와 pass/return by value는 계속 UNKNOWN입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,031 (77.08%) | **23,142 (77.45%)** |
+| 증가 | | **+111** |
+| 기존 성공 회귀 | | **0** |
+| 첫 aggregate-copy 차단 | 221 | **0** |
+| verifier 통과 | 23,031 / 23,031 | **23,142 / 23,142** |
+| status 실패 | 0 | **0** |
+
+221개의 첫 차단 가운데 111개가 성공했고 110개는 뒤의 기존 제한으로 이동했습니다. 후속 제한에는 uninitialized address escape 43개와 record-return call 33개가 포함됩니다. `tests/test_c_lower_aggregates.cpp`는 두 record object의 크기를 compiler `sizeof`로 고정하고, copy 뒤 source를 수정해도 destination snapshot이 유지되는지 같은 원문의 compiled 함수와 64개 입력에서 대조합니다. 영향 범위의 `CLower*` 시험 85/85와 전체 train 비교가 통과했습니다. 변경은 내부 record 초기화에 한정되므로 전체 CTest는 반복하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1530,11 +1547,11 @@ record의 `.member = value` 목록은 선언 순서가 아니라 지정한 membe
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 2,743
-- `uninitialized_read` 2,225
-- `unsupported_pointer` 576
-- `unsupported_control_flow` 528
-- `unsupported_call` 373
+- `unsupported_type` 2,544
+- `uninitialized_read` 2,268
+- `unsupported_pointer` 581
+- `unsupported_control_flow` 530
+- `unsupported_call` 378
 
 ## 조율자에게 요청할 것
 
