@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,886 / 29,880 (96.67%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_control_flow` 311, `unsupported_call` 225, `unsupported_type` 148, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,044 / 29,880 (97.20%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_control_flow` 149, `unsupported_type` 148, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -2076,6 +2076,26 @@ prototype이 없는 이름은 계속 UNKNOWN입니다. 선택된 `FUN_0`의 func
 
 `tests/test_c_lower_calls.cpp`는 `int FUN_7(int)` prototype을 가진 designator가 정확한 callback parameter로 전달되는지 고정합니다. 변경은 C identifier와 call argument lowering에만 닿으므로 C lowering, parser reuse, IR interpreter와 verifier 영향 범위 149/149를 실행했습니다. 공용 IR, interpreter, solver, plugin 구현은 바뀌지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage만 G9 수치와 기존 성공 회귀 0건을 확인하기 위해 실행했습니다.
 
+### 73. 뒤로 가는 goto를 cyclic SSA label로 내린다
+
+이전에는 이미 지난 label로 향하는 goto를 무조건 `unsupported_control_flow`로 거부했습니다. 함수 label을 수집하는 두 번째 pass가 뒤쪽 goto의 target을 미리 표시하고, label의 일반 fallthrough와 forward incoming 상태를 합친 뒤 전용 cyclic header를 만듭니다. 그 header는 기존 loop와 같은 scalar value, definedness, memory, call trace PHI를 가지며 각 backward goto가 자신의 predecessor 상태를 추가합니다. 한 label로 향하는 backedge가 여러 개여도 같은 PHI 집합에 각각 들어갑니다.
+
+label entry에서 보이던 변수만 cycle에 운반합니다. 선언 초기화를 건너뛰거나 nested automatic state가 필요한 goto, 바깥에서 loop 또는 switch로 들어가는 goto는 계속 UNKNOWN입니다. pointer가 반복 중 다른 object authority로 바뀌는 경우도 기존 loop authority 검사에서 거부합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 28,886 (96.67%) | **29,044 (97.20%)** |
+| 증가 | | **+158** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_control_flow` | 311 | **149** |
+| `unsupported_pointer` | 55 | **59** |
+| verifier 통과 | 28,886 / 28,886 | **29,044 / 29,044** |
+| status 실패 | 0 | **0** |
+
+기존 backward-goto 첫 차단 171개를 먼저 재측정해 158개가 성공했습니다. 나머지 13개는 nested automatic 또는 structured entry 9개와 loop-carried pointer authority 4개라는 기존 안전 경계에서 계속 UNKNOWN입니다. goto를 포함한 train 단위 2,153개를 영향 범위의 상한으로 다시 측정해 이전 상세 결과와 모두 대응했고, 순증 158개, 기존 성공 회귀 0개, verifier 실패 0개였습니다. goto가 없는 단위는 새 분기를 타지 않으므로 전체 train을 반복 실행하지 않고 이 영향 범위 결과를 직전 29,880개 기준선에 합성했습니다.
+
+`tests/test_ir_differential.cpp`는 top-level label의 복수 backedge와 loop 안 label의 backedge를 종료 가능한 compiled C와 edge 및 random 입력에서 대조합니다. C lowering, parser reuse, IR interpreter, compiled differential, verifier 영향 범위 152/152가 통과했습니다. 공용 IR, interpreter, solver, plugin 구현은 바뀌지 않아 전체 CTest는 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -2084,11 +2104,11 @@ prototype이 없는 이름은 계속 UNKNOWN입니다. 선택된 `FUN_0`의 func
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_control_flow` 311
 - `unsupported_call` 225
+- `unsupported_control_flow` 149
 - `unsupported_type` 148
 - `undeclared_identifier` 66
-- `unsupported_pointer` 61
+- `unsupported_pointer` 59
 - `duplicate_declaration` 58
 - `unsupported_volatile_or_atomic` 50
 - `unsupported_expression` 9
@@ -2108,7 +2128,7 @@ prototype이 없는 이름은 계속 UNKNOWN입니다. 선택된 `FUN_0`의 func
 ## 다음에 할 것
 
 1. 선언 없는 callee와 identifier는 추출 context에서 복구 가능한 근거가 있는지 먼저 분리합니다.
-2. 남은 nested 및 backward goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 확장합니다.
+2. 남은 nested goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 확장합니다.
 3. selected-function record의 source-signature schema는 layout image를 독립적으로 교차 검사할 수 있을 때만 확장합니다.
 4. function pointer의 남은 깊이 제한은 실제 call signature를 복구할 수 있는 형태만 확장합니다.
 5. 각 단위마다 compiled differential, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다. source-signature가 표현하는 범위는 binding도 함께 검사합니다.

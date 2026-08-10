@@ -331,8 +331,21 @@ pending edges need only function-scope state. A terminated compound keeps
 scanning for such a live label, including a chain of adjacent labels. Entering
 a nested scope with live automatic declarations, entering a loop or switch
 from outside its structured entry, and bypassing a function-scope declaration
-remain explicit UNKNOWN cases. Backward gotos likewise remain outside the
-lowering.
+remain explicit UNKNOWN cases.
+
+#### A backward label is a cyclic SSA header
+
+Before body lowering, a syntactic backward goto marks its target label. The
+label first merges ordinary fallthrough and forward incoming edges, then
+branches through a dedicated cyclic header. That header carries the same
+scalar value, definedness, memory, and call-trace PHIs as a structured loop.
+Each backward goto appends its predecessor state to those PHIs, including when
+one label has several backedges.
+
+Only variables visible at label entry participate in the cycle. A goto that
+needs nested automatic state, bypasses an initialization, or enters a loop or
+switch from outside remains `UNKNOWN`. A loop-carried pointer must also retain
+compatible object authority across every backedge.
 
 #### Data pointers retain up to three levels of indirection
 

@@ -289,11 +289,24 @@ typedef struct lower_break_scope {
   size_t block_capacity;
 } lower_break_scope;
 
+typedef struct lower_loop_phis {
+  ql_ir_instruction_id *variables;
+  ql_ir_instruction_id *defined;
+  size_t variable_count;
+  ql_ir_instruction_id memory;
+  ql_ir_instruction_id trace;
+} lower_loop_phis;
+
 typedef struct lower_label {
   char *name;
   size_t node;
   size_t body_node;
   lower_break_scope incoming;
+  lower_state cycle_entry;
+  lower_loop_phis cycle_phis;
+  ql_ir_block_id cycle_header;
+  uint32_t has_backward_incoming;
+  uint32_t cycle_ready;
   uint32_t lowered;
 } lower_label;
 
@@ -1820,8 +1833,9 @@ static const lower_enumerator *find_enumerator(const lower_context *context,
 
 /* Labels have function scope in C. Recording every label before body lowering
    lets a forward goto resolve a target nested in structured control flow
-   without creating an unreachable IR block prematurely. Backward edges remain
-   a separate cyclic-CFG problem. */
+   without creating an unreachable IR block prematurely. A second pass marks
+   backward targets so their label entry can reserve a cyclic SSA header before
+   any back-edge is emitted. */
 static ql_status collect_labels(lower_context *context, size_t body,
                                 ql_error *error) {
   size_t end = subtree_end(context, body);
@@ -1882,6 +1896,38 @@ static ql_status collect_labels(lower_context *context, size_t body,
     entry->name = name;
     entry->node = node;
     entry->body_node = statement_node;
+    entry->cycle_header = QL_IR_INVALID_BLOCK_ID;
+  }
+  /* A backward edge is known syntactically before its target is lowered.
+     Reserve a real loop header at that target so later goto statements can
+     append PHI incoming edges without rewriting already emitted IR. */
+  for (node = body + 1u; node < end; ++node) {
+    size_t name_node;
+    char *name;
+    size_t label_index;
+    if (strcmp(context->nodes[node].view.kind, "goto_statement") != 0) {
+      continue;
+    }
+    name_node = direct_field_child(context, node, "label");
+    if (name_node == SIZE_MAX) {
+      continue;
+    }
+    name = copy_node_text(context, name_node);
+    if (name == NULL) {
+      ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+      return QL_STATUS_OUT_OF_MEMORY;
+    }
+    for (label_index = 0u; label_index < context->label_count;
+         ++label_index) {
+      lower_label *label = &context->labels[label_index];
+      if (strcmp(label->name, name) == 0 &&
+          context->nodes[label->node].view.range.start_byte <=
+              context->nodes[node].view.range.start_byte) {
+        label->has_backward_incoming = 1u;
+        break;
+      }
+    }
+    context->allocator->deallocate(context->allocator->user_data, name);
   }
   return QL_STATUS_OK;
 }
@@ -10708,14 +10754,6 @@ cleanup:
   return status;
 }
 
-typedef struct lower_loop_phis {
-  ql_ir_instruction_id *variables;
-  ql_ir_instruction_id *defined;
-  size_t variable_count;
-  ql_ir_instruction_id memory;
-  ql_ir_instruction_id trace;
-} lower_loop_phis;
-
 static void destroy_loop_phis(lower_context *context, lower_loop_phis *phis) {
   context->allocator->deallocate(context->allocator->user_data,
                                  phis->variables);
@@ -11436,13 +11474,6 @@ static ql_status lower_goto_statement(lower_context *context, size_t node,
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, label_node,
         "goto target has no label in the function", error);
   }
-  if (label->lowered != 0u ||
-      context->nodes[label->node].view.range.start_byte <=
-          context->nodes[node].view.range.start_byte) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
-        "a backward goto would introduce a cycle in IR schema v1", error);
-  }
   if (goto_skips_declaration(context, node, label->node)) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
@@ -11454,6 +11485,33 @@ static ql_status lower_goto_statement(lower_context *context, size_t node,
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
         "goto into a loop or switch needs an explicit structured entry edge",
         error);
+  }
+  if (label->lowered != 0u ||
+      context->nodes[label->node].view.range.start_byte <=
+          context->nodes[node].view.range.start_byte) {
+    ql_ir_block_id backedge = context->current_block;
+    if (label->cycle_ready == 0u ||
+        label->cycle_header == QL_IR_INVALID_BLOCK_ID ||
+        context->variable_count < label->cycle_entry.count) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+          "a backward goto has no compatible label-entry state", error);
+    }
+    status = save_state(context, label->cycle_entry.count, &state, error);
+    if (status == QL_STATUS_OK) {
+      status = set_branch(context, backedge, label->cycle_header, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = append_loop_backedge(context, &label->cycle_phis,
+                                    &label->cycle_entry, &state, backedge, node,
+                                    error);
+    }
+    destroy_state(context, &state);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    context->current_terminated = 1u;
+    return QL_STATUS_OK;
   }
   variable_count = function_scope_variable_count(context);
   if (label->incoming.count != 0u &&
@@ -11538,6 +11596,31 @@ static ql_status lower_labeled_statement(lower_context *context, size_t node,
     return status;
   }
   destroy_break_scope(context, &label->incoming);
+  if (label->has_backward_incoming != 0u) {
+    ql_ir_block_id preheader = block;
+    status = save_state(context, variable_count, &label->cycle_entry, error);
+    if (status == QL_STATUS_OK) {
+      status =
+          ql_ir_builder_set_cfg_kind(context->builder, QL_IR_CFG_CYCLIC, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = add_block(context, "goto.loop.header", &label->cycle_header,
+                         error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = set_branch(context, preheader, label->cycle_header, error);
+    }
+    if (status == QL_STATUS_OK) {
+      context->current_block = label->cycle_header;
+      context->current_terminated = 0u;
+      status = begin_loop_phis(context, &label->cycle_entry, preheader,
+                               &label->cycle_phis, error);
+    }
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    label->cycle_ready = 1u;
+  }
   return lower_statement(context, label->body_node, error);
 }
 
@@ -13287,6 +13370,8 @@ static void cleanup_context(lower_context *context) {
     context->allocator->deallocate(context->allocator->user_data,
                                    context->labels[index].name);
     destroy_break_scope(context, &context->labels[index].incoming);
+    destroy_state(context, &context->labels[index].cycle_entry);
+    destroy_loop_phis(context, &context->labels[index].cycle_phis);
   }
   context->allocator->deallocate(context->allocator->user_data,
                                  context->labels);

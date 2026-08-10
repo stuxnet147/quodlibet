@@ -158,6 +158,37 @@ QL_DIFF_FUNCTION(
       return seed;
     });
 QL_DIFF_FUNCTION(
+    backward_goto,
+    unsigned int diff_backward_goto(unsigned int x, unsigned int seed) {
+      unsigned int sum = seed;
+      x &= 7u;
+    again:
+      sum += x;
+      if (x == 0u)
+        return sum;
+      if ((x & 1u) != 0u) {
+        --x;
+        goto again;
+      }
+      x -= 2u;
+      goto again;
+    });
+QL_DIFF_FUNCTION(
+    nested_backward_goto,
+    unsigned int diff_nested_backward_goto(unsigned int x,
+                                            unsigned int seed) {
+      x &= 7u;
+      while (x != 0u) {
+      again:
+        seed += x;
+        --x;
+        if ((x & 1u) != 0u) {
+          goto again;
+        }
+      }
+      return seed;
+    });
+QL_DIFF_FUNCTION(
     loop_flow, unsigned int diff_loop(unsigned int a, unsigned int seed) {
       unsigned int i = 0u;
       unsigned int n = a & 15u;
@@ -578,6 +609,16 @@ const Case kCases[] = {
      AlwaysDefined,
      [](uint64_t a, uint64_t b) {
        return FromU32(diff_nested_goto(AsU32(a), AsU32(b)));
+     }},
+    {"backward_goto", backward_goto_source, "diff_backward_goto", 32u, 32u,
+     32u, AlwaysDefined,
+     [](uint64_t a, uint64_t b) {
+       return FromU32(diff_backward_goto(AsU32(a), AsU32(b)));
+     }},
+    {"nested_backward_goto", nested_backward_goto_source,
+     "diff_nested_backward_goto", 32u, 32u, 32u, AlwaysDefined,
+     [](uint64_t a, uint64_t b) {
+       return FromU32(diff_nested_backward_goto(AsU32(a), AsU32(b)));
      }},
     {"loop_flow", loop_flow_source, "diff_loop", 32u, 32u, 32u, AlwaysDefined,
      [](uint64_t a, uint64_t b) {
