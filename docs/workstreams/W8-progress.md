@@ -4,7 +4,39 @@
 
 ## 지금 하는 것
 
-W8 이 혼자 닫을 수 있는 G6 항목은 전부 닫혔습니다. 남은 것은 W9 의 threading 결과 소화이고, 다음 최적화 후보는 아래 WU13 이 짚은 `emit_store` 와 `ql_ir_builder_destroy` 입니다(W1 소유).
+G8(퍼징 크래시-0). 캠페인은 돌렸고 **크래시-0 이 아닙니다.** 아홉 타깃 중 일곱이 깨끗하고 둘이 `src/policy.c` 의 같은 결함 하나로 죽습니다. 그 파일은 W8 소유가 아니라 조율자에게 라우팅을 올렸고, 회귀 시드와 기록은 아래 WU17 대로 넣었습니다. G8 은 그 두 줄이 고쳐지고 캠페인을 다시 돌린 뒤에 닫힙니다.
+
+G6 쪽은 W8 이 혼자 닫을 수 있는 항목이 전부 닫혀 있습니다. 남은 것은 W9 의 threading 결과 소화이고, 다음 최적화 후보는 아래 WU13 이 짚은 `emit_store` 와 `ql_ir_builder_destroy` 입니다(W1 소유).
+
+### WU17. G8 퍼징 캠페인. 크래시-0 이 아니고, 이유가 하나입니다
+
+WSL Ubuntu-24.04 에서 `linux-fuzz` 프리셋(`QL_BUILD_FUZZERS=ON`, ASan+UBSan+libFuzzer)으로 빌드하고 `scripts/coordinator/fuzz-campaign.sh` 로 타깃당 60초 유계 캠페인을 돌렸습니다. clang 18.1.8, glibc 2.39 이라 **Bitwuzla 번들의 GLIBC_2.38 요구는 걸리지 않았고 툴체인에서 막힌 곳은 없습니다.**
+
+**`/mnt/c` 가 아니라 WSL 네이티브 경로(`~/ql-fuzz`)로 트리를 복사해 거기서 빌드하고 돌렸습니다.** 브리프가 허용한 경로이고, WU6 에서 이미 같은 것을 겪었습니다. 9p 변환이 빌드와 퍼저 자신의 파일 I/O를 다 먹습니다. `fuzz-campaign.sh` 가 `out/build/linux-fuzz` 를 자기 위치 기준으로 잡으므로 사본과 캠페인이 같은 트리에 있으면 경로는 저절로 맞습니다.
+
+**타깃은 9개입니다.** 브리프의 "11개" 는 `tests/fuzz/` 의 헤더 둘(`fuzz_targets.h`, `fuzz_contract_targets.h`)을 같이 센 수로 보입니다. CMake 의 GLOB 은 `fuzz_*.c` 만 잡으므로 실제 실행 타깃은 9개입니다.
+
+**결과: 7 클린, 2 크래시.** 전체 벽시계 약 7분. 타깃별 수치는 `docs/fuzz/campaign-20260810.md` 에 표로 있습니다.
+
+**크래시 둘은 같은 결함 하나입니다.**
+
+```text
+fuzz_policy         -> ql_policy_parse        src/policy.c:650
+fuzz_policy_result  -> ql_policy_result_parse src/policy.c:1196
+ASan heap-buffer-overflow, READ of size 2, strlen 안
+```
+
+두 함수 모두 `if (json_size == 0u) { json_size = strlen(json); }` 라는 **문서화되지 않은 sentinel** 을 가지고 있습니다. 포인터+길이 계약대로 길이 0 인 non-NUL-terminated 슬라이스를 주면 할당 밖을 읽습니다. `include/quodlibet/policy.h` 에는 이 편의 규약이 한 줄도 적혀 있지 않고, `ql_precondition_parse`, `ql_problem_open`, `ql_source_signature_open` 은 길이를 준 대로 씁니다. **나머지 일곱 타깃이 같은 빈 입력에서 멀쩡한 이유가 그것입니다.** 저장소 전체에서 이 패턴은 `src/policy.c` 의 이 두 곳뿐입니다.
+
+**입력 최소화는 할 것이 없습니다. 빈 입력이 곧 최소입니다.** 한 바이트도 필요 없습니다.
+
+**고치지 않았습니다.** `src/policy.c` 는 W8 소유가 아니고 브리프도 크래시를 스스로 고치지 말라고 했습니다. 조율자에게 위치, 원인, 재현, 두 가지 수정 선택지(길이 0 을 빈 문서로 보고 거절 / sentinel 을 공개 헤더에 명시)를 status 로 올렸습니다. 헤더의 다른 계약이 전부 포인터+길이이므로 전자를 권했습니다.
+
+**회귀 시드**를 `tests/fuzz/corpus/policy/empty-input` 와 `tests/fuzz/corpus/policy_result/empty-input` 에 넣었습니다. 코퍼스 디렉터리를 드라이버에 넘기면 재현됩니다.
+
+**`tests/test_fuzz_contracts.cpp` 의 결정적 시드 목록에는 일부러 넣지 않았습니다.** 그 목록은 매 ctest 마다 도는데, W8 이 고칠 수 없는 결함으로 관문을 빨갛게 만드는 것은 다른 워크스트림의 검증을 막습니다. 이유를 `tests/fuzz/corpus/README.md` 에 적었고, `src/policy.c` 를 고치는 쪽이 같은 변경에서 두 시드를 그 목록에 넣으면 됩니다.
+
+**부수 관찰(고치지 않음, `scripts/coordinator/` 는 W8 소유가 아닙니다).** `fuzz-campaign.sh` 9행의 `code=$?` 는 `tail` 로 끝나는 파이프라인의 종료코드를 읽습니다. 그래서 **이번 크래시 둘도 로그에 `exit=0` 으로 찍혔습니다.** 크래시 판정을 종료코드로 하면 안 되고 `ERROR:`/`SUMMARY:` 줄로 해야 합니다. 이것 자체가 "크래시-0 을 실측했다" 는 주장을 조용히 위조할 수 있는 자리라 조율자에게 같이 올렸습니다.
 
 ### WU16. 반려 원인은 시험이 아니라 빌드였습니다
 
@@ -336,6 +368,7 @@ WU5 에서 스레드와 프로세스가 같은 대역에서 멈추는 것을 보
 
 ## 다음에 할 것
 
+0. **G8.** `src/policy.c:650` 과 `:1196` 이 고쳐지면 캠페인을 그대로 다시 돌리고 `docs/fuzz/` 에 새 날짜 기록을 남깁니다. 그때 두 `empty-input` 시드를 `tests/test_fuzz_contracts.cpp` 시드 목록에 넣는 것은 그 수정을 하는 워크스트림 몫입니다.
 1. **단발 `check()` 의 세션**(위 제안). 후보 2 는 비용 0 입니다.
 2. `emit_store` (50.3%) 와 `ql_ir_builder_destroy` (21.6%). 지금 coverage 도구의 3분의 2이고 **남은 최대 절대치**입니다. 둘 다 W1 소유라 합의가 필요합니다.
 3. `check_batch(workers=0)` 이 논리 코어를 씁니다. 최고점을 12% 지나칩니다.
