@@ -5,9 +5,35 @@
 
 ## 지금 하는 것
 
-러너 추출은 W7 의 `ql_solver_check` 오류 경로 누수 수정이 `main` 에 앉을 때까지 보류입니다(조율자가 status 로 알려 줍니다). 그동안 method 본체의 러너 비의존부를 만들고 있습니다. SAT 배정을 기존 replay 경로로 되돌리는 매핑을 끝냈습니다.
+러너 추출을 끝냈습니다(아래 11번). 게이트가 열렸으므로 다음은 `prove.aig-sat` method 본체입니다.
 
 ## 끝난 작업 단위
+
+### 11. 프로세스 실행기 추출 (`src/process_runner.c`)
+
+`src/solver.c` 의 프로세스 계층을 `src/process_runner.c` 로 옮겼습니다. 동작 보존이고 공개 ABI 는 그대로입니다. CTest 467/467 통과입니다(추출 전 459 + 러너 시험 8).
+
+옮긴 것은 셋입니다.
+
+- capture 기계 전체와 `run_process` -> `ql_process_run`. loop 수명 완결, 공유 읽기 열기, AV 재시도, CLOEXEC 상속 차단 네 수리가 주석까지 그대로 따라왔습니다
+- snapshot 생성/제거 -> `ql_process_snapshot_create` / `ql_process_snapshot_dispose`
+- 실행 파일 digest -> `ql_process_executable_digest`
+
+읽는 request 필드는 다섯이고 `ql_process_limits_v1` 에 일대일입니다: `timeout_ms`, `cancel_state`, `is_cancelled`, `stdout_limit_bytes`, `stderr_limit_bytes`. `memory_limit_mb` 는 러너가 쓰지 않고 Bitwuzla flag 로만 갑니다. request 는 두 호출부 모두 validate 를 지나므로 상한이 0 이 될 수 없고, 따라서 기본값 대체 경로는 실제로 밟히지 않습니다.
+
+러너는 자기 bounded capture buffer(`ql_process_buffer`)를 가집니다. `ql_buffer` 는 SMT builder 와 함께 `src/solver.c` 에 남습니다. 결과 문자열은 크기에 세지 않는 종단자를 달아서 넘기므로 빈 capture 가 null 이 아니라 빈 문자열입니다.
+
+**합의된 헤더에서 세 가지를 더했습니다.** 전부 추가이고 기존 선언은 건드리지 않았습니다.
+
+1. `ql_process_path_is_readable`. `src/solver.c` 의 `readable_file` 이 `open_binary_read` 를 쓰고 있었습니다. 러너로 옮기면서 그 열기 규율을 solver 에 한 벌 더 남기면 CLOEXEC 와 공유 읽기 수리가 두 곳이 됩니다
+2. `QL_PROCESS_WATCHDOG_GRACE_MS` 를 헤더로. version probe 가 총 5초를 맞추려고 이 값을 빼고 있어서, 두 곳이 같은 수를 따로 적으면 조용히 어긋납니다
+3. `ql_process_snapshot_create` 가 digest 까지 냅니다. 원래 순서가 복사 -> 해시였고 그 둘 사이에 아무것도 없었습니다
+
+**진단 문구 둘은 일부러 "solver" 를 유지했습니다.** `"solver stdout"` 과 `"solver stderr"` 는 `RunawayOutputIsBoundedByTheRequestLimit` 이 고정하고 있는 문자열입니다. 러너의 두 소비자가 결정 절차와 그 증명을 검사하는 checker 이므로 말이 틀리지도 않습니다. SMT 를 이름으로 부르던 문구(`"could not write SMT-LIB to solver process"`)는 중립으로 바꿨습니다. 아무도 고정하고 있지 않습니다.
+
+snapshot 임시 디렉터리 이름은 그대로 `quodlibet-bitwuzla-<pid>-*` 입니다. 러너는 `name` 의 마지막 점 앞까지를 stem 으로 씁니다. `test_solver.cpp` 가 이 접두사로 누출 검사를 하고 있어서 바꿀 수 없고, 바꿀 이유도 없습니다.
+
+`tests/test_process_runner.cpp` 8개 시험이 deadline, 출력 상한, 취소 hook, snapshot, digest 를 러너의 성질로 고정합니다. 자식은 이 시험 실행 파일 자신이고 `tests/test_fault_injection.cpp` 의 fault mode 정적 생성자가 시키는 대로 오작동합니다. `tests/CMakeLists.txt` 에 `src/` 를 include 경로로 넣었습니다. 공개 ABI 를 건너지 않으므로 shared 빌드에서는 이 파일이 통째로 비어 컴파일됩니다.
 
 ### 1. SAT solver / proof 형식 / checker 후보 비교 (`4264e16`)
 

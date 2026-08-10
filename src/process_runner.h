@@ -44,6 +44,13 @@ QL_EXTERN_C_BEGIN
    solver that floods its output is a solver whose answer is not usable. */
 #define QL_PROCESS_DEFAULT_OUTPUT_LIMIT ((size_t)(16u * 1024u * 1024u))
 
+/* The watchdog fires this much after the requested timeout, so a tool given
+   its own time limit is allowed to reach that limit and report rather than be
+   killed on the boundary. A caller that wants a total wall-clock budget must
+   subtract this from what it asks for, which is why the number is here and not
+   private to the runner. */
+#define QL_PROCESS_WATCHDOG_GRACE_MS UINT64_C(50)
+
 typedef struct ql_process_limits_v1 {
     size_t struct_size;
     /* Zero disables the watchdog. A run that hits it is reported as timed
@@ -112,6 +119,14 @@ void ql_process_snapshot_dispose(ql_process_snapshot *snapshot);
    runs a path it does not own. */
 ql_status ql_process_executable_digest(const char *path, ql_digest *digest,
                                        ql_error *error);
+
+/* Non-zero when `path` can be opened for reading under the same close-on-exec
+   and shared-read discipline every other open in this module uses. A caller
+   probing candidate executables must not open them any other way: a descriptor
+   that survives a fork is what makes a sibling judgement die with ETXTBSY, and
+   an exclusive open is what makes an antivirus scan look like a missing file.
+   That is why this is here rather than reimplemented at the call site. */
+int ql_process_path_is_readable(const char *path);
 
 /* Runs `executable_path` with `arguments`, which must not include argv[0]:
    the runner supplies the path as argv[0] itself so a caller cannot

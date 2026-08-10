@@ -20,6 +20,13 @@ target_link_libraries(quodlibet_tests PRIVATE
     quodlibet::quodlibet
     GTest::gtest
 )
+# src/ is on the path so the internal process runner can be tested where it
+# lives rather than only through a backend that happens to use it. Nothing
+# here crosses the public ABI; a shared build hides these symbols, and
+# test_process_runner.cpp compiles to nothing in that configuration.
+target_include_directories(quodlibet_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
 add_dependencies(quodlibet_tests ql_test_plugin)
 
 if(WIN32 AND QL_BUILD_SHARED)
