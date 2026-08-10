@@ -168,7 +168,13 @@ CTest 435/435 통과.
 
 ## 조율자에게 보고할 것
 
-### 병렬 CTest 에서 cache key 시험이 깨집니다 (`tests/test_cache_key.cpp`, W6 소유)
+### (해결) 병렬 CTest 에서 cache 시험이 깨집니다 (`tests/test_cache.cpp`, `tests/test_cache_key.cpp`)
+
+조율자가 최우선 dispatch 로 수정을 위임했습니다. 두 파일의 `ScopedRoot` 가 디렉터리 이름에 pid 를 넣고 counter 는 한 프로세스 안의 구분만 맡습니다. `test_cache.cpp` 가 쓰던 `this` 포인터 혼합은 대체재가 아닙니다. 같은 시험을 도는 동일 프로세스 둘은 스택 배치가 같아 같은 포인터를 돌려줍니다.
+
+관문: `ctest -R Cache --repeat until-fail:10` 통과, 스핀 프로세스 20개 부하에서 `until-fail:6` 통과, 12-way 전체 세 번 441/441 통과.
+
+### (원래 보고) 병렬 CTest 에서 cache key 시험이 깨집니다
 
 `ScopedRoot` 가 임시 디렉터리 이름을 **프로세스별 static counter** 로 만듭니다.
 
@@ -184,7 +190,13 @@ path_ = fs::temp_directory_path() /
 
 `tests/test_cache_key.cpp` 는 W6 소유라 고치지 않았습니다. 디렉터리 이름에 pid 를 넣으면 됩니다. `tests/test_solver.cpp` 의 snapshot prefix 가 이미 그 방식입니다.
 
-### result header 를 덮어쓴 backend 에서의 누수 (`src/solver.c`, W2 소유)
+### (해결) result header 를 덮어쓴 backend 에서의 누수 (`src/solver.c`)
+
+조율자가 이 결함에 한해 W7 에 수정을 위임했습니다(W10 의 프로세스 러너 추출이 이것을 기다림). `ql_solver_check` 안에서만 쓰는 `clear_own_result` 를 추가해 header 두 필드를 복원한 뒤 해제합니다. **바깥에서 들어온 구조체에 대한 `ql_solver_check_result_clear` 의 방어는 그대로 둡니다.** layout 이 미상일 때 그 포인터 필드가 artifact 가 아닐 수 있으므로 그 거부는 옳습니다. `ql_solver_check` 안에서는 adapter 자신이 초기화한 구조체이므로 layout 이 미상이 아닙니다.
+
+시험은 잔여 3 을 기대하던 것에서 0 을 기대하도록 조였고, 64회 반복해도 누적되지 않는 것을 추가로 고정했습니다.
+
+### (원래 보고) result header 를 덮어쓴 backend 에서의 누수 (`src/solver.c`, W2 소유)
 
 backend 가 `ql_solver_check_result_v1` 의 `abi_version` 이나 `struct_size` 를 덮어쓰면 `ql_solver_check` 는 `QL_STATUS_ABI_MISMATCH` 로 올바르게 거부합니다. 그러나 그 backend 가 할당한 artifact 는 해제되지 않습니다. 측정한 잔여 할당은 model artifact 하나당 3건입니다.
 

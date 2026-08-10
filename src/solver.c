@@ -889,6 +889,23 @@ ql_status QL_CALL ql_solver_pop(
     return status;
 }
 
+/* Releases a result the adapter itself created with
+   ql_solver_check_result_init().
+
+   ql_solver_check_result_clear() declines to touch a structure whose header
+   does not look right, which is correct for one arriving from outside: with
+   an unknown layout, those pointer fields may not be artifacts at all. Inside
+   this file the layout is not unknown. `local_result` was initialised here
+   and a backend only overwrote fields in it, so a backend that scribbled on
+   `abi_version` or `struct_size` would otherwise strand every artifact it
+   allocated. Restoring the two header fields the adapter knows are true is
+   what makes the release safe again. */
+static void clear_own_result(ql_solver_check_result_v1 *result) {
+    result->struct_size = sizeof(*result);
+    result->abi_version = QL_SOLVER_ABI_VERSION;
+    ql_solver_check_result_clear(result);
+}
+
 ql_status QL_CALL ql_solver_check(
     ql_solver *solver, const ql_solver_check_request_v1 *request,
     ql_solver_check_result_v1 *result, ql_error *error) {
@@ -909,14 +926,14 @@ ql_status QL_CALL ql_solver_check(
     status = solver->descriptor->check(solver->backend_state, request,
                                        &local_result, error);
     if (status != QL_STATUS_OK) {
-        ql_solver_check_result_clear(&local_result);
+        clear_own_result(&local_result);
         return status;
     }
     local_result.backend_name = solver->descriptor->name;
     local_result.backend_version = solver->descriptor->version;
     status = ql_solver_check_result_validate(request, &local_result, error);
     if (status != QL_STATUS_OK) {
-        ql_solver_check_result_clear(&local_result);
+        clear_own_result(&local_result);
         return status;
     }
     ql_solver_check_result_clear(result);

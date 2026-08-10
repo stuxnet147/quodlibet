@@ -537,23 +537,19 @@ TEST(SolverFaultInjection, RejectsEveryContradictoryResultAndLeaksNothing) {
     }
 }
 
-/* A backend that overwrites the result header is rejected, and the rejection
-   is what this fixes in place. The artifacts it allocated are NOT released
-   today, which is a defect rather than a decision:
+/* A backend that overwrites the result header is rejected, and everything it
+   allocated is still released.
 
-   ql_solver_check_result_clear() only releases when abi_version and
-   struct_size still look right, which is correct for a struct of unknown
-   layout arriving from outside. Inside ql_solver_check() the layout is not
-   unknown: the adapter created local_result with
-   ql_solver_check_result_init() and the backend overwrote fields in a struct
-   the adapter owns. Restoring the two header fields before clearing would
-   release them. src/solver.c belongs to W2, so this is recorded in
-   docs/workstreams/W7-progress.md and reported to the coordinator rather than
-   changed here.
-
-   The leak is asserted as a bounded quantity, not as a correct outcome: if W2
-   fixes it this test fails and gets tightened to expect zero. */
-TEST(SolverFaultInjection, RewrittenResultHeaderIsRejectedButStillLeaks) {
+   Both halves matter and they used to disagree. ql_solver_check_result_clear
+   only releases when abi_version and struct_size still look right, which is
+   the correct refusal for a structure of unknown layout arriving from
+   outside: those pointer fields might not be artifacts at all. Inside
+   ql_solver_check the layout is not unknown - the adapter initialised the
+   structure itself and the backend only overwrote fields in it - so the
+   adapter restores the two header fields it knows are true before clearing.
+   Without that, a backend could strand every artifact it allocated simply by
+   scribbling on a header field. */
+TEST(SolverFaultInjection, ARewrittenResultHeaderIsRejectedWithoutLeaking) {
     for (std::size_t index = 0u;
          index < sizeof(kHeaderRewriteCases) / sizeof(kHeaderRewriteCases[0]);
          ++index) {
@@ -583,11 +579,39 @@ TEST(SolverFaultInjection, RewrittenResultHeaderIsRejectedButStillLeaks) {
         ql_solver_check_result_clear(&result);
         ql_solver_destroy(solver);
         g_fault = Fault::kHonestSat;
-        /* One unreleased model artifact: its handle, its copied bytes, and
-           its kind string. Bounded and known, but not zero. */
-        EXPECT_EQ(3u, counter.live.load(std::memory_order_relaxed))
-            << "the known leak changed size; re-read the comment above";
+        EXPECT_EQ(0u, counter.live.load(std::memory_order_relaxed))
+            << "the adapter leaked what the backend allocated";
     }
+}
+
+/* Repeating it must not accumulate either. A single call leaking three
+   allocations is invisible next to a process that is about to exit; a scorer
+   running millions of judgements is not. */
+TEST(SolverFaultInjection, RepeatedHeaderRewritesDoNotAccumulate) {
+    CountingAllocator counter;
+    const ql_allocator allocator = counter.View();
+    ql_solver *solver = nullptr;
+    ql_solver_check_request_v1 request{};
+    ql_error error{};
+
+    g_fault = Fault::kRewritesAbiVersion;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_solver_create(&allocator, &kHostileDescriptor, nullptr,
+                               &solver, &error))
+        << error.message;
+    ql_solver_check_request_init(&request, QL_SOLVER_LOGIC_QF_BV);
+    request.maximum_bv_width = 8u;
+    request.artifact_requests = QL_SOLVER_REQUEST_MODEL;
+    for (std::size_t round = 0u; round < 64u; ++round) {
+        ql_solver_check_result_v1 result{};
+        ql_solver_check_result_init(&result);
+        EXPECT_EQ(QL_STATUS_ABI_MISMATCH,
+                  ql_solver_check(solver, &request, &result, &error));
+        ql_solver_check_result_clear(&result);
+    }
+    ql_solver_destroy(solver);
+    g_fault = Fault::kHonestSat;
+    EXPECT_EQ(0u, counter.live.load(std::memory_order_relaxed));
 }
 
 /* A rejected check must not hand the caller a half-populated result. A caller
