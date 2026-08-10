@@ -6461,12 +6461,14 @@ static ql_status lower_update_expression(lower_context *context, size_t node,
 
 static ql_status parse_local_type(lower_context *context, size_t declaration,
                                   size_t type_node, lower_type *output,
-                                  uint32_t *is_const, ql_error *error) {
+                                  uint32_t *is_const, uint32_t *is_static,
+                                  ql_error *error) {
   size_t end = subtree_end(context, declaration);
   size_t index;
   char *spelling;
 
   *is_const = 0u;
+  *is_static = 0u;
   for (index = declaration + 1u; index < end; ++index) {
     char *text;
     const char *kind;
@@ -6481,11 +6483,15 @@ static ql_status parse_local_type(lower_context *context, size_t declaration,
         return QL_STATUS_OUT_OF_MEMORY;
       }
       {
-        const int is_storage_duration =
+        const int global_storage =
             context->parsing_global != 0u &&
             (strcmp(text, "static") == 0 || strcmp(text, "extern") == 0);
-        if (strcmp(text, "auto") != 0 && strcmp(text, "register") != 0 &&
-            !is_storage_duration) {
+        const int local_static = context->parsing_global == 0u &&
+                                 strcmp(text, "static") == 0;
+        if (local_static) {
+          *is_static = 1u;
+        } else if (strcmp(text, "auto") != 0 &&
+                   strcmp(text, "register") != 0 && !global_storage) {
           context->allocator->deallocate(context->allocator->user_data, text);
           return lower_unknown(
               context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, index,
@@ -6834,6 +6840,7 @@ static ql_status lower_declaration(lower_context *context, size_t node,
   lower_type base_type;
   lower_type declarator_type;
   uint32_t is_const;
+  uint32_t is_static;
   size_t declarator_count = 0u;
   ql_status status;
 
@@ -6841,8 +6848,8 @@ static ql_status lower_declaration(lower_context *context, size_t node,
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION,
                          node, "local declaration has no type", error);
   }
-  status =
-      parse_local_type(context, node, type_node, &base_type, &is_const, error);
+  status = parse_local_type(context, node, type_node, &base_type, &is_const,
+                            &is_static, error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
   }
@@ -6895,6 +6902,13 @@ static ql_status lower_declaration(lower_context *context, size_t node,
          are handled separately when that surface is admitted. */
       if (pointer_depth != 0u) {
         object_is_const = 0u;
+      }
+      if (is_static != 0u && object_is_const == 0u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, named,
+            "mutable static locals and static pointer objects require "
+            "persistent function state",
+            error);
       }
       declarator_type = base_type;
       if (pointer_depth == 1u) {
@@ -8906,6 +8920,7 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
     size_t child;
     lower_type base;
     uint32_t is_const;
+    uint32_t is_static;
     ql_status status;
 
     if (strcmp(context->nodes[index].view.kind, "declaration") != 0) {
@@ -8954,8 +8969,8 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
       if (!matches) {
         continue;
       }
-      status =
-          parse_local_type(context, index, type_node, &base, &is_const, error);
+      status = parse_local_type(context, index, type_node, &base, &is_const,
+                                &is_static, error);
       if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
       }
@@ -9113,6 +9128,7 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
     uint64_t array_length = 0u;
     int rejected = 0;
     uint32_t is_const = 0u;
+    uint32_t is_static = 0u;
     lower_type type;
     char label[160];
     size_t object;
@@ -9145,7 +9161,7 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
     }
     context->parsing_global = 1u;
     status = parse_local_type(context, global->declaration_node, type_node,
-                              &type, &is_const, error);
+                              &type, &is_const, &is_static, error);
     context->parsing_global = 0u;
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;

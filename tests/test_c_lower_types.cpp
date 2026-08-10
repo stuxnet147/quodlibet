@@ -366,6 +366,24 @@ TEST(CLowerTypes, StopsOnATypedefChainThatDoesNotTerminate) {
                   "cyclic", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
 }
 
+TEST(CLowerTypes, KeepsPersistentLocalStateOutsideTheConstSlice) {
+    ExpectUnknown("int mutable_static(void) {\n"
+                  "  static int value = 1;\n"
+                  "  return ++value;\n"
+                  "}",
+                  "mutable_static", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
+    ExpectUnknown("int static_pointer(void) {\n"
+                  "  static const int *pointer;\n"
+                  "  return pointer != 0;\n"
+                  "}",
+                  "static_pointer", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
+    ExpectUnknown("int local_extern(void) {\n"
+                  "  extern int value;\n"
+                  "  return value;\n"
+                  "}",
+                  "local_extern", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
+}
+
 TEST(CLowerTypes, LowersCastsBetweenScalarTypes) {
     Lowered lowered;
     ASSERT_EQ(QL_STATUS_OK,

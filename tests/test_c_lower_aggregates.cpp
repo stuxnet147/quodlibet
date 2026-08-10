@@ -110,6 +110,10 @@ QL_AGG_FUNCTION(zero_pointer_member,
         struct AGG_ZERO_POINTER value = {0};
         return (value.pointer == 0) + value.value + (a - a) + (b - b);
     });
+QL_AGG_FUNCTION(static_const_array, int agg_static_const(int a) {
+    static const int values[4] = {11, -3, 27, 5};
+    return values[((unsigned)a) & 3u];
+});
 
 namespace {
 
@@ -364,6 +368,9 @@ TEST(CLowerAggregates, MatchesCompiledExecutionOnArraysAndRecords) {
         {"zero-pointer", zero_pointer_member_source, "agg_zero_pointer", 2,
          sizeof(struct AGG_ZERO_POINTER),
          [](int32_t a, int32_t b) { return agg_zero_pointer(a, b); }},
+        {"static-const-array", static_const_array_source,
+         "agg_static_const", 1, sizeof(int[4]),
+         [](int32_t a, int32_t) { return agg_static_const(a); }},
     };
 
     uint64_t state = UINT64_C(0x71b3e0c95d24af86);

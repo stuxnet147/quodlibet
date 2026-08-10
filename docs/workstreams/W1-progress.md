@@ -1379,6 +1379,24 @@ hosted C의 특별 규칙도 분리했습니다. 정확히 `int main(...)`인 �
 
 `tests/test_c_lower_locals.cpp`는 명시적 반환 분기, fallthrough UB 분기, `main`의 암시적 0을 interpreter로 실행합니다. lowering 단위 시험은 생성된 IR의 UB guard와 독립 verifier 통과를 확인합니다. 전체 검증은 Windows 531/531, Linux Clang 530/530, Linux ASan/UBSan 530/530입니다. `fuzz_c_lower`는 60초 동안 281,426회, crash 0으로 끝났습니다.
 
+### 35. 비포인터 `static const` 지역을 불변 객체로 내린다
+
+커밋: (이 단위)
+
+함수 안의 `static const` scalar, array, record는 한 호출 안에서 값이 바뀌지 않으므로 기존 불변 지역과 같은 SSA 또는 object 초기화 경로로 내립니다. 배열과 record는 크기가 고정된 object이고, initializer store 뒤의 load가 실제 compiler layout과 같은 값을 냅니다. 함수 진입마다 초기화 코드를 다시 내는 차이는 불변 객체에서는 관찰되지 않습니다.
+
+mutable static은 호출 사이의 persistent state가 필요하고, `static const T *p`는 pointee만 const라 pointer object 자체가 바뀔 수 있습니다. 두 경우와 local extern, thread-local은 계속 UNKNOWN입니다. 선언 specifier의 const를 pointer object const로 잘못 읽어 수용하지 않습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 20,816 (69.67%) | **20,879 (69.88%)** |
+| 증가 | | **+63** |
+| `unsupported_type` | 4,508 | **4,351** |
+| verifier 통과 | 20,816 / 20,816 | **20,879 / 20,879** |
+| status 실패 | 0 | **0** |
+
+157개가 첫 storage-duration 차단을 벗어났고, 그중 94개는 뒤의 initializer, pointer, control-flow 한계로 이동해 최종 성공 순증은 63개입니다. `tests/test_c_lower_aggregates.cpp`는 `static const int[4]`를 실제 컴파일 C와 64개 입력으로 대조합니다. 별도 회귀 시험은 mutable static, static pointer, local extern이 UNKNOWN인지 고정합니다. 전체 검증은 Windows 532/532, Linux Clang 531/531, Linux ASan/UBSan 531/531입니다. `fuzz_c_lower`는 60초 동안 284,124회, crash 0으로 끝났습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1387,11 +1405,11 @@ hosted C의 특별 규칙도 분리했습니다. 정확히 `int main(...)`인 �
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 4,508
-- `uninitialized_read` 1,972
-- `type_error` 702
-- `unsupported_pointer` 649
-- `unsupported_control_flow` 435
+- `unsupported_type` 4,351
+- `uninitialized_read` 1,993
+- `type_error` 708
+- `unsupported_pointer` 651
+- `unsupported_control_flow` 444
 
 ## 조율자에게 요청할 것
 
@@ -1407,7 +1425,8 @@ hosted C의 특별 규칙도 분리했습니다. 정확히 `int main(...)`인 �
 
 ## 다음에 할 것
 
-1. 남은 타입 철자와 선언 형태를 실제 source spelling별로 다시 나눠 가장 큰 정식 타입 묶음을 닫습니다.
-2. uninitialized address escape는 외부 호출의 memory-write 계약을 먼저 고정합니다.
-3. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.
-4. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.
+1. `static T * const`처럼 pointer object 자체가 const인 선언을 구문 트리에서 구분해 불변 static slice를 넓힙니다.
+2. 남은 타입 철자와 선언 형태를 실제 source spelling별로 다시 나누고, 부동소수점은 IR 타입과 연산 계약을 먼저 설계합니다.
+3. uninitialized address escape는 외부 호출의 memory-write 계약을 먼저 고정합니다.
+4. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.
+5. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.
