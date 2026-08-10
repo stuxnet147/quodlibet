@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,573 / 29,880 (78.89%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,308, `unsupported_type` 2,100, `unsupported_pointer` 663입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,626 / 29,880 (79.07%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,309, `unsupported_type` 2,100, `unsupported_pointer` 666입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1766,6 +1766,25 @@ string과 character literal은 escape 문법을 공유하지만 delimiter가 다
 
 `tests/test_c_lower_expressions.cpp`는 `'MUL'`과 `L'9'`를 같은 원문의 compiled 함수와 대조하고 기존 signed-byte escape도 함께 고정합니다. `tests/test_c_lower.cpp`는 5-byte constant를 계속 UNKNOWN으로 확인합니다. 공용 literal decoder가 string initializer에도 쓰이므로 영향 범위인 `CLower*` 92/92를 실행했습니다. 다른 subsystem은 바뀌지 않아 전체 CTest는 실행하지 않았고, 전체 train coverage는 G9 수용률과 기존 성공 회귀를 확인하기 위해 실행했습니다.
 
+### 57. 괄호로 감싼 function-pointer 역참조 호출을 같은 designator로 읽는다
+
+C에서 `callback(value)`와 `(*callback)(value)`는 같은 function designator를 호출합니다. record member도 `table->callback(value)`와 `(*table->callback)(value)`가 같습니다. call expression의 function 위치에서만 바깥 괄호를 벗기고 unary `*` 한 겹을 정규화해, 기존 callback parameter와 function-pointer member의 선언 및 간접 호출 경로를 그대로 사용합니다. 일반 expression의 pointer 역참조, data pointer 산술, 선언되지 않은 callee는 넓히지 않았습니다.
+
+호출 수집 prepass에도 같은 정규화를 적용했습니다. 따라서 괄호 표기라고 event trace와 memory state parameter를 놓치지 않으며, 실제 lowering과 prepass가 같은 callee를 봅니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,573 (78.89%) | **23,626 (79.07%)** |
+| 증가 | | **+53** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_call` | 395 | **333** |
+| verifier 통과 | 23,573 / 23,573 | **23,626 / 23,626** |
+| status 실패 | 0 | **0** |
+
+해당 진단 85개를 먼저 좁게 재측정해 53개가 성공했습니다. 나머지 32개 중 15개는 같은 진단, 8개는 선언 없는 callee, 9개는 기존 pointer, control-flow, uninitialized 제한으로 남았습니다. 전수 함수별 비교는 새 성공 53개, 기존 성공 회귀 0개, 변경 행 70개, 누락과 추가 행 0개입니다.
+
+`tests/test_c_lower_calls.cpp`는 callback parameter의 직접 표기와 `(*callback)(value)`, record member의 `(*table->callback)(value)`를 실제 compiled C와 interpreter의 반환값 및 간접-call event로 대조합니다. 변경은 call lowering과 호출 수집에 한정되지만 공용 C lower 경로이므로 `CLower*`와 `CReuse*`를 영향 범위 테스트로 삼았습니다. 다른 subsystem의 결과는 이 변경의 검증 근거로 삼지 않고, 전체 train coverage만 G9 수용률과 기존 성공 회귀를 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1774,11 +1793,11 @@ string과 character literal은 escape 문법을 공유하지만 delimiter가 다
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `uninitialized_read` 2,308
+- `uninitialized_read` 2,309
 - `unsupported_type` 2,100
-- `unsupported_pointer` 663
-- `unsupported_control_flow` 550
-- `unsupported_call` 395
+- `unsupported_pointer` 666
+- `unsupported_control_flow` 555
+- `unsupported_call` 333
 
 ## 조율자에게 요청할 것
 

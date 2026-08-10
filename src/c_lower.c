@@ -920,6 +920,32 @@ static size_t member_declarator_name(const lower_context *context,
                                      size_t declarator, uint32_t *pointer_depth,
                                      uint64_t *array_length, int *rejected);
 
+/* In call position C treats `f(...)` and `(*f)(...)` as the same function
+   designator. Strip only that exact parenthesized unary-star shell here; a
+   pointer expression anywhere else remains an ordinary data dereference. */
+static size_t unwrap_indirect_call_designator(const lower_context *context,
+                                              size_t node) {
+  while (node != SIZE_MAX &&
+         strcmp(context->nodes[node].view.kind,
+                "parenthesized_expression") == 0) {
+    node = first_named_child(context, node);
+  }
+  if (node != SIZE_MAX &&
+      strcmp(context->nodes[node].view.kind, "pointer_expression") == 0) {
+    size_t operator_node = direct_field_child(context, node, "operator");
+    size_t argument_node = direct_field_child(context, node, "argument");
+    if (operator_node != SIZE_MAX && argument_node != SIZE_MAX) {
+      ql_source_range range = context->nodes[operator_node].view.range;
+      if (range.end_byte == range.start_byte + 1u &&
+          range.end_byte <= context->source_size &&
+          context->source[range.start_byte] == '*') {
+        return argument_node;
+      }
+    }
+  }
+  return node;
+}
+
 static ql_status remember_storage_name(lower_context *context, const char *text,
                                        ql_error *error) {
   size_t existing;
@@ -1481,6 +1507,10 @@ static void collect_calls(lower_context *context, size_t body_node) {
       continue;
     }
     function_node = direct_field_child(context, index, "function");
+    if (function_node == SIZE_MAX) {
+      continue;
+    }
+    function_node = unwrap_indirect_call_designator(context, function_node);
     if (function_node == SIZE_MAX) {
       continue;
     }
@@ -6343,6 +6373,12 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
         "call expression has no function or argument list", error);
+  }
+  function_node = unwrap_indirect_call_designator(context, function_node);
+  if (function_node == SIZE_MAX) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+        "call expression has an empty function designator", error);
   }
   if (strcmp(context->nodes[function_node].view.kind, "identifier") == 0) {
     name = copy_node_text(context, function_node);
@@ -11340,6 +11376,10 @@ static ql_status initialize_parameters(lower_context *context,
       continue;
     }
     function_node = direct_field_child(context, index, "function");
+    if (function_node == SIZE_MAX) {
+      continue;
+    }
+    function_node = unwrap_indirect_call_designator(context, function_node);
     if (function_node == SIZE_MAX ||
         strcmp(context->nodes[function_node].view.kind, "identifier") != 0) {
       continue;

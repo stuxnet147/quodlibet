@@ -108,10 +108,16 @@ QL_CALL_FUNCTION(indirect, struct CALL_VTABLE {
     }
     int call_indirect_pointer(struct CALL_VTABLE *table) {
         return table->pointer_callback() == 0;
+    }
+    int call_indirect_parenthesized(struct CALL_VTABLE *table, int value) {
+        return (*table->callback)(value) - 1;
     });
 QL_CALL_FUNCTION(parameter_indirect,
     int call_parameter_indirect(int (*callback)(int), int value) {
         return callback(value) + 1;
+    }
+    int call_parameter_indirect_parenthesized(int (*callback)(int), int value) {
+        return (*callback)(value) + 1;
     });
 static const char callback_argument_source[] =
     "int CALLEE_accept(int (*)(int), int);\n"
@@ -608,6 +614,21 @@ TEST(CLowerCalls, AnIndirectCallCarriesItsTargetAndMatchesCompiledC) {
     EXPECT_EQ(call_indirect_pointer(&native), Returned(pointer_run.result));
     EXPECT_EQ(std::vector<std::string>{"__ql_indirect_call_v1"},
               pointer_log.symbols);
+
+    Lowered parenthesized;
+    ASSERT_TRUE(parenthesized.Open(indirect_source,
+                                   "call_indirect_parenthesized"));
+    for (int32_t value : {-17, 0, 41}) {
+        CallLog log;
+        const Outcome run = Execute(
+            parenthesized.ir(), {object.base, Widen(value)}, &log, &object);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
+        EXPECT_EQ(call_indirect_parenthesized(&native, value),
+                  Returned(run.result));
+        EXPECT_EQ(std::vector<std::string>{"__ql_indirect_call_v1"},
+                  log.symbols);
+    }
 }
 
 TEST(CLowerCalls, CarriesAFunctionPointerAsAnOpaqueExternalArgument) {
@@ -641,6 +662,43 @@ TEST(CLowerCalls, CallsAFunctionPointerParameterWithItsDeclaredSignature) {
         ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
             << ql_ir_interp_ub_reason_string(run.result.ub_reason);
         EXPECT_EQ(call_parameter_indirect(CALLEE_double, value),
+                  Returned(run.result));
+        EXPECT_EQ(std::vector<std::string>{"__ql_indirect_call_v1"},
+                  log.symbols);
+    }
+
+    CallLog null_log;
+    const Outcome null_run =
+        Execute(lowered.ir(), {0u, Widen(7)}, &null_log, &object);
+    ASSERT_EQ(QL_STATUS_OK, null_run.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+              null_run.result.outcome);
+    EXPECT_TRUE(null_log.symbols.empty());
+}
+
+TEST(CLowerCalls, CallsAParenthesizedFunctionPointerParameter) {
+    Lowered lowered;
+    uint8_t dummy = 0u;
+    ql_ir_interp_object_v1 object{};
+    ql_ir_interp_object_init(&object);
+    object.base = QL_IR_INTERP_FIRST_OBJECT_ADDRESS;
+    object.size = 1u;
+    object.initial = &dummy;
+
+    ASSERT_TRUE(lowered.Open(parameter_indirect_source,
+                             "call_parameter_indirect_parenthesized"));
+    for (int32_t value : {-91, 0, 37, 1000}) {
+        CallLog log;
+        const Outcome run = Execute(
+            lowered.ir(),
+            {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                 &CALLEE_double)),
+             Widen(value)},
+            &log, &object);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(call_parameter_indirect_parenthesized(CALLEE_double, value),
                   Returned(run.result));
         EXPECT_EQ(std::vector<std::string>{"__ql_indirect_call_v1"},
                   log.symbols);
