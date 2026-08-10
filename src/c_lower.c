@@ -6971,12 +6971,13 @@ static ql_status parse_local_type(lower_context *context, size_t declaration,
   if (strcmp(context->nodes[type_node].view.kind, "primitive_type") != 0 &&
       strcmp(context->nodes[type_node].view.kind, "sized_type_specifier") !=
           0 &&
-      strcmp(context->nodes[type_node].view.kind, "type_identifier") != 0) {
+      strcmp(context->nodes[type_node].view.kind, "type_identifier") != 0 &&
+      strcmp(context->nodes[type_node].view.kind, "enum_specifier") != 0) {
     context->allocator->deallocate(context->allocator->user_data, spelling);
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
                          type_node,
-                         "typedef, enum, aggregate, and floating local types "
-                         "are outside this slice",
+                         "local type syntax is outside the scalar, enum, and "
+                         "record slice",
                          error);
   }
   {

@@ -42,6 +42,13 @@ QL_EXPR_FUNCTION(select_value, int expr_select(int a, int b) {
 QL_EXPR_FUNCTION(nested_conditional, int expr_nested(int a, int b) {
     return a > 0 ? (b > 0 ? 1 : 2) : (b > 0 ? 3 : 4);
 });
+QL_EXPR_FUNCTION(local_enum,
+    enum EXPR_LOCAL_ENUM { EXPR_NEGATIVE = -3, EXPR_POSITIVE = 5 };
+    int expr_local_enum(int a, int b) {
+        enum EXPR_LOCAL_ENUM selected =
+            a > b ? EXPR_POSITIVE : EXPR_NEGATIVE;
+        return selected + (a - a) + (b - b);
+    });
 QL_EXPR_FUNCTION(comma_value, int expr_comma(int a, int b) {
     int c = 0;
     return (c = a + 1, c + b);
@@ -315,6 +322,8 @@ const Case kCases[] = {
      [](int32_t a, int32_t b) { return expr_select(a, b); }, &Always},
     {"nested", nested_conditional_source, "expr_nested",
      [](int32_t a, int32_t b) { return expr_nested(a, b); }, &Always},
+    {"local-enum", local_enum_source, "expr_local_enum",
+     [](int32_t a, int32_t b) { return expr_local_enum(a, b); }, &Always},
     {"comma", comma_value_source, "expr_comma",
      [](int32_t a, int32_t b) { return expr_comma(a, b); }, &Always},
     {"assign", assignment_value_source, "expr_assign",

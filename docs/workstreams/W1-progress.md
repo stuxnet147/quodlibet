@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,306 / 29,880 (78.00%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 2,324, `uninitialized_read` 2,270, `unsupported_pointer` 628입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,446 / 29,880 (78.47%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,296, `unsupported_type` 2,125, `unsupported_pointer` 634입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1590,6 +1590,21 @@ null은 새 object authority를 요구하지 않습니다. 따라서 다른 arm�
 
 해당 첫 차단 9개를 먼저 좁게 측정해 모두 성공하는 것을 확인했습니다. `tests/test_c_lower_pointers.cpp`는 null이 양쪽 arm에 있는 조건식의 결과를 compiled 함수와 대조하고, 포인터 선택 뒤 역참조와 null 선택 뒤 UB를 각각 확인합니다. `tests/test_c_lower_expressions.cpp`는 0이 아닌 정수 arm을 계속 UNKNOWN으로 고정합니다. 영향 범위의 `CLower*` 시험 89/89와 전체 train 함수별 비교가 통과했고 누락, 예상 밖 행, 기존 성공 회귀가 없었습니다. 변경은 내부 conditional expression의 pointer/integer arm 판정에 한정되므로 전체 CTest는 실행하지 않았습니다.
 
+### 47. 지역 enum object를 프로파일의 int 타입으로 내린다
+
+`ASM2C_GNU_V1`은 enum 타입을 32비트 signed `int`로 고정하고 기존 parameter, record member, enumerator 경로도 같은 타입을 사용합니다. 지역 선언의 `enum_specifier`만 별도 구문 관문에서 거부하고 있었으므로 `parse_local_type`이 같은 공용 type resolver로 이어지게 했습니다. 정수 승격, usual arithmetic conversion, 배열 element, 주소가 필요한 지역 storage는 기존 int 경로를 그대로 사용합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,306 (78.00%) | **23,446 (78.47%)** |
+| 증가 | | **+140** |
+| 기존 성공 회귀 | | **0** |
+| 지역 enum 첫 차단 | 202 | **0** |
+| verifier 통과 | 23,306 / 23,306 | **23,446 / 23,446** |
+| status 실패 | 0 | **0** |
+
+첫 차단 202개는 전부 `enum_specifier`였고, 좁은 subset에서 140개가 성공했습니다. 나머지 62개는 uninitialized address escape 26개, call 17개, control flow 10개, pointer 6개, 다른 type 제한 3개로 이동했습니다. `tests/test_c_lower_expressions.cpp`는 음수와 양수 enumerator 중 하나로 지역 enum을 초기화하고 compiled 함수와 무작위 입력 512개에서 대조합니다. 영향 범위의 `CLower*` 시험 89/89와 전체 train 함수별 비교가 통과했고 누락, 예상 밖 행, 기존 성공 회귀가 없었습니다. 변경은 지역 enum type 관문에만 한정되므로 전체 CTest는 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1598,11 +1613,11 @@ null은 새 object authority를 요구하지 않습니다. 따라서 다른 arm�
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 2,324
-- `uninitialized_read` 2,270
-- `unsupported_pointer` 628
-- `unsupported_control_flow` 535
-- `unsupported_call` 380
+- `uninitialized_read` 2,296
+- `unsupported_type` 2,125
+- `unsupported_pointer` 634
+- `unsupported_control_flow` 545
+- `unsupported_call` 397
 
 ## 조율자에게 요청할 것
 
