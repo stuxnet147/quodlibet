@@ -193,6 +193,15 @@ const char *const kPolicySeeds[] = {
         {"name":"accept","disposition":"pass","claims":"proof",
          "verdicts":["proved_equivalent"],"score":1.0}],
         "default_class":"accept"})",
+    /* A score of -0.0, which is what first broke the canonical form: it was
+       written as `-0`, read back as the integer zero and rewritten as `0`.
+       Kept as a seed so mutation keeps exploring numeric spellings from a
+       shape that already reached the writer. The same input is in
+       tests/fuzz/corpus/policy/ for the coverage-guided drivers. */
+    R"({"schema_version":1,"name":"fixed-point","classes":[
+        {"name":"open","disposition":"abstain","claims":"none",
+         "verdicts":["unknown"],"score":-0.0}],
+        "default_class":"open"})",
 };
 
 /* Tokens the two JSON schemas care about. Splicing these in reaches

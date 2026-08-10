@@ -973,9 +973,24 @@ static void writer_append_escaped(ql_policy_writer *writer,
     writer_append(writer, "\"");
 }
 
+/* A canonical form has to be a fixed point: writing it, reading it back and
+   writing it again must reach the same bytes, or the same policy acquires two
+   identities and a store keyed on the text answers for the wrong one.
+
+   Negative zero was the one value that broke it. "%.17g" writes -0.0 as "-0",
+   the JSON reader takes "-0" as the integer zero and loses the sign, and the
+   next write produces "0". Collapsing both zeros here is not a rounding: -0.0
+   and 0.0 are the same number, and a canonical form is exactly where two
+   spellings of one number become one text. Every other double this writes
+   already round-trips, because "%.17g" carries enough digits to name a double
+   uniquely. */
 static void writer_append_number(ql_policy_writer *writer, double value) {
     char text[64];
 
+    if (value == 0.0) {
+        writer_append(writer, "0");
+        return;
+    }
     (void)snprintf(text, sizeof(text), "%.17g", value);
     writer_append(writer, text);
 }

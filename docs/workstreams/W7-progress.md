@@ -207,7 +207,17 @@ backend 가 `ql_solver_check_result_v1` 의 `abi_version` 이나 `struct_size` �
 시험은 이 누수를 정상으로 적지 않습니다. `RewrittenResultHeaderIsRejectedButStillLeaks` 가 잔여를 정확히 3으로 고정하므로 W2 가 고치면 이 시험이 실패하고 0 으로 조여집니다.
 
 
-### 정규 형태가 고정점이 아닌 경우 (`src/policy.c`, W3 소유)
+### (해결) 정규 형태가 고정점이 아닌 경우 (`src/policy.c`)
+
+조율자가 이 결함에 한해 W7 에 수정을 위임했습니다. 위임 조건 셋을 그대로 따랐습니다.
+
+1. **일반형 시험.** `tests/test_policy_canonical.cpp` 가 `-0.0` 사례가 아니라 "정규 형태는 한 번의 왕복에 대한 고정점이다" 라는 성질 자체를 박습니다. 정책 3종과 double 이 왕복에서 깨질 수 있는 방식(영의 부호, 정수로 읽힐 수 있는 값, 17자리를 다 쓰는 값, 양 극단)을 노린 score 18종에 대해 검사하고, policy result 쪽도 같은 writer 를 공유하므로 같이 검사합니다. `-0.0` 만 보는 시험이었다면 같은 방식으로 깨지는 다음 값을 놓칩니다.
+2. **digest 변화 근거.** 기존 시험 중 score 가 `-0.0` 인 것이 없어 직렬화 digest 가 바뀐 기존 시험은 없습니다(전 시험 447/447 통과). 근거는 커밋 메시지에 적었습니다.
+3. **corpus 시드.** `tests/fuzz/corpus/policy/negative-zero-score.json` 과 `tests/fuzz/corpus/README.md` 를 만들고, 매 ctest 에서 도는 결정적 campaign 의 `kPolicySeeds` 에도 같은 입력을 넣었습니다.
+
+수정은 canonical writer 에서 두 영을 하나로 모으는 것입니다. 반올림이 아닙니다. `-0.0` 과 `0.0` 은 같은 수이고 정규 형태란 한 수의 두 표기가 하나의 텍스트가 되는 자리입니다. `fuzz_contract_targets.h` 의 약화했던 불변식(두 번째 직렬화부터의 고정점)도 원래의 강한 형태로 되돌렸고, 받아들여진 정책 7198건에 대해 성립합니다.
+
+### (원래 보고) 정규 형태가 고정점이 아닌 경우 (`src/policy.c`, W3 소유)
 
 `ql_policy_serialize` 는 score `-0.0` 을 `-0` 으로 씁니다. 그 텍스트를 `ql_policy_parse` 로 다시 읽으면 yyjson 이 정수 0 으로 읽고, 다시 serialize 하면 `0` 이 나옵니다. 즉 `serialize(parse(serialize(p)))` 가 `serialize(p)` 와 다릅니다.
 
@@ -226,7 +236,7 @@ campaign 은 그동안 두 번째 serialize 부터의 고정점을 검사합니�
 
 ## 막힌 것
 
-없습니다. 위 `-0.0` 건은 판단 대기이지 진행을 막지 않습니다.
+없습니다.
 
 ## 다음에 할 것
 

@@ -430,52 +430,39 @@ QL_FUZZ_MAYBE_UNUSED static void ql_fuzz_policy(const unsigned char *data,
                         "a class inside the reported count could not be read");
         ql_fuzz_policy_class(&class_view);
     }
-    /* The canonical form must parse back and then stop moving. A stored
-       policy whose text kept changing every time it was read and written
-       would not be the same policy the next run loads.
+    /* The canonical form must parse back and reach the same bytes on the
+       first round trip, not eventually. A policy whose text kept changing
+       every time it was read and written would not be the same policy the
+       next run loads, and a store keyed on that text would answer for the
+       wrong one.
 
-       This checks the fixed point from the second serialisation onward, not
-       from the first. The first step is genuinely not idempotent today: a
-       score of -0.0 is written as `-0`, which yyjson reads back as the
-       integer 0 and the writer then emits as `0`. That is a defect in
-       src/policy.c, which W3 owns; it is recorded in
-       docs/workstreams/W7-progress.md and reported to the coordinator rather
-       than fixed here. Anything beyond that one step is still caught.
+       This was once weakened to check the fixed point from the second
+       serialisation onward, because a score of -0.0 was written as `-0`,
+       read back as the integer 0 and rewritten as `0`. src/policy.c now
+       collapses both zeros in the canonical writer, so the strong form holds
+       and is what is checked.
 
        `written` counts the terminator, which is not part of the JSON. */
     if (ql_policy_serialize(policy, buffer, sizeof(buffer), &written,
                             &error) == QL_STATUS_OK) {
         ql_policy *again = NULL;
-        char second[8192];
-        size_t second_written = 0u;
-        if (ql_policy_parse(NULL, buffer, written - 1u, &again, &error) !=
+        const size_t length = written - 1u;
+        if (ql_policy_parse(NULL, buffer, length, &again, &error) ==
             QL_STATUS_OK) {
+            char second[8192];
+            size_t second_written = 0u;
+            if (ql_policy_serialize(again, second, sizeof(second),
+                                    &second_written, &error) ==
+                QL_STATUS_OK) {
+                QL_FUZZ_REQUIRE(second_written == written &&
+                                    memcmp(second, buffer, length) == 0,
+                                "an accepted policy's canonical form is not a "
+                                "fixed point of one round trip");
+            }
+        } else {
             QL_FUZZ_REQUIRE(0,
                             "the serialisation of an accepted policy was "
                             "rejected by the parser that produced it");
-        } else if (ql_policy_serialize(again, second, sizeof(second),
-                                       &second_written, &error) ==
-                   QL_STATUS_OK) {
-            ql_policy *third = NULL;
-            if (ql_policy_parse(NULL, second, second_written - 1u, &third,
-                                &error) != QL_STATUS_OK) {
-                QL_FUZZ_REQUIRE(0,
-                                "the canonical form of an accepted policy was "
-                                "rejected on the second round trip");
-            } else {
-                char final[8192];
-                size_t final_written = 0u;
-                if (ql_policy_serialize(third, final, sizeof(final),
-                                        &final_written, &error) ==
-                    QL_STATUS_OK) {
-                    QL_FUZZ_REQUIRE(
-                        final_written == second_written &&
-                            memcmp(final, second, second_written - 1u) == 0,
-                        "an accepted policy's canonical form never reaches a "
-                        "fixed point");
-                }
-            }
-            ql_policy_destroy(third);
         }
         ql_policy_destroy(again);
     }
