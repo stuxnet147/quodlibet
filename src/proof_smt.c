@@ -778,6 +778,45 @@ static ql_status QL_CALL smt_product_validate(void *instance,
     return QL_STATUS_OK;
 }
 
+/* Does either side thread an event trace? A body that calls takes the
+   incoming history as a parameter, which is what says its execution has calls
+   in it at all. */
+static int ir_side_threads_an_event_trace(const ql_ir *ir) {
+    ql_ir_view_v1 view;
+    ql_error ignored;
+    size_t index;
+
+    memset(&view, 0, sizeof(view));
+    view.struct_size = sizeof(view);
+    if (ql_ir_get_view(ir, &view, &ignored) != QL_STATUS_OK) {
+        return 0;
+    }
+    for (index = 0u; index < view.value_count; ++index) {
+        ql_ir_value_view_v1 value;
+        ql_ir_type_view_v1 type;
+        memset(&value, 0, sizeof(value));
+        value.struct_size = sizeof(value);
+        if (ql_ir_value_at(ir, index, &value, &ignored) != QL_STATUS_OK) {
+            return 0;
+        }
+        if (value.definition_kind != QL_IR_VALUE_PARAMETER) {
+            continue;
+        }
+        memset(&type, 0, sizeof(type));
+        type.struct_size = sizeof(type);
+        if (ql_ir_type_at(ir, value.type, &type, &ignored) == QL_STATUS_OK &&
+            type.kind == QL_IR_TYPE_EVENT_TRACE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ir_threads_an_event_trace(const ql_ir *left, const ql_ir *right) {
+    return ir_side_threads_an_event_trace(left) != 0 ||
+           ir_side_threads_an_event_trace(right) != 0;
+}
+
 /* Second attempt at a replayable model, over the same violation claim with
    every object bounded. Only its SAT answer is used; the bounded query has no
    proof authority and this function never touches the verdict. A failure to
@@ -870,6 +909,18 @@ static ql_status decide(const ql_allocator *allocator,
     decision->backend_name = violation.backend_name;
     decision->backend_version = violation.backend_version;
 
+    if (violation.kind == QL_SOLVER_CHECK_SAT &&
+        ir_threads_an_event_trace(left_ir, right_ir)) {
+        /* The miter states external calls, so a violation over a body that
+           calls is a real claim about the encoding. Confirming it is another
+           matter: replay runs the IR concretely, and running a call needs a
+           callee to run, which the witness does not carry. An unreplayed
+           model is not a counterexample, so this stops at UNKNOWN and says
+           why rather than promoting a model nothing has reproduced. */
+        set_diagnostic(decision,
+                       "the violation involves an external call, and replaying one needs a callee the witness does not carry, so no counterexample is claimed");
+        goto finish;
+    }
     if (violation.kind == QL_SOLVER_CHECK_SAT) {
         if (violation.model_artifact == NULL) {
             set_diagnostic(decision,

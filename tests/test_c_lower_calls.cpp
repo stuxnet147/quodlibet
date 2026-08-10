@@ -433,4 +433,39 @@ TEST(CLowerCalls, RefusesCallsItCannotCheckAgainstADeclaration) {
     }
 }
 
+/* An argument may itself be a call. The outer call has to be handed the
+   history and the memory that stand after the inner one ran, or the IR says
+   the outer call never saw the inner call's effects. Nothing about the
+   returned value shows this, which is why it is checked on the IR directly. */
+TEST(CLowerCalls, ANestedCallThreadsItsStateIntoTheOuterCall) {
+    static const char source[] =
+        "int CALLEE_double(int); int CALLEE_sum(int, int);\n"
+        "int nested(int a) { return CALLEE_sum(CALLEE_double(a), a); }\n";
+    Lowered lowered;
+    ql_ir_view_v1 view{};
+    ql_error error{};
+    std::vector<ql_ir_instruction_view_v1> calls;
+
+    ASSERT_TRUE(lowered.Open(source, "nested"));
+    view.struct_size = sizeof(view);
+    ASSERT_EQ(QL_STATUS_OK, ql_ir_get_view(lowered.ir(), &view, &error));
+    for (std::size_t index = 0u; index < view.instruction_count; ++index) {
+        ql_ir_instruction_view_v1 instruction{};
+        instruction.struct_size = sizeof(instruction);
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_ir_instruction_at(lowered.ir(), index, &instruction,
+                                       &error));
+        if (instruction.opcode == QL_IR_OPCODE_CALL) {
+            calls.push_back(instruction);
+        }
+    }
+    ASSERT_EQ(2u, calls.size());
+    /* The inner call runs first and produces a trace and a memory; the outer
+       call consumes exactly those two. */
+    ASSERT_LE(2u, calls[0].result_count);
+    ASSERT_LE(2u, calls[1].operand_count);
+    EXPECT_EQ(calls[0].results[0], calls[1].operands[0]);
+    EXPECT_EQ(calls[0].results[1], calls[1].operands[1]);
+}
+
 }  // namespace

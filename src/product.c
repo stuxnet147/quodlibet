@@ -24,6 +24,19 @@
 #define QL_PRODUCT_VIOLATION_SYMBOL "quodlibet_violation"
 #define QL_PRODUCT_ASSUMPTION_SYMBOL "quodlibet_assumptions"
 #define QL_PRODUCT_MEMORY_SYMBOL "mem0"
+#define QL_PRODUCT_TRACE_SYMBOL "trace0"
+/* An event trace has no bit-width of its own. It is carried as a bit-vector
+   because what the encoding needs of it is equality, and because congruence
+   -- not the width -- is what makes two traces provably the same. Two traces
+   the solver leaves equal when the programs would not is a proof this
+   encoding will not find, never one it will accept. */
+#define QL_PRODUCT_TRACE_WIDTH 64u
+/* Congruence is stated pairwise over call sites, so it grows with the square
+   of how many there are. Past this the query is refused rather than built at
+   a size nothing will answer. */
+#define QL_PRODUCT_MAX_CALL_SITES 32u
+/* The lowering already refuses a call with more arguments than this. */
+#define QL_PRODUCT_MAX_CALL_ARGUMENTS 32u
 /* One free address constant states the whole final-memory comparison. In the
    violation query a free constant is existential, which is exactly "some
    address differs"; in the same query answered UNSAT it is universal, which is
@@ -50,6 +63,8 @@ typedef struct product_site {
     ql_ir_value_id value;
     /* The terminal memory a return carries, or the invalid sentinel. */
     ql_ir_value_id memory;
+    /* The terminal event trace a return carries, or the invalid sentinel. */
+    ql_ir_value_id trace;
     uint64_t code;
 } product_site;
 
@@ -58,6 +73,20 @@ typedef struct product_site_list {
     size_t count;
     size_t capacity;
 } product_site_list;
+
+/* One external call, on one side. The operands are the incoming trace, the
+   incoming memory, and the arguments; the results are whichever of the
+   outgoing trace, outgoing memory, and returned value the call produces. */
+typedef struct product_call {
+    const char *symbol;
+    size_t symbol_size;
+    char prefix;
+    ql_ir_block_id block;
+    ql_ir_value_id operands[QL_PRODUCT_MAX_CALL_ARGUMENTS + 2u];
+    size_t operand_count;
+    ql_ir_value_id results[3];
+    size_t result_count;
+} product_call;
 
 typedef struct product_edge {
     ql_ir_block_id from;
@@ -82,6 +111,8 @@ typedef struct product_side {
     product_site_list undefined;
     product_site_list diverges;
     product_site_list assumes;
+    product_call calls[QL_PRODUCT_MAX_CALL_SITES];
+    size_t call_count;
     ql_ir_type_kind return_kind;
     uint32_t return_width;
     /* One shared object index per pointer parameter of this side, in this
@@ -241,6 +272,7 @@ static ql_status site_list_add(product_site_list *list,
     list->items[list->count].block = block;
     list->items[list->count].value = value;
     list->items[list->count].memory = QL_IR_INVALID_VALUE_ID;
+    list->items[list->count].trace = QL_IR_INVALID_VALUE_ID;
     list->items[list->count].code = code;
     ++list->count;
     return QL_STATUS_OK;
@@ -292,6 +324,7 @@ static int opcode_is_supported(ql_ir_opcode opcode) {
     case QL_IR_OPCODE_STORE:
     case QL_IR_OPCODE_ASSUME:
     case QL_IR_OPCODE_MEMORY_IMAGE:
+    case QL_IR_OPCODE_CALL:
         return 1;
     default:
         return 0;
@@ -321,9 +354,10 @@ static ql_status check_ir_fragment(const ql_ir *ir,
         if (type.kind != QL_IR_TYPE_VOID && type.kind != QL_IR_TYPE_BOOL &&
             type.kind != QL_IR_TYPE_BIT_VECTOR &&
             type.kind != QL_IR_TYPE_POINTER &&
-            type.kind != QL_IR_TYPE_MEMORY) {
+            type.kind != QL_IR_TYPE_MEMORY &&
+            type.kind != QL_IR_TYPE_EVENT_TRACE) {
             ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                         "%s IR uses a type the miter cannot state; floats, aggregates, and event traces are outside this fragment",
+                         "%s IR uses a type the miter cannot state; floats and aggregates are outside this fragment",
                          side);
             return QL_STATUS_TYPE_MISMATCH;
         }
@@ -362,6 +396,34 @@ static ql_status check_ir_fragment(const ql_ir *ir,
         /* A load or a store carries exactly the memory effect and nothing
            else. Every other effect names an axis this encoding has no term
            for, so it is refused instead of dropped. */
+        if (instruction.opcode == QL_IR_OPCODE_CALL) {
+            /* An external call is uninterpreted: it may read and write
+               memory and it is itself observable. Those three effects
+               together are the call this encoding states; any other effect
+               bit names an axis it has no term for. */
+            if (instruction.effects !=
+                (QL_IR_EFFECT_CALL | QL_IR_EFFECT_MEMORY |
+                 QL_IR_EFFECT_IO)) {
+                ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                             "%s IR call carries an effect beyond call, memory, and I/O that this miter does not model",
+                             side);
+                return QL_STATUS_TYPE_MISMATCH;
+            }
+            if (instruction.symbol_size == 0u) {
+                ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                             "%s IR call names no callee, so nothing says which calls correspond",
+                             side);
+                return QL_STATUS_TYPE_MISMATCH;
+            }
+            if (instruction.operand_count >
+                QL_PRODUCT_MAX_CALL_ARGUMENTS + 2u) {
+                ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                             "%s IR call passes more arguments than this miter states",
+                             side);
+                return QL_STATUS_TYPE_MISMATCH;
+            }
+            continue;
+        }
         if (opcode_is_memory_access(instruction.opcode)) {
             if (instruction.effects != QL_IR_EFFECT_MEMORY) {
                 ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
@@ -385,12 +447,6 @@ static ql_status check_ir_fragment(const ql_ir *ir,
         status = ql_ir_block_at(ir, index, &block, error);
         if (status != QL_STATUS_OK) {
             return status;
-        }
-        if (block.terminator.event_trace != QL_IR_INVALID_VALUE_ID) {
-            ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                         "%s IR observes an event trace, which this miter does not model",
-                         side);
-            return QL_STATUS_TYPE_MISMATCH;
         }
         switch (block.terminator.kind) {
         case QL_IR_TERMINATOR_RETURN:
@@ -451,7 +507,8 @@ static ql_status side_type_of(const ql_ir *ir, const ql_ir_view_v1 *view,
         return QL_STATUS_TYPE_MISMATCH;
     }
     *kind = type.kind;
-    *width = type.bit_width;
+    *width = type.kind == QL_IR_TYPE_EVENT_TRACE ? QL_PRODUCT_TRACE_WIDTH
+                                                 : type.bit_width;
     if (element_width != NULL) {
         *element_width = 0u;
     }
@@ -570,7 +627,8 @@ static ql_status side_parameter_symbol(product_side *side,
                                        const product_object *objects,
                                        size_t object_count,
                                        size_t parameter_index,
-                                       ql_ir_type_kind kind, char *symbol,
+                                       ql_ir_type_kind kind,
+                                       size_t *object_ordinal, char *symbol,
                                        ql_error *error) {
     size_t input;
     size_t offset;
@@ -594,26 +652,26 @@ static ql_status side_parameter_symbol(product_side *side,
         }
         written = snprintf(symbol, QL_PRODUCT_SYMBOL_CAPACITY, "%s",
                            inputs[input].symbol);
+    } else if (kind == QL_IR_TYPE_EVENT_TRACE) {
+        /* Both sides start from the same history, exactly as they start from
+           the same memory. Otherwise two identical call sequences would be
+           free to produce different traces and nothing would ever cancel. */
+        written = snprintf(symbol, QL_PRODUCT_SYMBOL_CAPACITY, "%s",
+                           QL_PRODUCT_TRACE_SYMBOL);
+    } else if (kind == QL_IR_TYPE_MEMORY) {
+        written = snprintf(symbol, QL_PRODUCT_SYMBOL_CAPACITY, "%s",
+                           QL_PRODUCT_MEMORY_SYMBOL);
     } else if (object_count == 0u) {
         ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
                      "IR parameter %zu is outside the signature and no object table explains it",
                      parameter_index);
         return QL_STATUS_TYPE_MISMATCH;
-    } else if (parameter_index == input_count) {
-        written = snprintf(symbol, QL_PRODUCT_SYMBOL_CAPACITY, "%s",
-                           QL_PRODUCT_MEMORY_SYMBOL);
-    } else if (kind == QL_IR_TYPE_EVENT_TRACE) {
-        /* A body that calls threads an event trace beside the memory. This
-           miter has no term for a trace and no term for the call that
-           appends to it, so it says which of the two it is missing rather
-           than counting the trace as an object and reporting the object
-           table as the thing that ran out. */
-        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                     "IR parameter %zu is an event trace, and this miter states no term for a trace or for the calls that append to one",
-                     parameter_index);
-        return QL_STATUS_TYPE_MISMATCH;
     } else {
-        offset = parameter_index - input_count - 1u;
+        /* The object ordinal is counted as the walk goes rather than derived
+           from the parameter index. What stands between the C arguments and
+           the objects is not a fixed number of parameters: a body that calls
+           threads an event trace beside the memory. */
+        offset = (*object_ordinal)++;
         local = offset / 2u;
         if (local >= object_count) {
             ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
@@ -634,6 +692,45 @@ static ql_status side_parameter_symbol(product_side *side,
     return QL_STATUS_OK;
 }
 
+/* A body that calls takes the incoming history as a parameter. That, and not
+   the presence of a call instruction, is what says the two sides have a
+   history to compare at all. */
+static int ir_threads_a_trace(const ql_ir *ir, const ql_ir_view_v1 *given) {
+    ql_ir_view_v1 owned;
+    const ql_ir_view_v1 *view = given;
+    size_t index;
+
+    if (view == NULL) {
+        ql_error ignored;
+        memset(&owned, 0, sizeof(owned));
+        owned.struct_size = sizeof(owned);
+        if (ql_ir_get_view(ir, &owned, &ignored) != QL_STATUS_OK) {
+            return 0;
+        }
+        view = &owned;
+    }
+    for (index = 0u; index < view->value_count; ++index) {
+        ql_ir_value_view_v1 value;
+        ql_ir_type_view_v1 type;
+        ql_error ignored;
+        memset(&value, 0, sizeof(value));
+        value.struct_size = sizeof(value);
+        if (ql_ir_value_at(ir, index, &value, &ignored) != QL_STATUS_OK) {
+            return 0;
+        }
+        if (value.definition_kind != QL_IR_VALUE_PARAMETER) {
+            continue;
+        }
+        memset(&type, 0, sizeof(type));
+        type.struct_size = sizeof(type);
+        if (ql_ir_type_at(ir, value.type, &type, &ignored) == QL_STATUS_OK &&
+            type.kind == QL_IR_TYPE_EVENT_TRACE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static ql_status side_prepare(product_side *side, const ql_ir *ir,
                               char prefix, const ql_allocator *allocator,
                               const ql_product_input_v1 *inputs,
@@ -643,6 +740,9 @@ static ql_status side_prepare(product_side *side, const ql_ir *ir,
                               const uint32_t *object_map, ql_error *error) {
     size_t index;
     size_t parameter_index = 0u;
+    size_t object_ordinal = 0u;
+    int side_has_memory = 0;
+    int side_has_trace = 0;
     ql_status status;
 
     memset(side, 0, sizeof(*side));
@@ -696,10 +796,15 @@ static ql_status side_prepare(product_side *side, const ql_ir *ir,
             return status;
         }
         if (value.definition_kind == QL_IR_VALUE_PARAMETER) {
+            if (side->value_kinds[index] == QL_IR_TYPE_MEMORY) {
+                side_has_memory = 1;
+            } else if (side->value_kinds[index] == QL_IR_TYPE_EVENT_TRACE) {
+                side_has_trace = 1;
+            }
             status = side_parameter_symbol(side, inputs, input_count, objects,
                                            object_count, parameter_index,
-                                           side->value_kinds[index], symbol,
-                                           error);
+                                           side->value_kinds[index],
+                                           &object_ordinal, symbol, error);
             if (status != QL_STATUS_OK) {
                 return status;
             }
@@ -714,14 +819,28 @@ static ql_status side_prepare(product_side *side, const ql_ir *ir,
             return QL_STATUS_INTERNAL_ERROR;
         }
     }
-    if (parameter_index !=
-        input_count + (object_count == 0u ? 0u : 1u + 2u * object_count)) {
-        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                     "IR declares %zu parameters but the signature and its object table imply %zu",
-                     parameter_index,
-                     input_count +
-                         (object_count == 0u ? 0u : 1u + 2u * object_count));
-        return QL_STATUS_TYPE_MISMATCH;
+    {
+        /* The C arguments, then the observable states this side threads --
+           the memory, and an event trace when it calls -- then two
+           parameters per object. Counting the states rather than assuming
+           one is what lets a calling body through. */
+        const size_t states = (object_ordinal == 0u && !side_has_memory
+                                   ? 0u
+                                   : 1u) +
+                              (side_has_trace ? 1u : 0u);
+        const size_t expected = input_count + states + object_ordinal;
+        if (parameter_index != expected) {
+            ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                         "IR declares %zu parameters but the signature and its object table imply %zu",
+                         parameter_index, expected);
+            return QL_STATUS_TYPE_MISMATCH;
+        }
+        if (object_ordinal != 2u * object_count) {
+            ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                         "IR declares %zu object parameters for %zu objects",
+                         object_ordinal, object_count);
+            return QL_STATUS_TYPE_MISMATCH;
+        }
     }
     status = side_type_of(ir, &side->view, side->view.return_type,
                           &side->return_kind, &side->return_width, NULL,
@@ -971,6 +1090,61 @@ static ql_status encode_memory_image(product_encoder *encoder,
     return status;
 }
 
+/* An external call's results are free constants: nothing in this encoding
+   says what the callee computes. What ties the two sides together is stated
+   afterwards, as congruence between call sites. */
+static ql_status declare_call_results(product_encoder *encoder,
+                                      product_side *side,
+                                      const ql_ir_instruction_view_v1 *view) {
+    product_call *call;
+    size_t index;
+    ql_status status;
+
+    if (side->call_count == QL_PRODUCT_MAX_CALL_SITES) {
+        ql_error_set(encoder->error, QL_STATUS_TYPE_MISMATCH,
+                     "a side makes more than %u calls, and congruence over them is stated pairwise",
+                     (unsigned)QL_PRODUCT_MAX_CALL_SITES);
+        return QL_STATUS_TYPE_MISMATCH;
+    }
+    call = &side->calls[side->call_count];
+    memset(call, 0, sizeof(*call));
+    call->symbol = view->symbol;
+    call->symbol_size = view->symbol_size;
+    call->prefix = side->prefix;
+    call->block = view->block;
+    call->operand_count = view->operand_count;
+    for (index = 0u; index < view->operand_count; ++index) {
+        call->operands[index] = view->operands[index];
+    }
+    call->result_count = view->result_count;
+    for (index = 0u; index < view->result_count && index < 3u; ++index) {
+        const ql_ir_value_id result = view->results[index];
+        const char *symbol = side_value_symbol(side, result);
+        call->results[index] = result;
+        switch (side->value_kinds[result]) {
+        case QL_IR_TYPE_MEMORY:
+            status = ql_smt2_builder_declare_array(
+                encoder->builder, symbol, QL_PRODUCT_ADDRESS_WIDTH,
+                QL_PRODUCT_BYTE_WIDTH, encoder->error);
+            break;
+        case QL_IR_TYPE_BOOL:
+            status = ql_smt2_builder_declare_bool(encoder->builder, symbol,
+                                                  encoder->error);
+            break;
+        default:
+            status = ql_smt2_builder_declare_bv(encoder->builder, symbol,
+                                                side->value_widths[result],
+                                                encoder->error);
+            break;
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+    ++side->call_count;
+    return QL_STATUS_OK;
+}
+
 static ql_status encode_load(product_encoder *encoder, product_side *side,
                              const ql_ir_instruction_view_v1 *view,
                              uint32_t width) {
@@ -1053,6 +1227,9 @@ static ql_status encode_instruction(product_encoder *encoder,
     if (view->opcode == QL_IR_OPCODE_UB_GUARD) {
         return site_list_add(&side->guards, allocator, block,
                              view->operands[0], 0u, encoder->error);
+    }
+    if (view->opcode == QL_IR_OPCODE_CALL) {
+        return declare_call_results(encoder, side, view);
     }
     if (view->opcode == QL_IR_OPCODE_ASSUME) {
         /* The model's disjointness, first-page, and no-wrap constraints reach
@@ -1624,6 +1801,74 @@ static ql_status encode_side_aggregates(product_encoder *encoder,
         }
     }
 
+    /* The history a run leaves behind is the history of whichever return it
+       reached, on the same footing as its memory. A run that traps or
+       diverges leaves none, and the comparison is gated on termination for
+       exactly that reason. */
+    if (side->call_count != 0u) {
+        size_t carrier;
+        size_t carriers = 0u;
+
+        for (index = 0u; index < side->returns.count; ++index) {
+            if (side->returns.items[index].trace != QL_IR_INVALID_VALUE_ID) {
+                ++carriers;
+            }
+        }
+        (void)snprintf(symbol, sizeof(symbol), "%c_final_trace",
+                       side->prefix);
+        buffer_reset(&encoder->term);
+        status = QL_STATUS_OK;
+        if (carriers == 0u) {
+            status = term_add(encoder, QL_PRODUCT_TRACE_SYMBOL);
+        } else {
+            size_t seen = 0u;
+            for (index = 0u; index < side->returns.count &&
+                             status == QL_STATUS_OK;
+                 ++index) {
+                if (side->returns.items[index].trace ==
+                    QL_IR_INVALID_VALUE_ID) {
+                    continue;
+                }
+                ++seen;
+                if (seen == carriers) {
+                    status = term_add(
+                        encoder,
+                        side_value_symbol(side,
+                                          side->returns.items[index].trace));
+                    break;
+                }
+                status = term_add(encoder, "(ite ");
+                if (status == QL_STATUS_OK) {
+                    status = term_block_symbol(
+                        encoder, side, side->returns.items[index].block);
+                }
+                if (status == QL_STATUS_OK) {
+                    status = term_add(encoder, " ");
+                }
+                if (status == QL_STATUS_OK) {
+                    status = term_add(
+                        encoder,
+                        side_value_symbol(side,
+                                          side->returns.items[index].trace));
+                }
+                if (status == QL_STATUS_OK) {
+                    status = term_add(encoder, " ");
+                }
+            }
+            for (carrier = 0u; carrier + 1u < carriers &&
+                               status == QL_STATUS_OK;
+                 ++carrier) {
+                status = term_add(encoder, ")");
+            }
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_bv(encoder, symbol, QL_PRODUCT_TRACE_WIDTH);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+
     /* The memory a run leaves behind is the memory of whichever return it
        reached. A run that traps or diverges leaves none, and the comparison
        below is gated on both sides terminating for exactly that reason. */
@@ -1762,6 +2007,8 @@ static ql_status encode_side(product_encoder *encoder, product_side *side,
             if (status == QL_STATUS_OK) {
                 side->returns.items[side->returns.count - 1u].memory =
                     block.terminator.memory;
+                side->returns.items[side->returns.count - 1u].trace =
+                    block.terminator.event_trace;
             }
             break;
         case QL_IR_TERMINATOR_TRAP:
@@ -1965,6 +2212,154 @@ static ql_status encode_precondition(product_encoder *encoder,
 /* Every ASSUME the lowering emitted, conditioned on its block being reached.
    These carry the memory model's standing constraints into the query, so both
    the violation and the domain range over admissible object layouts only. */
+/* Two call sites can be the same call. They are when they name the same
+   callee and are handed the same things: the same history, the same memory,
+   and the same arguments. That is all "the callee is a function" says, and it
+   is the whole of what makes a pair of calls cancel.
+
+   Nothing here says what any callee computes. A pair that does not match on
+   every operand gets no equality at all, which is why a different callee or a
+   different argument leaves the two sides free to disagree and the miter
+   returns no verdict rather than a wrong one. */
+static ql_status term_call_congruence(product_encoder *encoder,
+                                      const product_side *left_side,
+                                      const product_call *left,
+                                      const product_side *right_side,
+                                      const product_call *right) {
+    size_t index;
+    ql_status status;
+
+    if (left->symbol_size != right->symbol_size ||
+        memcmp(left->symbol, right->symbol, left->symbol_size) != 0 ||
+        left->operand_count != right->operand_count ||
+        left->result_count != right->result_count) {
+        return QL_STATUS_OK;
+    }
+    status = term_add(encoder, " (=> (and true");
+    for (index = 0u; index < left->operand_count && status == QL_STATUS_OK;
+         ++index) {
+        status = term_add(encoder, " (= ");
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder,
+                              side_value_symbol((product_side *)left_side,
+                                                left->operands[index]));
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder, " ");
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder,
+                              side_value_symbol((product_side *)right_side,
+                                                right->operands[index]));
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder, ")");
+        }
+    }
+    if (status == QL_STATUS_OK) {
+        status = term_add(encoder, ") (and true");
+    }
+    for (index = 0u; index < left->result_count && index < 3u &&
+                     status == QL_STATUS_OK;
+         ++index) {
+        status = term_add(encoder, " (= ");
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder,
+                              side_value_symbol((product_side *)left_side,
+                                                left->results[index]));
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder, " ");
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder,
+                              side_value_symbol((product_side *)right_side,
+                                                right->results[index]));
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_add(encoder, ")");
+        }
+    }
+    if (status == QL_STATUS_OK) {
+        status = term_add(encoder, "))");
+    }
+    return status;
+}
+
+/* Congruence over every ordered pair of call sites on both sides. The pairs
+   within one side matter too: a body that calls the same function twice with
+   the same arguments has to get the same answer both times, or the two sides
+   could not be compared through it. */
+/* How many call pairs congruence has anything to say about. A conjunction
+   with nothing in it is not a smaller conjunction, it is `true`. */
+static size_t count_call_congruences(const product_side *left,
+                                     const product_side *right) {
+    const product_side *sides[2];
+    size_t outer_side;
+    size_t inner_side;
+    size_t outer;
+    size_t inner;
+    size_t count = 0u;
+
+    sides[0] = left;
+    sides[1] = right;
+    for (outer_side = 0u; outer_side < 2u; ++outer_side) {
+        for (outer = 0u; outer < sides[outer_side]->call_count; ++outer) {
+            const product_call *a = &sides[outer_side]->calls[outer];
+            for (inner_side = outer_side; inner_side < 2u; ++inner_side) {
+                const size_t first = inner_side == outer_side ? outer + 1u
+                                                              : 0u;
+                for (inner = first; inner < sides[inner_side]->call_count;
+                     ++inner) {
+                    const product_call *b = &sides[inner_side]->calls[inner];
+                    if (a->symbol_size == b->symbol_size &&
+                        memcmp(a->symbol, b->symbol, a->symbol_size) == 0 &&
+                        a->operand_count == b->operand_count &&
+                        a->result_count == b->result_count) {
+                        ++count;
+                    }
+                }
+            }
+        }
+    }
+    return count;
+}
+
+static ql_status term_all_call_congruences(product_encoder *encoder,
+                                           const product_side *left,
+                                           const product_side *right) {
+    const product_side *sides[2];
+    size_t outer_side;
+    size_t inner_side;
+    size_t outer;
+    size_t inner;
+    ql_status status = QL_STATUS_OK;
+
+    sides[0] = left;
+    sides[1] = right;
+    for (outer_side = 0u; outer_side < 2u && status == QL_STATUS_OK;
+         ++outer_side) {
+        for (outer = 0u; outer < sides[outer_side]->call_count &&
+                         status == QL_STATUS_OK;
+             ++outer) {
+            for (inner_side = outer_side;
+                 inner_side < 2u && status == QL_STATUS_OK; ++inner_side) {
+                const size_t first = inner_side == outer_side ? outer + 1u
+                                                              : 0u;
+                for (inner = first; inner < sides[inner_side]->call_count &&
+                                    status == QL_STATUS_OK;
+                     ++inner) {
+                    status = term_call_congruence(
+                        encoder, sides[outer_side],
+                        &sides[outer_side]->calls[outer], sides[inner_side],
+                        &sides[inner_side]->calls[inner]);
+                }
+            }
+        }
+    }
+    return status;
+}
+
 static ql_status encode_assumptions(product_encoder *encoder,
                                     const product_side *left,
                                     const product_side *right) {
@@ -1976,13 +2371,21 @@ static ql_status encode_assumptions(product_encoder *encoder,
     sides[0] = left;
     sides[1] = right;
     buffer_reset(&encoder->term);
-    if (left->assumes.count == 0u && right->assumes.count == 0u) {
+    if (left->assumes.count == 0u && right->assumes.count == 0u &&
+        count_call_congruences(left, right) == 0u) {
         status = term_add(encoder, "true");
         return status == QL_STATUS_OK
                    ? emit_bool(encoder, QL_PRODUCT_ASSUMPTION_SYMBOL)
                    : status;
     }
     status = term_add(encoder, "(and true");
+    if (status == QL_STATUS_OK) {
+        /* Congruence is an assumption about the environment, not a claim
+           about either program, so it sits with the model's other standing
+           constraints and the domain query gets to check that it leaves
+           something to compare. */
+        status = term_all_call_congruences(encoder, left, right);
+    }
     for (which = 0u; which < 2u && status == QL_STATUS_OK; ++which) {
         const product_side *side = sides[which];
         for (index = 0u; index < side->assumes.count && status == QL_STATUS_OK;
@@ -2040,7 +2443,7 @@ static ql_status term_probe_in_range(product_encoder *encoder) {
    produces no return value, which is a different observation from any value. */
 static ql_status encode_observation_equality(
     product_encoder *encoder, const ql_semantic_contract_v1 *contract,
-    int compare_return_value) {
+    int compare_return_value, int compare_traces) {
     ql_status status;
 
     buffer_reset(&encoder->term);
@@ -2076,6 +2479,16 @@ static ql_status encode_observation_equality(
     if (status == QL_STATUS_OK &&
         (contract->observations & QL_OBSERVE_TERMINATION) != 0u) {
         status = term_add(encoder, " (= l_terminates r_terminates)");
+    }
+    if (status == QL_STATUS_OK && compare_traces) {
+        /* The order the calls happened in is what the history records, so a
+           contract that observes external calls in order compares the
+           histories the two runs ended with. Congruence is what lets two
+           identical call sequences reach the same one. */
+        status = term_add(
+            encoder,
+            " (=> (and l_terminates r_terminates)"
+            " (= l_final_trace r_final_trace))");
     }
     if (status == QL_STATUS_OK &&
         (contract->observations & QL_OBSERVE_TRAPS) != 0u) {
@@ -2553,6 +2966,8 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
     ql_artifact_view artifact_view;
     uint32_t *left_object_map = NULL;
     uint32_t *right_object_map = NULL;
+    int left_threads_a_trace = 0;
+    int right_threads_a_trace = 0;
     uint32_t maximum_width = 1u;
     ql_solver_logic logic = QL_SOLVER_LOGIC_QF_BV;
     size_t index;
@@ -2636,7 +3051,14 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
         status = QL_STATUS_TYPE_MISMATCH;
         goto cleanup;
     }
-    if (query->object_count != 0u) {
+    /* A body that calls threads a memory value even when it touches no
+       object of its own, because the call may write memory. The memory is an
+       array whatever the object table looks like, so the array theory is
+       needed as soon as either side threads one. */
+    left_threads_a_trace = ir_threads_a_trace(left_ir, NULL);
+    right_threads_a_trace = ir_threads_a_trace(right_ir, NULL);
+    if (query->object_count != 0u || left_threads_a_trace != 0 ||
+        right_threads_a_trace != 0) {
         logic = QL_SOLVER_LOGIC_QF_ABV;
     }
 
@@ -2671,6 +3093,17 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
     if (status != QL_STATUS_OK) {
         goto cleanup;
     }
+    if ((problem_view.contract.observations & QL_OBSERVE_EXTERNAL_CALLS) !=
+            0u &&
+        problem_view.contract.external_call_observation !=
+            QL_EXTERNAL_CALLS_IGNORE &&
+        problem_view.contract.external_call_observation !=
+            QL_EXTERNAL_CALLS_ORDERED_TRACE) {
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "the contract observes external calls in a way this miter has no term for");
+        status = QL_STATUS_TYPE_MISMATCH;
+        goto cleanup;
+    }
     if (left.return_kind != right.return_kind ||
         left.return_width != right.return_width) {
         ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
@@ -2682,6 +3115,27 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
     status = declare_inputs(encoder.builder, query->inputs,
                             query->view.input_count, query->objects,
                             query->object_count, &maximum_width, error);
+    if (status == QL_STATUS_OK &&
+        (left_threads_a_trace != 0 || right_threads_a_trace != 0)) {
+        /* One history both sides start from, exactly as they start from one
+           memory. The memory itself is declared with the object table when
+           there is one; a body that only calls threads memory without owning
+           any object, and still needs the one they share. */
+        if (maximum_width < QL_PRODUCT_TRACE_WIDTH) {
+            maximum_width = QL_PRODUCT_TRACE_WIDTH;
+        }
+        if (query->object_count == 0u) {
+            status = ql_smt2_builder_declare_array(
+                encoder.builder, QL_PRODUCT_MEMORY_SYMBOL,
+                QL_PRODUCT_ADDRESS_WIDTH, QL_PRODUCT_BYTE_WIDTH, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = ql_smt2_builder_declare_bv(encoder.builder,
+                                                QL_PRODUCT_TRACE_SYMBOL,
+                                                QL_PRODUCT_TRACE_WIDTH,
+                                                error);
+        }
+    }
     if (status == QL_STATUS_OK) {
         status = encode_precondition(&encoder, left_signature,
                                      &problem_view.contract);
@@ -2698,7 +3152,12 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
     if (status == QL_STATUS_OK) {
         status = encode_observation_equality(
             &encoder, &problem_view.contract,
-            left.return_kind != QL_IR_TYPE_VOID);
+            left.return_kind != QL_IR_TYPE_VOID,
+            (problem_view.contract.observations &
+             QL_OBSERVE_EXTERNAL_CALLS) != 0u &&
+                problem_view.contract.external_call_observation ==
+                    QL_EXTERNAL_CALLS_ORDERED_TRACE &&
+                left_threads_a_trace != 0 && right_threads_a_trace != 0);
     }
     if (status == QL_STATUS_OK) {
         status = encode_domain(&encoder, &problem_view.contract);

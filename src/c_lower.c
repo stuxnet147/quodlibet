@@ -5046,8 +5046,13 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
         return status;
     }
 
-    operands[operand_count++] = context->trace_value;
-    operands[operand_count++] = context->memory_value;
+    /* The observable states this call is handed are the ones that stand
+       after its arguments have been evaluated, not before. An argument may
+       itself contain a call, and reading the states first would hand the
+       outer call a history and a memory from before the inner one ran --
+       which is to say it would lose the inner call's effects. The two
+       operands are filled in below, once the arguments are in. */
+    operand_count = 2u;
     end = subtree_end(context, arguments_node);
     for (child = arguments_node + 1u; child < end; ++child) {
         lower_value argument;
@@ -5093,6 +5098,8 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
             "the call passes fewer arguments than the callee declares",
             error);
     }
+    operands[0] = context->trace_value;
+    operands[1] = context->memory_value;
 
     result_types[result_count++] = context->trace_type;
     result_types[result_count++] = context->memory_type;
