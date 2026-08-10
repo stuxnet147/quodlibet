@@ -91,17 +91,18 @@
 - [ ] 성능 기준선이 `docs/perf/baseline.md` 에 고정되고 회귀를 재는 방법이 적혀 있다
 - [ ] 튜닝이 건전성을 바꾸지 않았다(전 구성 CTest 통과, ASan/UBSan 통과)
 
-## G7. asm2c-03 VM 에서 채점기/강화학습기로 돌아가는지 확인
+## G7. asm2c-03 VM 에서 채점기/강화학습기로 돌아가는지 확인 (2026-08-10 닫힘)
 
 **요구.** RTX PRO 6000 x8 로 asm2c-03 을 임대해서 확인한다. **확인 수준으로 충분하며 장시간 학습/평가를 돌리지 않는다.**
 
-**종료 조건**
+**종료 조건 (docs/vm/asm2c-03-plan-20260810.md)**
 
-- [ ] Linux VM 에서 vendor + build + CTest 전체가 통과한다
-- [ ] 파이썬 확장이 그 VM 에서 import 되고 asm2c 코퍼스 표본에 대해 판정을 낸다
-- [ ] **채점기 경로**: 표본 N 쌍에 대해 판정과 쌍당 지연을 측정한 수치가 있다
-- [ ] **강화학습기 경로**: 배치 호출이 GPU 학습 루프와 같은 프로세스/머신에서 병행 가능함을 확인한다(짧은 스모크. 장시간 금지)
-- [ ] VM 기록(생성/확인/삭제)과 비용이 `docs/vm/` 에 남는다. 확인이 끝나면 머신을 정리한다
+- [x] Linux VM 에서 vendor + build + CTest 전체 통과 - ubuntu-2404(glibc 2.39) 이미지, ctest 266/266, pytest 28 passed
+- [x] 파이썬 확장 import 및 판정 - import OK, solver 활성으로 판정 정상
+- [x] **채점기 경로**: 쌍당 median 4ms / p90 7ms, 219.6 pairs/s at workers=8, error 0 (100쌍)
+- [x] **강화학습기 경로**: 첫 대여에서 8 GPU 전부하 병행 check_batch 완주 확인(all devices active). 단 CUDA context + workers=8 의 uv_spawn SEGV 를 재현표와 함께 기록, RL 통합 시 solver 쪽 별건으로 이관
+- [x] VM 기록(생성/확인/삭제)과 비용이 `docs/vm/` 에. 두 대여 모두 상한 안에 삭제, asm2c-01/02 불간섭
+- **미달 하나**: VTune threading 리포트는 세 번 다 'Cannot load raw collector data' 로 실패해 미달성 기록. 채점기 판정과 무관
 
 ## G8. 로어링과 IR 이 정확하고 빠르고 건전하며 확장에 유리함을 증명
 
