@@ -6768,6 +6768,92 @@ static ql_status parse_local_type(lower_context *context, size_t declaration,
   }
 }
 
+/* The corpus spells a local copy of a file-scope string table as
+   `char local[] = STR_n`. That is not an ordinary C array initializer, so
+   admit only the narrow form whose complete byte image is still stated by a
+   file-scope, unsized character array initialized with a string literal. */
+static int decode_character_array_initializer(
+    lower_context *context, size_t node, lower_type element,
+    unsigned char *decoded, size_t *decoded_size) {
+  size_t initializer = node;
+  char *name = NULL;
+  size_t global;
+  char *text;
+  int ok;
+
+  if (node == SIZE_MAX || element.array_length != 0u ||
+      element.kind != QL_C_SCALAR_INTEGER || element.width != 8u) {
+    return 0;
+  }
+  if (strcmp(context->nodes[node].view.kind, "identifier") == 0) {
+    name = copy_node_text(context, node);
+    if (name == NULL) {
+      return 0;
+    }
+    initializer = SIZE_MAX;
+    for (global = 0u; global < context->global_count; ++global) {
+      size_t type_node;
+      char *type_spelling;
+      uint32_t pointer_depth = 0u;
+      uint64_t array_length = 0u;
+      int rejected = 0;
+      if (strcmp(context->globals[global].name, name) != 0) {
+        continue;
+      }
+      type_node = direct_field_child(
+          context, context->globals[global].declaration_node, "type");
+      type_spelling =
+          type_node == SIZE_MAX ? NULL : copy_node_text(context, type_node);
+      if (type_spelling == NULL) {
+        break;
+      }
+      if (strcmp(type_spelling, "char") != 0) {
+        context->allocator->deallocate(context->allocator->user_data,
+                                       type_spelling);
+        break;
+      }
+      context->allocator->deallocate(context->allocator->user_data,
+                                     type_spelling);
+      (void)member_declarator_name(
+          context, context->globals[global].declarator_node, &pointer_depth,
+          &array_length, &rejected);
+      if (rejected == 0 && pointer_depth == 0u &&
+          array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER) {
+        initializer = context->globals[global].initializer_node;
+      }
+      break;
+    }
+    context->allocator->deallocate(context->allocator->user_data, name);
+  }
+  if (initializer == SIZE_MAX ||
+      strcmp(context->nodes[initializer].view.kind, "string_literal") != 0) {
+    return 0;
+  }
+  text = copy_node_text(context, initializer);
+  if (text == NULL) {
+    return 0;
+  }
+  ok = decode_string_literal(text, strlen(text), decoded, decoded_size);
+  context->allocator->deallocate(context->allocator->user_data, text);
+  return ok;
+}
+
+static int inferred_array_length(lower_context *context, size_t initializer,
+                                 lower_type element, uint64_t *length) {
+  unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
+  size_t decoded_size = 0u;
+
+  if (positional_initializer_count(context, initializer, length)) {
+    return 1;
+  }
+  if (!decode_character_array_initializer(context, initializer, element,
+                                          decoded, &decoded_size)) {
+    return 0;
+  }
+  *length = (uint64_t)decoded_size;
+  return 1;
+}
+
 /* Produces an address at a byte offset inside local aggregate storage. Arrays
    use a pointer to their element, because C array values never exist as IR
    values; records and scalars use a pointer to the declared type. */
@@ -6929,6 +7015,56 @@ static ql_status initialize_object(lower_context *context, size_t node,
       return status;
     }
     return emit_store(context, address, value, error);
+  }
+
+  if (type.array_length != 0u && !is_list) {
+    unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
+    size_t decoded_size = 0u;
+    lower_type element = array_element(type);
+    uint64_t width = type_byte_width(context, element);
+    size_t write_count;
+    size_t index;
+    if (decode_character_array_initializer(context, node, element, decoded,
+                                           &decoded_size)) {
+      write_count = decoded_size;
+      if ((uint64_t)write_count > type.array_length) {
+        /* `char a[3] = "abc"` is the one permitted truncation: only the
+           terminating NUL is omitted. Other excess bytes are an error. */
+        if ((uint64_t)write_count != type.array_length + 1u ||
+            decoded[write_count - 1u] != 0u) {
+          return lower_unknown(
+              context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+              "string initializer has more bytes than the local array",
+              error);
+        }
+        --write_count;
+      }
+      status = zero_initialize_object(context, node, address, type, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+      for (index = 0u; index < write_count; ++index) {
+        lower_value element_address;
+        lower_value value;
+        status = aggregate_child_address(context, address,
+                                         (uint64_t)index * width, element,
+                                         &element_address, error);
+        if (status == QL_STATUS_OK) {
+          memset(&value, 0, sizeof(value));
+          value.type = element;
+          value.defined = context->true_value;
+          status = add_uint_constant(context, element, decoded[index],
+                                     &value.value, error);
+        }
+        if (status == QL_STATUS_OK) {
+          status = emit_store(context, element_address, value, error);
+        }
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          return status;
+        }
+      }
+      return QL_STATUS_OK;
+    }
   }
 
   if (is_list) {
@@ -7121,7 +7257,8 @@ static ql_status lower_declaration(lower_context *context, size_t node,
       }
       if (array_length != 0u) {
         if (array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER &&
-            !positional_initializer_count(context, value_node, &array_length)) {
+            !inferred_array_length(context, value_node, declarator_type,
+                                   &array_length)) {
           return lower_unknown(context,
                                QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION, named,
                                "an inferred local array bound needs a small "
@@ -9198,8 +9335,8 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
       }
       if (array_length != 0u) {
         if (array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER &&
-            !positional_initializer_count(context, initializer,
-                                          &array_length)) {
+            !inferred_array_length(context, initializer, *output,
+                                   &array_length)) {
           return lower_unknown(context,
                                QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION, named,
                                "an inferred local array bound needs a small "

@@ -114,6 +114,17 @@ QL_AGG_FUNCTION(static_const_array, int agg_static_const(int a) {
     static const int values[4] = {11, -3, 27, 5};
     return values[((unsigned)a) & 3u];
 });
+QL_AGG_FUNCTION(initialized_string, int agg_init_string(int i) {
+    char text[] = "Az!";
+    return (int)sizeof(text) * 100 + text[((unsigned)i) & 3u];
+});
+static const char string_alias_source[] =
+    "const char STR_0[] = \"Az!\";\n"
+    "int agg_string_alias(int i) {\n"
+    "    char local[] = STR_0;\n"
+    "    return (int)sizeof(local) * 100 + "
+    "local[((unsigned)i) & 3u];\n"
+    "}\n";
 
 namespace {
 
@@ -216,7 +227,8 @@ struct Outcome {
    the compiler's `sizeof` a check rather than a restatement. */
 Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
                 const std::vector<uint64_t> &sizes,
-                const void *initial_image) {
+                const void *initial_image,
+                std::size_t initial_object = 0u) {
     ql_ir_view_v1 view{};
     std::vector<std::vector<uint8_t>> storage;
     std::vector<ql_ir_interp_input_v1> inputs;
@@ -286,7 +298,7 @@ Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
         object.base = kBase + kStride * (index + 1u);
         object.size = sizes[index];
         images[index].assign(static_cast<std::size_t>(sizes[index]), 0u);
-        if (index == 0u && initial_image != nullptr) {
+        if (index == initial_object && initial_image != nullptr) {
             object.initial = initial_image;
         }
         object.final_image = images[index].empty() ? nullptr
@@ -397,6 +409,46 @@ TEST(CLowerAggregates, MatchesCompiledExecutionOnArraysAndRecords) {
                 << ql_ir_interp_ub_reason_string(run.result.ub_reason);
             EXPECT_EQ(item.reference(a, b), Returned(run.result));
         }
+    }
+}
+
+TEST(CLowerAggregates, InfersAndInitializesALocalCharacterArrayFromAString) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(initialized_string_source, "agg_init_string"));
+    const char text[] = "Az!";
+    for (int32_t i = 0; i < 4; ++i) {
+        SCOPED_TRACE(i);
+        /* The local array is the first object and the literal is the second.
+           Supplying the compiler's literal image also checks the independent
+           immutable-literal assumption. */
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(i)}, {sizeof(text), sizeof(text)},
+                    text, 1u);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(agg_init_string(i), Returned(run.result));
+    }
+}
+
+TEST(CLowerAggregates, CopiesACorpusStringAliasIntoAnInferredLocalArray) {
+    /* The extracted corpus uses STR_n as a literal alias in local array
+       initializers. That spelling is not ordinary C, so the exact compiled-C
+       case above fixes the character-array rules while this case checks the
+       deliberately narrow alias extension. The local and global remain
+       distinct objects: only the file-scope object's input image is seeded. */
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(string_alias_source, "agg_string_alias"));
+    const char text[] = "Az!";
+    for (int32_t i = 0; i < 4; ++i) {
+        SCOPED_TRACE(i);
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(i)}, {sizeof(text), sizeof(text)},
+                    text, 1u);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(agg_init_string(i), Returned(run.result));
     }
 }
 

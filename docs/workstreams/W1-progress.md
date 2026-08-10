@@ -1486,6 +1486,25 @@ ASM2C_GNU_V1에서 `void *`의 덧셈과 뺄셈은 GNU C 규칙대로 pointee �
 
 106개의 첫 `void *` 산술 차단 가운데 84개가 성공했고 22개는 뒤의 기존 제한으로 이동했습니다. 후속 제한은 pointer authority 또는 bounded object table 16개, uninitialized address escape 4개, record value 2개입니다. `tests/test_c_lower_pointers.cpp`는 GNU C 원문을 lowering하고 byte 단위 주소 차이를 64개 입력에서 interpreter로 확인합니다. 시험 실행 파일은 C++로 빌드되므로 참조 함수는 원문 `void *` 산술 대신 동치인 `char *` 산술을 사용하며, 이를 같은 C 원문의 compiled differential이라고 주장하지 않습니다. 영향 범위의 `CLower*` 시험 82/82와 전체 train 비교가 통과했습니다. 변경은 내부 C lowering의 pointee 크기 계산에 한정되므로 전체 CTest는 반복하지 않았습니다.
 
+### 41. 문자열로 초기화한 지역 문자 배열의 bound와 byte를 보존한다
+
+일반 C의 `char local[] = "text"`는 terminating NUL을 포함한 literal 길이로 bound를 정하고 그 byte들로 별도 지역 object를 초기화합니다. 명시적 bound가 literal보다 크면 나머지를 0으로 채우고, bound가 terminating NUL 하나만 제외한 크기이면 C가 허용하는 NUL 생략을 적용합니다. 그 외의 초과 initializer는 type error입니다.
+
+추출 코퍼스의 `char local[] = STR_n` 표기는 일반 C의 array initializer가 아니므로 별도 확장으로 격리했습니다. `STR_n`이 실제 파일 범위의 unsized `char[]`이고 initializer가 해석 가능한 string literal일 때만 같은 byte image를 복사합니다. 임의의 array identifier, record, designated initializer는 이 경로로 수용하지 않습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 22,872 (76.55%) | **22,946 (76.79%)** |
+| 증가 | | **+74** |
+| 기존 성공 회귀 | | **0** |
+| `invalid_declaration` | 112 | **10** |
+| verifier 통과 | 22,872 / 22,872 | **22,946 / 22,946** |
+| status 실패 | 0 | **0** |
+
+unsized alias 109개의 초기 장벽을 모두 제거했습니다. 71개는 바로 성공했고 31개는 뒤의 기존 제한으로 이동했으며 7개는 같은 함수의 뒤쪽 designated unsized array가 다음 첫 진단이 되어 detail의 code와 message가 그대로 남았습니다. 명시적 bound 때문에 이전에는 aggregate copy로 막혔던 alias 3개도 성공해 최종 순증은 74개입니다. 남은 inferred-bound 10개는 모두 designated initializer 계열입니다.
+
+`tests/test_c_lower_aggregates.cpp`는 일반 C string initializer를 같은 원문의 compiled 함수와 대조하고 `sizeof`로 inferred bound도 확인합니다. 코퍼스 전용 alias는 일반 C가 아니므로 동일 byte literal을 쓰는 compiled 함수와 결과를 비교하되 같은 원문의 compiled differential이라고 주장하지 않습니다. 영향 범위의 `CLower*` 시험 84/84와 전체 train 비교가 통과했습니다. 변경은 내부 C aggregate 초기화에 한정되므로 전체 CTest는 반복하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1494,11 +1513,11 @@ ASM2C_GNU_V1에서 `void *`의 덧셈과 뺄셈은 GNU C 규칙대로 pointee �
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 2,709
-- `uninitialized_read` 2,211
+- `unsupported_type` 2,726
+- `uninitialized_read` 2,214
 - `unsupported_pointer` 574
 - `unsupported_control_flow` 525
-- `unsupported_call` 369
+- `unsupported_call` 371
 
 ## 조율자에게 요청할 것
 
