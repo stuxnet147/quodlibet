@@ -217,4 +217,65 @@ TEST(CReuse, RefusesATreeThatIsNotThisSource) {
     ql_c_parser_destroy(parser);
 }
 
+/* The whole point of borrowing the unit's own tree is that the source is
+   parsed once for the pair. Analysing and then parsing again, as the test
+   above does, still parses twice; this is the path a corpus walk takes. */
+TEST(CReuse, TheUnitLendsTheTreeItWasBuiltFrom) {
+    ql_c_parser *parser = nullptr;
+    ql_error error{};
+    ASSERT_EQ(QL_STATUS_OK, ql_c_parser_create(nullptr, &parser, &error));
+
+    for (const char *source : kSources) {
+        const std::size_t size = std::strlen(source);
+        const char *name = FunctionName(source);
+        Unit unit;
+        ql_c_syntax_tree *borrowed = nullptr;
+        ql_c_function_view function{};
+        ql_c_lower_result *reused = nullptr;
+        ql_c_lower_result *plain = nullptr;
+        SCOPED_TRACE(source);
+
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_c_frontend_analyze_with_parser(nullptr, parser, source,
+                                                    size, unit.output(),
+                                                    &error))
+            << error.message;
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_c_frontend_unit_borrow_tree(unit.get(), &borrowed,
+                                                 &error))
+            << error.message;
+        ASSERT_NE(nullptr, borrowed);
+        EXPECT_EQ(0u, ql_c_syntax_tree_has_errors(borrowed));
+
+        function.struct_size = sizeof(function);
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_c_frontend_select_function(unit.get(), name,
+                                                std::strlen(name), &function,
+                                                &error))
+            << error.message;
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_c_lower_selected_function_with_tree(
+                      nullptr, source, size, unit.get(), &function, borrowed,
+                      &reused, &error))
+            << error.message;
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_c_lower_selected_function(nullptr, source, size,
+                                               unit.get(), &function, &plain,
+                                               &error))
+            << error.message;
+        EXPECT_EQ(LoweredDigest(plain), LoweredDigest(reused));
+        ql_c_lower_result_destroy(reused);
+        ql_c_lower_result_destroy(plain);
+        /* Borrowed, so the unit still owns it; Unit's destructor frees it. */
+    }
+    ql_c_parser_destroy(parser);
+}
+
+TEST(CReuse, LendingATreeNeedsAUnit) {
+    ql_c_syntax_tree *tree = reinterpret_cast<ql_c_syntax_tree *>(1);
+    ql_error error{};
+    EXPECT_EQ(QL_STATUS_INVALID_ARGUMENT,
+              ql_c_frontend_unit_borrow_tree(nullptr, &tree, &error));
+}
+
 }  // namespace

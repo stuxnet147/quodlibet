@@ -140,6 +140,19 @@ QL_API ql_status QL_CALL ql_c_frontend_analyze_with_parser(
 
 QL_API void QL_CALL ql_c_frontend_unit_destroy(ql_c_frontend_unit *unit);
 
+/* The parse this unit was built from, borrowed. A caller that goes on to
+   lower would otherwise parse the same source a second time, which is the
+   whole cost of the frontend for a short function.
+
+   The tree belongs to the unit and stays valid until the unit is destroyed.
+   Destroying it, or using it after the unit is gone, is a mistake; hand it to
+   ql_c_lower_selected_function_with_tree and let the unit outlive that call.
+   Analysis of a unit that failed to parse never produces a unit at all, so a
+   unit that exists always has a tree. */
+QL_API ql_status QL_CALL ql_c_frontend_unit_borrow_tree(
+    const ql_c_frontend_unit *unit, ql_c_syntax_tree **output,
+    ql_error *error);
+
 QL_API ql_status QL_CALL ql_c_frontend_unit_get_view(
     const ql_c_frontend_unit *unit, ql_c_frontend_unit_view *view,
     ql_error *error);

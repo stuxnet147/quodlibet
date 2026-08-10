@@ -45,6 +45,11 @@ typedef struct lower_type {
     ql_c_scalar_type pointee;
     /* The record this type is, or bottoms out at. SIZE_MAX when neither. */
     size_t record;
+    /* Element count when this is an array, zero when it is not. An array is
+       storage rather than a value: it has no IR type of its own, it is never
+       loaded or stored whole, and every use of its name decays to a pointer
+       to its first element. */
+    uint64_t array_length;
     ql_ir_type_id ir_type;
 } lower_type;
 
@@ -160,6 +165,17 @@ typedef struct lower_callee {
     size_t parameter_capacity;
 } lower_callee;
 
+/* A string literal. C makes it an array of char with static storage
+   duration, so it is an object here like any other array, with its bytes
+   written into the entry block because the declaration states them. */
+typedef struct lower_string {
+    size_t node;
+    unsigned char *bytes;
+    size_t size;          /* including the terminating NUL */
+    size_t object;
+    ql_ir_value_id address;
+} lower_string;
+
 /* An object with static storage duration. It is an object in the flat
    memory model exactly as a pointer parameter's region is, which is what puts
    a write to it and a call in the same order: both thread the memory state.
@@ -255,6 +271,9 @@ typedef struct lower_context {
     lower_callee *callees;
     size_t callee_count;
     size_t callee_capacity;
+    lower_string *strings;
+    size_t string_count;
+    size_t string_capacity;
     lower_global *globals;
     /* Set while a global's declaration is being read, which is what tells
        parse_local_type that `static` and `extern` are the storage duration
@@ -703,8 +722,26 @@ static uint64_t pointee_byte_width(const lower_context *context,
 }
 
 /* Storage width of an object of this type. */
+static lower_type array_element(lower_type array) {
+    lower_type element = array;
+    element.array_length = 0u;
+    element.ir_type = QL_IR_INVALID_TYPE_ID;
+    return element;
+}
+
+static lower_type make_array_of(lower_type element, uint64_t length) {
+    lower_type array = element;
+    array.array_length = length;
+    array.ir_type = QL_IR_INVALID_TYPE_ID;
+    return array;
+}
+
 static uint64_t type_byte_width(const lower_context *context,
                                 lower_type type) {
+    if (type.array_length != 0u) {
+        return type.array_length * type_byte_width(context,
+                                                   array_element(type));
+    }
     if (type.kind == QL_C_SCALAR_RECORD) {
         return record_size(context, type.record);
     }
@@ -716,6 +753,11 @@ static uint64_t type_byte_width(const lower_context *context,
 
 static uint32_t type_alignment(const lower_context *context,
                                lower_type type) {
+    if (type.array_length != 0u) {
+        /* An array is as aligned as one element. Taking its whole size would
+           over-align every member that follows it. */
+        return type_alignment(context, array_element(type));
+    }
     if (type.kind == QL_C_SCALAR_RECORD) {
         return record_alignment(context, type.record);
     }
@@ -776,6 +818,277 @@ static size_t typedef_declarator_name(const lower_context *context,
 /* A local only needs storage if something asks for its address. Finding that
    out up front keeps every other local in an SSA value, where it is cheaper
    and easier to reason about. */
+static const lower_typedef *find_typedef(const lower_context *context,
+                                         const char *name);
+static size_t member_declarator_name(const lower_context *context,
+                                     size_t declarator,
+                                     uint32_t *pointer_depth,
+                                     uint64_t *array_length, int *rejected);
+
+static ql_status remember_storage_name(lower_context *context,
+                                       const char *text, ql_error *error) {
+    size_t existing;
+    char *name;
+    ql_status status;
+
+    for (existing = 0u; existing < context->address_taken_count; ++existing) {
+        if (strcmp(context->address_taken[existing], text) == 0) {
+            return QL_STATUS_OK;
+        }
+    }
+    status = grow_array(context->allocator, (void **)&context->address_taken,
+                        &context->address_taken_capacity,
+                        sizeof(*context->address_taken),
+                        context->address_taken_count + 1u, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    name = copy_text(context->allocator, text, strlen(text));
+    if (name == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    context->address_taken[context->address_taken_count++] = name;
+    return QL_STATUS_OK;
+}
+
+/* An array or a record local is storage whether or not its address is ever
+   written down. `a[i]` and `v.f` are addresses into it just as `&a` is, and
+   neither has a value that could live in an SSA register instead: an array
+   decays to a pointer wherever it is named, and a record is only ever reached
+   through its members. So both get an object up front, on the same footing as
+   an address-taken scalar. */
+static ql_status collect_storage_locals(lower_context *context,
+                                        size_t body_node, ql_error *error) {
+    size_t end = subtree_end(context, body_node);
+    size_t index;
+
+    for (index = body_node + 1u; index < end; ++index) {
+        size_t type_node;
+        size_t declaration_end;
+        size_t child;
+        int base_is_record;
+
+        if (strcmp(context->nodes[index].view.kind, "declaration") != 0) {
+            continue;
+        }
+        type_node = direct_field_child(context, index, "type");
+        if (type_node == SIZE_MAX) {
+            continue;
+        }
+        base_is_record =
+            strcmp(context->nodes[type_node].view.kind,
+                   "struct_specifier") == 0 ||
+            strcmp(context->nodes[type_node].view.kind,
+                   "union_specifier") == 0;
+        if (!base_is_record &&
+            strcmp(context->nodes[type_node].view.kind,
+                   "type_identifier") == 0) {
+            char *spelling = copy_node_text(context, type_node);
+            if (spelling != NULL) {
+                const lower_typedef *named = find_typedef(context, spelling);
+                base_is_record = named != NULL && named->is_aggregate != 0u &&
+                                 named->pointer_depth == 0u;
+                context->allocator->deallocate(context->allocator->user_data,
+                                               spelling);
+            }
+        }
+        declaration_end = subtree_end(context, index);
+        for (child = index + 1u; child < declaration_end; ++child) {
+            size_t declarator = child;
+            uint32_t pointer_depth;
+            uint64_t array_length;
+            int rejected;
+            size_t named;
+            char *text;
+            ql_status status;
+
+            if (context->nodes[child].parent != index ||
+                context->nodes[child].view.field_name == NULL ||
+                strcmp(context->nodes[child].view.field_name,
+                       "declarator") != 0) {
+                continue;
+            }
+            if (strcmp(context->nodes[declarator].view.kind,
+                       "init_declarator") == 0) {
+                declarator = direct_field_child(context, declarator,
+                                                "declarator");
+            }
+            if (declarator == SIZE_MAX) {
+                continue;
+            }
+            named = member_declarator_name(context, declarator,
+                                           &pointer_depth, &array_length,
+                                           &rejected);
+            if (named == SIZE_MAX || rejected != 0) {
+                continue;
+            }
+            if (array_length == 0u &&
+                (pointer_depth != 0u || !base_is_record)) {
+                continue;
+            }
+            text = copy_node_text(context, named);
+            if (text == NULL) {
+                ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                return QL_STATUS_OUT_OF_MEMORY;
+            }
+            status = remember_storage_name(context, text, error);
+            context->allocator->deallocate(context->allocator->user_data,
+                                           text);
+            if (status != QL_STATUS_OK) {
+                return status;
+            }
+        }
+    }
+    return QL_STATUS_OK;
+}
+
+/* The longest literal this slice writes out. Each byte becomes a store in
+   the entry block, so an unbounded literal would be an unbounded prologue. */
+#define LOWER_MAX_STRING_BYTES 256u
+
+/* Reads the bytes a literal denotes. Only the escapes C spells with a single
+   letter and the octal and hex forms are decoded; anything else is refused
+   rather than passed through as its own text, because a literal whose bytes
+   are wrong is a wrong object, not a missing one. */
+static int decode_string_literal(const char *text, size_t size,
+                                 unsigned char *out, size_t *out_size) {
+    size_t index = 0u;
+    size_t written = 0u;
+
+    while (index < size) {
+        char c = text[index];
+        /* Adjacent literals concatenate, and a prefix marks encoding this
+           slice does not carry. */
+        if (c == 'L' || c == 'u' || c == 'U') {
+            return 0;
+        }
+        if (c != '"') {
+            ++index;
+            continue;
+        }
+        ++index;
+        while (index < size && text[index] != '"') {
+            unsigned char value;
+            if (written >= LOWER_MAX_STRING_BYTES) {
+                return 0;
+            }
+            if (text[index] != '\\') {
+                out[written++] = (unsigned char)text[index++];
+                continue;
+            }
+            if (++index >= size) {
+                return 0;
+            }
+            switch (text[index]) {
+            case 'n': value = 10u; break;
+            case 't': value = 9u; break;
+            case 'r': value = 13u; break;
+            case '0': value = 0u; break;
+            case 'a': value = 7u; break;
+            case 'b': value = 8u; break;
+            case 'f': value = 12u; break;
+            case 'v': value = 11u; break;
+            case '\\': value = 92u; break;
+            case '\'': value = 39u; break;
+            case '"': value = 34u; break;
+            case '?': value = 63u; break;
+            default: return 0;
+            }
+            out[written++] = value;
+            ++index;
+        }
+        if (index >= size) {
+            return 0;
+        }
+        ++index;
+    }
+    if (written >= LOWER_MAX_STRING_BYTES) {
+        return 0;
+    }
+    out[written] = 0u;
+    *out_size = written + 1u;
+    return 1;
+}
+
+static ql_status collect_string_literals(lower_context *context,
+                                         size_t body_node, ql_error *error) {
+    size_t end = subtree_end(context, body_node);
+    size_t index;
+
+    for (index = body_node + 1u; index < end; ++index) {
+        unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
+        size_t decoded_size = 0u;
+        lower_string *entry;
+        char *text;
+        int ok;
+        ql_status status;
+
+        if (strcmp(context->nodes[index].view.kind, "string_literal") != 0) {
+            continue;
+        }
+        text = copy_node_text(context, index);
+        if (text == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        ok = decode_string_literal(text, strlen(text), decoded,
+                                   &decoded_size);
+        context->allocator->deallocate(context->allocator->user_data, text);
+        if (!ok) {
+            /* Left uncollected. The expression path reports it where it is
+               used, which is where the diagnostic belongs. */
+            continue;
+        }
+        status = grow_array(context->allocator, (void **)&context->strings,
+                            &context->string_capacity,
+                            sizeof(*context->strings),
+                            context->string_count + 1u, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        entry = &context->strings[context->string_count];
+        memset(entry, 0, sizeof(*entry));
+        entry->bytes = context->allocator->allocate(
+            context->allocator->user_data, decoded_size);
+        if (entry->bytes == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        memcpy(entry->bytes, decoded, decoded_size);
+        entry->node = index;
+        entry->size = decoded_size;
+        entry->object = SIZE_MAX;
+        entry->address = QL_IR_INVALID_VALUE_ID;
+        ++context->string_count;
+        context->uses_memory = 1u;
+    }
+    return QL_STATUS_OK;
+}
+
+static lower_string *find_string(lower_context *context, size_t node) {
+    size_t index;
+    for (index = 0u; index < context->string_count; ++index) {
+        if (context->strings[index].node == node) {
+            return &context->strings[index];
+        }
+    }
+    return NULL;
+}
+
+static void release_strings(lower_context *context) {
+    size_t index;
+    for (index = 0u; index < context->string_count; ++index) {
+        context->allocator->deallocate(context->allocator->user_data,
+                                       context->strings[index].bytes);
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   context->strings);
+    context->strings = NULL;
+    context->string_count = 0u;
+    context->string_capacity = 0u;
+}
+
 static ql_status collect_address_taken(lower_context *context,
                                        size_t body_node, ql_error *error) {
     size_t end = subtree_end(context, body_node);
@@ -851,7 +1164,8 @@ static lower_callee *find_callee(lower_context *context,
 
 static size_t member_declarator_name(const lower_context *context,
                                      size_t declarator,
-                                     uint32_t *pointer_depth, int *rejected);
+                                     uint32_t *pointer_depth,
+                                     uint64_t *array_length, int *rejected);
 
 /* A file-scope declaration that names an object rather than a function. */
 static ql_status collect_globals(lower_context *context, ql_error *error) {
@@ -871,6 +1185,7 @@ static ql_status collect_globals(lower_context *context, ql_error *error) {
             size_t initializer = SIZE_MAX;
             size_t named;
             uint32_t pointer_depth;
+            uint64_t array_length;
             int rejected;
             lower_global *entry;
             ql_status status;
@@ -894,7 +1209,8 @@ static ql_status collect_globals(lower_context *context, ql_error *error) {
                 continue;
             }
             named = member_declarator_name(context, declarator,
-                                           &pointer_depth, &rejected);
+                                           &pointer_depth, &array_length,
+                                           &rejected);
             if (named == SIZE_MAX || rejected != 0) {
                 continue;
             }
@@ -1514,12 +1830,62 @@ static ql_status resolve_type_node(lower_context *context, size_t type_node,
 
 /* Walks a member declarator down to its name, counting the stars on the way.
    An array or function declarator inside a record is not laid out here. */
+/* `T a[]` said an array but not how long. */
+#define LOWER_ARRAY_BOUND_FROM_INITIALIZER UINT64_MAX
+
+/* An array bound has to be a constant this pass can read, because the
+   object's size is what keeps an out-of-bounds access out of bounds. A bound
+   that is a run-time expression, or one this pass cannot fold, is refused
+   rather than guessed at. `T a[]` with no bound is a pointer parameter in C,
+   and is reported as a zero length for the caller to interpret. */
+static int constant_array_bound(const lower_context *context, size_t node,
+                                uint64_t *length) {
+    const char *kind;
+    char *text;
+    int ok = 0;
+
+    if (node == SIZE_MAX) {
+        return 0;
+    }
+    kind = context->nodes[node].view.kind;
+    text = copy_node_text(context, node);
+    if (text == NULL) {
+        return 0;
+    }
+    if (strcmp(kind, "number_literal") == 0) {
+        char *stop = NULL;
+        unsigned long long value = strtoull(text, &stop, 0);
+        /* Only a plain unsuffixed or integer-suffixed count, and never zero:
+           a zero-length array has no bytes for an access to be inside. */
+        if (stop != text && value != 0ull && value <= (1ull << 32)) {
+            while (*stop == 'u' || *stop == 'U' || *stop == 'l' ||
+                   *stop == 'L') {
+                ++stop;
+            }
+            if (*stop == '\0') {
+                *length = (uint64_t)value;
+                ok = 1;
+            }
+        }
+    } else if (strcmp(kind, "identifier") == 0) {
+        const lower_enumerator *enumerator = find_enumerator(context, text);
+        if (enumerator != NULL && enumerator->value != 0u) {
+            *length = (uint64_t)enumerator->value;
+            ok = 1;
+        }
+    }
+    context->allocator->deallocate(context->allocator->user_data, text);
+    return ok;
+}
+
 static size_t member_declarator_name(const lower_context *context,
                                      size_t declarator,
-                                     uint32_t *pointer_depth, int *rejected) {
+                                     uint32_t *pointer_depth,
+                                     uint64_t *array_length, int *rejected) {
     size_t guard = 0u;
 
     *pointer_depth = 0u;
+    *array_length = 0u;
     *rejected = 0;
     while (declarator != SIZE_MAX && guard++ < 64u) {
         const char *kind = context->nodes[declarator].view.kind;
@@ -1535,6 +1901,30 @@ static size_t member_declarator_name(const lower_context *context,
             continue;
         }
         if (strcmp(kind, "parenthesized_declarator") == 0) {
+            declarator = direct_field_child(context, declarator,
+                                            "declarator");
+            continue;
+        }
+        if (strcmp(kind, "array_declarator") == 0) {
+            size_t size_node = direct_field_child(context, declarator,
+                                                  "size");
+            if (*array_length != 0u) {
+                /* A second bound is a multidimensional array, which is one
+                   object with a shape this slice does not carry. */
+                *rejected = 1;
+                return SIZE_MAX;
+            }
+            if (size_node != SIZE_MAX &&
+                !constant_array_bound(context, size_node, array_length)) {
+                *rejected = 1;
+                return SIZE_MAX;
+            }
+            if (size_node == SIZE_MAX) {
+                /* `T a[]`: an array whose bound is stated somewhere else,
+                   by an initialiser or by the adjustment C makes to a
+                   parameter. The caller decides which. */
+                *array_length = LOWER_ARRAY_BOUND_FROM_INITIALIZER;
+            }
             declarator = direct_field_child(context, declarator,
                                             "declarator");
             continue;
@@ -1598,6 +1988,7 @@ static ql_status ensure_record_layout(lower_context *context, size_t record,
         for (declarator = child + 1u; declarator < declarator_end;
              ++declarator) {
             uint32_t pointer_depth;
+            uint64_t member_array_length;
             int rejected;
             size_t name_node;
             lower_member *member;
@@ -1613,18 +2004,37 @@ static ql_status ensure_record_layout(lower_context *context, size_t record,
                 continue;
             }
             name_node = member_declarator_name(context, declarator,
-                                               &pointer_depth, &rejected);
+                                               &pointer_depth,
+                                               &member_array_length,
+                                               &rejected);
             if (rejected != 0 || name_node == SIZE_MAX) {
                 return lower_unknown(
                     context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
                     declarator,
-                    "array, function, and bit-field members are outside this "
-                    "slice", error);
+                    "function and bit-field members, and members whose array "
+                    "bound this pass cannot fold, are outside this slice",
+                    error);
             }
             status = resolve_type_node(context, type_node, pointer_depth,
                                        &member_type, error);
             if (status != QL_STATUS_OK || context->unknown != 0u) {
                 return status;
+            }
+            if (member_array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER) {
+                /* A flexible array member has no size of its own, so the
+                   record has none this slice can state. */
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+                    declarator,
+                    "a flexible array member leaves the record without a "
+                    "size this slice can state", error);
+            }
+            if (member_array_length != 0u) {
+                /* An array member takes its element's alignment and its
+                   element count in bytes, which is what puts the members
+                   after it at the offsets a compiled struct uses. */
+                member_type = make_array_of(member_type,
+                                            member_array_length);
             }
             if (member_type.kind == QL_C_SCALAR_VOID) {
                 return lower_unknown(
@@ -1804,12 +2214,28 @@ static ql_status type_from_inventory(lower_context *context,
             "restrict-qualified declarations require pointer semantics",
             error);
     }
-    if ((inventory->shape &
-         (QL_C_TYPE_SHAPE_ARRAY | QL_C_TYPE_SHAPE_FUNCTION)) != 0u) {
+    if ((inventory->shape & QL_C_TYPE_SHAPE_FUNCTION) != 0u) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-            "array and function-valued declarations are outside this "
-            "lowering slice", error);
+            "function-valued declarations are outside this lowering slice",
+            error);
+    }
+    if ((inventory->shape & QL_C_TYPE_SHAPE_ARRAY) != 0u) {
+        /* A parameter declared `T a[]` or `T a[N]` is a `T *`. C adjusts it
+           that way itself, and the bound, where there is one, says nothing
+           the callee can rely on. Treating it as anything else would invent
+           an object the caller never promised. */
+        ql_c_type_inventory_v1 adjusted = *inventory;
+        if (allow_void != 0u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                "a function cannot return an array", error);
+        }
+        adjusted.shape =
+            (uint32_t)(adjusted.shape & ~(uint32_t)QL_C_TYPE_SHAPE_ARRAY);
+        adjusted.pointer_depth += 1u;
+        return type_from_inventory(context, &adjusted, node, allow_void,
+                                   output, error);
     }
     if (inventory->pointer_depth > 2u) {
         return lower_unknown(
@@ -3479,6 +3905,19 @@ static ql_status lower_identifier(lower_context *context, size_t node,
     if (status != QL_STATUS_OK) {
         return status;
     }
+    if (variable->type.array_length != 0u) {
+        /* Naming an array yields a pointer to its first element. It is never
+           loaded: there is no value of array type to load. */
+        memset(output, 0, sizeof(*output));
+        *output = stack_address(context, variable);
+        return QL_STATUS_OK;
+    }
+    if (variable->type.kind == QL_C_SCALAR_RECORD) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+            "a struct or union value is outside this slice; only its members "
+            "are", error);
+    }
     if (variable->is_stack != 0u) {
         return emit_load(context, stack_address(context, variable), output,
                          error);
@@ -4126,6 +4565,11 @@ static const lower_member *find_member(const lower_record *record,
    the caller, which keeps one indirection level in the type and still lets
    `p->next->f` work. */
 static lower_type member_load_type(lower_type member) {
+    if (member.array_length != 0u) {
+        /* An array member is addressed at its element type, which is what
+           makes h.slots[i] the ordinary pointer arithmetic it already is. */
+        return array_element(member);
+    }
     if (member.kind == QL_C_SCALAR_POINTER) {
         return make_integer_type(QL_C_POINTER_WIDTH, 4u, 0u);
     }
@@ -4395,6 +4839,12 @@ static ql_status lower_designator_load(lower_context *context, size_t node,
     if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
     }
+    if (declared.array_length != 0u) {
+        /* Naming an array yields a pointer to its first element. There is no
+           value of array type to load, here or anywhere. */
+        *output = address;
+        return QL_STATUS_OK;
+    }
     if (declared.kind == QL_C_SCALAR_RECORD) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
@@ -4430,6 +4880,7 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
     size_t end;
     size_t child;
     uint32_t pointer_depth = 0u;
+    uint64_t return_array_length = 0u;
     int rejected = 0;
     size_t named;
     ql_status status;
@@ -4446,7 +4897,8 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
     /* Stars between the return type and the function name belong to the
        return type, not to the function. */
     named = member_declarator_name(context, callee->declarator_node,
-                                   &pointer_depth, &rejected);
+                                   &pointer_depth, &return_array_length,
+                                   &rejected);
     (void)named;
     status = resolve_type_node(context, type_node, pointer_depth,
                                &callee->return_type, error);
@@ -4773,6 +5225,67 @@ static ql_status lower_expression(lower_context *context, size_t node,
             "pointer and aggregate expressions require memory semantics",
             error);
     }
+    if (strcmp(kind, "string_literal") == 0) {
+        lower_string *literal = find_string(context, node);
+        ql_status status;
+        if (literal == NULL || literal->address == QL_IR_INVALID_VALUE_ID) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "a string literal with an encoding prefix, an escape this "
+                "pass cannot decode, or more bytes than this slice writes",
+                error);
+        }
+        memset(output, 0, sizeof(*output));
+        output->value = literal->address;
+        output->type = make_pointer_to(make_integer_type(8u, 1u, 1u));
+        output->has_object = 1u;
+        status = ensure_bool_constants(context, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        output->defined = context->true_value;
+        return ensure_ir_type(context, &output->type, error);
+    }
+    if (strcmp(kind, "char_literal") == 0) {
+        unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
+        size_t decoded_size = 0u;
+        char *text = copy_node_text(context, node);
+        ql_status status;
+        int ok;
+        if (text == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        /* A character constant has type int in C, and its value is the
+           character's. The same decoder reads it, with the quotes swapped. */
+        {
+            size_t length = strlen(text);
+            size_t at;
+            for (at = 0u; at < length; ++at) {
+                if (text[at] == '\'') {
+                    text[at] = '"';
+                }
+            }
+            ok = decode_string_literal(text, length, decoded, &decoded_size);
+        }
+        context->allocator->deallocate(context->allocator->user_data, text);
+        if (!ok || decoded_size != 2u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+                "a multi-character or wide character constant is outside "
+                "this slice", error);
+        }
+        memset(output, 0, sizeof(*output));
+        output->type = make_integer_type(32u, 3u, 1u);
+        status = ensure_bool_constants(context, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        output->defined = context->true_value;
+        return add_uint_constant(context, output->type,
+                                 (uint64_t)decoded[0], &output->value,
+                                 error);
+    }
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
         "expression is outside the loop-free integer lowering slice", error);
@@ -5007,6 +5520,18 @@ static ql_status parse_local_type(lower_context *context, size_t declaration,
         ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
         return QL_STATUS_OUT_OF_MEMORY;
     }
+    if (strcmp(context->nodes[type_node].view.kind,
+               "struct_specifier") == 0 ||
+        strcmp(context->nodes[type_node].view.kind,
+               "union_specifier") == 0) {
+        /* A record local is storage, and resolve_type_node already knows how
+           to find the declared record and lay it out. Whether a declarator
+           then adds a star is decided per declarator, as it is for every
+           other base type here. */
+        context->allocator->deallocate(context->allocator->user_data,
+                                       spelling);
+        return resolve_type_node(context, type_node, 0u, output, error);
+    }
     if (strcmp(context->nodes[type_node].view.kind, "primitive_type") != 0 &&
         strcmp(context->nodes[type_node].view.kind,
                "sized_type_specifier") != 0 &&
@@ -5073,21 +5598,23 @@ static ql_status lower_declaration(lower_context *context, size_t node,
         }
         {
             uint32_t pointer_depth = 0u;
+            uint64_t array_length = 0u;
             int rejected = 0;
             size_t named = declarator == SIZE_MAX
                                ? SIZE_MAX
                                : member_declarator_name(context, declarator,
                                                         &pointer_depth,
+                                                        &array_length,
                                                         &rejected);
             if (named == SIZE_MAX || rejected != 0) {
                 return lower_unknown(
                     context,
                     rejected != 0
-                        ? QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER
+                        ? QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE
                         : QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION,
                     declarator != SIZE_MAX ? declarator : index,
-                    "array and function locals are outside this slice",
-                    error);
+                    "a function local, a multidimensional array, or an array "
+                    "whose bound this pass cannot fold", error);
             }
             if (pointer_depth > 2u) {
                 return lower_unknown(
@@ -5097,18 +5624,34 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             declarator_type = base_type;
             if (pointer_depth == 1u) {
                 declarator_type = make_pointer_to(base_type);
-            } else if (base_type.kind == QL_C_SCALAR_RECORD) {
-                return lower_unknown(
-                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, named,
-                    "a struct or union local is outside this slice", error);
+            } else if (pointer_depth == 2u) {
+                declarator_type = make_pointer_to(make_pointer_to(base_type));
             } else if (base_type.kind == QL_C_SCALAR_VOID) {
                 return lower_unknown(
                     context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, named,
                     "void is not an object type here", error);
             }
-            status = ensure_ir_type(context, &declarator_type, error);
-            if (status != QL_STATUS_OK) {
-                return status;
+            if (array_length != 0u) {
+                declarator_type = make_array_of(declarator_type,
+                                                array_length);
+            }
+            if (declarator_type.kind == QL_C_SCALAR_RECORD) {
+                status = ensure_record_layout(context, declarator_type.record,
+                                              named, error);
+                if (status != QL_STATUS_OK || context->unknown != 0u) {
+                    return status;
+                }
+            }
+            /* An array and a record are storage, never a value, so neither
+               has an IR type of its own. Asking for one here would be asking
+               for the representation of something that is never loaded or
+               stored whole. */
+            if (declarator_type.array_length == 0u &&
+                declarator_type.kind != QL_C_SCALAR_RECORD) {
+                status = ensure_ir_type(context, &declarator_type, error);
+                if (status != QL_STATUS_OK) {
+                    return status;
+                }
             }
             identifier = named;
         }
@@ -5125,6 +5668,21 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             return status;
         }
         variable = &context->variables[context->variable_count - 1u];
+        if (declarator_type.array_length != 0u ||
+            declarator_type.kind == QL_C_SCALAR_RECORD) {
+            /* Storage this slice never reads whole. Its bytes come from the
+               object's initial image exactly as a caller's region does, so
+               there is no value to demand up front and none to invent. */
+            variable->initialized = 1u;
+            if (value_node != SIZE_MAX) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION,
+                    value_node,
+                    "an initialiser for an array or record local is outside "
+                    "this slice", error);
+            }
+            continue;
+        }
         if (variable->is_stack != 0u) {
             if (value_node == SIZE_MAX) {
                 /* Storage without an initialiser holds an indeterminate
@@ -5181,7 +5739,7 @@ static ql_status lower_declaration(lower_context *context, size_t node,
     if (declarator_count == 0u) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION, node,
-            "declaration does not introduce a scalar local", error);
+            "declaration does not introduce a local object", error);
     }
     return QL_STATUS_OK;
 }
@@ -5715,6 +6273,7 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
         for (child = index + 1u; child < declaration_end; ++child) {
             size_t declarator = child;
             uint32_t pointer_depth;
+            uint64_t array_length;
             int rejected;
             size_t named;
             char *candidate;
@@ -5735,7 +6294,8 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
                 continue;
             }
             named = member_declarator_name(context, declarator,
-                                           &pointer_depth, &rejected);
+                                           &pointer_depth, &array_length,
+                                           &rejected);
             if (named == SIZE_MAX || rejected != 0) {
                 continue;
             }
@@ -5764,6 +6324,9 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
             *output = base;
             while (pointer_depth-- > 0u) {
                 *output = make_pointer_to(*output);
+            }
+            if (array_length != 0u) {
+                *output = make_array_of(*output, array_length);
             }
             return QL_STATUS_OK;
         }
@@ -5808,13 +6371,18 @@ static ql_status add_stack_slot_objects(lower_context *context,
         if (status != QL_STATUS_OK || context->unknown != 0u) {
             return status;
         }
-        if (type.kind == QL_C_SCALAR_RECORD ||
-            type.kind == QL_C_SCALAR_VOID) {
+        if (type.kind == QL_C_SCALAR_VOID) {
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
                 context->body_node,
-                "storage for a record or void local is outside this slice",
-                error);
+                "storage for a void local is outside this slice", error);
+        }
+        if (type.kind == QL_C_SCALAR_RECORD) {
+            status = ensure_record_layout(context, type.record,
+                                          context->body_node, error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
         }
         if (type.kind == QL_C_SCALAR_POINTER && type.indirection >= 2u) {
             /* Its address is one level deeper than the name itself, so a
@@ -5860,6 +6428,27 @@ static ql_status add_stack_slot_objects(lower_context *context,
     return QL_STATUS_OK;
 }
 
+/* The byte count a global's string initialiser states, including the
+   terminating NUL, or zero when it does not state one this pass can read. */
+static size_t global_string_bytes(lower_context *context, size_t node) {
+    unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
+    size_t decoded_size = 0u;
+    char *text;
+    int ok;
+
+    if (node == SIZE_MAX ||
+        strcmp(context->nodes[node].view.kind, "string_literal") != 0) {
+        return 0u;
+    }
+    text = copy_node_text(context, node);
+    if (text == NULL) {
+        return 0u;
+    }
+    ok = decode_string_literal(text, strlen(text), decoded, &decoded_size);
+    context->allocator->deallocate(context->allocator->user_data, text);
+    return ok ? decoded_size : 0u;
+}
+
 /* Storage with static storage duration becomes an object under exactly the
    discipline a pointer parameter's region gets: a base and a size parameter,
    the three standing model constraints, and a pinned size. Reads become loads
@@ -5872,6 +6461,7 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
         lower_global *global = &context->globals[index];
         size_t type_node;
         uint32_t pointer_depth = 0u;
+        uint64_t array_length = 0u;
         int rejected = 0;
         uint32_t is_const = 0u;
         lower_type type;
@@ -5900,7 +6490,8 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
                 error);
         }
         (void)member_declarator_name(context, global->declarator_node,
-                                     &pointer_depth, &rejected);
+                                     &pointer_depth, &array_length,
+                                     &rejected);
         if (rejected != 0) {
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
@@ -5923,12 +6514,36 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
         while (pointer_depth-- > 0u) {
             type = make_pointer_to(type);
         }
-        if (type.kind == QL_C_SCALAR_RECORD || type.kind == QL_C_SCALAR_VOID) {
+        if (array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER) {
+            /* Only a string literal states a bound this pass can read. The
+               object's size is what keeps an out-of-bounds access out of
+               bounds, so a bound nobody states is refused, not assumed. */
+            size_t bytes = global_string_bytes(context,
+                                               global->initializer_node);
+            if (bytes == 0u) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+                    global->declaration_node,
+                    "an array with no bound needs a string initialiser this "
+                    "pass can read", error);
+            }
+            array_length = (uint64_t)bytes;
+        }
+        if (type.kind == QL_C_SCALAR_VOID) {
             return lower_unknown(
                 context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
                 global->declaration_node,
-                "storage for a record or void global is outside this slice",
-                error);
+                "storage for a void global is outside this slice", error);
+        }
+        if (array_length != 0u) {
+            type = make_array_of(type, array_length);
+        }
+        if (type.kind == QL_C_SCALAR_RECORD) {
+            status = ensure_record_layout(context, type.record,
+                                          global->declaration_node, error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
         }
         if (snprintf(label, sizeof(label), "%s@%zu", global->name,
                      context->object_count) < 0) {
@@ -5942,6 +6557,30 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
         }
         global->type = type;
         global->object = object;
+    }
+    return QL_STATUS_OK;
+}
+
+static ql_status add_string_objects(lower_context *context,
+                                   ql_error *error) {
+    size_t index;
+
+    for (index = 0u; index < context->string_count; ++index) {
+        char label[64];
+        size_t object;
+        ql_status status;
+
+        if (snprintf(label, sizeof(label), "__string%zu@%zu", index,
+                     context->object_count) < 0) {
+            ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                         "string object label does not fit");
+            return QL_STATUS_INTERNAL_ERROR;
+        }
+        status = add_object(context, label, NULL, &object, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        context->strings[index].object = object;
     }
     return QL_STATUS_OK;
 }
@@ -6000,7 +6639,11 @@ static ql_status add_object_parameters(lower_context *context,
     if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
     }
-    return add_global_objects(context, error);
+    status = add_global_objects(context, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+    }
+    return add_string_objects(context, error);
 }
 
 static ql_status emit_assume(lower_context *context, ql_ir_value_id predicate,
@@ -6092,7 +6735,12 @@ static lower_value stack_address(const lower_context *context,
     lower_value address;
     memset(&address, 0, sizeof(address));
     address.value = variable->address;
-    address.type = make_pointer_to(variable->type);
+    /* An array's storage is addressed at its element type, which is what
+       makes `a[i]` the ordinary pointer arithmetic it already is and `&a`
+       the same address the array's name gives. */
+    address.type = variable->type.array_length != 0u
+                       ? make_pointer_to(array_element(variable->type))
+                       : make_pointer_to(variable->type);
     address.defined = context->true_value;
     address.may_ub = 0u;
     address.has_object = 1u;
@@ -6277,6 +6925,56 @@ static ql_status materialize_stack_slots(lower_context *context,
     return QL_STATUS_OK;
 }
 
+/* Writes a run of bytes into an object through its own base pointer. Both a
+   string literal and an initialised char array come to the same thing, so
+   they share one writer rather than two that could drift. */
+static ql_status store_bytes(lower_context *context,
+                             const lower_variable *variable,
+                             const unsigned char *bytes, size_t size,
+                             ql_error *error) {
+    lower_value base = stack_address(context, variable);
+    lower_type offset_type = make_integer_type(64u, 4u, 1u);
+    size_t at;
+
+    for (at = 0u; at < size; ++at) {
+        lower_value slot = base;
+        lower_value offset;
+        lower_value value;
+        ql_status status = QL_STATUS_OK;
+
+        if (at != 0u) {
+            memset(&offset, 0, sizeof(offset));
+            offset.type = offset_type;
+            offset.defined = context->true_value;
+            status = add_uint_constant(context, offset.type, (uint64_t)at,
+                                       &offset.value, error);
+            if (status == QL_STATUS_OK) {
+                status = emit_pointer_offset(context, base, offset, 0, &slot,
+                                             error);
+            }
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+        }
+        memset(&value, 0, sizeof(value));
+        value.type = array_element(variable->type);
+        value.defined = context->true_value;
+        status = ensure_ir_type(context, &value.type, error);
+        if (status == QL_STATUS_OK) {
+            status = add_uint_constant(context, value.type,
+                                       (uint64_t)bytes[at], &value.value,
+                                       error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_store(context, slot, value, error);
+        }
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+    }
+    return QL_STATUS_OK;
+}
+
 static ql_status materialize_globals(lower_context *context,
                                      ql_error *error) {
     size_t index;
@@ -6360,6 +7058,35 @@ static ql_status materialize_globals(lower_context *context,
            that states nothing leaves the contents unknown; in this corpus
            `int GLB_0;` is a placeholder for a definition that lives in
            another translation unit, not a tentative definition of zero. */
+        if (global->type.array_length != 0u) {
+            unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
+            size_t decoded_size = 0u;
+            char *text = global->initializer_node == SIZE_MAX
+                             ? NULL
+                             : copy_node_text(context,
+                                              global->initializer_node);
+            int ok = 0;
+            if (text != NULL) {
+                ok = decode_string_literal(text, strlen(text), decoded,
+                                           &decoded_size);
+                context->allocator->deallocate(context->allocator->user_data,
+                                               text);
+            }
+            if (ok) {
+                status = store_bytes(context, variable, decoded,
+                                     decoded_size, error);
+                if (status != QL_STATUS_OK || context->unknown != 0u) {
+                    return status;
+                }
+            } else if (global->initializer_node != SIZE_MAX) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION,
+                    global->initializer_node,
+                    "an array initialiser other than a string literal this "
+                    "pass can read is outside this slice", error);
+            }
+            continue;
+        }
         if (global->initializer_node != SIZE_MAX) {
             lower_value initial;
             lower_value converted;
@@ -6376,6 +7103,95 @@ static ql_status materialize_globals(lower_context *context,
             status = emit_store(context,
                                 stack_address(context, variable), converted,
                                 error);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+        }
+    }
+    return QL_STATUS_OK;
+}
+
+/* A literal's bytes are stated by the program, so they are written into the
+   object before the body runs, exactly as an initialised global's value is.
+   What the caller supplied for those bytes is therefore never read. */
+static ql_status materialize_strings(lower_context *context,
+                                     ql_error *error) {
+    lower_type byte = make_integer_type(8u, 1u, 1u);
+    size_t index;
+
+    for (index = 0u; index < context->string_count; ++index) {
+        lower_string *literal = &context->strings[index];
+        lower_type pointer = make_pointer_to(byte);
+        lower_value address;
+        lower_value base;
+        ql_ir_value_id expected;
+        ql_ir_value_id predicate;
+        size_t at;
+        ql_status status;
+
+        if (literal->object == SIZE_MAX) {
+            continue;
+        }
+        status = emit_assumptions_for_object(context, literal->object, error);
+        if (status == QL_STATUS_OK) {
+            status = add_uint_constant(context, address_type(),
+                                       (uint64_t)literal->size, &expected,
+                                       error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_compare(context, QL_IR_OPCODE_EQ,
+                                  context->objects[literal->object].size,
+                                  expected, &predicate, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = emit_assume(context, predicate, error);
+        }
+        if (status == QL_STATUS_OK) {
+            status = ensure_bool_constants(context, error);
+        }
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        memset(&address, 0, sizeof(address));
+        address.value = context->objects[literal->object].base;
+        address.type = address_type();
+        address.defined = context->true_value;
+        address.has_object = 1u;
+        status = emit_pointer_of_address(context, address, pointer, &base,
+                                         error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        literal->address = base.value;
+        for (at = 0u; at < literal->size; ++at) {
+            lower_value slot = base;
+            lower_value offset;
+            lower_value value;
+
+            memset(&offset, 0, sizeof(offset));
+            offset.type = make_integer_type(64u, 4u, 1u);
+            offset.defined = context->true_value;
+            status = add_uint_constant(context, offset.type, (uint64_t)at,
+                                       &offset.value, error);
+            if (status == QL_STATUS_OK && at != 0u) {
+                status = emit_pointer_offset(context, base, offset, 0, &slot,
+                                             error);
+            }
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+            memset(&value, 0, sizeof(value));
+            value.type = byte;
+            value.defined = context->true_value;
+            status = ensure_ir_type(context, &value.type, error);
+            if (status == QL_STATUS_OK) {
+                status = add_uint_constant(context, value.type,
+                                           (uint64_t)literal->bytes[at],
+                                           &value.value, error);
+            }
+            if (status == QL_STATUS_OK) {
+                status = emit_store(context, slot, value, error);
+            }
             if (status != QL_STATUS_OK || context->unknown != 0u) {
                 return status;
             }
@@ -6466,6 +7282,7 @@ static void cleanup_context(lower_context *context) {
     release_address_taken(context);
     release_callees(context);
     release_globals(context);
+    release_strings(context);
     for (index = 0u; index < context->stack_slot_count; ++index) {
         context->allocator->deallocate(context->allocator->user_data,
                                        context->stack_slots[index].name);
@@ -6644,7 +7461,13 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
     context.body_node = body_node;
     collect_calls(&context, body_node);
     collect_global_uses(&context, body_node);
-    status = collect_address_taken(&context, body_node, error);
+    status = collect_string_literals(&context, body_node, error);
+    if (status == QL_STATUS_OK) {
+        status = collect_storage_locals(&context, body_node, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = collect_address_taken(&context, body_node, error);
+    }
     if (status != QL_STATUS_OK) {
         cleanup_context(&context);
         ql_c_lower_result_destroy(result);
@@ -6688,6 +7511,9 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
         }
         if (status == QL_STATUS_OK && context.unknown == 0u) {
             status = materialize_globals(&context, error);
+        }
+        if (status == QL_STATUS_OK && context.unknown == 0u) {
+            status = materialize_strings(&context, error);
         }
         if (status == QL_STATUS_OK && context.unknown == 0u) {
             status = lower_compound(&context, body_node, 0u, error);

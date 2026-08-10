@@ -47,6 +47,9 @@ struct ql_c_frontend_unit {
     size_t diagnostic_count;
     size_t diagnostic_capacity;
     ql_c_function_support support;
+    /* The parse this analysis was built from, kept so that a caller going on
+       to lower does not have to parse the same source a second time. */
+    ql_c_syntax_tree *tree;
 };
 
 static const ql_allocator *select_allocator(const ql_allocator *allocator) {
@@ -547,6 +550,7 @@ void QL_CALL ql_c_frontend_unit_destroy(ql_c_frontend_unit *unit) {
     }
     allocator.deallocate(allocator.user_data, unit->functions);
     allocator.deallocate(allocator.user_data, unit->diagnostics);
+    ql_c_syntax_tree_destroy(unit->tree);
     allocator.deallocate(allocator.user_data, unit);
 }
 
@@ -1044,6 +1048,10 @@ ql_status QL_CALL ql_c_frontend_analyze_with_parser(
     memset(unit, 0, sizeof(*unit));
     unit->allocator = *selected;
     unit->support = QL_C_FUNCTION_SUPPORTED;
+    /* The unit owns the tree from here, including on the failure paths
+       below, which is why the local handle is cleared. */
+    unit->tree = tree;
+    tree = NULL;
 
     for (index = 0u; index < node_count; ++index) {
         if (strcmp(nodes[index].view.kind, "function_definition") == 0 &&
@@ -1079,6 +1087,19 @@ cleanup:
     /* A borrowed parser outlives the call; only one made here is freed. */
     ql_c_parser_destroy(owned_parser);
     return status;
+}
+
+ql_status QL_CALL ql_c_frontend_unit_borrow_tree(
+    const ql_c_frontend_unit *unit, ql_c_syntax_tree **output,
+    ql_error *error) {
+    if (unit == NULL || output == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "C frontend unit and tree output are required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    *output = unit->tree;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
 }
 
 static ql_status validate_view(const void *view, size_t struct_size,

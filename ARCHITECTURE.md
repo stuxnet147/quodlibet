@@ -176,6 +176,22 @@ spelling 3,998 times and no other spelling of it. A name absent from this
 table stays unresolved and is refused, and a unit that declares the name
 itself overrides the table.
 
+#### An uninitialised aggregate starts from a shared unknown image
+
+An array or record local with no initialiser gets an object whose initial
+bytes are unknown, supplied by whatever runs the module, exactly as a caller's
+pointer region is. ISO C calls those bytes indeterminate and permits two
+executions to see different ones; the profile does not. It gives both sides of
+a comparison the same image and quantifies over it.
+
+That is the same modelling decision already made for every other object in
+this model, and it is the right one for the profile's source material: two
+translations of one function run on one machine state, so the frame really is
+shared. It is stated here because it is an assumption rather than a fact about
+C, and because a proof that rests on it is a proof about programs paired that
+way. An address-taken *scalar* local with no initialiser is still refused, so
+this widening reaches only storage the slice never reads whole.
+
 #### Corpus globals carry no promised initial value
 
 A file-scope object with no initialiser is, in ISO C, a tentative definition

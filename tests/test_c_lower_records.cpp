@@ -393,8 +393,11 @@ TEST(CLowerRecords, RefusesWholeRecordValues) {
     const Case cases[] = {
         {"struct S { int a; };\nint by_value(struct S s) { return s.a; }",
          "by_value"},
-        {"struct S { int a; };\nint local(int a) { struct S s; return a; }",
-         "local"},
+        /* A record local is storage now, but the record still has no value:
+           copying one whole is a memory operation this slice does not do. */
+        {"struct S { int a; };\nint whole(int a) "
+         "{ struct S s; struct S t; t = s; return t.a + a; }",
+         "whole"},
         /* A record that contains itself has no layout, and Tree-sitter
            accepts the declaration, so this has to be refused. */
         {"struct S { struct S inner; };\nint cyclic(struct S *p) "
