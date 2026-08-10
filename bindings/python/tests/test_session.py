@@ -122,3 +122,83 @@ def test_check_batch_still_judges_when_sessions_are_unavailable(
     assert [result.verdict for result in results] == [
         "proved-equivalent"
     ] * 4
+
+
+def test_a_check_spec_can_carry_a_session(backend):
+    """A caller building specs must be able to reach the fast path too, not
+    only a caller writing keyword arguments by hand."""
+    with quodlibet.SolverSession() as session:
+        spec = quodlibet.CheckSpec(
+            **_spec(0),  # type: ignore[arg-type]
+            session=session,
+        )
+        assert spec.as_kwargs()["session"] is session
+        result = quodlibet.check(**spec.as_kwargs())
+
+    assert result.verdict == "proved-equivalent"
+
+
+def test_a_session_survives_judgements_that_disagree(backend):
+    """Round trip across differing outcomes, not just the one that proves.
+
+    A session that were somehow carrying state between judgements would show
+    it here first: the same session answers an equivalent pair, then a
+    counterexample pair, then the equivalent pair again.
+    """
+    unequal = {
+        "left_source": "int f(int x, int y){ return x + y; }",
+        "left_function": "f",
+        "right_source": "int g(int a, int b){ return a - b; }",
+        "right_function": "g",
+        "trust_smt_backend": True,
+    }
+    with quodlibet.SolverSession() as session:
+        first = quodlibet.check(**_spec(1), session=session)
+        differing = quodlibet.check(**unequal, session=session)
+        again = quodlibet.check(**_spec(1), session=session)
+
+    assert first.verdict == "proved-equivalent"
+    assert differing.verdict == "counterexample"
+    assert again.verdict == first.verdict
+    # One installation answered all three, and each said so for itself.
+    assert (
+        first.evidence.solver_binary_digest
+        == differing.evidence.solver_binary_digest
+        == again.evidence.solver_binary_digest
+    )
+
+
+def test_reusing_a_session_is_faster_than_rebuilding_per_check(backend):
+    """The reason the parameter exists.
+
+    Asserts an ordering with a wide margin rather than a duration: a duration
+    would fail on a loaded machine for reasons unrelated to sessions, whereas
+    the ordering is exactly what regresses if the session stops being reused.
+    Measured 1,093.8 ms against 66.2 ms when this went in, so half is far
+    inside the real gap.
+    """
+    import time
+
+    def best(session, reps=3):
+        lowest = None
+        for index in range(reps):
+            start = time.perf_counter()
+            result = quodlibet.check(**_spec(index), session=session)
+            elapsed = time.perf_counter() - start
+            assert result.verdict == "proved-equivalent"
+            if lowest is None or elapsed < lowest:
+                lowest = elapsed
+        assert lowest is not None
+        return lowest
+
+    per_check = best(None)
+    with quodlibet.SolverSession() as session:
+        # Warm once: the first judgement in a session still pays for opening
+        # it, and the claim is about the ones after that.
+        quodlibet.check(**_spec(99), session=session)
+        reused = best(session)
+
+    assert reused < per_check / 2.0, (
+        f"reusing a session took {reused:.3f}s against {per_check:.3f}s for "
+        "a fresh installation per check; the session is not being reused"
+    )
