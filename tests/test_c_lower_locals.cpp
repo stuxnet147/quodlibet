@@ -76,6 +76,18 @@ QL_LOCAL_FUNCTION(braced_scalar, int loc_braced_scalar(int a, int b) {
     int *pointer = {(int *)0};
     return value + (pointer == 0) + (b - b);
 });
+static const char vla_source[] =
+    "int loc_vla(int n, int seed) {\n"
+    "  int values[n];\n"
+    "  for (int i = 0; i < n; ++i) values[i] = seed + i * 3;\n"
+    "  return values[n - 1] + (int)sizeof(values);\n"
+    "}\n";
+static const char vla_once_source[] =
+    "int loc_vla_once(int n) {\n"
+    "  int values[n++];\n"
+    "  values[0] = n;\n"
+    "  return values[0] + (int)sizeof(values);\n"
+    "}\n";
 
 namespace {
 
@@ -370,6 +382,51 @@ TEST(CLowerLocals, SizesTheSlotFromTheDeclaredTypeNotAWord) {
        contradicts it and the run says the inputs were outside the assumed
        domain rather than inventing an answer. */
     EXPECT_EQ(QL_IR_INTERP_OUTCOME_ASSUMPTION_VIOLATED, wrong.result.outcome);
+}
+
+TEST(CLowerLocals, BindsASingleDimensionVlaAtItsDeclaration) {
+    Lowered lowered;
+    std::vector<std::vector<uint8_t>> images;
+    ASSERT_TRUE(lowered.Open(vla_source, "loc_vla"));
+    for (int32_t n : {1, 2, 7, 12}) {
+        const int32_t seed = 11 - n;
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(n), Widen(seed)},
+                    {static_cast<uint64_t>(n) * sizeof(int32_t)}, &images);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(seed + (n - 1) * 3 + n * 4, Returned(run.result));
+    }
+
+    for (int32_t invalid : {0, -1}) {
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(invalid), Widen(3)}, {4u}, &images);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+                  run.result.outcome);
+        EXPECT_EQ(QL_IR_INTERP_UB_GUARD_FAILED, run.result.ub_reason);
+    }
+}
+
+TEST(CLowerLocals, EvaluatesAVlaBoundOnceAndKeepsItsSize) {
+    Lowered lowered;
+    std::vector<std::vector<uint8_t>> images;
+    ASSERT_TRUE(lowered.Open(vla_once_source, "loc_vla_once"));
+    const Outcome run = Execute(lowered.ir(), {Widen(3)}, {12u}, &images);
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
+    EXPECT_EQ(16, Returned(run.result));
+}
+
+TEST(CLowerLocals, KeepsPerIterationAndMultidimensionalVlasOutsideTheSlice) {
+    ExpectUnknown("int f(int n) { while (n-- > 0) { int a[n + 1]; a[0] = n; } "
+                  "return n; }",
+                  QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW);
+    ExpectUnknown("int f(int n) { int a[n][2]; return a[0][0]; }",
+                  QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
+    ExpectUnknown("int f(int n) { int (*p)[n]; return (int)sizeof(*p); }",
+                  QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
 }
 
 TEST(CLowerLocals, RefusesStorageWithNothingPutInIt) {

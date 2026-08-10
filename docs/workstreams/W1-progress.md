@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **26,985 / 29,880 (90.31%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 1,073, `unsupported_control_flow` 674, `unsupported_pointer` 415입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **27,554 / 29,880 (92.22%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_control_flow` 738, `unsupported_pointer` 439, `unsupported_call` 398, `unsupported_type` 369입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1904,6 +1904,25 @@ source signature에는 별도 `FLOAT` kind와 32/64 bit width를 기록하고 lo
 
 `tests/test_c_lower_types.cpp`는 binary32 및 binary64 산술, literal 폭, NaN 비교, 정수 변환 경계를 실행합니다. `tests/test_c_lower_pointers.cpp`는 실제 float object의 load/store와 final image를 compiled C와 대조합니다. `tests/test_c_lower_calls.cpp`는 float 인자, double 결과, variadic 승격을 같은 compiled callee와 대조하고, `tests/test_signature.cpp`는 artifact round trip과 IR binding 및 precondition 거부를 고정합니다. 직접 묶음 71/71과 공용 C lowering, IR, verifier, interpreter 영향 범위 163/163이 통과했습니다. EGraph와 plugin은 영향을 받지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 G9 성공률과 기존 성공 회귀를 확인하기 위한 필수 측정으로만 실행했습니다.
 
+### 64. 단일 차원 VLA의 선언 시점 크기를 object descriptor에 묶는다
+
+자동 저장 기간의 단일 차원 variable length array를 수용합니다. bound 식은 선언에 도달했을 때 정확히 한 번 평가하고, 양수인지와 element byte 수를 곱해도 64비트 object size가 넘치지 않는지를 `UB_GUARD`로 확인합니다. 계산한 byte 수는 미리 만든 local object descriptor의 size와 같다고 가정하므로 기존 subscript의 범위 검사와 `sizeof(array)`가 같은 동적 크기를 사용합니다.
+
+이 IR schema는 순환 CFG와 반복마다 새로 생기는 object lifetime을 아직 표현하지 않습니다. 따라서 loop body 안의 VLA, 다차원 배열, static storage VLA, initializer가 붙은 VLA는 계속 UNKNOWN입니다. 실행자는 VLA object에 계산된 크기와 같은 caller-supplied memory image를 제공해야 하며, 잘못된 bound는 object 가정 불일치가 아니라 source UB로 끝납니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 26,985 (90.31%) | **27,554 (92.22%)** |
+| 증가 | | **+569** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_type` | 1,073 | **369** |
+| verifier 통과 | 26,985 / 26,985 | **27,554 / 27,554** |
+| status 실패 | 0 | **0** |
+
+기존 array 관련 첫 차단 753개를 먼저 재측정해 566개가 성공했습니다. 나머지는 고정 길이 다차원 또는 function local 46개, loop 안 VLA 39개, 기존 loop label 17개, pointer authority 19개, call 26개 등 다음 제한으로 이동했습니다. 전체 train에서는 첫 진단이 다른 3개까지 함께 열려 순증 569개였고, 기존 성공 회귀와 누락 또는 추가 행은 0개였습니다.
+
+`tests/test_c_lower_locals.cpp`는 여러 동적 크기의 element 접근과 `sizeof`, 부작용이 있는 bound의 1회 평가, 0과 음수 bound의 UB를 concrete interpreter로 확인합니다. loop body와 다차원 VLA가 계속 UNKNOWN인 것도 고정합니다. 변경은 공용 local storage와 type lowering 경로에 닿으므로 관련 C lowering, parser reuse, IR verifier 영향 범위 122/122를 실행했습니다. 다른 subsystem을 포함한 전체 CTest는 실행하지 않았습니다. 전체 train coverage만 G9 성공률과 기존 성공 사례 회귀를 확인하기 위한 필수 측정으로 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1912,11 +1931,11 @@ source signature에는 별도 `FLOAT` kind와 32/64 bit width를 기록하고 lo
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 1,073
-- `unsupported_control_flow` 674
-- `unsupported_pointer` 415
-- `unsupported_call` 372
-- `undeclared_identifier` 136
+- `unsupported_control_flow` 738
+- `unsupported_pointer` 439
+- `unsupported_call` 398
+- `unsupported_type` 369
+- `undeclared_identifier` 135
 
 ## 조율자에게 요청할 것
 
@@ -1932,8 +1951,8 @@ source signature에는 별도 `FLOAT` kind와 32/64 bit width를 기록하고 lo
 
 ## 다음에 할 것
 
-1. 남은 `unsupported_type`을 array declarator와 record by-value로 나눠 큰 단위부터 닫습니다.
-2. runtime-bound local array는 object size와 loop access guard를 함께 표현하는 경우에만 수용합니다.
-3. 남은 uninitialized address escape는 직접 out-local보다 넓은 alias와 수명 계약을 먼저 고정합니다.
+1. 남은 `unsupported_control_flow`를 loop label, backward goto, VLA lifetime으로 나눠 큰 독립 단위부터 닫습니다.
+2. record by-value argument와 return은 source signature, CALL result, object copy 계약을 함께 정한 뒤 수용합니다.
+3. 남은 pointer authority와 undeclared callee는 alias 및 외부 호출 계약을 먼저 고정합니다.
 4. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.
 5. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.

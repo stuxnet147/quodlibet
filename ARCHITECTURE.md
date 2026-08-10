@@ -246,6 +246,23 @@ image. This represents effects left by earlier invocations without inventing
 an invocation count. Immutable static objects may still state their invariant
 initializer bytes because no defined execution can change them.
 
+#### A one-dimensional VLA binds its object size at declaration
+
+An automatic one-dimensional variable length array introduces its local object
+before the body, like fixed local storage, but leaves that descriptor's size
+unconstrained until execution reaches the declaration. The bound expression is
+evaluated exactly once there. A `UB_GUARD` requires a positive bound and a byte
+count that does not overflow the 64-bit object-size domain, then an assumption
+binds the descriptor size to that byte count. Subscript bounds and
+`sizeof(array)` consequently observe the same declaration-time size.
+
+The executor must supply a memory image with that computed size. A non-positive
+or overflowing source bound is undefined behavior, whereas a mismatching image
+violates the module's input assumptions. VLA declarations inside loops would
+need a fresh object lifetime on every iteration and remain outside the acyclic
+schema-v1 slice. Multidimensional arrays, static-storage VLAs, and initialized
+VLAs also remain outside this profile.
+
 #### Memory model
 
 `ASM2C_GNU_V1` gives memory a flat 64-bit address space. A pointer is an

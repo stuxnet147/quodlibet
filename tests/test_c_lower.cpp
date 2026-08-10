@@ -280,10 +280,6 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
        "goto_statement"},
       {"int bypass(int x) { goto done; int y = x; done: return x; }", "bypass",
        QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, "goto_statement"},
-      {"int dynamic(int n) { int values[n]; values[0] = 1; "
-       "return values[0]; }",
-       "dynamic", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
-       "array_declarator"},
       {"int multidimensional(void) { int values[2][3]; values[0][0] = 1; "
        "return values[0][0]; }",
        "multidimensional", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,

@@ -18,6 +18,9 @@
    owns it. */
 #include "stage_timer.h"
 
+#define LOWER_ARRAY_BOUND_FROM_INITIALIZER UINT64_MAX
+#define LOWER_ARRAY_BOUND_DYNAMIC (UINT64_MAX - UINT64_C(1))
+
 typedef struct ql_c_lower_diagnostic_record {
   ql_c_lower_diagnostic_code code;
   ql_source_range range;
@@ -54,10 +57,11 @@ typedef struct lower_type {
   ql_c_scalar_type pointee;
   /* The record this type is, or bottoms out at. SIZE_MAX when neither. */
   size_t record;
-  /* Element count when this is an array, zero when it is not. An array is
-     storage rather than a value: it has no IR type of its own, it is never
-     loaded or stored whole, and every use of its name decays to a pointer
-     to its first element. */
+  /* Element count when this is an array, zero when it is not. The dynamic
+     sentinel denotes a single-dimensional VLA whose count is bound at its
+     declaration. An array is storage rather than a value: it has no IR type
+     of its own, it is never loaded or stored whole, and every use of its name
+     decays to a pointer to its first element. */
   uint64_t array_length;
   /* Function pointers share the target ABI's pointer representation but not
      data-pointer operations. Keeping that distinction here prevents an
@@ -841,6 +845,9 @@ static lower_type make_array_of(lower_type element, uint64_t length) {
 }
 
 static uint64_t type_byte_width(const lower_context *context, lower_type type) {
+  if (type.array_length == LOWER_ARRAY_BOUND_DYNAMIC) {
+    return 0u;
+  }
   if (type.array_length != 0u) {
     return type.array_length * type_byte_width(context, array_element(type));
   }
@@ -2337,7 +2344,6 @@ static ql_status resolve_type_node_allowing_void(
 /* Walks a member declarator down to its name, counting the stars on the way.
    An array or function declarator inside a record is not laid out here. */
 /* `T a[]` said an array but not how long. */
-#define LOWER_ARRAY_BOUND_FROM_INITIALIZER UINT64_MAX
 #define LOWER_MAX_INITIALIZER_ELEMENTS UINT64_C(256)
 
 /* Counts positional elements without interpreting them. Designators need a
@@ -2503,8 +2509,13 @@ static size_t member_declarator_name(const lower_context *context,
       }
       if (size_node != SIZE_MAX &&
           !constant_array_bound(context, size_node, array_length)) {
-        *rejected = 1;
-        return SIZE_MAX;
+        uint64_t folded = 0u;
+        if (constant_array_bound_value(context, size_node, &folded) != 0) {
+          /* A zero-sized array is a separate GNU extension, not a VLA. */
+          *rejected = 1;
+          return SIZE_MAX;
+        }
+        *array_length = LOWER_ARRAY_BOUND_DYNAMIC;
       }
       if (size_node == SIZE_MAX) {
         /* `T a[]`: an array whose bound is stated somewhere else,
@@ -2520,6 +2531,54 @@ static size_t member_declarator_name(const lower_context *context,
   }
   *rejected = 1;
   return SIZE_MAX;
+}
+
+/* Returns the one runtime bound in a single-dimensional VLA declarator. The
+   shape parser above has already rejected a second array layer. */
+static size_t dynamic_array_bound_node(const lower_context *context,
+                                       size_t declarator) {
+  size_t guard = 0u;
+  while (declarator != SIZE_MAX && guard++ < 64u) {
+    const char *kind = context->nodes[declarator].view.kind;
+    if (strcmp(kind, "array_declarator") == 0) {
+      size_t nested =
+          direct_field_child(context, declarator, "declarator");
+      if (nested != SIZE_MAX &&
+          strcmp(context->nodes[nested].view.kind,
+                 "parenthesized_declarator") == 0) {
+        size_t inner = direct_field_child(context, nested, "declarator");
+        if (inner != SIZE_MAX &&
+            strcmp(context->nodes[inner].view.kind,
+                   "pointer_declarator") == 0) {
+          /* `T (*p)[n]` declares a pointer to a VLA type, not a VLA object
+             whose storage this lowering owns. */
+          return SIZE_MAX;
+        }
+      }
+      return direct_field_child(context, declarator, "size");
+    }
+    if (strcmp(kind, "pointer_declarator") == 0 ||
+        strcmp(kind, "parenthesized_declarator") == 0) {
+      declarator = direct_field_child(context, declarator, "declarator");
+      continue;
+    }
+    break;
+  }
+  return SIZE_MAX;
+}
+
+static int declaration_is_inside_loop(const lower_context *context,
+                                      size_t node) {
+  while (node != SIZE_MAX && node != context->body_node) {
+    const char *kind = context->nodes[node].view.kind;
+    if (strcmp(kind, "for_statement") == 0 ||
+        strcmp(kind, "while_statement") == 0 ||
+        strcmp(kind, "do_statement") == 0) {
+      return 1;
+    }
+    node = context->nodes[node].parent;
+  }
+  return 0;
 }
 
 /* In `const T *p`, the declaration-specifier const qualifies T. In
@@ -2709,6 +2768,11 @@ static ql_status ensure_record_layout(lower_context *context, size_t record,
         if (status != QL_STATUS_OK || context->unknown != 0u) {
           return status;
         }
+      }
+      if (member_array_length == LOWER_ARRAY_BOUND_DYNAMIC) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, declarator,
+            "a record member requires a constant array bound", error);
       }
       if (member_array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER) {
         /* A flexible array member has no size of its own, so the
@@ -3303,6 +3367,8 @@ static ql_status emit_ub_guard(lower_context *context, const lower_value *value,
 }
 
 static lower_type address_type(void);
+static ql_status emit_assume(lower_context *context,
+                             ql_ir_value_id predicate, ql_error *error);
 static ql_status convert_value(lower_context *context, lower_value input,
                                lower_type target, lower_value *output,
                                ql_error *error);
@@ -6045,6 +6111,51 @@ static ql_status lower_sizeof_type(lower_context *context, size_t node,
   ql_status status;
 
   if (descriptor == SIZE_MAX) {
+    size_t designator = value_node;
+    size_t guard = 0u;
+    while (designator != SIZE_MAX && guard++ < 64u &&
+           strcmp(context->nodes[designator].view.kind,
+                  "parenthesized_expression") == 0) {
+      designator = first_named_child(context, designator);
+    }
+    if (designator != SIZE_MAX &&
+        strcmp(context->nodes[designator].view.kind, "identifier") == 0) {
+      char *variable_name = copy_node_text(context, designator);
+      lower_variable *variable =
+          variable_name == NULL
+              ? NULL
+              : find_variable(context, variable_name, strlen(variable_name));
+      if (variable_name == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+      }
+      context->allocator->deallocate(context->allocator->user_data,
+                                     variable_name);
+      if (variable != NULL &&
+          variable->type.array_length == LOWER_ARRAY_BOUND_DYNAMIC) {
+        size_t slot;
+        for (slot = 0u; slot < context->stack_slot_count; ++slot) {
+          if (strcmp(context->stack_slots[slot].name, variable->name) == 0) {
+            break;
+          }
+        }
+        if (slot == context->stack_slot_count) {
+          ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                       "VLA sizeof has no lowering-owned object");
+          return QL_STATUS_INTERNAL_ERROR;
+        }
+        status = ensure_bool_constants(context, error);
+        if (status != QL_STATUS_OK) {
+          return status;
+        }
+        memset(output, 0, sizeof(*output));
+        output->type = size_type;
+        output->value =
+            context->objects[context->stack_slots[slot].object].size;
+        output->defined = context->true_value;
+        return QL_STATUS_OK;
+      }
+    }
     /* Tree-sitter cannot know that an identifier is a typedef. It parses
        `sizeof(T)` as an expression, just as it parses `(T)(x)` as a call.
        Recover only the unambiguous case this unit's symbol tables settle:
@@ -8853,6 +8964,121 @@ static ql_status scalar_initializer_expression(lower_context *context,
   return QL_STATUS_OK;
 }
 
+/* Evaluates one VLA bound at its declaration and binds the lowering-owned
+   object descriptor to the resulting byte count. Positivity and byte-size
+   overflow are C definedness conditions, so they are guards. The descriptor
+   equality is model plumbing, so it is an assumption. */
+static ql_status bind_dynamic_array_size(lower_context *context, size_t node,
+                                         size_t bound_node,
+                                         lower_variable *variable,
+                                         ql_error *error) {
+  lower_type u64 = address_type();
+  lower_type boolean = make_bool_type();
+  lower_value bound;
+  lower_value promoted;
+  lower_value widened;
+  lower_value guard;
+  lower_type element = array_element(variable->type);
+  uint64_t element_size = type_byte_width(context, element);
+  ql_ir_value_id zero;
+  ql_ir_value_id positive;
+  ql_ir_value_id maximum;
+  ql_ir_value_id fits;
+  ql_ir_value_id valid;
+  ql_ir_value_id scale;
+  ql_ir_value_id bytes;
+  ql_ir_value_id equal;
+  ql_ir_value_id operands[2];
+  size_t slot;
+  ql_status status;
+
+  if (declaration_is_inside_loop(context, node)) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+        "a VLA declared inside a loop needs per-iteration object lifetime",
+        error);
+  }
+  if (bound_node == SIZE_MAX || element_size == 0u) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                         "a VLA needs one evaluable bound and a sized element",
+                         error);
+  }
+  status = lower_expression(context, bound_node, &bound, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  if (bound.type.kind != QL_C_SCALAR_INTEGER &&
+      bound.type.kind != QL_C_SCALAR_BOOL) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, bound_node,
+                         "a VLA bound must have integer type", error);
+  }
+  status = integer_promote(context, bound, &promoted, error);
+  if (status == QL_STATUS_OK) {
+    status = add_uint_constant(context, promoted.type, 0u, &zero, error);
+  }
+  if (status == QL_STATUS_OK) {
+    status = emit_compare(context,
+                          promoted.type.is_signed != 0u ? QL_IR_OPCODE_SLT
+                                                       : QL_IR_OPCODE_NE,
+                          zero, promoted.value, &positive, error);
+  }
+  if (status == QL_STATUS_OK) {
+    status = convert_value(context, promoted, u64, &widened, error);
+  }
+  if (status == QL_STATUS_OK) {
+    status = add_uint_constant(context, u64, UINT64_MAX / element_size,
+                               &maximum, error);
+  }
+  if (status == QL_STATUS_OK) {
+    status = emit_compare(context, QL_IR_OPCODE_ULE, widened.value, maximum,
+                          &fits, error);
+  }
+  if (status == QL_STATUS_OK) {
+    status = emit_bool_and(context, positive, fits, &valid, error);
+  }
+  if (status == QL_STATUS_OK && promoted.may_ub != 0u) {
+    status = emit_bool_and(context, promoted.defined, valid, &valid, error);
+  }
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  memset(&guard, 0, sizeof(guard));
+  guard.type = boolean;
+  guard.defined = valid;
+  guard.may_ub = 1u;
+  status = emit_ub_guard(context, &guard, error);
+  if (status == QL_STATUS_OK) {
+    status = add_uint_constant(context, u64, element_size, &scale, error);
+  }
+  if (status == QL_STATUS_OK) {
+    operands[0] = widened.value;
+    operands[1] = scale;
+    status = emit_instruction(context, QL_IR_OPCODE_MUL, &u64, operands, 2u,
+                              NULL, 0u, QL_IR_EFFECT_NONE, &bytes, error);
+  }
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  for (slot = 0u; slot < context->stack_slot_count; ++slot) {
+    if (strcmp(context->stack_slots[slot].name, variable->name) == 0) {
+      break;
+    }
+  }
+  if (slot == context->stack_slot_count || variable->is_stack == 0u) {
+    ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                 "VLA declaration has no lowering-owned object");
+    return QL_STATUS_INTERNAL_ERROR;
+  }
+  status = emit_compare(context, QL_IR_OPCODE_EQ,
+                        context->objects[context->stack_slots[slot].object]
+                            .size,
+                        bytes, &equal, error);
+  if (status == QL_STATUS_OK) {
+    status = emit_assume(context, equal, error);
+  }
+  return status;
+}
+
 static ql_status lower_declaration(lower_context *context, size_t node,
                                    ql_error *error) {
   size_t type_node = direct_field_child(context, node, "type");
@@ -8887,6 +9113,7 @@ static ql_status lower_declaration(lower_context *context, size_t node,
     char *name;
     lower_variable *variable;
     uint32_t object_is_const = is_const;
+    size_t dynamic_bound = SIZE_MAX;
 
     if (context->nodes[index].parent != node ||
         context->nodes[index].view.field_name == NULL ||
@@ -8950,6 +9177,28 @@ static ql_status lower_declaration(lower_context *context, size_t node,
                                "positional initializer list",
                                error);
         }
+        if (array_length == LOWER_ARRAY_BOUND_DYNAMIC) {
+          if (is_static != 0u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, named,
+                "an object with static storage requires a constant array bound",
+                error);
+          }
+          if (value_node != SIZE_MAX) {
+            return lower_unknown(context,
+                                 QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION,
+                                 named, "a VLA cannot have an initializer",
+                                 error);
+          }
+          dynamic_bound =
+              dynamic_array_bound_node(context, declarator_root);
+          if (dynamic_bound == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, named,
+                "only an automatic VLA object has lowering-owned storage",
+                error);
+          }
+        }
         declarator_type = make_array_of(declarator_type, array_length);
       }
       if (declarator_type.kind == QL_C_SCALAR_RECORD) {
@@ -8985,6 +9234,13 @@ static ql_status lower_declaration(lower_context *context, size_t node,
       return status;
     }
     variable = &context->variables[context->variable_count - 1u];
+    if (declarator_type.array_length == LOWER_ARRAY_BOUND_DYNAMIC) {
+      status = bind_dynamic_array_size(context, node, dynamic_bound, variable,
+                                       error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+    }
     if (is_static != 0u && object_is_const == 0u) {
       /* A mutable static's declaration does not execute its initializer on
          each function invocation. Its slot begins with the caller-supplied
@@ -11239,6 +11495,13 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
     while (pointer_depth-- > 0u) {
       type = make_pointer_to(type);
     }
+    if (array_length == LOWER_ARRAY_BOUND_DYNAMIC) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+          global->declaration_node,
+          "an object with static storage requires a constant array bound",
+          error);
+    }
     if (array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER) {
       /* Only a string literal states a bound this pass can read. The
          object's size is what keeps an out-of-bounds access out of
@@ -11659,7 +11922,10 @@ static ql_status materialize_stack_slots(lower_context *context,
   for (index = 0u; index < context->stack_slot_count; ++index) {
     lower_stack_slot *slot = &context->stack_slots[index];
     lower_type pointer = make_pointer_to(slot->type);
-    uint64_t size = type_byte_width(context, slot->type);
+    const int dynamic_array =
+        slot->type.array_length == LOWER_ARRAY_BOUND_DYNAMIC;
+    uint64_t size =
+        dynamic_array != 0 ? 0u : type_byte_width(context, slot->type);
     lower_value address;
     lower_value pointer_value;
     ql_ir_value_id expected;
@@ -11670,16 +11936,19 @@ static ql_status materialize_stack_slots(lower_context *context,
     if (status != QL_STATUS_OK) {
       return status;
     }
-    /* The size is known here, so it is pinned rather than left for a
-       solver to choose. */
-    status = add_uint_constant(context, address_type(), size, &expected, error);
-    if (status == QL_STATUS_OK) {
-      status = emit_compare(context, QL_IR_OPCODE_EQ,
-                            context->objects[slot->object].size, expected,
-                            &predicate, error);
-    }
-    if (status == QL_STATUS_OK) {
-      status = emit_assume(context, predicate, error);
+    /* A fixed slot is pinned here. A VLA is pinned at its declaration, after
+       the bound expression has been evaluated exactly once. */
+    if (dynamic_array == 0) {
+      status =
+          add_uint_constant(context, address_type(), size, &expected, error);
+      if (status == QL_STATUS_OK) {
+        status = emit_compare(context, QL_IR_OPCODE_EQ,
+                              context->objects[slot->object].size, expected,
+                              &predicate, error);
+      }
+      if (status == QL_STATUS_OK) {
+        status = emit_assume(context, predicate, error);
+      }
     }
     if (status == QL_STATUS_OK) {
       status = ensure_bool_constants(context, error);
