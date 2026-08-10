@@ -1419,6 +1419,24 @@ mutable static은 호출 사이의 persistent state가 필요하고, `static con
 
 `tests/test_c_lower_records.cpp`는 직접 `int **`, 배열 매개변수 조정, 이중 포인터 typedef 세 형태를 두 개의 실제 object image로 실행하고 컴파일된 C와 대조합니다. `tests/test_c_lower_types.cpp`는 typedef와 표면 별표를 합친 3중 포인터가 UNKNOWN인지 고정합니다. 관련 선택 시험 34개와 Windows 전체 CTest 533/533이 통과했습니다. 공개 ABI, allocator, scheduler를 바꾸지 않은 내부 lowering 수정이므로 이번 단위에서는 Linux 전체, sanitizer, fuzzer를 반복하지 않았습니다.
 
+### 37. GNU void 표현식과 포인터 조건식의 타입을 보존한다
+
+커밋: (이 단위)
+
+GNU C가 허용하는 `return void_expression;`은 표현식의 호출과 memory 효과를 실행한 뒤 값 없는 반환으로 내립니다. 일반 값을 void 함수에서 반환하는 경우는 계속 UNKNOWN입니다. 같은 dialect에서 `sizeof(void)`와 `sizeof(*void_pointer)`는 1이며, 직접 쓴 `void`와 typedef를 거친 `void`를 모두 같은 규칙으로 처리합니다. object 선언에서 bare void를 거부하는 기존 계약은 바꾸지 않았습니다.
+
+조건식의 두 arm이 pointer이면 결과를 정수 주소로 바꾸지 않고 공통 pointer type으로 유지합니다. 같은 record pointer 뒤의 `->`와 string pointer를 중첩 선택한 call argument가 그 타입을 그대로 사용합니다. object pointer와 `void *` 조합만 표준 변환하고, 호환되지 않는 pointer 조합과 pointer/integer 조합은 계속 UNKNOWN입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 22,117 (74.02%) | **22,146 (74.12%)** |
+| 증가 | | **+29** |
+| 기존 성공 회귀 | | **0** |
+| verifier 통과 | 22,117 / 22,117 | **22,146 / 22,146** |
+| status 실패 | 0 | **0** |
+
+새 성공은 void 표현식 반환 7개, GNU void 크기 10개, pointer 조건식 12개입니다. `tests/test_c_lower_calls.cpp`, `tests/test_c_lower_records.cpp`, `tests/test_c_lower_types.cpp`가 각각 호출 효과, 실제 compiled record-pointer 선택, GNU 크기를 고정합니다. 영향 범위인 모든 `CLower*` 시험 80/80과 전체 train 비교가 통과했고 기존 성공 회귀가 없었습니다. 변경은 내부 C lowering에만 한정되므로 이 중간 체크포인트에서는 무관한 solver와 transport 시험까지 포함하는 전체 CTest를 반복하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1427,11 +1445,11 @@ mutable static은 호출 사이의 persistent state가 필요하고, `static con
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 3,607
+- `unsupported_type` 3,597
 - `uninitialized_read` 2,118
-- `unsupported_pointer` 648
+- `unsupported_pointer` 631
 - `unsupported_control_flow` 493
-- `unsupported_call` 308
+- `unsupported_call` 309
 
 ## 조율자에게 요청할 것
 

@@ -47,6 +47,7 @@ char *CALLEE_high(void) {
 }
 static int CALLEE_storage = 73;
 int *CALLEE_cell(void) { return &CALLEE_storage; }
+void CALLEE_sink(int value) { CALLEE_storage = value; }
 }
 
 QL_CALL_FUNCTION(single, int CALLEE_double(int);
@@ -86,6 +87,8 @@ QL_CALL_FUNCTION(pointerresult, char *CALLEE_high(void);
     int call_ptr_result(void) { return CALLEE_high() == 0; });
 QL_CALL_FUNCTION(pointerfollow, int *CALLEE_cell(void);
     int call_ptr_follow(void) { return *CALLEE_cell(); });
+QL_CALL_FUNCTION(voidreturn, void CALLEE_sink(int);
+    void call_void_return(int value) { return CALLEE_sink(value); });
 
 namespace {
 
@@ -159,6 +162,9 @@ int QL_CALL Invoke(void *user_data, const char *symbol,
         EXPECT_EQ(4u, arguments[1].size);
         EXPECT_EQ(4u, arguments[2].size);
         value = seen[0] + seen[1] + seen[2];
+    } else if (std::strcmp(symbol, "CALLEE_sink") == 0 &&
+               argument_count == 1u && result_size == 0u) {
+        CALLEE_sink(seen[0]);
     } else {
         /* Refusing is what an unspecified callee has to mean. */
         return 0;
@@ -455,6 +461,21 @@ TEST(CLowerCalls, FollowsAPointerTheCalleeReturned) {
         << ql_ir_interp_ub_reason_string(run.result.ub_reason);
     EXPECT_EQ(call_ptr_follow(), Returned(run.result));
     EXPECT_EQ(std::vector<std::string>{"CALLEE_cell"}, log.symbols);
+    EXPECT_EQ(1u, run.result.events);
+}
+
+TEST(CLowerCalls, AReturnOfAVoidExpressionStillRunsTheCall) {
+    Lowered lowered;
+    CallLog log;
+    CALLEE_storage = 0;
+    ASSERT_TRUE(lowered.Open(voidreturn_source, "call_void_return"));
+    const Outcome run = Execute(lowered.ir(), {Widen(91)}, &log);
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+        << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+    EXPECT_EQ(0u, run.result.has_value);
+    EXPECT_EQ(91, CALLEE_storage);
+    EXPECT_EQ(std::vector<std::string>{"CALLEE_sink"}, log.symbols);
     EXPECT_EQ(1u, run.result.events);
 }
 

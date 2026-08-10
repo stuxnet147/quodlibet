@@ -71,6 +71,12 @@ QL_REC_FUNCTION(array_adjusted_pointer,
 QL_REC_FUNCTION(typedef_double_pointer,
     typedef int **REC_INT_DOUBLE_POINTER;
     int rec_typedef_double(REC_INT_DOUBLE_POINTER p) { return **p; });
+QL_REC_FUNCTION(conditional_pointer,
+    struct REC_CHOICE { int value; };
+    int rec_choose(struct REC_CHOICE *left, struct REC_CHOICE *right,
+                   int choose_left) {
+        return (choose_left ? left : right)->value;
+    });
 
 namespace {
 
@@ -462,6 +468,33 @@ TEST(CLowerRecords, PreservesTwoPointerLevelsAcrossFunctionSignatures) {
                 << ql_ir_interp_ub_reason_string(run.result.ub_reason);
             EXPECT_EQ(item.reference(&native_pointer), Returned(run.result));
         }
+    }
+}
+
+TEST(CLowerRecords, AConditionalPreservesItsPointerTypeAndObject) {
+    Lowered lowered;
+    struct REC_CHOICE native_left = {17};
+    struct REC_CHOICE native_right = {-29};
+    struct REC_CHOICE model_left = native_left;
+    struct REC_CHOICE model_right = native_right;
+    const uint64_t right_base = kBase + UINT64_C(0x1000);
+    const Region left_region = {
+        kBase, sizeof(model_left),
+        reinterpret_cast<const uint8_t *>(&model_left), nullptr};
+    const Region right_region = {
+        right_base, sizeof(model_right),
+        reinterpret_cast<const uint8_t *>(&model_right), nullptr};
+    ASSERT_TRUE(lowered.Open(conditional_pointer_source, "rec_choose"));
+    for (int32_t choose_left : {0, 1, -3}) {
+        const Outcome run = Execute(
+            lowered.ir(), {kBase, right_base},
+            {static_cast<uint64_t>(static_cast<uint32_t>(choose_left))},
+            {left_region, right_region});
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(rec_choose(&native_left, &native_right, choose_left),
+                  Returned(run.result));
     }
 }
 

@@ -214,6 +214,20 @@ TEST(CLowerTypes, RefusesVoidWhereAnObjectTypeIsRequired) {
                   QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR);
 }
 
+TEST(CLowerTypes, UsesTheGnuSizeForVoidOnlyInsideSizeof) {
+    Lowered lowered;
+    ASSERT_EQ(QL_STATUS_OK,
+              lowered.Lower("typedef void TYP_VOID;\n"
+                            "unsigned long sizes(void) {\n"
+                            "  return sizeof(void) + sizeof(TYP_VOID);\n"
+                            "}",
+                            "sizes"));
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
+    const ql_ir_interp_result_v1 result = RunModule(lowered.ir(), {});
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, result.outcome);
+    EXPECT_EQ(2, ReturnedSigned(result, 64u));
+}
+
 TEST(CLowerTypes, ResolvesTypedefNamesThroughTheirDeclaredChain) {
     Lowered lowered;
     ASSERT_EQ(QL_STATUS_OK,

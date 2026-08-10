@@ -2007,6 +2007,36 @@ static ql_status resolve_type_node(lower_context *context, size_t type_node,
   }
 }
 
+/* Return declarations and GNU sizeof are the two contexts where bare void is
+   meaningful. Object declarations continue through resolve_type_node and
+   reject it. Pointer-to-void already works there because a non-zero pointer
+   depth makes the base incomplete type admissible. */
+static ql_status resolve_type_node_allowing_void(
+    lower_context *context, size_t type_node, uint32_t pointer_depth,
+    lower_type *output, ql_error *error) {
+  const char *kind = context->nodes[type_node].view.kind;
+  char *spelling;
+  lower_type base;
+  ql_status status;
+
+  if (pointer_depth != 0u || strcmp(kind, "struct_specifier") == 0 ||
+      strcmp(kind, "union_specifier") == 0) {
+    return resolve_type_node(context, type_node, pointer_depth, output, error);
+  }
+  spelling = copy_node_text(context, type_node);
+  if (spelling == NULL) {
+    ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+    return QL_STATUS_OUT_OF_MEMORY;
+  }
+  status = parse_type_spelling(context, spelling, type_node, 1u, &base, error);
+  context->allocator->deallocate(context->allocator->user_data, spelling);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  return add_pointer_depth(context, type_node, base, pointer_depth, output,
+                           error);
+}
+
 /* Walks a member declarator down to its name, counting the stars on the way.
    An array or function declarator inside a record is not laid out here. */
 /* `T a[]` said an array but not how long. */
@@ -4925,7 +4955,7 @@ static ql_status lower_sizeof_type(lower_context *context, size_t node,
     }
     if (names_type != 0) {
       status =
-          parse_type_spelling(context, name, identifier, 0u, &measured, error);
+          parse_type_spelling(context, name, identifier, 1u, &measured, error);
       context->allocator->deallocate(context->allocator->user_data, name);
       if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
@@ -4977,13 +5007,15 @@ static ql_status lower_sizeof_type(lower_context *context, size_t node,
           type_node,
           "sizeof of an atomic type is outside the current type model", error);
     }
-    status =
-        resolve_type_node(context, type_node, pointer_depth, &measured, error);
+    status = resolve_type_node_allowing_void(
+        context, type_node, pointer_depth, &measured, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
   }
-  size = type_byte_width(context, measured);
+  size = measured.kind == QL_C_SCALAR_VOID
+             ? 1u
+             : type_byte_width(context, measured);
   if (size == 0u) {
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
                          diagnostic_node,
@@ -5527,8 +5559,9 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
   /* Stars between the return type and the function name belong to the
      return type, not to the function; `collect_callees` counted them off
      the declarator chain on the way in. */
-  status = resolve_type_node(context, type_node, callee->return_pointer_depth,
-                             &callee->return_type, error);
+  status = resolve_type_node_allowing_void(
+      context, type_node, callee->return_pointer_depth, &callee->return_type,
+      error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
   }
@@ -5868,10 +5901,6 @@ static ql_status lower_conditional_expression(lower_context *context,
   }
   if (consequence.type.kind == QL_C_SCALAR_POINTER ||
       alternative.type.kind == QL_C_SCALAR_POINTER) {
-    /* Two addresses select to an address. The result carries no object,
-       because naming either arm's object for both would claim a
-       provenance the expression does not have. */
-    lower_type u64 = address_type();
     if (consequence.type.kind != alternative.type.kind) {
       return lower_unknown(
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
@@ -5879,15 +5908,31 @@ static ql_status lower_conditional_expression(lower_context *context,
           "this slice",
           error);
     }
-    status = convert_value(context, consequence, u64, &left, error);
-    if (status != QL_STATUS_OK || context->unknown != 0u) {
-      return status;
+    if (type_same(consequence.type, alternative.type)) {
+      common = consequence.type;
+      left = consequence;
+      right = alternative;
+    } else if (consequence.type.indirection == 1u &&
+               consequence.type.pointee.kind == QL_C_SCALAR_VOID) {
+      common = consequence.type;
+      left = consequence;
+      status = convert_value(context, alternative, common, &right, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+    } else if (alternative.type.indirection == 1u &&
+               alternative.type.pointee.kind == QL_C_SCALAR_VOID) {
+      common = alternative.type;
+      right = alternative;
+      status = convert_value(context, consequence, common, &left, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+    } else {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+          "a conditional needs compatible pointer arm types", error);
     }
-    status = convert_value(context, alternative, u64, &right, error);
-    if (status != QL_STATUS_OK || context->unknown != 0u) {
-      return status;
-    }
-    common = u64;
   } else {
     status = usual_arithmetic_conversions(context, consequence, alternative,
                                           &left, &right, &common, error);
@@ -8734,8 +8779,21 @@ static ql_status lower_return_statement(lower_context *context, size_t node,
 
   if (context->return_type.kind == QL_C_SCALAR_VOID) {
     if (value_node != SIZE_MAX) {
-      return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
-                           "a void function cannot return a value", error);
+      /* ASM2C_GNU_V1 admits GNU C's `return void_expression;`. The
+         expression still runs for its call/memory effects, but contributes
+         no return value. A non-void expression remains a type error. */
+      status = lower_expression(context, value_node, &value, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+      if (value.type.kind != QL_C_SCALAR_VOID) {
+        return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                             "a void function cannot return a value", error);
+      }
+      status = emit_ub_guard(context, &value, error);
+      if (status != QL_STATUS_OK) {
+        return status;
+      }
     }
     return terminate_void_return(context, error);
   }

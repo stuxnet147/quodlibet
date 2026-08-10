@@ -483,11 +483,6 @@ TEST(CLowerExpressions, RefusesWhatItCannotState) {
            descriptors, but not array declarators. */
         {"unsigned long f(void) { return sizeof(int[4]); }", "f",
          QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE},
-        /* A typedef can name an incomplete/non-object type too. It remains a
-           semantic UNKNOWN instead of becoming an indexing or status error. */
-        {"typedef void TYP_NO_OBJECT;\n"
-         "unsigned long f(void) { return sizeof(TYP_NO_OBJECT); }", "f",
-         QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR},
         /* The target byte cannot represent these escape values. A compiler
            may diagnose them before translation, while the lowering receives
            source text and must conservatively keep it UNKNOWN. */
