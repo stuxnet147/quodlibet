@@ -1,63 +1,152 @@
 # quodlibet
 
-Quodlibet is a native C17 foundation for composing function-equivalence
-methods. It is not yet an end-to-end equivalence checker: this milestone
-establishes the portable host, semantic data, solver boundary, and plugin model
-on which checked proof pipelines can be assembled.
+Quodlibet 0.1.0 is a native C17 function-equivalence engine and a framework
+for composing proof and refutation methods. It has an end-to-end path for the
+currently supported, loop-free subset of the `ASM2C_GNU_V1` C profile:
 
-The current foundation provides:
+1. parse and resolve two C functions;
+2. lower them to typed SSA IR with explicit definedness and effects;
+3. bind their signatures, argument correspondence, precondition, and semantic
+   contract into one content-addressed problem;
+4. prove the requested relation or find a concrete counterexample;
+5. return the verdict together with the evidence and trust boundary that
+   justify it.
 
-- immutable, typed and content-addressed artifacts;
-- a versioned C plugin ABI that does not transfer CRT-owned memory;
-- a method registry and a portable dynamic loader;
-- composable DAG pipelines loaded from JSON;
+Quodlibet is not yet a general C equivalence checker. Unsupported syntax or
+semantics produce an explicit `UNKNOWN` result instead of being approximated
+as a narrower problem. Loops and several important C features remain outside
+the implemented proof slice.
+
+## What is implemented
+
+### Native host and semantic core
+
+- immutable, typed artifacts with persistent BLAKE3 identities;
+- a versioned C ABI and plugin boundary that do not transfer CRT-owned memory;
+- a method registry, portable dynamic loading, and JSON DAG pipelines;
 - parallel execution of independent DAG nodes on a native worker pool;
-- cancellation, task groups, deterministic sink ordering, and error cleanup;
-- explicit semantic-contract and verdict vocabulary;
-- user-selectable observations, UB/refinement rules, target profiles, and
-  versioned input preconditions;
-- a reusable Tree-sitter C syntax parser with opaque tree traversal;
-- an immutable, content-addressed problem artifact containing both functions
-  and their complete semantic contract;
-- restricted-C eligibility and function/type inventory without pretending that
-  syntax analysis is semantic lowering;
-- a typed, immutable SSA IR with explicit effects, UB guards, traps,
-  termination, memory, and event traces;
-- a loop-free integer and `_Bool` C lowering slice with explicit conversions,
-  control flow, PHI nodes, and definedness predicates;
-- a typed and canonical input-precondition AST for integer constraints, valid
-  pointer ranges, alignment, and disjointness;
-- a pure Bool/bit-vector e-graph with bounded saturation and replayable merge
-  evidence;
-- a solver-neutral ABI backed by the pinned Bitwuzla 0.9.1 process adapter,
-  with real SAT/model and UNSAT-metadata results;
-- capability checks for user-selected e-graph, SMT, AIG/SAT, bounded execution,
-  concrete differential, CHC/PDR, and extension methods;
-- deterministic BLAKE3 cache identities and method-independent evidence
-  envelopes;
-- pinned, checksum-verified dependencies in `third_party`;
-- native tests exercised on Windows and Linux.
+- cancellation, deterministic sink ordering, task groups, and cleanup on
+  failure;
+- configurable relation, UB policy, observations, target profile, and typed
+  input preconditions;
+- caller-controlled wall-clock, node, solver, total-memory, and
+  single-allocation budgets;
+- runtime logging with independent level, category, timestamp, source, and
+  thread-id controls;
+- caller-defined verdict policies whose parser and evaluator cannot weaken the
+  core soundness rules.
 
-## Build
+### C frontend and IR
 
-Prerequisites are CMake 3.21 or newer, Ninja, a C17 compiler, a C++17 compiler
-for GoogleTest, Git Bash on Windows, and a POSIX shell on Linux. Dependency
-downloads require `curl`, `tar`, `unzip`, and `sha256sum` only once.
+- a reusable Tree-sitter C syntax parser with no Tree-sitter types in the
+  public API;
+- restricted-C eligibility, function selection, type inventory, and reusable
+  parser/tree entry points for corpus processing;
+- source-signature artifacts that preserve widths, signedness, pointer depth,
+  address space, and ABI profile;
+- immutable typed SSA IR with control flow, PHI nodes, memory objects, calls,
+  traps, termination, effects, UB guards, and initial memory images;
+- an independent IR verifier and a concrete interpreter;
+- differential tests that compare lowered execution with compiled C;
+- a flat 64-bit little-endian memory model for the `ASM2C_GNU_V1` profile,
+  including aligned in-object access checks and disjoint live objects.
+
+The current lowering handles a useful loop-free slice that includes fixed-width
+integer and `_Bool` expressions, conversions, short-circuit control flow,
+conditionals, assignments, increments, pointers, selected arrays and records,
+locals, selected globals, and calls to declared callees. The exact accepted
+surface is intentionally narrower than the syntax frontend.
+
+### Proof, refutation, and evidence
+
+The builtin registry currently contains:
+
+| Method | Role | Positive evidence |
+| --- | --- | --- |
+| `builtin.identity` | Pipeline and plugin plumbing | No logical claim |
+| `prove.smt-product` | Relational SMT product over loop-free IR and flat memory | Explicit trusted-Bitwuzla policy, recorded as `checked_proof=false` |
+| `prove.aig-sat` | Bit-blasted scalar product using CaDiCaL | LRAT certificate accepted by the independent `lrat-check`, recorded as `checked_proof=true` |
+| `refute.concrete-differential` | Deterministic boundary and random input search | Replay-confirmed counterexample only |
+
+Both exact paths use the same product-query encoding. A SAT assignment is only
+a candidate until the shared concrete replay path reproduces the violation.
+The SMT method defaults to retaining raw Bitwuzla `UNSAT` as evidence while
+returning `UNKNOWN`; promotion requires the caller to select the recorded
+`trusted-backend` policy. The AIG/SAT method promotes `UNSAT` only after its
+LRAT certificate is independently checked and the comparison domain is shown
+to be inhabited.
+
+The core also provides:
+
+- a pure bit-vector e-graph, a versioned rewrite-rule catalogue, and an
+  independent merge-log replay checker;
+- evidence-based combination of method results, with no majority voting;
+- a persistent artifact and evidence store whose records and cache-key inputs
+  are revalidated on load;
+- deterministic cache keys that bind the problem, contract, method version,
+  options, backend, queries, and trust policy.
+
+`BOUNDED_CLEAN` is never promoted to a proof. An unreplayed solver model is
+never reported as a counterexample. A budget failure withdraws any logical
+claim to `UNKNOWN` before a caller policy is applied.
+
+## Current coverage and limits
+
+The latest checked corpus report uses 29,893 distinct training C bodies from
+`D:/projects/machine-model/datasets/records-local`:
+
+| Stage | Current result |
+| --- | ---: |
+| Tree-sitter parse without recovery nodes | 29,880 / 29,893, 99.96% |
+| Restricted-C frontend eligibility | 29,822 / 29,880, 99.81% |
+| Semantic IR lowering | 8,541 / 29,880, 28.58% |
+| Verdicts on lowerable validation self-pairs | 337 / 349, 96.6% |
+
+The lowering number is the relevant completeness limit. The largest remaining
+groups include pointers loaded from memory whose object provenance cannot yet
+be recovered, `sizeof`, loops, uninitialized-read analysis, additional record
+and function types, variadic calls, and unsupported control flow. Preprocessor
+directives are detected but not expanded, so callers must supply preprocessed
+source. Volatile and atomic behavior is represented in the contract and IR
+vocabulary but is not yet lowered from general C.
+
+CHC/PDR and bounded symbolic execution are documented future methods, not
+registered implementations. The AIG/SAT path is currently scalar and refuses
+array sorts. The Python `check` API uses the SMT product path; other registered
+methods are available through the native C API and pipelines.
+
+The detailed measurement and remaining diagnostic distribution are in
+[`docs/coverage/coverage-20260812b.md`](docs/coverage/coverage-20260812b.md).
+The bounded libFuzzer campaign ran all nine current targets for one minute each
+under ASan and UBSan with zero crashes after fixing the defect found by the
+first pass. See [`docs/fuzz/campaign-20260810.md`](docs/fuzz/campaign-20260810.md).
+
+## Build and test
+
+The native build requires CMake 3.21 or newer, Ninja, Clang with C17 and C++17
+support, and Git Bash on Windows or a POSIX shell on Linux. The tests use
+GoogleTest. Dependency preparation requires `curl`, `tar`, `unzip`, and
+`sha256sum` on the first run.
+
+On Windows, run from Git Bash:
 
 ```sh
 cd D:/projects/machine-model/python/quodlibet
 ./scripts/vendor.sh
-./scripts/check.sh
+./scripts/check.sh windows-clang
 ```
 
-The first command is idempotent for an unchanged dependency lock. CMake never
-downloads source code during configuration.
+On Linux:
 
-The bundled Linux Bitwuzla executable targets glibc-based x86-64 systems with
-`GLIBC_2.38` and `GLIBCXX_3.4.32`. On older glibc or musl systems, configure
-with `-DQL_BITWUZLA_EXECUTABLE=/absolute/path/to/bitwuzla-0.9.1`.
+```sh
+./scripts/vendor.sh
+./scripts/check.sh linux-clang
+```
 
-Equivalent explicit commands are:
+`vendor.sh` is idempotent while the pinned dependency versions and checksums
+are unchanged. CMake does not download dependencies during configuration.
+`check.sh` configures, builds, and runs CTest. The equivalent explicit commands
+on Windows are:
 
 ```sh
 cmake --preset windows-clang
@@ -65,110 +154,141 @@ cmake --build --preset windows-clang --parallel
 ctest --preset windows-clang
 ```
 
-On Linux, replace `windows-clang` with `linux-clang`.
+Useful build options are:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `QL_BUILD_SHARED` | `OFF` | Build a shared core library instead of the default static library |
+| `QL_BUILD_TESTS` | `ON` | Build the native GoogleTest suite |
+| `QL_ENABLE_BITWUZLA` | `ON` | Enable the canonical SMT process backend |
+| `QL_ENABLE_SAT` | `ON` | Build the pinned CaDiCaL backend and LRAT checker |
+| `QL_ENABLE_LOGGING` | `ON` | Compile the logging backend |
+| `QL_BUILD_FUZZERS` | `OFF` | Build Clang/libFuzzer targets |
+| `QL_BITWUZLA_EXECUTABLE` | vendored executable | Override the Bitwuzla 0.9.1 path |
+
+The bundled Linux Bitwuzla executable targets glibc-based x86-64 systems with
+`GLIBC_2.38` and `GLIBCXX_3.4.32`. On an older glibc or musl system, provide a
+compatible Bitwuzla 0.9.1 executable through `QL_BITWUZLA_EXECUTABLE`.
+With `QL_ENABLE_BITWUZLA=OFF`, the transport-independent core still builds and
+the solver descriptor remains discoverable as unavailable.
+
+Sanitizer and fuzz configurations are available as `linux-sanitize` and
+`linux-fuzz` presets. The fuzz targets require Clang on Linux.
 
 ## CLI
 
-The CLI currently exposes foundation diagnostics and pipeline validation:
+The CLI exposes diagnostics, method discovery, syntax validation, pipeline
+validation, and corpus coverage measurement:
 
 ```sh
 out/build/windows-clang/quodlibet.exe version
 out/build/windows-clang/quodlibet.exe methods
 out/build/windows-clang/quodlibet.exe parse-c input.c
 out/build/windows-clang/quodlibet.exe validate examples/branching.json
+out/build/windows-clang/quodlibet.exe coverage units.txt detail.tsv
 ```
 
-The example is a fan-out pipeline. `normalize` receives the initial artifact;
-`prove` and `refute` consume its output and may run in parallel. Both terminal
-artifacts are returned to the caller.
+On Linux, use `out/build/linux-clang/quodlibet`. The current CLI does not have
+a direct pair-check command. End-to-end judgments are exposed by the Python
+binding and the native method APIs.
 
-## Embedding
+## Python binding
 
-Include the umbrella header and link the `quodlibet::quodlibet` CMake target:
+The package is a CPython C extension, not `ctypes` or `cffi`. It is built for
+the CPython 3.11 stable ABI, releases the GIL for the whole judgment, and links
+the native core into a self-contained extension module. Building it requires
+CMake 3.26 or newer and CPython 3.11 or newer.
+
+From the repository root:
+
+```sh
+python -m pip install ./bindings/python
+```
+
+The distribution name is `quodlibet-engine`; the import name is `quodlibet`.
+It should not be installed into the same environment as the unrelated Quod
+Libet music-player package.
+
+```python
+import quodlibet
+
+with quodlibet.SolverSession() as session:
+    result = quodlibet.check(
+        "int f(int x) { return x + x; }", "f",
+        "int g(int x) { return 2 * x; }", "g",
+        trust_smt_backend=True,
+        budget={"total_ms": 5000, "solver_ms": 3000},
+        session=session,
+    )
+
+print(result.verdict)
+print(result.evidence.checked_proof)
+```
+
+`trust_smt_backend=False` is the default. In that mode an SMT `UNSAT` remains
+`UNKNOWN` with solver evidence. Passing `True` is an explicit trust decision;
+the result still reports `checked_proof=False`. Counterexamples are returned
+only after replay.
+
+For a training or scoring loop, use `quodlibet.check_batch(specs, workers=0)`.
+It gives each worker its own reusable `SolverSession`, runs judgments in real
+parallel threads while the GIL is released, and returns an exception in place
+of the failed item without discarding the rest of the batch. See
+[`bindings/python/README.md`](bindings/python/README.md) for the complete API.
+
+## Native embedding and installation
+
+Public headers are installed under `include/quodlibet`. In a build tree,
+include the umbrella header and link the CMake target:
 
 ```c
 #include <quodlibet/quodlibet.h>
-
-ql_registry *registry = NULL;
-ql_scheduler *scheduler = NULL;
-ql_error error;
-
-if (ql_registry_create(NULL, &registry, &error) != QL_STATUS_OK) {
-    return 1;
-}
-if (ql_register_builtin_methods(registry, &error) != QL_STATUS_OK) {
-    ql_registry_destroy(registry);
-    return 1;
-}
-if (ql_scheduler_create(NULL, 0, &scheduler, &error) != QL_STATUS_OK) {
-    ql_registry_destroy(registry);
-    return 1;
-}
-
-/* Load methods, build or parse a pipeline, create a problem artifact, run. */
-
-ql_scheduler_destroy(scheduler);
-ql_registry_destroy(registry);
 ```
 
-A worker count of zero selects the host's available parallelism. The public
-headers are under `include/quodlibet`.
-
-## C syntax frontend
-
-The public `c_syntax.h` API owns no source text and exposes no Tree-sitter type.
-Create one `ql_c_parser` per worker and reuse it across independent inputs. A
-successful call may return a recovered tree containing `ERROR` or missing
-nodes, so call `ql_c_syntax_tree_has_errors` before accepting the syntax. The
-cursor API traverses both named and anonymous nodes and exposes byte and UTF-8
-row/column ranges.
-
-This layer only establishes C syntax. It does not run a preprocessor or prove
-source semantics. The separate `c_frontend` eligibility layer and `c_lower`
-vertical slice currently handle loop-free integer and `_Bool` functions; loops,
-pointers, calls, volatile and atomic operations return an explicit unsupported
-result. There is still no product-program equivalence method, counterexample
-replayer, or complete checked-proof path. See `ARCHITECTURE.md` for the exact
-boundaries.
-
-## Semantic contract
-
-Initialize the public contract and then narrow only the axes the application
-intends to ignore:
-
-```c
-ql_semantic_contract_v1 contract;
-ql_error error;
-
-ql_semantic_contract_init(&contract);
-contract.relation = QL_RELATION_LEFT_REFINES_RIGHT;
-contract.ub_policy = QL_UB_LANGUAGE_REFINEMENT;
-contract.observations &= ~QL_OBSERVE_EXTERNAL_CALLS;
-contract.external_call_observation = QL_EXTERNAL_CALLS_IGNORE;
-
-if (ql_semantic_contract_validate(&contract, &error) != QL_STATUS_OK) {
-    /* Reject the request before any proof method runs. */
-}
+```cmake
+target_link_libraries(my_target PRIVATE quodlibet::quodlibet)
 ```
 
-The default profile follows the canonical asm2c corpus: GCC and Clang families,
-PIC and non-PIC x86-64 Linux SysV code, with target feature groups selectable by
-the caller. Exact compiler versions and an explicit C standard were not stored
-in the corpus, so Quodlibet does not silently claim either. Input assumptions,
-including symbolic readable/writable pointer ranges, are supplied through the
-versioned `precondition_json` field described in `ARCHITECTURE.md`. The typed
-precondition parser is implemented, but binding its signature digest to both
-lowered C functions and the problem artifact remains required before a method
-may claim `PROVED_*` for a non-null precondition.
+For an installed package:
 
-## Proof method selection
+```sh
+cmake --install out/build/windows-clang --prefix out/install/windows
+```
 
-No proof algorithm is privileged by the host. A pipeline node selects a method
-by its registered name and supplies method-specific options. Before execution,
-the proof capability API can reject a method that does not support the
-problem's relation, UB policy, observations, precondition, or requested result
-kind. `BOUNDED_CLEAN` remains a finite-search result and is never promoted to a
-proof.
+```cmake
+find_package(quodlibet REQUIRED)
+target_link_libraries(my_target PRIVATE quodlibet::quodlibet)
+```
 
-See `METHODS.md` for the method catalogue, soundness boundaries, evidence
-requirements, and pipeline examples.
+The default static install folds the vendored libraries into Quodlibet. The
+CLI and Bitwuzla executable are installed together, and the solver lookup first
+checks beside the running host executable so the prefix can be moved. Windows
+and Linux install and relocation checks are implemented by
+`scripts/check-install.sh`. Shared-library installation remains a separately
+measured configuration.
+
+## Semantic and trust contracts
+
+The semantic contract records relation direction, UB policy, observations,
+memory and call observation modes, the frozen C/ABI profile, and the typed
+precondition. Problem schema v2 binds both source signatures, a total argument
+correspondence, and the precondition digest. Schema v1 problems are accepted as
+data but cannot cross the proof-binding gate.
+
+The default `ASM2C_GNU_V1` profile models GCC and Clang corpus syntax on x86-64
+Linux SysV LP64. It uses a flat 64-bit address-space model chosen for recovered
+machine-oriented C. This model is deliberately not ISO C pointer provenance,
+and every verdict carries the profile identity.
+
+For exact definitions and trust boundaries, read:
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) for artifacts, pipelines, the semantic
+  contract, and the memory model;
+- [`METHODS.md`](METHODS.md) for implemented and planned methods, evidence, and
+  verdict combination;
+- [`SOLVERS.md`](SOLVERS.md) for Bitwuzla process isolation, resource limits,
+  identity checks, and the raw-UNSAT boundary;
+- [`DEPENDENCIES.md`](DEPENDENCIES.md) for pinned versions, checksums, licenses,
+  and backend choices;
+- [`GOAL.md`](GOAL.md) and [`todo.md`](todo.md) for the current completion
+  criteria and open work.
