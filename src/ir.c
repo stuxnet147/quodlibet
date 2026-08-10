@@ -37,6 +37,8 @@ typedef struct ir_instruction_entry {
     uint64_t immediate;
     char *symbol;
     size_t symbol_size;
+    void *image;
+    size_t image_size;
 } ir_instruction_entry;
 
 typedef struct ir_terminator_entry {
@@ -217,6 +219,7 @@ static void graph_init(ir_graph *graph, const ql_allocator *allocator) {
 
 static void free_instruction(const ql_allocator *allocator,
                              ir_instruction_entry *instruction) {
+    allocator->deallocate(allocator->user_data, instruction->image);
     allocator->deallocate(allocator->user_data, instruction->symbol);
     allocator->deallocate(allocator->user_data, instruction->results);
     allocator->deallocate(allocator->user_data,
@@ -835,7 +838,7 @@ static ql_status validate_instruction_shape(
         return QL_STATUS_INVALID_ARGUMENT;
     }
     if (instruction->opcode == 0u ||
-        (instruction->opcode > QL_IR_OPCODE_FP_TRUNC &&
+        (instruction->opcode > QL_IR_OPCODE_MEMORY_IMAGE &&
          instruction->opcode < QL_IR_OPCODE_EXTENSION_BASE)) {
         ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
                      "IR instruction %u has unknown opcode %u", id,
@@ -1103,6 +1106,20 @@ static ql_status validate_instruction_shape(
             return instruction_type_error(id, "assume", error);
         }
         break;
+    case QL_IR_OPCODE_MEMORY_IMAGE:
+        REQUIRE_COUNTS(2u, 1u);
+        /* It reads no memory the program could observe and writes none: it
+           asks a question about a memory value it was handed. Declaring an
+           effect would make it an access, and an access needs a guard. */
+        REQUIRE_PURE();
+        if (first_kind != QL_IR_TYPE_MEMORY ||
+            value_kind(graph, instruction->operands[1]) !=
+                QL_IR_TYPE_POINTER ||
+            result_kind != QL_IR_TYPE_BOOL ||
+            instruction->image_size == 0u) {
+            return instruction_type_error(id, "memory image", error);
+        }
+        break;
     case QL_IR_OPCODE_UB_GUARD:
         REQUIRE_COUNTS(1u, 0u);
         if (first_kind != QL_IR_TYPE_BOOL ||
@@ -1240,7 +1257,8 @@ ql_status QL_CALL ql_ir_builder_append_instruction(
          definition->block_operands == NULL) ||
         (definition->result_count != 0u &&
          (definition->result_types == NULL || results_output == NULL)) ||
-        (definition->symbol_size != 0u && definition->symbol == NULL)) {
+        (definition->symbol_size != 0u && definition->symbol == NULL) ||
+        (definition->image_size != 0u && definition->image == NULL)) {
         ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
                      "IR instruction pointer and count fields disagree");
         return QL_STATUS_INVALID_ARGUMENT;
@@ -1290,6 +1308,7 @@ ql_status QL_CALL ql_ir_builder_append_instruction(
     entry.result_count = definition->result_count;
     entry.immediate = definition->immediate;
     entry.symbol_size = definition->symbol_size;
+    entry.image_size = definition->image_size;
     status = copy_id_array(&graph->allocator, definition->operands,
                            definition->operand_count,
                            (uint32_t **)&entry.operands, error);
@@ -1320,6 +1339,10 @@ ql_status QL_CALL ql_ir_builder_append_instruction(
     if (status == QL_STATUS_OK) {
         status = copy_text(&graph->allocator, definition->symbol,
                            definition->symbol_size, &entry.symbol, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = copy_bytes(&graph->allocator, definition->image,
+                            definition->image_size, &entry.image, error);
     }
     if (status != QL_STATUS_OK) {
         free_instruction(&graph->allocator, &entry);
@@ -2249,6 +2272,7 @@ static ql_status serialize_graph(const ir_graph *graph, uint8_t **data,
                          error));
         WRITE(writer_u64(&writer, instruction->immediate, error));
         WRITE(writer_size(&writer, instruction->symbol_size, error));
+        WRITE(writer_size(&writer, instruction->image_size, error));
         for (nested = 0u; nested < instruction->operand_count; ++nested) {
             WRITE(writer_u32(&writer, instruction->operands[nested], error));
         }
@@ -2262,6 +2286,8 @@ static ql_status serialize_graph(const ir_graph *graph, uint8_t **data,
         }
         WRITE(writer_bytes(&writer, instruction->symbol,
                            instruction->symbol_size, error));
+        WRITE(writer_bytes(&writer, instruction->image,
+                           instruction->image_size, error));
     }
     for (index = 0u; index < graph->block_count; ++index) {
         const ir_block_entry *block = &graph->blocks[index];
@@ -2581,7 +2607,7 @@ static ql_status parse_graph(const ql_allocator *allocator,
                                error));
         value->name_size = name_size;
     }
-    READ(reader_require_minimum_records(&reader, instruction_count, 48u,
+    READ(reader_require_minimum_records(&reader, instruction_count, 56u,
                                         "instruction", error));
     if (instruction_count != 0u) {
         READ(reserve_array(allocator, (void **)&graph->instructions,
@@ -2597,6 +2623,7 @@ static ql_status parse_graph(const ql_allocator *allocator,
         uint32_t block_operand_count;
         uint32_t result_count;
         size_t symbol_size;
+        size_t image_size;
         graph->instruction_count = index + 1u;
         READ(reader_u32(&reader, &instruction->block, error));
         READ(reader_u32(&reader, &instruction->opcode, error));
@@ -2610,6 +2637,7 @@ static ql_status parse_graph(const ql_allocator *allocator,
         instruction->result_count = (size_t)result_count;
         READ(reader_u64(&reader, &instruction->immediate, error));
         READ(reader_size(&reader, &symbol_size, error));
+        READ(reader_size(&reader, &image_size, error));
         READ(reader_id_array(&reader, allocator, instruction->operand_count,
                              (uint32_t **)&instruction->operands, error));
         READ(reader_id_array(&reader, allocator,
@@ -2621,6 +2649,9 @@ static ql_status parse_graph(const ql_allocator *allocator,
         READ(reader_owned_text(&reader, allocator, symbol_size,
                                &instruction->symbol, error));
         instruction->symbol_size = symbol_size;
+        READ(reader_owned_bytes(&reader, allocator, image_size,
+                                &instruction->image, error));
+        instruction->image_size = image_size;
     }
     READ(reader_require_minimum_records(&reader, block_count, 56u, "block",
                                         error));
@@ -2901,6 +2932,8 @@ ql_status QL_CALL ql_ir_instruction_at(
     view->immediate = instruction->immediate;
     view->symbol = instruction->symbol;
     view->symbol_size = instruction->symbol_size;
+    view->image = instruction->image;
+    view->image_size = instruction->image_size;
     ql_error_clear(error);
     return QL_STATUS_OK;
 }

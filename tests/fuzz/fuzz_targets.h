@@ -252,7 +252,8 @@ QL_FUZZ_MAYBE_UNUSED static void ql_fuzz_ir_decoder(const unsigned char *data,
     ql_ir *ir = NULL;
     ql_error error;
 
-    if (ql_artifact_create(NULL, QL_ARTIFACT_KIND_IR, 1u, data, size,
+    if (ql_artifact_create(NULL, QL_ARTIFACT_KIND_IR,
+                           QL_IR_ARTIFACT_SCHEMA_VERSION, data, size,
                            &artifact, &error) != QL_STATUS_OK) {
         return;
     }

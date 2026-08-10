@@ -1275,6 +1275,18 @@ static ql_status ir_type_matches(const ql_ir *ir, ql_ir_type_id type_id,
     return QL_STATUS_TYPE_MISMATCH;
 }
 
+static int value_is_event_trace(const ql_ir *ir,
+                                const ql_ir_value_view_v1 *value) {
+    ql_ir_type_view_v1 type;
+    ql_error ignored;
+    memset(&type, 0, sizeof(type));
+    type.struct_size = sizeof(type);
+    if (ql_ir_type_at(ir, value->type, &type, &ignored) != QL_STATUS_OK) {
+        return 0;
+    }
+    return type.kind == QL_IR_TYPE_EVENT_TRACE;
+}
+
 static int name_has_suffix(const ql_ir_value_view_v1 *value,
                            const char *suffix) {
     const size_t length = strlen(suffix);
@@ -1285,10 +1297,21 @@ static int name_has_suffix(const ql_ir_value_view_v1 *value,
 
 /* Tail parameter `ordinal` counts from the first one past the C arguments:
    zero is the memory value, then base and size alternate. */
-static ql_status object_parameter_matches(const ql_ir *ir,
-                                          const ql_ir_value_view_v1 *value,
-                                          uint32_t pointer_width,
-                                          size_t ordinal, ql_error *error) {
+/* The observable-state and object parameters that stand behind the C ones.
+   `ordinal` counts from the first of them. */
+typedef enum signature_tail_kind {
+    SIGNATURE_TAIL_MEMORY = 0,
+    SIGNATURE_TAIL_TRACE,
+    SIGNATURE_TAIL_BASE,
+    SIGNATURE_TAIL_SIZE
+} signature_tail_kind;
+
+static ql_status tail_parameter_matches(const ql_ir *ir,
+                                        const ql_ir_value_view_v1 *value,
+                                        uint32_t pointer_width,
+                                        signature_tail_kind expected,
+                                        size_t object_ordinal,
+                                        ql_error *error) {
     ql_ir_view_v1 view;
     ql_ir_type_view_v1 type;
     size_t index;
@@ -1316,7 +1339,8 @@ static ql_status object_parameter_matches(const ql_ir *ir,
                      "IR object parameter references an unknown type");
         return QL_STATUS_TYPE_MISMATCH;
     }
-    if (ordinal == 0u) {
+    switch (expected) {
+    case SIGNATURE_TAIL_MEMORY:
         if (type.kind == QL_IR_TYPE_MEMORY &&
             name_has_suffix(value, "__memory")) {
             return QL_STATUS_OK;
@@ -1324,17 +1348,27 @@ static ql_status object_parameter_matches(const ql_ir *ir,
         ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
                      "the parameter after the C arguments is not the memory value the flat memory model requires");
         return QL_STATUS_TYPE_MISMATCH;
+    case SIGNATURE_TAIL_TRACE:
+        if (type.kind == QL_IR_TYPE_EVENT_TRACE &&
+            name_has_suffix(value, "__trace")) {
+            return QL_STATUS_OK;
+        }
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "the parameter after the memory value is not the event trace it claims to be");
+        return QL_STATUS_TYPE_MISMATCH;
+    default:
+        break;
     }
     if (type.kind == QL_IR_TYPE_BIT_VECTOR &&
         type.bit_width == pointer_width &&
-        name_has_suffix(value, ((ordinal - 1u) % 2u) == 0u ? ".__base"
-                                                           : ".__size")) {
+        name_has_suffix(value, expected == SIGNATURE_TAIL_BASE ? ".__base"
+                                                               : ".__size")) {
         return QL_STATUS_OK;
     }
     ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
                  "IR object parameter %zu is not the %s the flat memory model requires",
-                 (ordinal - 1u) / 2u,
-                 ((ordinal - 1u) % 2u) == 0u ? "base" : "size");
+                 object_ordinal,
+                 expected == SIGNATURE_TAIL_BASE ? "base" : "size");
     return QL_STATUS_TYPE_MISMATCH;
 }
 
@@ -1344,6 +1378,8 @@ ql_status QL_CALL ql_source_signature_bind_ir(
     size_t index;
     size_t parameter_index = 0u;
     size_t pointer_count = 0u;
+    size_t object_count = 0u;
+    size_t trace_count = 0u;
     size_t expected;
     ql_status status;
 
@@ -1375,13 +1411,22 @@ ql_status QL_CALL ql_source_signature_bind_ir(
             ++pointer_count;
         }
     }
-    /* A function with pointer arguments carries the flat memory model's own
-       parameters behind the C ones: one memory value, then a base and a size
-       per pointer argument in source order. The tail is checked rather than
-       skipped, because a lowering that got it wrong would silently hand the
-       miter a different object table than the signature implies. */
-    expected = signature->view.argument_count +
-               (pointer_count == 0u ? 0u : 1u + 2u * pointer_count);
+    /* Behind the C arguments the flat memory model carries its own
+       parameters: the memory value, an event trace when the body calls, then
+       a base and a size per object.
+
+       The objects are not only the pointer arguments'. A lowering makes one
+       for storage the source never passes in -- a global, a local array or
+       record, a string literal -- and those follow the argument objects in
+       the same shape. They are admitted here, and nothing else is: every tail
+       parameter still has to be the memory value, the trace, or a
+       pointer-width base or size, in that order and in pairs. This table is
+       written independently of the lowering on purpose, so widening it to
+       "some number of objects" must not widen it to "some parameters".
+
+       The count of argument objects is still required, because a lowering
+       that forgot a pointer argument's object would otherwise pass by
+       calling one of its own objects that argument's. */
     for (index = 0u; index < view.value_count; ++index) {
         ql_ir_value_view_v1 value;
         memset(&value, 0, sizeof(value));
@@ -1393,24 +1438,53 @@ ql_status QL_CALL ql_source_signature_bind_ir(
         if (value.definition_kind != QL_IR_VALUE_PARAMETER) {
             continue;
         }
-        if (parameter_index >= expected) {
-            ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                         "IR declares more parameters than the source signature");
-            return QL_STATUS_TYPE_MISMATCH;
-        }
         if (parameter_index < signature->view.argument_count) {
             status = ir_type_matches(ir, value.type,
                                      &signature->arguments[parameter_index],
                                      "parameter", error);
+        } else if (parameter_index == signature->view.argument_count) {
+            status = tail_parameter_matches(ir, &value,
+                                            signature->view.pointer_width,
+                                            SIGNATURE_TAIL_MEMORY, 0u, error);
+        } else if (parameter_index == signature->view.argument_count + 1u &&
+                   value_is_event_trace(ir, &value)) {
+            status = tail_parameter_matches(ir, &value,
+                                            signature->view.pointer_width,
+                                            SIGNATURE_TAIL_TRACE, 0u, error);
+            ++trace_count;
         } else {
-            status = object_parameter_matches(
+            const size_t tail = parameter_index -
+                                signature->view.argument_count - 1u -
+                                trace_count;
+            status = tail_parameter_matches(
                 ir, &value, signature->view.pointer_width,
-                parameter_index - signature->view.argument_count, error);
+                (tail % 2u) == 0u ? SIGNATURE_TAIL_BASE
+                                  : SIGNATURE_TAIL_SIZE,
+                tail / 2u, error);
+            if (status == QL_STATUS_OK && (tail % 2u) == 0u) {
+                ++object_count;
+            }
         }
         if (status != QL_STATUS_OK) {
             return status;
         }
         ++parameter_index;
+    }
+    if (parameter_index < signature->view.argument_count) {
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "IR declares %zu parameters but the source signature has %zu arguments",
+                     parameter_index, signature->view.argument_count);
+        return QL_STATUS_TYPE_MISMATCH;
+    }
+    expected = signature->view.argument_count +
+               (parameter_index == signature->view.argument_count
+                    ? 0u
+                    : 1u + trace_count + 2u * object_count);
+    if (object_count < pointer_count) {
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "IR declares %zu objects but the source signature has %zu pointer arguments",
+                     object_count, pointer_count);
+        return QL_STATUS_TYPE_MISMATCH;
     }
     if (parameter_index != expected) {
         ql_error_set(error, QL_STATUS_TYPE_MISMATCH,

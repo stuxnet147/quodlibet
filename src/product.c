@@ -291,6 +291,7 @@ static int opcode_is_supported(ql_ir_opcode opcode) {
     case QL_IR_OPCODE_LOAD:
     case QL_IR_OPCODE_STORE:
     case QL_IR_OPCODE_ASSUME:
+    case QL_IR_OPCODE_MEMORY_IMAGE:
         return 1;
     default:
         return 0;
@@ -559,8 +560,8 @@ static ql_status side_collect_edges(product_side *side,
 }
 
 /* Parameters beyond the C arguments are the memory model's own: one memory
-   value, then a base and a size per pointer argument in this side's source
-   order. Every one of them is bound to a symbol both sides share, which is
+   value, an event trace when the body calls, then a base and a size per
+   object in this side's own order. Every one of them is bound to a symbol both sides share, which is
    what makes the two functions run over the same objects and the same initial
    memory without either side describing the table to the other. */
 static ql_status side_parameter_symbol(product_side *side,
@@ -568,7 +569,8 @@ static ql_status side_parameter_symbol(product_side *side,
                                        size_t input_count,
                                        const product_object *objects,
                                        size_t object_count,
-                                       size_t parameter_index, char *symbol,
+                                       size_t parameter_index,
+                                       ql_ir_type_kind kind, char *symbol,
                                        ql_error *error) {
     size_t input;
     size_t offset;
@@ -600,6 +602,16 @@ static ql_status side_parameter_symbol(product_side *side,
     } else if (parameter_index == input_count) {
         written = snprintf(symbol, QL_PRODUCT_SYMBOL_CAPACITY, "%s",
                            QL_PRODUCT_MEMORY_SYMBOL);
+    } else if (kind == QL_IR_TYPE_EVENT_TRACE) {
+        /* A body that calls threads an event trace beside the memory. This
+           miter has no term for a trace and no term for the call that
+           appends to it, so it says which of the two it is missing rather
+           than counting the trace as an object and reporting the object
+           table as the thing that ran out. */
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "IR parameter %zu is an event trace, and this miter states no term for a trace or for the calls that append to one",
+                     parameter_index);
+        return QL_STATUS_TYPE_MISMATCH;
     } else {
         offset = parameter_index - input_count - 1u;
         local = offset / 2u;
@@ -686,7 +698,8 @@ static ql_status side_prepare(product_side *side, const ql_ir *ir,
         if (value.definition_kind == QL_IR_VALUE_PARAMETER) {
             status = side_parameter_symbol(side, inputs, input_count, objects,
                                            object_count, parameter_index,
-                                           symbol, error);
+                                           side->value_kinds[index], symbol,
+                                           error);
             if (status != QL_STATUS_OK) {
                 return status;
             }
@@ -925,6 +938,39 @@ static ql_status term_selected_byte(product_encoder *encoder,
 
 /* concat puts the most significant byte first, and under little-endian that is
    the byte at the highest address. */
+/* An image is a conjunction over its bytes: each address in the run holds the
+   constant the instruction states. It reaches the array theory as the initial
+   contents of that range, which is what a store chain was standing in for. */
+static ql_status encode_memory_image(product_encoder *encoder,
+                                     product_side *side,
+                                     const ql_ir_instruction_view_v1 *view) {
+    size_t byte;
+    ql_status status;
+
+    if (view->image_size == 0u) {
+        ql_error_set(encoder->error, QL_STATUS_TYPE_MISMATCH,
+                     "a memory image states no bytes");
+        return QL_STATUS_TYPE_MISMATCH;
+    }
+    status = term_add(encoder, "(and true");
+    for (byte = 0u; byte < view->image_size && status == QL_STATUS_OK;
+         ++byte) {
+        status = term_add(encoder, " (= ");
+        if (status == QL_STATUS_OK) {
+            status = term_selected_byte(encoder, side, view, byte);
+        }
+        if (status == QL_STATUS_OK) {
+            status = term_addf(encoder, " (_ bv%u %u))",
+                               (unsigned)((const uint8_t *)view->image)[byte],
+                               QL_PRODUCT_BYTE_WIDTH);
+        }
+    }
+    if (status == QL_STATUS_OK) {
+        status = term_add(encoder, ")");
+    }
+    return status;
+}
+
 static ql_status encode_load(product_encoder *encoder, product_side *side,
                              const ql_ir_instruction_view_v1 *view,
                              uint32_t width) {
@@ -1134,6 +1180,9 @@ static ql_status encode_instruction(product_encoder *encoder,
         if (status == QL_STATUS_OK) {
             status = term_add(encoder, ")");
         }
+        break;
+    case QL_IR_OPCODE_MEMORY_IMAGE:
+        status = encode_memory_image(encoder, side, view);
         break;
     case QL_IR_OPCODE_LOAD:
         status = encode_load(encoder, side, view,
@@ -2212,37 +2261,135 @@ static ql_status build_inputs(ql_product_query *query,
     return QL_STATUS_OK;
 }
 
-/* The object table follows from the pointer arguments alone. The left order is
-   canonical; each side's own pointer ordering is mapped onto it so a problem
-   whose argument correspondence permutes the two lists still binds the same
-   object to the same symbol on both sides. */
-static ql_status build_objects(ql_product_query *query,
-                               uint32_t **left_map, uint32_t **right_map,
-                               ql_error *error) {
+/* Counts the objects a side declares and records where each one's base
+   parameter sits, by reading the parameter list rather than by predicting it.
+   Predicting worked while every object was a pointer argument's; it stops
+   working the moment a lowering makes one of its own -- for a global, a local
+   array or record, a string literal -- or threads an event trace. */
+static ql_status collect_object_parameters(const ql_ir *ir,
+                                           const ql_allocator *allocator,
+                                           uint32_t **indices, size_t *count,
+                                           ql_error *error) {
+    ql_ir_view_v1 view;
     size_t index;
-    size_t count = 0u;
-    size_t next = 0u;
+    size_t found = 0u;
+    size_t capacity = 0u;
+    uint32_t *list = NULL;
+    ql_status status;
 
+    *indices = NULL;
+    *count = 0u;
+    memset(&view, 0, sizeof(view));
+    view.struct_size = sizeof(view);
+    status = ql_ir_get_view(ir, &view, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    for (index = 0u; index < view.value_count; ++index) {
+        ql_ir_value_view_v1 value;
+        memset(&value, 0, sizeof(value));
+        value.struct_size = sizeof(value);
+        status = ql_ir_value_at(ir, index, &value, error);
+        if (status != QL_STATUS_OK) {
+            allocator->deallocate(allocator->user_data, list);
+            return status;
+        }
+        if (value.definition_kind != QL_IR_VALUE_PARAMETER ||
+            value.name == NULL ||
+            strstr(value.name, ".__base") == NULL) {
+            continue;
+        }
+        if (found == capacity) {
+            const size_t next = capacity == 0u ? 8u : capacity * 2u;
+            void *grown = allocator->reallocate(allocator->user_data, list,
+                                                next * sizeof(*list));
+            if (grown == NULL) {
+                allocator->deallocate(allocator->user_data, list);
+                ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                return QL_STATUS_OUT_OF_MEMORY;
+            }
+            list = (uint32_t *)grown;
+            capacity = next;
+        }
+        list[found++] = value.id;
+    }
+    *indices = list;
+    *count = found;
+    return QL_STATUS_OK;
+}
+
+/* The object table is the objects each side declares, in the order it
+   declares them. The pointer arguments' objects come first and keep the
+   argument correspondence, so a problem that permutes the two argument lists
+   still binds the same storage to the same symbol; the objects a lowering
+   made for itself follow, and correspond by position, because nothing in the
+   source signature names them. Both sides must declare the same number, or
+   one is reasoning about storage the other does not have. */
+static ql_status build_objects(ql_product_query *query, const ql_ir *left_ir,
+                               const ql_ir *right_ir, uint32_t **left_map,
+                               uint32_t **right_map, ql_error *error) {
+    uint32_t *left_bases = NULL;
+    uint32_t *right_bases = NULL;
+    size_t left_count = 0u;
+    size_t right_count = 0u;
+    size_t pointer_count = 0u;
+    size_t index;
+    size_t next = 0u;
+    ql_status status = collect_object_parameters(left_ir, &query->allocator,
+                                                 &left_bases, &left_count,
+                                                 error);
+
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    status = collect_object_parameters(right_ir, &query->allocator,
+                                       &right_bases, &right_count, error);
+    if (status != QL_STATUS_OK) {
+        query->allocator.deallocate(query->allocator.user_data, left_bases);
+        return status;
+    }
+    if (left_count != right_count) {
+        query->allocator.deallocate(query->allocator.user_data, left_bases);
+        query->allocator.deallocate(query->allocator.user_data, right_bases);
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "the two sides declare %zu and %zu objects, so they do not describe the same storage",
+                     left_count, right_count);
+        return QL_STATUS_TYPE_MISMATCH;
+    }
     for (index = 0u; index < query->view.input_count; ++index) {
         if (query->inputs[index].kind == QL_SOURCE_TYPE_POINTER) {
-            ++count;
+            ++pointer_count;
         }
     }
-    query->object_count = count;
-    if (count == 0u) {
+    if (left_count < pointer_count) {
+        query->allocator.deallocate(query->allocator.user_data, left_bases);
+        query->allocator.deallocate(query->allocator.user_data, right_bases);
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "the sides declare %zu objects for %zu pointer arguments",
+                     left_count, pointer_count);
+        return QL_STATUS_TYPE_MISMATCH;
+    }
+    query->object_count = left_count;
+    if (left_count == 0u) {
+        query->allocator.deallocate(query->allocator.user_data, left_bases);
+        query->allocator.deallocate(query->allocator.user_data, right_bases);
         return QL_STATUS_OK;
     }
     query->objects = query->allocator.allocate(
-        query->allocator.user_data, count * sizeof(*query->objects));
+        query->allocator.user_data, left_count * sizeof(*query->objects));
     *left_map = query->allocator.allocate(query->allocator.user_data,
-                                          count * sizeof(**left_map));
+                                          left_count * sizeof(**left_map));
     *right_map = query->allocator.allocate(query->allocator.user_data,
-                                           count * sizeof(**right_map));
+                                           left_count * sizeof(**right_map));
     if (query->objects == NULL || *left_map == NULL || *right_map == NULL) {
+        query->allocator.deallocate(query->allocator.user_data, left_bases);
+        query->allocator.deallocate(query->allocator.user_data, right_bases);
         ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
         return QL_STATUS_OUT_OF_MEMORY;
     }
-    memset(query->objects, 0, count * sizeof(*query->objects));
+    memset(query->objects, 0, left_count * sizeof(*query->objects));
+
+    /* The pointer arguments' objects, in left argument order. */
     for (index = 0u; index < query->view.input_count; ++index) {
         const ql_product_input_v1 *input = &query->inputs[index];
         product_object *object;
@@ -2264,18 +2411,42 @@ static ql_status build_objects(ql_product_query *query,
                      "obj%zu_base", next) < 0 ||
             snprintf(object->size_symbol, sizeof(object->size_symbol),
                      "obj%zu_size", next) < 0) {
+            query->allocator.deallocate(query->allocator.user_data,
+                                        left_bases);
+            query->allocator.deallocate(query->allocator.user_data,
+                                        right_bases);
             ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
-                         "could not format an object symbol");
+                         "could not format a product object symbol");
             return QL_STATUS_INTERNAL_ERROR;
         }
-        object->left_base_parameter =
-            (uint32_t)(query->view.input_count + 1u + 2u * next);
-        object->right_base_parameter =
-            (uint32_t)(query->view.input_count + 1u + 2u * right_rank);
+        object->left_base_parameter = left_bases[next];
+        object->right_base_parameter = right_bases[right_rank];
         (*left_map)[next] = (uint32_t)next;
         (*right_map)[right_rank] = (uint32_t)next;
         ++next;
     }
+    /* Then the objects the lowerings made for themselves, by position. */
+    for (; next < left_count; ++next) {
+        product_object *object = &query->objects[next];
+        if (snprintf(object->base_symbol, sizeof(object->base_symbol),
+                     "obj%zu_base", next) < 0 ||
+            snprintf(object->size_symbol, sizeof(object->size_symbol),
+                     "obj%zu_size", next) < 0) {
+            query->allocator.deallocate(query->allocator.user_data,
+                                        left_bases);
+            query->allocator.deallocate(query->allocator.user_data,
+                                        right_bases);
+            ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                         "could not format a product object symbol");
+            return QL_STATUS_INTERNAL_ERROR;
+        }
+        object->left_base_parameter = left_bases[next];
+        object->right_base_parameter = right_bases[next];
+        (*left_map)[next] = (uint32_t)next;
+        (*right_map)[next] = (uint32_t)next;
+    }
+    query->allocator.deallocate(query->allocator.user_data, left_bases);
+    query->allocator.deallocate(query->allocator.user_data, right_bases);
     return QL_STATUS_OK;
 }
 
@@ -2449,7 +2620,8 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
         goto cleanup;
     }
     query->view.input_count = left_signature_view.argument_count;
-    status = build_objects(query, &left_object_map, &right_object_map, error);
+    status = build_objects(query, left_ir, right_ir, &left_object_map,
+                           &right_object_map, error);
     if (status != QL_STATUS_OK) {
         goto cleanup;
     }

@@ -42,6 +42,7 @@ typedef struct verify_instruction {
     const ql_ir_value_id *results;
     size_t result_count;
     size_t symbol_size;
+    size_t image_size;
     size_t position;
     uint64_t key;
     uint8_t owned;
@@ -340,6 +341,7 @@ static ql_status verify_load_instructions(verify_context *context,
         instruction->results = view.results;
         instruction->result_count = view.result_count;
         instruction->symbol_size = view.symbol_size;
+        instruction->image_size = view.image_size;
         instruction->position = 0u;
         instruction->key = 0u;
         instruction->owned = 0u;
@@ -1147,7 +1149,7 @@ static ql_status verify_shape(verify_context *context,
                            instruction->opcode);
     }
     if (instruction->opcode == 0u ||
-        instruction->opcode > QL_IR_OPCODE_FP_TRUNC) {
+        instruction->opcode > QL_IR_OPCODE_MEMORY_IMAGE) {
         return verify_fail(context, QL_IR_VERIFY_OPCODE, block, id,
                            QL_IR_INVALID_VALUE_ID, "unknown opcode %u",
                            instruction->opcode);
@@ -1413,6 +1415,28 @@ static ql_status verify_shape(verify_context *context,
     case QL_IR_OPCODE_ASSUME:
         VERIFY_ARITY(1, 0);
         VERIFY_TYPES(first_kind == QL_IR_TYPE_BOOL, "assume");
+        break;
+    case QL_IR_OPCODE_MEMORY_IMAGE:
+        VERIFY_ARITY(2, 1);
+        VERIFY_TYPES(first_kind == QL_IR_TYPE_MEMORY &&
+                         verify_value_kind(context, instruction->operands[1]) ==
+                             QL_IR_TYPE_POINTER &&
+                         result_kind == QL_IR_TYPE_BOOL,
+                     "memory image");
+        if (instruction->image_size == 0u) {
+            return verify_fail(context, QL_IR_VERIFY_TYPE_RULE, block, id,
+                               QL_IR_INVALID_VALUE_ID,
+                               "a memory image states no bytes");
+        }
+        if (instruction->effects != 0u) {
+            /* An image asks a question about a memory value. If it declared
+               an effect it would be an access, and the rule below would then
+               demand a guard for something that accesses nothing. */
+            return verify_fail(context, QL_IR_VERIFY_EFFECT_RULE, block, id,
+                               QL_IR_INVALID_VALUE_ID,
+                               "a memory image declares an effect though it "
+                               "performs no access");
+        }
         break;
     case QL_IR_OPCODE_UB_GUARD:
         VERIFY_ARITY(1, 0);

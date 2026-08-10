@@ -6,8 +6,9 @@
 
 QL_EXTERN_C_BEGIN
 
-/* Schema v1 is an append-only, acyclic, typed SSA control-flow graph. */
-#define QL_IR_ARTIFACT_SCHEMA_VERSION 1u
+/* An append-only, acyclic, typed SSA control-flow graph. v2 adds an
+   instruction image payload, which MEMORY_IMAGE carries. */
+#define QL_IR_ARTIFACT_SCHEMA_VERSION 2u
 
 typedef uint32_t ql_ir_instruction_id;
 
@@ -101,6 +102,19 @@ typedef uint32_t ql_ir_opcode;
 #define QL_IR_OPCODE_UBV_TO_FP UINT32_C(52)
 #define QL_IR_OPCODE_FP_EXT UINT32_C(53)
 #define QL_IR_OPCODE_FP_TRUNC UINT32_C(54)
+/* Asks whether a run of bytes stands at an address in a memory state.
+   Operands are the memory and the pointer; the bytes are the instruction's
+   image payload. The result is a bool, so stating that the bytes are there
+   is ASSUME of this, and nothing about the opcode itself decides whether it
+   is a statement or a question.
+
+   This exists so that bytes a program already states -- a string literal, an
+   initialised array -- reach the IR as the constants they are, instead of as
+   a store per byte with a bounds guard on each. The store chain said the same
+   thing at a cost that grew with the byte count and with the object count at
+   once, and it said it as a write, which it is not: nothing in the program
+   performs those writes. */
+#define QL_IR_OPCODE_MEMORY_IMAGE UINT32_C(55)
 #define QL_IR_OPCODE_EXTENSION_BASE UINT32_C(65536)
 
 typedef enum ql_ir_terminator_kind {
@@ -138,7 +152,13 @@ typedef struct ql_ir_instruction_definition_v1 {
     uint64_t immediate;
     const char *symbol;
     size_t symbol_size;
-    uint64_t reserved[4];
+    /* An instruction's constant byte payload. `symbol` is text and may not
+       contain NUL; this may contain anything, because the bytes a program
+       states about memory are bytes and not a name. MEMORY_IMAGE is what
+       carries one today. */
+    const void *image;
+    size_t image_size;
+    uint64_t reserved[2];
 } ql_ir_instruction_definition_v1;
 
 /* `condition` is used only by COND_BRANCH. RETURN uses `return_value` unless
@@ -220,7 +240,9 @@ typedef struct ql_ir_instruction_view_v1 {
     uint64_t immediate;
     const char *symbol;
     size_t symbol_size;
-    uint64_t reserved[3];
+    const void *image;
+    size_t image_size;
+    uint64_t reserved[1];
 } ql_ir_instruction_view_v1;
 
 typedef struct ql_ir_block_view_v1 {

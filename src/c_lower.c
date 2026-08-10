@@ -6928,51 +6928,52 @@ static ql_status materialize_stack_slots(lower_context *context,
 /* Writes a run of bytes into an object through its own base pointer. Both a
    string literal and an initialised char array come to the same thing, so
    they share one writer rather than two that could drift. */
-static ql_status store_bytes(lower_context *context,
-                             const lower_variable *variable,
-                             const unsigned char *bytes, size_t size,
-                             ql_error *error) {
-    lower_value base = stack_address(context, variable);
-    lower_type offset_type = make_integer_type(64u, 4u, 1u);
-    size_t at;
+/* States that a run of bytes stands at the start of an object, as one IR
+   instruction carrying the bytes.
 
-    for (at = 0u; at < size; ++at) {
-        lower_value slot = base;
-        lower_value offset;
-        lower_value value;
-        ql_status status = QL_STATUS_OK;
+   This used to be a store per byte. That said the same thing, but it said it
+   as a write the program never performs, and it cost an address, a constant,
+   a bounds guard over every live object, and a store for each byte -- so the
+   work grew with the byte count and the object count multiplied together.
+   The bytes are constants the program already states, so the IR states them
+   as constants. */
+static ql_status assume_bytes(lower_context *context, lower_value address,
+                              const unsigned char *bytes, size_t size,
+                              ql_error *error) {
+    ql_ir_instruction_definition_v1 definition;
+    ql_ir_instruction_id instruction;
+    ql_ir_value_id operands[2];
+    ql_ir_value_id holds;
+    ql_ir_type_id result_type;
+    lower_type boolean = make_bool_type();
+    ql_status status;
 
-        if (at != 0u) {
-            memset(&offset, 0, sizeof(offset));
-            offset.type = offset_type;
-            offset.defined = context->true_value;
-            status = add_uint_constant(context, offset.type, (uint64_t)at,
-                                       &offset.value, error);
-            if (status == QL_STATUS_OK) {
-                status = emit_pointer_offset(context, base, offset, 0, &slot,
-                                             error);
-            }
-            if (status != QL_STATUS_OK || context->unknown != 0u) {
-                return status;
-            }
-        }
-        memset(&value, 0, sizeof(value));
-        value.type = array_element(variable->type);
-        value.defined = context->true_value;
-        status = ensure_ir_type(context, &value.type, error);
-        if (status == QL_STATUS_OK) {
-            status = add_uint_constant(context, value.type,
-                                       (uint64_t)bytes[at], &value.value,
-                                       error);
-        }
-        if (status == QL_STATUS_OK) {
-            status = emit_store(context, slot, value, error);
-        }
-        if (status != QL_STATUS_OK || context->unknown != 0u) {
-            return status;
-        }
+    if (size == 0u) {
+        return QL_STATUS_OK;
     }
-    return QL_STATUS_OK;
+    status = ensure_ir_type(context, &boolean, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    result_type = boolean.ir_type;
+    operands[0] = context->memory_value;
+    operands[1] = address.value;
+    ql_ir_instruction_definition_init(&definition,
+                                      QL_IR_OPCODE_MEMORY_IMAGE);
+    definition.operands = operands;
+    definition.operand_count = 2u;
+    definition.result_types = &result_type;
+    definition.result_count = 1u;
+    definition.image = bytes;
+    definition.image_size = size;
+    status = ql_ir_builder_append_instruction(context->builder,
+                                              context->current_block,
+                                              &definition, &instruction,
+                                              &holds, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    return emit_assume(context, holds, error);
 }
 
 static ql_status materialize_globals(lower_context *context,
@@ -7073,8 +7074,9 @@ static ql_status materialize_globals(lower_context *context,
                                                text);
             }
             if (ok) {
-                status = store_bytes(context, variable, decoded,
-                                     decoded_size, error);
+                status = assume_bytes(context,
+                                      stack_address(context, variable),
+                                      decoded, decoded_size, error);
                 if (status != QL_STATUS_OK || context->unknown != 0u) {
                     return status;
                 }
@@ -7112,8 +7114,9 @@ static ql_status materialize_globals(lower_context *context,
 }
 
 /* A literal's bytes are stated by the program, so they are written into the
-   object before the body runs, exactly as an initialised global's value is.
-   What the caller supplied for those bytes is therefore never read. */
+   object as one image instruction, exactly as an initialised char array's
+   are. Nothing writes them: the program states them, so the IR states them
+   and the entry block assumes they hold. */
 static ql_status materialize_strings(lower_context *context,
                                      ql_error *error) {
     lower_type byte = make_integer_type(8u, 1u, 1u);
@@ -7126,7 +7129,6 @@ static ql_status materialize_strings(lower_context *context,
         lower_value base;
         ql_ir_value_id expected;
         ql_ir_value_id predicate;
-        size_t at;
         ql_status status;
 
         if (literal->object == SIZE_MAX) {
@@ -7163,38 +7165,10 @@ static ql_status materialize_strings(lower_context *context,
             return status;
         }
         literal->address = base.value;
-        for (at = 0u; at < literal->size; ++at) {
-            lower_value slot = base;
-            lower_value offset;
-            lower_value value;
-
-            memset(&offset, 0, sizeof(offset));
-            offset.type = make_integer_type(64u, 4u, 1u);
-            offset.defined = context->true_value;
-            status = add_uint_constant(context, offset.type, (uint64_t)at,
-                                       &offset.value, error);
-            if (status == QL_STATUS_OK && at != 0u) {
-                status = emit_pointer_offset(context, base, offset, 0, &slot,
-                                             error);
-            }
-            if (status != QL_STATUS_OK || context->unknown != 0u) {
-                return status;
-            }
-            memset(&value, 0, sizeof(value));
-            value.type = byte;
-            value.defined = context->true_value;
-            status = ensure_ir_type(context, &value.type, error);
-            if (status == QL_STATUS_OK) {
-                status = add_uint_constant(context, value.type,
-                                           (uint64_t)literal->bytes[at],
-                                           &value.value, error);
-            }
-            if (status == QL_STATUS_OK) {
-                status = emit_store(context, slot, value, error);
-            }
-            if (status != QL_STATUS_OK || context->unknown != 0u) {
-                return status;
-            }
+        status = assume_bytes(context, base, literal->bytes, literal->size,
+                              error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
         }
     }
     return QL_STATUS_OK;

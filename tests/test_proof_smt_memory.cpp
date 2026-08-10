@@ -127,6 +127,189 @@ TEST(SmtProductMemory, BuildsAnArrayQueryWithSharedObjects) {
     ql_product_query_destroy(query);
 }
 
+/* A string literal is an object whose bytes the program states. The lowering
+   states them as one MEMORY_IMAGE rather than a store per byte, so the miter
+   has to turn that into the array theory's initial contents for the range:
+   one equality per byte against `select` on the initial memory. If it did
+   not, the object's bytes would be unconstrained and the solver could pick
+   any of them. */
+TEST(SmtProductMemory, AMemoryImageBecomesInitialArrayContents) {
+    constexpr char left[] =
+        "const char TXT_L[] = \"hi\";\n"
+        "int f(int i){ return TXT_L[i]; }";
+    constexpr char right[] =
+        "const char TXT_R[] = \"hi\";\n"
+        "int g(int j){ return TXT_R[j]; }";
+    w2::Pair pair;
+    ql_product_query *query = nullptr;
+    ql_artifact_view prefix{};
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build(left, "f", right, "g",
+                         w2::ContractObserving(MemoryObservations()), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_product_query_build(nullptr, pair.problem(), pair.left_ir(),
+                                     pair.right_ir(), &query, &error))
+        << error.message;
+    prefix.struct_size = sizeof(prefix);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_artifact_get_view(ql_product_query_prefix_artifact(query),
+                                   &prefix, &error));
+    const std::string text(static_cast<const char *>(prefix.data),
+                           prefix.size);
+
+    /* 'h', 'i', and the terminator, each pinned against a select on the
+       initial memory rather than against a stored-into version. */
+    EXPECT_NE(std::string::npos, text.find("(_ bv104 8)"));
+    EXPECT_NE(std::string::npos, text.find("(_ bv105 8)"));
+    EXPECT_NE(std::string::npos, text.find("(_ bv0 8)"));
+    EXPECT_NE(std::string::npos, text.find("(select mem0 "));
+    /* The image reaches the query as an assumption, so it is inside the
+       assumption conjunction and not asserted unconditionally. */
+    EXPECT_NE(std::string::npos, text.find("quodlibet_assumptions"));
+    /* Nothing writes those bytes: with the image there is no store chain to
+       build a new memory version from. */
+    EXPECT_EQ(std::string::npos, text.find("(store mem0 "));
+    ql_product_query_destroy(query);
+}
+
+/* Same pair, driven to a verdict: the two literals are the same bytes, so the
+   values read out of them agree. This is what says the encoding is usable and
+   not merely present. */
+TEST(SmtProductMemory, ProvesTwoLiteralsWithTheSameBytesAgree) {
+    constexpr char left[] =
+        "const char TXT_A[] = \"hi\";\n"
+        "int f(int i){ return TXT_A[i]; }";
+    constexpr char right[] =
+        "const char TXT_B[] = \"hi\";\n"
+        "int g(int j){ return TXT_B[j]; }";
+    w2::Pair pair;
+    OutcomeRun run;
+    ql_error error{};
+
+    if (!BackendAvailable()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build(left, "f", right, "g",
+                         w2::ContractObserving(MemoryObservations()), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, run.Run(pair, kTrusted, &error)) << error.message;
+    const ql_smt_product_outcome_view_v1 view = run.view();
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_UNSAT, view.violation_answer);
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_SAT, view.domain_answer);
+    EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, view.verdict);
+}
+
+/* Two sides whose static data differs cannot both hold in this model: the
+   miter gives corresponding objects one base in one shared array, so the two
+   images contradict each other and the domain is empty.
+
+   That is incomplete, not unsound, and the pipeline is what makes the
+   difference: an empty domain is never promoted, so the pair comes back
+   without a verdict instead of coming back proved. Making it decidable means
+   giving the objects a lowering invents an identity per side, which is a
+   change to what the miter says storage is, not to what an image says. */
+TEST(SmtProductMemory, DifferentStaticBytesEmptyTheDomainRatherThanProving) {
+    constexpr char left[] =
+        "const char TXT_C[] = \"hi\";\n"
+        "int f(int i){ return TXT_C[i]; }";
+    constexpr char right[] =
+        "const char TXT_D[] = \"ho\";\n"
+        "int g(int j){ return TXT_D[j]; }";
+    w2::Pair pair;
+    OutcomeRun run;
+    ql_error error{};
+
+    if (!BackendAvailable()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build(left, "f", right, "g",
+                         w2::ContractObserving(MemoryObservations()), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, run.Run(pair, kTrusted, &error)) << error.message;
+    const ql_smt_product_outcome_view_v1 view = run.view();
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_UNSAT, view.domain_answer);
+    /* An empty domain proves nothing, and the envelope says so rather than
+       reading the vacuous UNSAT as agreement. */
+    EXPECT_NE(QL_VERDICT_PROVED_EQUIVALENT, view.verdict);
+}
+
+/* A global is storage both sides share, so a pair over one reaches a verdict
+   the same way a pointer argument does. Until the object table admitted
+   objects a lowering makes for itself, this pair could not even be built. */
+TEST(SmtProductMemory, ProvesAPairOverAGlobal) {
+    w2::Pair pair;
+    OutcomeRun run;
+    ql_error error{};
+
+    if (!BackendAvailable()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build("int GA; int f(int i){ GA = i + 1; return GA; }", "f",
+                         "int GB; int g(int j){ GB = 1 + j; return GB; }", "g",
+                         w2::ContractObserving(MemoryObservations()), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, run.Run(pair, kTrusted, &error)) << error.message;
+    const ql_smt_product_outcome_view_v1 view = run.view();
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_UNSAT, view.violation_answer);
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_SAT, view.domain_answer);
+    EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, view.verdict);
+}
+
+/* And a real difference over that global is found, so the pair above is not
+   passing because the miter cannot see the storage at all. */
+TEST(SmtProductMemory, AGlobalLeftHoldingADifferentValueIsACounterexample) {
+    w2::Pair pair;
+    OutcomeRun run;
+    ql_error error{};
+
+    if (!BackendAvailable()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build("int GC; int f(int i){ GC = i + 1; return i; }", "f",
+                         "int GD; int g(int j){ GD = j + 2; return j; }", "g",
+                         w2::ContractObserving(MemoryObservations()), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, run.Run(pair, kTrusted, &error)) << error.message;
+    const ql_smt_product_outcome_view_v1 view = run.view();
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_SAT, view.violation_answer);
+    EXPECT_NE(QL_VERDICT_PROVED_EQUIVALENT, view.verdict);
+}
+
+/* A local array is storage the lowering invents. Two spellings of the same
+   writes agree, which needs the object table, the pinned size, and the access
+   guards all to line up. */
+TEST(SmtProductMemory, ProvesAPairOverALocalArray) {
+    constexpr char left[] =
+        "int f(int a){ int buf[4]; buf[0] = a; buf[1] = a + 1; "
+        "return buf[0] + buf[1]; }";
+    constexpr char right[] =
+        "int g(int b){ int arr[4]; arr[1] = b + 1; arr[0] = b; "
+        "return arr[1] + arr[0]; }";
+    w2::Pair pair;
+    OutcomeRun run;
+    ql_error error{};
+
+    if (!BackendAvailable()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build(left, "f", right, "g",
+                         w2::ContractObserving(MemoryObservations()), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, run.Run(pair, kTrusted, &error)) << error.message;
+    const ql_smt_product_outcome_view_v1 view = run.view();
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_UNSAT, view.violation_answer);
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_SAT, view.domain_answer);
+    EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, view.verdict);
+}
+
 TEST(SmtProductMemory, ProvesTwoSpellingsOfTheSameWrite) {
     w2::Pair pair;
     OutcomeRun run;

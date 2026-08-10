@@ -965,6 +965,42 @@ static int interp_execute_instruction(
         bits_mask(&result.bits, result_width);
         break;
     }
+    case QL_IR_OPCODE_MEMORY_IMAGE: {
+        const interp_value *pointer =
+            &context->values[instruction->operands[1]];
+        uint64_t address;
+        size_t byte;
+        int holds = 1;
+        if (left->defined == 0u || pointer->defined == 0u) {
+            result.defined = 0u;
+            break;
+        }
+        address = pointer->bits.words[0];
+        /* The bytes have to be somewhere an access could reach them. An
+           image of bytes outside every live object is a claim about storage
+           that does not exist, which is false rather than unmodelled. */
+        if (bits_exceeds_word(&pointer->bits) ||
+            !interp_access_defined(context, address, 1u) ||
+            !interp_access_defined(
+                context, address + (uint64_t)(instruction->image_size - 1u),
+                1u)) {
+            holds = 0;
+        }
+        for (byte = 0u; holds != 0 && byte < instruction->image_size;
+             ++byte) {
+            uint8_t value = 0u;
+            (void)interp_read_byte(context, left->store,
+                                   address + (uint64_t)byte, &value);
+            if (value != ((const uint8_t *)instruction->image)[byte]) {
+                holds = 0;
+            }
+        }
+        bits_zero(&result.bits);
+        if (holds != 0) {
+            result.bits.words[0] = 1u;
+        }
+        break;
+    }
     case QL_IR_OPCODE_STORE: {
         const interp_value *pointer =
             &context->values[instruction->operands[1]];
