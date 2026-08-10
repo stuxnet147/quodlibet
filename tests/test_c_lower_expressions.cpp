@@ -103,6 +103,13 @@ QL_EXPR_FUNCTION(compound_narrow, int expr_narrow(short a, int b) {
     c += (short) b;
     return c;
 });
+QL_EXPR_FUNCTION(sizeof_types,
+    typedef unsigned short TYP_SIZE_WORD;
+    struct expr_size_pair { char first; int second; };
+    int expr_sizeof_types(int a, int b) {
+        return (int)(sizeof(TYP_SIZE_WORD) + sizeof(int *) +
+                     sizeof(struct expr_size_pair)) + (a - a) + (b - b);
+    });
 
 namespace {
 
@@ -143,7 +150,16 @@ public:
         if (ql_c_lower_result_get_view(result_, &view, &error) !=
                 QL_STATUS_OK ||
             view.support != QL_C_LOWER_SUPPORTED) {
-            ADD_FAILURE() << "the lowering did not accept " << name;
+            ql_c_lower_diagnostic_view_v1 diagnostic{};
+            diagnostic.struct_size = sizeof(diagnostic);
+            if (view.diagnostic_count != 0u &&
+                ql_c_lower_result_diagnostic_at(result_, 0u, &diagnostic,
+                                                &error) == QL_STATUS_OK) {
+                ADD_FAILURE() << "the lowering did not accept " << name
+                              << ": " << diagnostic.message;
+            } else {
+                ADD_FAILURE() << "the lowering did not accept " << name;
+            }
             return false;
         }
         if (ql_ir_open(nullptr, view.ir_artifact, &ir_, &error) !=
@@ -312,6 +328,9 @@ const Case kCases[] = {
          return expr_narrow(static_cast<short>(a), b);
      },
      &Always},
+    {"sizeof-types", sizeof_types_source, "expr_sizeof_types",
+     [](int32_t a, int32_t b) { return expr_sizeof_types(a, b); },
+     &Always},
 };
 
 /* Small enough that the arithmetic in every case stays inside the defined
@@ -405,17 +424,33 @@ TEST(CLowerExpressions, RefusesWhatItCannotState) {
     struct Refused {
         const char *source;
         const char *name;
+        int expected;
     };
     const Refused cases[] = {
         /* Reading a target before it is written stays a refusal, and a
            compound assignment reads its target. */
-        {"int f(int a) { int c; c += a; return c; }", "f"},
+        {"int f(int a) { int c; c += a; return c; }", "f",
+         -1},
         /* A const local is not writable, whatever the operator. */
-        {"int f(int a) { const int c = a; c += 1; return c; }", "f"},
+        {"int f(int a) { const int c = a; c += 1; return c; }", "f",
+         -1},
         /* An arm of a conditional that has no value this slice can carry. */
         {"struct S { int x; };\n"
          "int f(int a, struct S *p, struct S *q) { return (a ? *p : *q).x; }",
-         "f"},
+         "f", -1},
+        /* `sizeof(expression)` must not lower its operand. A future static
+           type query may accept this without ever evaluating `1 / a`. */
+        {"unsigned long f(int a) { return sizeof(1 / a); }", "f",
+         QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION},
+        /* The first slice accepts complete scalar, pointer and record type
+           descriptors, but not array declarators. */
+        {"unsigned long f(void) { return sizeof(int[4]); }", "f",
+         QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE},
+        /* A typedef can name an incomplete/non-object type too. It remains a
+           semantic UNKNOWN instead of becoming an indexing or status error. */
+        {"typedef void TYP_NO_OBJECT;\n"
+         "unsigned long f(void) { return sizeof(TYP_NO_OBJECT); }", "f",
+         QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR},
     };
     for (const Refused &item : cases) {
         ql_c_frontend_unit *unit = nullptr;
@@ -442,6 +477,16 @@ TEST(CLowerExpressions, RefusesWhatItCannotState) {
                   ql_c_lower_result_get_view(result, &view, &error));
         /* A limit is always UNKNOWN, never a status failure. */
         EXPECT_EQ(QL_C_LOWER_UNKNOWN, view.support);
+        if (item.expected >= 0) {
+            ql_c_lower_diagnostic_view_v1 diagnostic{};
+            diagnostic.struct_size = sizeof(diagnostic);
+            ASSERT_EQ(1u, view.diagnostic_count);
+            ASSERT_EQ(QL_STATUS_OK,
+                      ql_c_lower_result_diagnostic_at(result, 0u,
+                                                      &diagnostic, &error));
+            EXPECT_EQ(static_cast<ql_c_lower_diagnostic_code>(item.expected),
+                      diagnostic.code);
+        }
         ql_c_lower_result_destroy(result);
         ql_c_frontend_unit_destroy(unit);
     }

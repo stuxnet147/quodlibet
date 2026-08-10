@@ -222,6 +222,32 @@ spawn 은 9p 에서 순차 5.45ms 로 비싸지만 **병렬화가 잘 되고**(1
 
 프로세스 쪽 워커당 절대 처리량이 낮은 것은 워커마다 인터프리터 시작과 backend 프로브를 따로 물기 때문이다. 곡선의 모양이 논점이다.
 
+## G8 코퍼스 처리량 (2026-08-10)
+
+G8은 비율뿐 아니라 함수/초를 요구합니다. `bench-coverage.sh`가 JSON의
+실제 `definitions`를 읽어 처리량을 출력하도록 확장했습니다. 이 경로는
+파스, 프런트엔드, 로어링과 모든 `SUPPORTED` IR의 verifier를 포함합니다.
+
+호스트는 위와 같은 Windows 11이고, 대상은 Windows Clang RelWithDebInfo
+바이너리입니다. 네이티브 Windows 실행은 NTFS의 추출 코퍼스를 직접
+읽습니다. 최소값은 스케줄러 잡음이 가장 적은 반복입니다.
+
+| split | 반복 | 함수 | 로어링·검증 | 최소 wall | 함수/초 | digest |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| val | 5 | 1,050 | 365/365 | 909 ms | 1,155.12 | 3472372619 |
+| train | 3 | 29,880 | 8,755/8,755 | 19,287 ms | 1,549.23 | 3521655901 |
+
+```sh
+QL_PERF_EXE="$PWD/out/build/windows-clang/quodlibet.exe" \
+  ./scripts/perf/bench-coverage.sh val 5
+QL_PERF_EXE="$PWD/out/build/windows-clang/quodlibet.exe" \
+  ./scripts/perf/bench-coverage.sh train 3
+```
+
+두 split의 처리량 차이는 짧은 val 측정의 고정비와 파일 캐시 영향입니다.
+둘 사이를 성능 비교로 쓰지 않고, 같은 split과 digest의 이후 측정만 회귀
+비교에 씁니다.
+
 ## 건전성 확인
 
 튜닝이 판정을 바꾸지 않았음을 매번 전 구성으로 확인한다. `main` (`fbfac09`) 을 병합한 2026-08-10 기준:

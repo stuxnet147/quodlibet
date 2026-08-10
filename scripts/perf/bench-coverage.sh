@@ -25,14 +25,32 @@ if [ ! -x "$exe" ]; then
     exit 1
 fi
 
-list=$("$root/scripts/perf/stage-corpus.sh" "$split" 1)
+result="/tmp/qlperf-cov-$split.json"
+
+# Linux-on-WSL needs the corpus copied off the 9p mount before timing. A native
+# Windows executable is already reading native NTFS and cannot open MSYS /tmp
+# paths, so use the extracted corpus list in place.
+case "$exe" in
+    *.exe)
+        list="$root/out/corpus/$split/units.txt"
+        if [ ! -f "$list" ]; then
+            echo "error: $list is missing. Extract the corpus first." >&2
+            exit 1
+        fi
+        coverage_list=$(cygpath -w "$list")
+        ;;
+    *)
+        list=$("$root/scripts/perf/stage-corpus.sh" "$split" 1)
+        coverage_list="$list"
+        ;;
+esac
 units=$(wc -l < "$list")
 
 best=""
 run=1
 while [ "$run" -le "$repeats" ]; do
     start=$(date +%s%N)
-    "$exe" coverage "$list" > "/tmp/qlperf-cov-$split.json"
+    "$exe" coverage "$coverage_list" > "$result"
     end=$(date +%s%N)
     ms=$(( (end - start) / 1000000 ))
     if [ -z "$best" ] || [ "$ms" -lt "$best" ]; then
@@ -42,13 +60,32 @@ while [ "$run" -le "$repeats" ]; do
     run=$((run + 1))
 done
 
-digest=$(cksum < "/tmp/qlperf-cov-$split.json" | cut -d' ' -f1)
+digest=$(cksum < "$result" | cut -d' ' -f1)
+definitions=$(sed -n 's/.*"definitions": \([0-9][0-9]*\).*/\1/p' "$result")
+lowered=$(sed -n 's/.*"definitions_lowered": \([0-9][0-9]*\).*/\1/p' "$result")
+verified=$(sed -n 's/.*"definitions_lower_verified": \([0-9][0-9]*\).*/\1/p' "$result")
+unreadable=$(sed -n 's/.*"units_unreadable": \([0-9][0-9]*\).*/\1/p' "$result")
+
+if [ -z "$definitions" ] || [ -z "$lowered" ] || [ -z "$verified" ] ||
+    [ -z "$unreadable" ]; then
+    echo "error: coverage output is missing G8 measurement fields" >&2
+    exit 1
+fi
+if [ "$unreadable" -ne 0 ]; then
+    echo "error: coverage could not read $unreadable staged units" >&2
+    exit 1
+fi
 
 echo
 echo "split          $split"
 echo "units          $units"
+echo "functions      $definitions"
+echo "lowered        $lowered"
+echo "verified       $verified"
 echo "best wall      ${best} ms"
 awk -v b="$best" -v u="$units" 'BEGIN { printf "per unit       %.4f ms\n", b / u }'
+awk -v b="$best" -v f="$definitions" \
+    'BEGIN { printf "functions/s    %.2f\n", f * 1000 / b }'
 echo "result digest  $digest"
 echo
 echo "Compare against docs/perf/baseline.md. A changed digest means the"

@@ -3,6 +3,8 @@
 #include "quodlibet/c_frontend.h"
 #include "quodlibet/c_lower.h"
 #include "quodlibet/c_syntax.h"
+#include "quodlibet/ir.h"
+#include "quodlibet/ir_verify.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +62,8 @@ typedef struct ql_coverage_totals {
     unsigned long long definitions;
     unsigned long long definitions_frontend_supported;
     unsigned long long definitions_lowered;
+    unsigned long long definitions_lower_verified;
+    unsigned long long definitions_lower_verification_failed;
     unsigned long long definitions_lower_failed_status;
     unsigned long long frontend_codes[QL_COVERAGE_FRONTEND_CODE_MAX];
     unsigned long long lower_codes[QL_COVERAGE_LOWER_CODE_MAX];
@@ -245,6 +249,7 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
         ql_c_lower_result *lowered = NULL;
         ql_c_lower_result_view_v1 lower_view = { 0 };
         const char *outcome = "lower_error";
+        const char *detail_code = NULL;
         unsigned first_lower_code = 0u;
 
         function.struct_size = sizeof(function);
@@ -276,8 +281,25 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
                 QL_STATUS_OK) {
                 totals->definitions_lower_failed_status += 1u;
             } else if (lower_view.support == QL_C_LOWER_SUPPORTED) {
+                ql_ir *ir = NULL;
+                ql_ir_verify_report_v1 report;
+
                 totals->definitions_lowered += 1u;
-                outcome = "lowered";
+                ql_ir_verify_report_init(&report);
+                if (ql_ir_open(NULL, lower_view.ir_artifact, &ir, &error) ==
+                        QL_STATUS_OK &&
+                    ql_ir_verify(NULL, ir, &report, &error) == QL_STATUS_OK) {
+                    totals->definitions_lower_verified += 1u;
+                    outcome = "lowered";
+                    detail_code = "none";
+                } else {
+                    totals->definitions_lower_verification_failed += 1u;
+                    outcome = "verify_failed";
+                    detail_code = report.code != QL_IR_VERIFY_OK
+                                      ? ql_ir_verify_code_string(report.code)
+                                      : "ir_open_or_verify_error";
+                }
+                ql_ir_release(ir);
             } else {
                 outcome = "unknown";
                 coverage_count_lower(totals, lowered,
@@ -296,10 +318,12 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
         ql_c_lower_result_destroy(lowered);
 
         if (detail != NULL) {
-            const char *code_name =
-                first_lower_code < QL_COVERAGE_LOWER_CODE_MAX
-                    ? k_lower_code_names[first_lower_code]
-                    : "unknown_code";
+            const char *code_name = detail_code;
+            if (code_name == NULL) {
+                code_name = first_lower_code < QL_COVERAGE_LOWER_CODE_MAX
+                                ? k_lower_code_names[first_lower_code]
+                                : "unknown_code";
+            }
             (void)fprintf(detail, "%s\t%s\t%s\t%s\n", path,
                           function.name != NULL ? function.name : "?", outcome,
                           code_name);
@@ -325,6 +349,10 @@ static void coverage_print_json(const ql_coverage_totals *totals) {
                  totals->definitions_frontend_supported);
     (void)printf("  \"definitions_lowered\": %llu,\n",
                  totals->definitions_lowered);
+    (void)printf("  \"definitions_lower_verified\": %llu,\n",
+                 totals->definitions_lower_verified);
+    (void)printf("  \"definitions_lower_verification_failed\": %llu,\n",
+                 totals->definitions_lower_verification_failed);
     (void)printf("  \"definitions_lower_failed_status\": %llu,\n",
                  totals->definitions_lower_failed_status);
 
@@ -419,5 +447,5 @@ int ql_cli_coverage(const char *list_path, const char *detail_path) {
     }
     ql_c_parser_destroy(parser);
     coverage_print_json(&totals);
-    return 0;
+    return totals.definitions_lower_verification_failed == 0u ? 0 : 1;
 }

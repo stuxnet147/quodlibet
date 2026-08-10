@@ -4453,6 +4453,127 @@ static int abstract_pointer_depth(const lower_context *context,
     return declarator == SIZE_MAX;
 }
 
+/* Resolves the type descriptor carried by `sizeof(type)`. The expression
+   form deliberately does not come through here: asking for its type must not
+   lower and therefore evaluate it. That needs a separate static type query. */
+static ql_status lower_sizeof_type(lower_context *context, size_t node,
+                                   lower_value *output, ql_error *error) {
+    size_t descriptor = direct_field_child(context, node, "type");
+    size_t value_node = direct_field_child(context, node, "value");
+    size_t diagnostic_node = descriptor != SIZE_MAX ? descriptor : node;
+    size_t type_node;
+    size_t end;
+    size_t child;
+    uint32_t pointer_depth = 0u;
+    lower_type measured;
+    lower_type size_type = make_integer_type(64u, 4u, 0u);
+    uint64_t size;
+    ql_status status;
+
+    if (descriptor == SIZE_MAX) {
+        /* Tree-sitter cannot know that an identifier is a typedef. It parses
+           `sizeof(T)` as an expression, just as it parses `(T)(x)` as a call.
+           Recover only the unambiguous case this unit's symbol tables settle:
+           one parenthesised identifier that names a typedef and is not
+           shadowed by a visible object. */
+        size_t identifier = SIZE_MAX;
+        char *name = NULL;
+        ql_c_scalar_type corpus_type;
+        int names_type = 0;
+        if (value_node != SIZE_MAX &&
+            strcmp(context->nodes[value_node].view.kind,
+                   "parenthesized_expression") == 0) {
+            identifier = first_named_child(context, value_node);
+        }
+        if (identifier != SIZE_MAX &&
+            strcmp(context->nodes[identifier].view.kind, "identifier") == 0) {
+            name = copy_node_text(context, identifier);
+            diagnostic_node = identifier;
+        }
+        if (name != NULL &&
+            find_variable(context, name, strlen(name)) == NULL) {
+            names_type = find_typedef(context, name) != NULL ||
+                         ql_c_scalar_from_corpus_typedef(name,
+                                                        &corpus_type);
+        }
+        if (names_type != 0) {
+            status = parse_type_spelling(context, name, identifier, 0u,
+                                         &measured, error);
+            context->allocator->deallocate(context->allocator->user_data,
+                                           name);
+            if (status != QL_STATUS_OK || context->unknown != 0u) {
+                return status;
+            }
+        } else {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           name);
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION,
+                value_node != SIZE_MAX ? value_node : node,
+                "sizeof(expression) needs a static type query; its operand "
+                "is not evaluated", error);
+        }
+    } else {
+        type_node = direct_field_child(context, descriptor, "type");
+        if (type_node == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, descriptor,
+                "sizeof type descriptor names no type", error);
+        }
+        end = subtree_end(context, descriptor);
+        for (child = descriptor + 1u; child < end; ++child) {
+            if (context->nodes[child].parent != descriptor ||
+                context->nodes[child].view.field_name == NULL ||
+                strcmp(context->nodes[child].view.field_name,
+                       "declarator") != 0) {
+                continue;
+            }
+            if (!abstract_pointer_depth(context, child, &pointer_depth)) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, child,
+                    "sizeof of an array or function type needs a complete "
+                    "type-descriptor query", error);
+            }
+            if (pointer_depth > 2u) {
+                return lower_unknown(
+                    context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
+                    "this slice carries at most two levels of indirection",
+                    error);
+            }
+            break;
+        }
+        if (strcmp(context->nodes[type_node].view.kind,
+                   "atomic_type_specifier") == 0) {
+            return lower_unknown(
+                context,
+                QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_VOLATILE_OR_ATOMIC,
+                type_node,
+                "sizeof of an atomic type is outside the current type model",
+                error);
+        }
+        status = resolve_type_node(context, type_node, pointer_depth,
+                                   &measured, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+            return status;
+        }
+    }
+    size = type_byte_width(context, measured);
+    if (size == 0u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, diagnostic_node,
+            "sizeof requires a complete object type", error);
+    }
+    status = ensure_bool_constants(context, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    memset(output, 0, sizeof(*output));
+    output->type = size_type;
+    output->defined = context->true_value;
+    output->may_ub = 0u;
+    return add_uint_constant(context, size_type, size, &output->value, error);
+}
+
 static ql_status lower_cast_expression(lower_context *context, size_t node,
                                        lower_value *output,
                                        ql_error *error) {
@@ -5584,6 +5705,9 @@ static ql_status lower_expression(lower_context *context, size_t node,
     }
     if (strcmp(kind, "update_expression") == 0) {
         return lower_update_expression(context, node, output, error);
+    }
+    if (strcmp(kind, "sizeof_expression") == 0) {
+        return lower_sizeof_type(context, node, output, error);
     }
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
