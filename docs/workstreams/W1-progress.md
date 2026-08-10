@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **16,388 / 29,880 (54.85%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_loop` 4,962, `unsupported_type` 4,221, `uninitialized_read` 1,865입니다. `unsupported_control_flow`는 118까지 줄었습니다. 다음 단위는 타입과 definite initialization의 메시지별 큰 원인을 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **20,249 / 29,880 (67.77%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 4,543, `uninitialized_read` 2,438, `type_error` 699입니다. 구조화 루프 버킷은 0이 되었습니다. 다음 단위는 타입과 definite initialization의 메시지별 큰 원인을 닫습니다.
 
 ## 기준선
 
@@ -1296,17 +1296,41 @@ label에 정상 fallthrough도 도달하면 goto 상태들과 함께 임의 pred
 
 compiled differential은 두 전방 label, 중첩 block의 goto, 여러 합류 경로를 실제 C 실행과 edge 및 random 입력에서 대조합니다. product miter는 같은 cleanup을 early return과 structured if로 쓴 함수와 동치임을 증명합니다. 후방 edge와 선언 우회는 UNKNOWN 회귀 시험으로 고정합니다.
 
+### 30. 순환 CFG와 구조적 C 루프를 내린다
+
+커밋: (이 단위)
+
+IR payload에 이미 있던 `cfg_kind`를 사용해 `QL_IR_CFG_CYCLIC`을 추가했습니다. artifact schema와 payload 배치는 바꾸지 않았습니다. builder는 루프 헤더 결과를 먼저 노출한 뒤 back-edge가 완성될 때 incoming을 추가하는 append-only PHI API를 제공합니다. decoder와 reader view는 선언된 CFG 종류를 보존합니다.
+
+코어 검증은 비순환 그래프의 기존 Kahn 경로를 그대로 유지하고, 순환 그래프에서는 DFS reverse postorder와 반복 immediate-dominator 계산을 사용합니다. 독립 verifier는 지배자 비트 집합을 고정점까지 교집합합니다. 인터프리터는 back-edge를 실제로 실행하고 step limit을 실행 예산으로 사용하며, 한 블록의 PHI들을 이전 상태 snapshot에서 동시에 읽습니다. loop-free SMT product는 순환 IR을 명시적으로 거부하므로 루프를 증명했다고 주장하지 않습니다.
+
+C lowering은 `for`, `while`, `do while`을 구조 그대로 내립니다. 루프 진입 상태와 각 정상 back-edge, `continue` edge를 header PHI로 연결하고 scalar, memory, external-call trace를 함께 운반합니다. `for`의 `continue`는 update block을 거쳐 가며, `do while`의 `continue`는 조건 block으로 갑니다. `break`와 `continue` scope를 분리해 루프 안의 중첩 switch에서 `break`는 switch만, `continue`는 루프를 대상으로 합니다. ordinary label과 goto가 루프 안에 섞인 경우는 아직 별도 scope/lifetime 모델이 없어 UNKNOWN입니다.
+
+`const T *p`에서 `const`가 포인터 객체가 아니라 pointee를 한정한다는 점도 바로잡았습니다. 이 수정 전에는 포인터 인자나 지역 포인터의 정상 대입을 const 객체 수정으로 잘못 거부했습니다. 초기화 없는 const 객체는 존재할 수 있지만 읽기와 대입은 각각 기존 uninitialized/const 규칙으로 계속 거부합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 16,388 (54.85%) | **20,249 (67.77%)** |
+| 증가 | | **+3,861** |
+| `unsupported_loop` | 5,076 | **0** |
+| verifier 통과 | 16,388 / 16,388 | **20,249 / 20,249** |
+| status 실패 | 0 | **0** |
+
+`tests/test_ir.cpp`는 self-loop의 교차 PHI가 병렬로 실행되는지, cyclic artifact가 왕복 후 독립 verifier를 통과하는지 확인합니다. `tests/test_ir_interp.cpp`는 세 루프와 `break`/`continue` 결과를 고정합니다. `tests/test_ir_differential.cpp`는 같은 루프 소스를 실제 컴파일해 경계값과 무작위 입력에서 IR interpreter와 비교합니다.
+
 ## 막힌 것
 
 - 없음
 
-## 알게 된 로어링 공백 (2단계 후보)
+## 알게 된 로어링 공백
 
-시험을 쓰면서 발견한 것들입니다. 커버리지 재측정으로 순위를 정합니다.
+현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- **cast expression** (`(short)(a + b)`) 이 `lower_expression` 에 없습니다
-- conditional expression (`?:`), comma, `sizeof` 도 없습니다
-- `long` 은 로어링이 64비트로 봅니다 (LP64 타겟). differential 시험에서는 호스트와 어긋나므로 제외했습니다
+- `unsupported_type` 4,543
+- `uninitialized_read` 2,438
+- `type_error` 699
+- `unsupported_pointer` 607
+- `unsupported_control_flow` 423
 
 ## 조율자에게 요청할 것
 
@@ -1322,7 +1346,7 @@ compiled differential은 두 전방 label, 중첩 block의 goto, 여러 합류 �
 
 ## 다음에 할 것
 
-1. 최신 17,902개 UNKNOWN을 diagnostic message까지 다시 분류합니다. 요약 코드만으로는 `unsupported_type` 4,080과 `unsupported_loop` 4,056 내부의 독립 원인을 정할 수 없습니다.
-2. 비순환 CFG에서 정확히 내릴 수 있는 `switch`와 전방 `goto`, 남은 타입 철자를 빈도순으로 닫습니다.
-3. `for`, `while`, `do`와 후방 `goto`는 IR schema v1의 비순환 계약과 충돌합니다. G9 99%를 위해 schema v2 순환 CFG와 W6 CHC/PDR proof method를 함께 설계하고 구현해야 합니다.
+1. 최신 9,631개 UNKNOWN을 diagnostic message까지 다시 분류합니다. 요약 코드만으로는 타입과 definite-initialization 범주의 독립 원인을 정할 수 없습니다.
+2. 남은 타입 철자와 선언 형태를 빈도순으로 닫고, uninitialized address escape는 외부 호출의 memory-write 계약을 먼저 고정합니다.
+3. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.
 4. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.

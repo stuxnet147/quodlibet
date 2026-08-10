@@ -55,8 +55,21 @@ def test_counterexample_is_replayed_before_it_is_reported(backend):
     assert result.evidence.counterexample_digest != ""
 
 
-def test_a_source_outside_the_slice_stays_unknown(backend):
+def test_a_cyclic_source_stays_unknown_for_the_loop_free_method(backend):
     result = quodlibet.check(LOOPING, "add", SUM, "sum")
+    assert result.verdict == "unknown"
+    assert result.status.kind == "method"
+    assert result.status.ok is True
+    assert "loop-free" in result.diagnostic
+    assert result.counterexample is None
+
+
+def test_a_source_outside_the_lowering_slice_stays_unknown(backend):
+    volatile = (
+        "int add(int x, int y){ volatile int observed = x; "
+        "return observed + y; }"
+    )
+    result = quodlibet.check(volatile, "add", SUM, "sum")
     assert result.verdict == "unknown"
     assert result.status.kind == "unsupported"
     assert result.status.ok is False

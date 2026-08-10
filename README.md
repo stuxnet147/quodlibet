@@ -2,7 +2,9 @@
 
 Quodlibet 0.1.0 is a native C17 function-equivalence engine and a framework
 for composing proof and refutation methods. It has an end-to-end path for the
-currently supported, loop-free subset of the `ASM2C_GNU_V1` C profile:
+currently supported subset of the `ASM2C_GNU_V1` C profile. Exact proof
+backends remain loop-free, while the lowering, verifier, and interpreter also
+carry cyclic CFGs:
 
 1. parse and resolve two C functions;
 2. lower them to typed SSA IR with explicit definedness and effects;
@@ -14,8 +16,8 @@ currently supported, loop-free subset of the `ASM2C_GNU_V1` C profile:
 
 Quodlibet is not yet a general C equivalence checker. Unsupported syntax or
 semantics produce an explicit `UNKNOWN` result instead of being approximated
-as a narrower problem. Loops and several important C features remain outside
-the implemented proof slice.
+as a narrower problem. Loops remain outside the exact proof slice and several
+important C features remain outside the lowering.
 
 ## What is implemented
 
@@ -44,17 +46,19 @@ the implemented proof slice.
   parser/tree entry points for corpus processing;
 - source-signature artifacts that preserve widths, signedness, pointer depth,
   address space, and ABI profile;
-- immutable typed SSA IR with control flow, PHI nodes, memory objects, calls,
+- immutable typed SSA IR with acyclic or cyclic control flow, PHI nodes,
+  memory objects, calls,
   traps, termination, effects, UB guards, and initial memory images;
 - an independent IR verifier and a concrete interpreter;
 - differential tests that compare lowered execution with compiled C;
 - a flat 64-bit little-endian memory model for the `ASM2C_GNU_V1` profile,
   including aligned in-object access checks and disjoint live objects.
 
-The current lowering handles a useful loop-free slice that includes fixed-width
+The current lowering handles a useful slice that includes fixed-width
 integer and `_Bool` expressions, conversions, short-circuit control flow,
-conditionals, assignments, increments, pointers, selected arrays and records,
-locals, selected globals, calls to declared callees, and selected
+conditionals, `for`/`while`/`do` loops, `break`, `continue`, assignments,
+increments, pointers, selected arrays and records, locals, selected globals,
+calls to declared callees, and selected
 `sizeof(type)` forms. The exact accepted
 surface is intentionally narrower than the syntax frontend.
 

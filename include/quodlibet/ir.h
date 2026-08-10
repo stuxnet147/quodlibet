@@ -6,8 +6,9 @@
 
 QL_EXTERN_C_BEGIN
 
-/* An append-only, acyclic, typed SSA control-flow graph. v2 adds an
-   instruction image payload, which MEMORY_IMAGE carries. */
+/* An append-only, typed SSA control-flow graph. v2 adds an instruction image
+   payload, which MEMORY_IMAGE carries. The CFG kind is encoded separately in
+   every payload. */
 #define QL_IR_ARTIFACT_SCHEMA_VERSION 2u
 
 typedef uint32_t ql_ir_instruction_id;
@@ -25,23 +26,24 @@ typedef struct ql_ir ql_ir;
    versioned source-signature/precondition binding. */
 
 typedef enum ql_ir_float_format {
-    QL_IR_FLOAT_INVALID = 0,
-    QL_IR_FLOAT_IEEE_BINARY16,
-    QL_IR_FLOAT_BFLOAT16,
-    QL_IR_FLOAT_IEEE_BINARY32,
-    QL_IR_FLOAT_IEEE_BINARY64,
-    QL_IR_FLOAT_X87_BINARY80,
-    QL_IR_FLOAT_IEEE_BINARY128
+  QL_IR_FLOAT_INVALID = 0,
+  QL_IR_FLOAT_IEEE_BINARY16,
+  QL_IR_FLOAT_BFLOAT16,
+  QL_IR_FLOAT_IEEE_BINARY32,
+  QL_IR_FLOAT_IEEE_BINARY64,
+  QL_IR_FLOAT_X87_BINARY80,
+  QL_IR_FLOAT_IEEE_BINARY128
 } ql_ir_float_format;
 
 typedef enum ql_ir_cfg_kind {
-    QL_IR_CFG_ACYCLIC = 0
+  QL_IR_CFG_ACYCLIC = 0,
+  QL_IR_CFG_CYCLIC = 1
 } ql_ir_cfg_kind;
 
 typedef enum ql_ir_value_definition_kind {
-    QL_IR_VALUE_PARAMETER = 1,
-    QL_IR_VALUE_CONSTANT,
-    QL_IR_VALUE_INSTRUCTION_RESULT
+  QL_IR_VALUE_PARAMETER = 1,
+  QL_IR_VALUE_CONSTANT,
+  QL_IR_VALUE_INSTRUCTION_RESULT
 } ql_ir_value_definition_kind;
 
 /* Built-in opcodes are stable. Values at or above EXTENSION_BASE are reserved
@@ -118,142 +120,142 @@ typedef uint32_t ql_ir_opcode;
 #define QL_IR_OPCODE_EXTENSION_BASE UINT32_C(65536)
 
 typedef enum ql_ir_terminator_kind {
-    QL_IR_TERMINATOR_RETURN = 1,
-    QL_IR_TERMINATOR_BRANCH,
-    QL_IR_TERMINATOR_COND_BRANCH,
-    QL_IR_TERMINATOR_TRAP,
-    QL_IR_TERMINATOR_UNDEFINED_BEHAVIOR,
-    QL_IR_TERMINATOR_TERMINATE,
-    QL_IR_TERMINATOR_DIVERGE
+  QL_IR_TERMINATOR_RETURN = 1,
+  QL_IR_TERMINATOR_BRANCH,
+  QL_IR_TERMINATOR_COND_BRANCH,
+  QL_IR_TERMINATOR_TRAP,
+  QL_IR_TERMINATOR_UNDEFINED_BEHAVIOR,
+  QL_IR_TERMINATOR_TERMINATE,
+  QL_IR_TERMINATOR_DIVERGE
 } ql_ir_terminator_kind;
 
 typedef struct ql_ir_type_definition_v1 {
-    size_t struct_size;
-    ql_ir_type_kind kind;
-    ql_ir_float_format float_format;
-    uint32_t bit_width;
-    uint32_t address_space;
-    ql_ir_type_id element_type;
-    uint64_t element_count;
-    uint64_t reserved[4];
+  size_t struct_size;
+  ql_ir_type_kind kind;
+  ql_ir_float_format float_format;
+  uint32_t bit_width;
+  uint32_t address_space;
+  ql_ir_type_id element_type;
+  uint64_t element_count;
+  uint64_t reserved[4];
 } ql_ir_type_definition_v1;
 
 typedef struct ql_ir_instruction_definition_v1 {
-    size_t struct_size;
-    ql_ir_opcode opcode;
-    uint32_t flags;
-    uint64_t effects;
-    const ql_ir_value_id *operands;
-    size_t operand_count;
-    const ql_ir_block_id *block_operands;
-    size_t block_operand_count;
-    const ql_ir_type_id *result_types;
-    size_t result_count;
-    uint64_t immediate;
-    const char *symbol;
-    size_t symbol_size;
-    /* An instruction's constant byte payload. `symbol` is text and may not
-       contain NUL; this may contain anything, because the bytes a program
-       states about memory are bytes and not a name. MEMORY_IMAGE is what
-       carries one today. */
-    const void *image;
-    size_t image_size;
-    uint64_t reserved[2];
+  size_t struct_size;
+  ql_ir_opcode opcode;
+  uint32_t flags;
+  uint64_t effects;
+  const ql_ir_value_id *operands;
+  size_t operand_count;
+  const ql_ir_block_id *block_operands;
+  size_t block_operand_count;
+  const ql_ir_type_id *result_types;
+  size_t result_count;
+  uint64_t immediate;
+  const char *symbol;
+  size_t symbol_size;
+  /* An instruction's constant byte payload. `symbol` is text and may not
+     contain NUL; this may contain anything, because the bytes a program
+     states about memory are bytes and not a name. MEMORY_IMAGE is what
+     carries one today. */
+  const void *image;
+  size_t image_size;
+  uint64_t reserved[2];
 } ql_ir_instruction_definition_v1;
 
 /* `condition` is used only by COND_BRANCH. RETURN uses `return_value` unless
    the function returns void. Memory and event_trace are optional terminal
    observable states. A true UB_GUARD predicate means execution is defined. */
 typedef struct ql_ir_terminator_definition_v1 {
-    size_t struct_size;
-    ql_ir_terminator_kind kind;
-    ql_ir_value_id condition;
-    ql_ir_value_id return_value;
-    ql_ir_value_id memory;
-    ql_ir_value_id event_trace;
-    ql_ir_block_id target;
-    ql_ir_block_id false_target;
-    uint64_t code;
-    const char *reason;
-    size_t reason_size;
-    uint64_t reserved[4];
+  size_t struct_size;
+  ql_ir_terminator_kind kind;
+  ql_ir_value_id condition;
+  ql_ir_value_id return_value;
+  ql_ir_value_id memory;
+  ql_ir_value_id event_trace;
+  ql_ir_block_id target;
+  ql_ir_block_id false_target;
+  uint64_t code;
+  const char *reason;
+  size_t reason_size;
+  uint64_t reserved[4];
 } ql_ir_terminator_definition_v1;
 
 typedef struct ql_ir_view_v1 {
-    size_t struct_size;
-    uint32_t schema_version;
-    ql_ir_cfg_kind cfg_kind;
-    const char *function_name;
-    size_t function_name_size;
-    ql_ir_type_id return_type;
-    ql_ir_block_id entry_block;
-    size_t type_count;
-    size_t value_count;
-    size_t block_count;
-    size_t instruction_count;
-    ql_digest artifact_digest;
-    uint64_t reserved[4];
+  size_t struct_size;
+  uint32_t schema_version;
+  ql_ir_cfg_kind cfg_kind;
+  const char *function_name;
+  size_t function_name_size;
+  ql_ir_type_id return_type;
+  ql_ir_block_id entry_block;
+  size_t type_count;
+  size_t value_count;
+  size_t block_count;
+  size_t instruction_count;
+  ql_digest artifact_digest;
+  uint64_t reserved[4];
 } ql_ir_view_v1;
 
 /* Every pointer returned through a reader view is borrowed from the immutable
    ql_ir and remains valid until its final ql_ir_release(). */
 
 typedef struct ql_ir_type_view_v1 {
-    size_t struct_size;
-    ql_ir_type_id id;
-    ql_ir_type_kind kind;
-    ql_ir_float_format float_format;
-    uint32_t bit_width;
-    uint32_t address_space;
-    ql_ir_type_id element_type;
-    uint64_t element_count;
-    uint64_t reserved[3];
+  size_t struct_size;
+  ql_ir_type_id id;
+  ql_ir_type_kind kind;
+  ql_ir_float_format float_format;
+  uint32_t bit_width;
+  uint32_t address_space;
+  ql_ir_type_id element_type;
+  uint64_t element_count;
+  uint64_t reserved[3];
 } ql_ir_type_view_v1;
 
 typedef struct ql_ir_value_view_v1 {
-    size_t struct_size;
-    ql_ir_value_id id;
-    ql_ir_type_id type;
-    ql_ir_value_definition_kind definition_kind;
-    uint32_t result_index;
-    ql_ir_instruction_id instruction;
-    const void *constant_data;
-    size_t constant_size;
-    const char *name;
-    size_t name_size;
-    uint64_t reserved[3];
+  size_t struct_size;
+  ql_ir_value_id id;
+  ql_ir_type_id type;
+  ql_ir_value_definition_kind definition_kind;
+  uint32_t result_index;
+  ql_ir_instruction_id instruction;
+  const void *constant_data;
+  size_t constant_size;
+  const char *name;
+  size_t name_size;
+  uint64_t reserved[3];
 } ql_ir_value_view_v1;
 
 typedef struct ql_ir_instruction_view_v1 {
-    size_t struct_size;
-    ql_ir_instruction_id id;
-    ql_ir_block_id block;
-    ql_ir_opcode opcode;
-    uint32_t flags;
-    uint64_t effects;
-    const ql_ir_value_id *operands;
-    size_t operand_count;
-    const ql_ir_block_id *block_operands;
-    size_t block_operand_count;
-    const ql_ir_value_id *results;
-    size_t result_count;
-    uint64_t immediate;
-    const char *symbol;
-    size_t symbol_size;
-    const void *image;
-    size_t image_size;
-    uint64_t reserved[1];
+  size_t struct_size;
+  ql_ir_instruction_id id;
+  ql_ir_block_id block;
+  ql_ir_opcode opcode;
+  uint32_t flags;
+  uint64_t effects;
+  const ql_ir_value_id *operands;
+  size_t operand_count;
+  const ql_ir_block_id *block_operands;
+  size_t block_operand_count;
+  const ql_ir_value_id *results;
+  size_t result_count;
+  uint64_t immediate;
+  const char *symbol;
+  size_t symbol_size;
+  const void *image;
+  size_t image_size;
+  uint64_t reserved[1];
 } ql_ir_instruction_view_v1;
 
 typedef struct ql_ir_block_view_v1 {
-    size_t struct_size;
-    ql_ir_block_id id;
-    const char *label;
-    size_t label_size;
-    const ql_ir_instruction_id *instructions;
-    size_t instruction_count;
-    ql_ir_terminator_definition_v1 terminator;
-    uint64_t reserved[3];
+  size_t struct_size;
+  ql_ir_block_id id;
+  const char *label;
+  size_t label_size;
+  const ql_ir_instruction_id *instructions;
+  size_t instruction_count;
+  ql_ir_terminator_definition_v1 terminator;
+  uint64_t reserved[3];
 } ql_ir_block_view_v1;
 
 QL_API void QL_CALL ql_ir_type_definition_init(
@@ -261,51 +263,65 @@ QL_API void QL_CALL ql_ir_type_definition_init(
 QL_API void QL_CALL ql_ir_instruction_definition_init(
     ql_ir_instruction_definition_v1 *definition, ql_ir_opcode opcode);
 QL_API void QL_CALL ql_ir_terminator_definition_init(
-    ql_ir_terminator_definition_v1 *definition,
-    ql_ir_terminator_kind kind);
+    ql_ir_terminator_definition_v1 *definition, ql_ir_terminator_kind kind);
 
-QL_API ql_status QL_CALL ql_ir_builder_create(
-    const ql_allocator *allocator, ql_ir_builder **output, ql_error *error);
+QL_API ql_status QL_CALL ql_ir_builder_create(const ql_allocator *allocator,
+                                              ql_ir_builder **output,
+                                              ql_error *error);
 QL_API void QL_CALL ql_ir_builder_destroy(ql_ir_builder *builder);
 QL_API ql_status QL_CALL ql_ir_builder_add_type(
     ql_ir_builder *builder, const ql_ir_type_definition_v1 *definition,
     ql_ir_type_id *output, ql_error *error);
-QL_API ql_status QL_CALL ql_ir_builder_set_function(
-    ql_ir_builder *builder, const char *name, size_t name_size,
-    ql_ir_type_id return_type, ql_error *error);
+QL_API ql_status QL_CALL ql_ir_builder_set_function(ql_ir_builder *builder,
+                                                    const char *name,
+                                                    size_t name_size,
+                                                    ql_ir_type_id return_type,
+                                                    ql_error *error);
+QL_API ql_status QL_CALL ql_ir_builder_set_cfg_kind(ql_ir_builder *builder,
+                                                    ql_ir_cfg_kind kind,
+                                                    ql_error *error);
 QL_API ql_status QL_CALL ql_ir_builder_add_parameter(
     ql_ir_builder *builder, ql_ir_type_id type, const char *name,
     size_t name_size, ql_ir_value_id *output, ql_error *error);
 /* Constants use exact-width, canonical little-endian bytes. Booleans are one
    byte (0 or 1); unused high bits of a bit-vector's last byte must be zero. */
 QL_API ql_status QL_CALL ql_ir_builder_add_constant(
-    ql_ir_builder *builder, ql_ir_type_id type, const void *data,
-    size_t size, ql_ir_value_id *output, ql_error *error);
-QL_API ql_status QL_CALL ql_ir_builder_add_block(
-    ql_ir_builder *builder, const char *label, size_t label_size,
-    ql_ir_block_id *output, ql_error *error);
-QL_API ql_status QL_CALL ql_ir_builder_set_entry_block(
-    ql_ir_builder *builder, ql_ir_block_id block, ql_error *error);
+    ql_ir_builder *builder, ql_ir_type_id type, const void *data, size_t size,
+    ql_ir_value_id *output, ql_error *error);
+QL_API ql_status QL_CALL ql_ir_builder_add_block(ql_ir_builder *builder,
+                                                 const char *label,
+                                                 size_t label_size,
+                                                 ql_ir_block_id *output,
+                                                 ql_error *error);
+QL_API ql_status QL_CALL ql_ir_builder_set_entry_block(ql_ir_builder *builder,
+                                                       ql_ir_block_id block,
+                                                       ql_error *error);
 QL_API ql_status QL_CALL ql_ir_builder_append_instruction(
     ql_ir_builder *builder, ql_ir_block_id block,
     const ql_ir_instruction_definition_v1 *definition,
     ql_ir_instruction_id *instruction, ql_ir_value_id *results,
     ql_error *error);
+/* Adds one value/predecessor pair to an existing PHI. This permits a loop
+   header to expose its PHI results before its back-edges have been lowered,
+   while keeping builder mutation append-only. */
+QL_API ql_status QL_CALL ql_ir_builder_append_phi_incoming(
+    ql_ir_builder *builder, ql_ir_instruction_id instruction,
+    ql_ir_value_id value, ql_ir_block_id block, ql_error *error);
 QL_API ql_status QL_CALL ql_ir_builder_set_terminator(
     ql_ir_builder *builder, ql_ir_block_id block,
     const ql_ir_terminator_definition_v1 *definition, ql_error *error);
-QL_API ql_status QL_CALL ql_ir_builder_finish(
-    const ql_ir_builder *builder, ql_artifact **output, ql_error *error);
+QL_API ql_status QL_CALL ql_ir_builder_finish(const ql_ir_builder *builder,
+                                              ql_artifact **output,
+                                              ql_error *error);
 
 /* Opening validates the kind, schema, every table extent and reference, type
-   rules, SSA dominance, reachability, and the v1 acyclic-CFG restriction. */
+   rules, SSA dominance, reachability, and the declared CFG kind. */
 QL_API ql_status QL_CALL ql_ir_open(const ql_allocator *allocator,
-                                    const ql_artifact *artifact,
-                                    ql_ir **output, ql_error *error);
+                                    const ql_artifact *artifact, ql_ir **output,
+                                    ql_error *error);
 QL_API void QL_CALL ql_ir_retain(ql_ir *ir);
 QL_API void QL_CALL ql_ir_release(ql_ir *ir);
-QL_API ql_status QL_CALL ql_ir_get_view(const ql_ir *ir,
-                                        ql_ir_view_v1 *view,
+QL_API ql_status QL_CALL ql_ir_get_view(const ql_ir *ir, ql_ir_view_v1 *view,
                                         ql_error *error);
 QL_API ql_status QL_CALL ql_ir_type_at(const ql_ir *ir, size_t index,
                                        ql_ir_type_view_v1 *view,
@@ -316,9 +332,9 @@ QL_API ql_status QL_CALL ql_ir_value_at(const ql_ir *ir, size_t index,
 QL_API ql_status QL_CALL ql_ir_block_at(const ql_ir *ir, size_t index,
                                         ql_ir_block_view_v1 *view,
                                         ql_error *error);
-QL_API ql_status QL_CALL ql_ir_instruction_at(
-    const ql_ir *ir, size_t index, ql_ir_instruction_view_v1 *view,
-    ql_error *error);
+QL_API ql_status QL_CALL ql_ir_instruction_at(const ql_ir *ir, size_t index,
+                                              ql_ir_instruction_view_v1 *view,
+                                              ql_error *error);
 
 QL_EXTERN_C_END
 

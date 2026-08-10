@@ -50,7 +50,7 @@
 - [ ] 배열, 구조체, 공용체, 비트필드, enum
 - [ ] 정수 promotion 과 usual arithmetic conversion 을 C11 6.3.1.8 대로
 - [ ] 함수 호출과 외부 효과, 호출 순서 관찰
-- [ ] 루프: 구조 보존 하강과 bounded unrolling
+- [x] 루프: `for`/`while`/`do` 구조 보존 하강, 순환 SSA와 interpreter 실행. exact proof method는 W6에 별도 미완료
 - [ ] `switch`, `goto`, 레이블, 중첩 제어 흐름
 - [ ] 전역 변수와 정적 저장 기간
 - [ ] `volatile`, `_Atomic`, I/O 관찰 의미론
