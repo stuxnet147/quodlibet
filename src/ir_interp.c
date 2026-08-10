@@ -2,6 +2,7 @@
 
 #include "quodlibet/allocator.h"
 
+#include <math.h>
 #include <string.h>
 
 /* Restoring division shifts the running remainder one bit past the operand
@@ -108,6 +109,83 @@ static int bits_equal(const interp_bits *left, const interp_bits *right) {
       return 0;
     }
   }
+  return 1;
+}
+
+static int bits_to_float64(const interp_bits *bits, uint32_t width,
+                           double *value) {
+  if (width == 32u) {
+    uint32_t raw = (uint32_t)bits->words[0];
+    float converted;
+    memcpy(&converted, &raw, sizeof(converted));
+    *value = (double)converted;
+    return 1;
+  }
+  if (width == 64u) {
+    uint64_t raw = bits->words[0];
+    memcpy(value, &raw, sizeof(*value));
+    return 1;
+  }
+  return 0;
+}
+
+static int float64_to_bits(double value, uint32_t width, interp_bits *bits) {
+  bits_zero(bits);
+  if (width == 32u) {
+    float converted = (float)value;
+    uint32_t raw;
+    memcpy(&raw, &converted, sizeof(raw));
+    bits->words[0] = raw;
+    return 1;
+  }
+  if (width == 64u) {
+    uint64_t raw;
+    memcpy(&raw, &value, sizeof(raw));
+    bits->words[0] = raw;
+    return 1;
+  }
+  return 0;
+}
+
+static long double bits_to_integer_value(const interp_bits *bits,
+                                         uint32_t width, int is_signed) {
+  uint64_t raw = bits->words[0];
+  if (width < 64u) {
+    raw &= (UINT64_C(1) << width) - UINT64_C(1);
+  }
+  if (is_signed != 0 && bits_test(bits, width - 1u)) {
+    uint64_t magnitude = width == 64u
+                             ? (~raw + UINT64_C(1))
+                             : ((UINT64_C(1) << width) - raw);
+    return -(long double)magnitude;
+  }
+  return (long double)raw;
+}
+
+static int integer_value_to_bits(long double value, uint32_t width,
+                                 int is_signed, interp_bits *bits) {
+  long double minimum =
+      is_signed != 0 ? -ldexpl(1.0L, (int)width - 1) : 0.0L;
+  long double upper = is_signed != 0 ? ldexpl(1.0L, (int)width - 1)
+                                     : ldexpl(1.0L, (int)width);
+  uint64_t raw;
+
+  if (!isfinite((double)value)) {
+    return 0;
+  }
+  value = truncl(value);
+  if (value < minimum || value >= upper) {
+    return 0;
+  }
+  if (value < 0.0L) {
+    uint64_t magnitude = (uint64_t)(-value);
+    raw = UINT64_C(0) - magnitude;
+  } else {
+    raw = (uint64_t)value;
+  }
+  bits_zero(bits);
+  bits->words[0] = raw;
+  bits_mask(bits, width);
   return 1;
 }
 
@@ -888,6 +966,130 @@ interp_execute_instruction(interp_context *context,
     }
     break;
   }
+  case QL_IR_OPCODE_FNEG:
+    if (any_undefined || (operand_width != 32u && operand_width != 64u)) {
+      result.defined = 0u;
+      break;
+    }
+    result.bits = left->bits;
+    result.bits.words[0] ^= UINT64_C(1) << (operand_width - 1u);
+    break;
+  case QL_IR_OPCODE_FADD:
+  case QL_IR_OPCODE_FSUB:
+  case QL_IR_OPCODE_FMUL:
+  case QL_IR_OPCODE_FDIV:
+  case QL_IR_OPCODE_FREM: {
+    double left_value;
+    double right_value;
+    double computed;
+    if (any_undefined ||
+        !bits_to_float64(&left->bits, operand_width, &left_value) ||
+        !bits_to_float64(&right->bits, operand_width, &right_value)) {
+      result.defined = 0u;
+      break;
+    }
+    if (operand_width == 32u) {
+      volatile float a = (float)left_value;
+      volatile float b = (float)right_value;
+      volatile float rounded;
+      if (instruction->opcode == QL_IR_OPCODE_FADD) {
+        rounded = a + b;
+      } else if (instruction->opcode == QL_IR_OPCODE_FSUB) {
+        rounded = a - b;
+      } else if (instruction->opcode == QL_IR_OPCODE_FMUL) {
+        rounded = a * b;
+      } else if (instruction->opcode == QL_IR_OPCODE_FDIV) {
+        rounded = a / b;
+      } else {
+        rounded = fmodf(a, b);
+      }
+      computed = (double)rounded;
+    } else {
+      volatile double a = left_value;
+      volatile double b = right_value;
+      volatile double rounded;
+      if (instruction->opcode == QL_IR_OPCODE_FADD) {
+        rounded = a + b;
+      } else if (instruction->opcode == QL_IR_OPCODE_FSUB) {
+        rounded = a - b;
+      } else if (instruction->opcode == QL_IR_OPCODE_FMUL) {
+        rounded = a * b;
+      } else if (instruction->opcode == QL_IR_OPCODE_FDIV) {
+        rounded = a / b;
+      } else {
+        rounded = fmod(a, b);
+      }
+      computed = rounded;
+    }
+    if (!float64_to_bits(computed, result_width, &result.bits)) {
+      return interp_stop(context, QL_IR_INTERP_OUTCOME_UNSUPPORTED,
+                         QL_IR_INTERP_UB_NONE, block, id);
+    }
+    break;
+  }
+  case QL_IR_OPCODE_FOEQ:
+  case QL_IR_OPCODE_FONE:
+  case QL_IR_OPCODE_FOLT:
+  case QL_IR_OPCODE_FOLE: {
+    double left_value;
+    double right_value;
+    int holds = 0;
+    if (any_undefined ||
+        !bits_to_float64(&left->bits, operand_width, &left_value) ||
+        !bits_to_float64(&right->bits, operand_width, &right_value)) {
+      result.defined = 0u;
+      break;
+    }
+    if (!isnan(left_value) && !isnan(right_value)) {
+      if (instruction->opcode == QL_IR_OPCODE_FOEQ) {
+        holds = left_value == right_value;
+      } else if (instruction->opcode == QL_IR_OPCODE_FONE) {
+        holds = left_value != right_value;
+      } else if (instruction->opcode == QL_IR_OPCODE_FOLT) {
+        holds = left_value < right_value;
+      } else {
+        holds = left_value <= right_value;
+      }
+    }
+    if (holds != 0) {
+      bits_set(&result.bits, 0u);
+    }
+    break;
+  }
+  case QL_IR_OPCODE_FP_TO_SBV:
+  case QL_IR_OPCODE_FP_TO_UBV: {
+    double value;
+    if (any_undefined ||
+        !bits_to_float64(&left->bits, operand_width, &value) ||
+        !integer_value_to_bits((long double)value, result_width,
+                               instruction->opcode ==
+                                   QL_IR_OPCODE_FP_TO_SBV,
+                               &result.bits)) {
+      result.defined = 0u;
+    }
+    break;
+  }
+  case QL_IR_OPCODE_SBV_TO_FP:
+  case QL_IR_OPCODE_UBV_TO_FP: {
+    long double integer = bits_to_integer_value(
+        &left->bits, operand_width,
+        instruction->opcode == QL_IR_OPCODE_SBV_TO_FP);
+    if (any_undefined ||
+        !float64_to_bits((double)integer, result_width, &result.bits)) {
+      result.defined = 0u;
+    }
+    break;
+  }
+  case QL_IR_OPCODE_FP_EXT:
+  case QL_IR_OPCODE_FP_TRUNC: {
+    double value;
+    if (any_undefined ||
+        !bits_to_float64(&left->bits, operand_width, &value) ||
+        !float64_to_bits(value, result_width, &result.bits)) {
+      result.defined = 0u;
+    }
+    break;
+  }
   case QL_IR_OPCODE_ZEXT:
     if (any_undefined) {
       result.defined = 0u;
@@ -1357,6 +1559,12 @@ static ql_status interp_prepare(interp_context *context,
     } else if ((type.kind == QL_IR_TYPE_BIT_VECTOR ||
                 type.kind == QL_IR_TYPE_POINTER) &&
                type.bit_width <= QL_IR_INTERP_MAX_BIT_WIDTH) {
+      value->width = type.bit_width;
+    } else if (type.kind == QL_IR_TYPE_FLOAT &&
+               ((type.float_format == QL_IR_FLOAT_IEEE_BINARY32 &&
+                 type.bit_width == 32u) ||
+                (type.float_format == QL_IR_FLOAT_IEEE_BINARY64 &&
+                 type.bit_width == 64u))) {
       value->width = type.bit_width;
     } else if (type.kind == QL_IR_TYPE_MEMORY) {
       /* A memory value carries a version of the object images rather

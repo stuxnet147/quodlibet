@@ -105,6 +105,12 @@ static ql_status validate_type(const ql_source_type_v1 *type,
             break;
         }
         return QL_STATUS_OK;
+    case QL_SOURCE_TYPE_FLOAT:
+        if ((type->bit_width != 32u && type->bit_width != 64u) ||
+            type->address_space != 0u || type->pointer_depth != 0u) {
+            break;
+        }
+        return QL_STATUS_OK;
     case QL_SOURCE_TYPE_POINTER:
         if (type->bit_width != pointer_width || type->pointer_depth == 0u) {
             break;
@@ -355,7 +361,7 @@ static int read_type_json(yyjson_val *object, ql_source_type_v1 *type) {
     }
     memset(type, 0, sizeof(*type));
     type->struct_size = sizeof(*type);
-    if (!get_uint64_field(object, "kind", (uint64_t)QL_SOURCE_TYPE_POINTER,
+    if (!get_uint64_field(object, "kind", (uint64_t)QL_SOURCE_TYPE_FLOAT,
                           &value)) {
         return 0;
     }
@@ -646,6 +652,14 @@ ql_status QL_CALL ql_source_signature_precondition_view(
                      "precondition signature storage needs %zu arguments",
                      signature->view.argument_count);
         return QL_STATUS_INVALID_ARGUMENT;
+    }
+    for (index = 0u; index < signature->view.argument_count; ++index) {
+        if (signature->arguments[index].kind == QL_SOURCE_TYPE_FLOAT) {
+            ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                         "precondition schema v1 cannot type floating argument %zu",
+                         index);
+            return QL_STATUS_TYPE_MISMATCH;
+        }
     }
     for (index = 0u; index < signature->view.argument_count; ++index) {
         const ql_source_type_v1 *type = &signature->arguments[index];
@@ -1096,6 +1110,12 @@ static ql_status type_from_inventory(const ql_c_type_inventory_v1 *inventory,
             output->bit_width = 1u;
             return QL_STATUS_OK;
         }
+        if (strcmp(normalized, "float") == 0 ||
+            strcmp(normalized, "double") == 0) {
+            output->kind = QL_SOURCE_TYPE_FLOAT;
+            output->bit_width = strcmp(normalized, "float") == 0 ? 32u : 64u;
+            return QL_STATUS_OK;
+        }
         for (index = 0u; index < sizeof(signature_integer_table) /
                                      sizeof(signature_integer_table[0]);
              ++index) {
@@ -1296,6 +1316,16 @@ static ql_status ir_type_matches(const ql_ir *ir, ql_ir_type_id type_id,
     case QL_SOURCE_TYPE_UNSIGNED_INTEGER:
         if (type.kind == QL_IR_TYPE_BIT_VECTOR &&
             type.bit_width == expected->bit_width) {
+            return QL_STATUS_OK;
+        }
+        break;
+    case QL_SOURCE_TYPE_FLOAT:
+        if (type.kind == QL_IR_TYPE_FLOAT &&
+            type.bit_width == expected->bit_width &&
+            ((expected->bit_width == 32u &&
+              type.float_format == QL_IR_FLOAT_IEEE_BINARY32) ||
+             (expected->bit_width == 64u &&
+              type.float_format == QL_IR_FLOAT_IEEE_BINARY64))) {
             return QL_STATUS_OK;
         }
         break;

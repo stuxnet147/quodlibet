@@ -16,6 +16,9 @@ typedef enum ql_c_scalar_kind {
     QL_C_SCALAR_VOID,
     QL_C_SCALAR_BOOL,
     QL_C_SCALAR_INTEGER,
+    /* IEC 60559 binary32 or binary64 under ASM2C_GNU_V1. `width` identifies
+       the format and `rank` carries the usual arithmetic conversions. */
+    QL_C_SCALAR_FLOAT,
     /* A pointer under this profile is an address and nothing else, so its
        width and signedness are the address's. What it points at is carried
        beside it by the lowering, not here. */
@@ -44,6 +47,7 @@ ql_c_scalar_type ql_c_scalar_make_void(void);
 ql_c_scalar_type ql_c_scalar_make_bool(void);
 ql_c_scalar_type ql_c_scalar_make_integer(uint32_t width, uint32_t rank,
                                           uint32_t is_signed);
+ql_c_scalar_type ql_c_scalar_make_float(uint32_t width, uint32_t rank);
 
 /* Strips whitespace from `spelling` and matches the result against the fixed
    profile vocabulary. Returns zero when the spelling names no type this

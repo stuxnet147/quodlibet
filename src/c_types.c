@@ -28,6 +28,15 @@ ql_c_scalar_type ql_c_scalar_make_integer(uint32_t width, uint32_t rank,
     return type;
 }
 
+ql_c_scalar_type ql_c_scalar_make_float(uint32_t width, uint32_t rank) {
+    ql_c_scalar_type type;
+    memset(&type, 0, sizeof(type));
+    type.kind = QL_C_SCALAR_FLOAT;
+    type.width = width;
+    type.rank = rank;
+    return type;
+}
+
 typedef struct scalar_spelling {
     const char *normalized;
     ql_c_scalar_kind kind;
@@ -68,7 +77,9 @@ static const scalar_spelling k_spellings[] = {
     {"signedlonglong", QL_C_SCALAR_INTEGER, 64u, 5u, 1u},
     {"signedlonglongint", QL_C_SCALAR_INTEGER, 64u, 5u, 1u},
     {"unsignedlonglong", QL_C_SCALAR_INTEGER, 64u, 5u, 0u},
-    {"unsignedlonglongint", QL_C_SCALAR_INTEGER, 64u, 5u, 0u}
+    {"unsignedlonglongint", QL_C_SCALAR_INTEGER, 64u, 5u, 0u},
+    {"float", QL_C_SCALAR_FLOAT, 32u, 6u, 0u},
+    {"double", QL_C_SCALAR_FLOAT, 64u, 7u, 0u}
 };
 
 int ql_c_scalar_from_spelling(const char *spelling,
@@ -166,6 +177,9 @@ int ql_c_scalar_same(ql_c_scalar_type left, ql_c_scalar_type right) {
 }
 
 ql_c_scalar_type ql_c_scalar_promote(ql_c_scalar_type type) {
+    if (type.kind == QL_C_SCALAR_FLOAT) {
+        return type;
+    }
     if (type.kind == QL_C_SCALAR_BOOL || type.rank < 3u) {
         return ql_c_scalar_make_integer(32u, 3u, 1u);
     }
@@ -174,6 +188,15 @@ ql_c_scalar_type ql_c_scalar_promote(ql_c_scalar_type type) {
 
 ql_c_scalar_type ql_c_scalar_usual(ql_c_scalar_type left,
                                    ql_c_scalar_type right) {
+    if (left.kind == QL_C_SCALAR_FLOAT || right.kind == QL_C_SCALAR_FLOAT) {
+        if (left.kind != QL_C_SCALAR_FLOAT) {
+            return right;
+        }
+        if (right.kind != QL_C_SCALAR_FLOAT) {
+            return left;
+        }
+        return left.rank >= right.rank ? left : right;
+    }
     if (left.is_signed == right.is_signed) {
         return left.rank >= right.rank ? left : right;
     }

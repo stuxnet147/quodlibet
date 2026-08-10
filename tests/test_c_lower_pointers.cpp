@@ -38,6 +38,10 @@ QL_PTR_FUNCTION(write, int ptr_write(int *p, int v) {
     p[1] = v;
     return p[1] + p[0];
 });
+QL_PTR_FUNCTION(float_update, int ptr_float_update(float *p, int v) {
+    p[1] += (float)v * 0.5f;
+    return (int)(p[0] + p[1]);
+});
 QL_PTR_FUNCTION(swap_first, int ptr_swap(int *p) {
     int t = p[0];
     p[0] = p[1];
@@ -310,6 +314,27 @@ TEST(CLowerPointers, StoresThroughAPointerParameterAndLeavesThemVisible) {
     EXPECT_EQ(104, Returned(run.result));
     EXPECT_EQ(99, final_image[1]);
     EXPECT_EQ(5, final_image[0]);
+}
+
+TEST(CLowerPointers, LoadsAndStoresBinary32ObjectBytes) {
+    Lowered lowered;
+    float reference[kElements] = {1.25f, 2.5f, -3.0f, 4.0f};
+    const float initial[kElements] = {1.25f, 2.5f, -3.0f, 4.0f};
+    float final_image[kElements] = {};
+    const int32_t expected = ptr_float_update(reference, 3);
+
+    ASSERT_TRUE(lowered.Open(float_update_source, "ptr_float_update"));
+    const Outcome run = Execute(
+        lowered.ir(), kBase, {3u}, kBase, sizeof(initial),
+        reinterpret_cast<const uint8_t *>(initial),
+        reinterpret_cast<uint8_t *>(final_image));
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+        << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+    EXPECT_EQ(expected, Returned(run.result));
+    for (std::size_t index = 0u; index < kElements; ++index) {
+        EXPECT_EQ(reference[index], final_image[index]);
+    }
 }
 
 TEST(CLowerPointers, TreatsANullDereferenceAsUndefined) {

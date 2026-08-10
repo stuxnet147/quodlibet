@@ -156,6 +156,40 @@ int64_t ReturnedSigned(const ql_ir_interp_result_v1 &result, uint32_t width) {
     return static_cast<int64_t>(raw);
 }
 
+uint64_t FloatBits(float value) {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+uint64_t DoubleBits(double value) {
+    uint64_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+float ReturnedFloat(const ql_ir_interp_result_v1 &result) {
+    uint32_t bits = 0u;
+    EXPECT_EQ(sizeof(bits), result.value_size);
+    if (result.value_size == sizeof(bits)) {
+        std::memcpy(&bits, result.value, sizeof(bits));
+    }
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+double ReturnedDouble(const ql_ir_interp_result_v1 &result) {
+    uint64_t bits = 0u;
+    EXPECT_EQ(sizeof(bits), result.value_size);
+    if (result.value_size == sizeof(bits)) {
+        std::memcpy(&bits, result.value, sizeof(bits));
+    }
+    double value = 0.0;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 void ExpectUnknown(const char *source, const char *name,
                    ql_c_lower_diagnostic_code expected) {
     Lowered lowered;
@@ -447,6 +481,92 @@ TEST(CLowerTypes, ReadsAParenthesisedTypedefNameAsACastNotACall) {
     ASSERT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
     EXPECT_EQ(static_cast<int64_t>(static_cast<int16_t>(0x8000)),
               ReturnedSigned(RunModule(lowered.ir(), {0x7fffu, 1u}), 32u));
+}
+
+TEST(CLowerTypes, ExecutesBinary32AndBinary64Arithmetic) {
+    Lowered lowered;
+    Lowered negate;
+    ASSERT_EQ(QL_STATUS_OK,
+              lowered.Lower("double mix(float a, int b) {\n"
+                            "  return (double)(a * 1.5f) + (double)b / 4.0;\n"
+                            "}",
+                            "mix"));
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
+    ASSERT_EQ(QL_STATUS_OK,
+              negate.Lower("double negated_gap(double a, double b) {\n"
+                           "  return -(a - b);\n"
+                           "}",
+                           "negated_gap"));
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED, negate.support());
+
+    ql_ir_interp_result_v1 result =
+        RunModule(lowered.ir(), {FloatBits(2.0f), UINT64_C(3)});
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, result.outcome)
+        << ql_ir_interp_ub_reason_string(result.ub_reason);
+    EXPECT_EQ(3.75, ReturnedDouble(result));
+
+    result = RunModule(lowered.ir(),
+                       {FloatBits(-4.0f), static_cast<uint64_t>(2)});
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, result.outcome)
+        << ql_ir_interp_ub_reason_string(result.ub_reason);
+    EXPECT_EQ(-5.5, ReturnedDouble(result));
+
+    result = RunModule(negate.ir(), {DoubleBits(1.25), DoubleBits(4.0)});
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, result.outcome);
+    EXPECT_EQ(2.75, ReturnedDouble(result));
+}
+
+TEST(CLowerTypes, FloatingComparisonsPreserveCNaNSemantics) {
+    Lowered lowered;
+    ASSERT_EQ(QL_STATUS_OK,
+              lowered.Lower("int classify(double a) {\n"
+                            "  return (a != 0.0) + 2 * (a < 0.0);\n"
+                            "}",
+                            "classify"));
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
+
+    EXPECT_EQ(0, ReturnedSigned(
+                     RunModule(lowered.ir(), {DoubleBits(0.0)}), 32u));
+    EXPECT_EQ(3, ReturnedSigned(
+                     RunModule(lowered.ir(), {DoubleBits(-2.0)}), 32u));
+    EXPECT_EQ(1, ReturnedSigned(
+                     RunModule(lowered.ir(),
+                               {UINT64_C(0x7ff8000000000000)}),
+                     32u));
+}
+
+TEST(CLowerTypes, FloatToIntegerChecksTheExactCDefinedRange) {
+    Lowered lowered;
+    ASSERT_EQ(QL_STATUS_OK,
+              lowered.Lower("int truncate(double a) { return (int)a; }",
+                            "truncate"));
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
+
+    ql_ir_interp_result_v1 result =
+        RunModule(lowered.ir(), {DoubleBits(-3.75)});
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, result.outcome);
+    EXPECT_EQ(-3, ReturnedSigned(result, 32u));
+    result = RunModule(lowered.ir(), {DoubleBits(-2147483648.0)});
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, result.outcome);
+    EXPECT_EQ(INT64_C(-2147483648), ReturnedSigned(result, 32u));
+
+    for (uint64_t bits : {DoubleBits(2147483648.0),
+                          UINT64_C(0x7ff8000000000000)}) {
+        result = RunModule(lowered.ir(), {bits});
+        EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR, result.outcome);
+        EXPECT_EQ(QL_IR_INTERP_UB_GUARD_FAILED, result.ub_reason);
+    }
+}
+
+TEST(CLowerTypes, FloatingLiteralSuffixControlsItsWidth) {
+    Lowered lowered;
+    ASSERT_EQ(QL_STATUS_OK,
+              lowered.Lower("float rounded(void) { return 0.1f + 0x1p-3f; }",
+                            "rounded"));
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
+    const ql_ir_interp_result_v1 result = RunModule(lowered.ir(), {});
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, result.outcome);
+    EXPECT_EQ(0.1f + 0.125f, ReturnedFloat(result));
 }
 
 TEST(CLowerTypes, LetsAVisibleObjectShadowTheTypedefName) {

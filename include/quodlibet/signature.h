@@ -18,14 +18,15 @@ typedef struct ql_source_signature ql_source_signature;
 /* IR bit-vector types are signless, so source signedness, pointer identity,
    and the ABI profile cannot be recovered from a quodlibet.ir artifact. This
    artifact is the separately versioned record of that information. Values 1
-   through 4 deliberately match ql_signature_argument_kind so a signature can
-   type-check a precondition without a second vocabulary. */
+   through 4 deliberately match ql_signature_argument_kind so non-floating
+   arguments can type-check a precondition without a second vocabulary. */
 typedef enum ql_source_type_kind {
     QL_SOURCE_TYPE_VOID = 0,
     QL_SOURCE_TYPE_BOOL = 1,
     QL_SOURCE_TYPE_SIGNED_INTEGER = 2,
     QL_SOURCE_TYPE_UNSIGNED_INTEGER = 3,
-    QL_SOURCE_TYPE_POINTER = 4
+    QL_SOURCE_TYPE_POINTER = 4,
+    QL_SOURCE_TYPE_FLOAT = 5
 } ql_source_type_kind;
 
 /* Bit values match ql_c_type_qualifier. */
@@ -40,10 +41,11 @@ typedef enum ql_source_type_qualifier {
     (QL_SOURCE_TYPE_QUALIFIER_CONST | QL_SOURCE_TYPE_QUALIFIER_VOLATILE | \
      QL_SOURCE_TYPE_QUALIFIER_RESTRICT | QL_SOURCE_TYPE_QUALIFIER_ATOMIC)
 
-/* A void type uses bit_width zero. A bool uses bit_width one. An integer uses
-   its exact source width. A pointer uses the signature's pointer_width and may
-   name a non-default address space. pointer_depth is retained so that `int *`
-   and `int **` remain distinguishable inputs to a later memory model. */
+/* A void type uses bit_width zero. A bool uses bit_width one. An integer or
+   floating type uses its exact source width. A pointer uses the signature's
+   pointer_width and may name a non-default address space. pointer_depth is
+   retained so that `int *` and `int **` remain distinguishable inputs to a
+   later memory model. */
 typedef struct ql_source_type_v1 {
     size_t struct_size;
     ql_source_type_kind kind;
@@ -112,7 +114,9 @@ QL_API const ql_artifact *QL_CALL ql_source_signature_artifact(
     const ql_source_signature *signature);
 
 /* Fills a precondition signature view backed by caller storage, so a typed
-   precondition is checked against exactly this artifact's argument types. */
+   precondition is checked against exactly this artifact's argument types.
+   Schema v1 preconditions have no floating expression vocabulary, so a
+   floating argument produces QL_STATUS_TYPE_MISMATCH. */
 QL_API ql_status QL_CALL ql_source_signature_precondition_view(
     const ql_source_signature *signature, ql_signature_view_v1 *view,
     ql_signature_argument_v1 *storage, size_t storage_capacity,

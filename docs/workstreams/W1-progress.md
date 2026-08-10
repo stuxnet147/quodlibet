@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **26,350 / 29,880 (88.19%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 1,726, `unsupported_control_flow` 661, `unsupported_pointer` 402입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **26,985 / 29,880 (90.31%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 1,073, `unsupported_control_flow` 674, `unsupported_pointer` 415입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1883,6 +1883,27 @@ CALL 결과 순서는 관찰 상태, 일반 반환값, out-local의 값과 write
 
 `tests/test_c_lower_globals.cpp`는 loop 안의 static 선언에 caller-supplied 초기 image를 주고, initializer가 반복 실행되지 않은 채 loop 횟수만큼 값과 final image가 증가하는지 확인합니다. 선언 사전 수집이 공용 C-lowering 경로이므로 `CLower*` 99/99를 실행했습니다. 인터프리터, solver, plugin, EGraph는 바뀌지 않아 전체 CTest는 실행하지 않았고, 전체 train coverage는 G9 수치와 기존 성공 회귀를 확인하기 위해 실행했습니다.
 
+### 63. `float`와 `double`을 폭이 보존되는 IR 값으로 내린다
+
+`ASM2C_GNU_V1`의 `float`와 `double`을 각각 IEC 60559 binary32와 binary64로 고정했습니다. 리터럴의 suffix와 정확한 object byte, usual arithmetic conversion, 단항 부호, 사칙연산, NaN을 포함한 비교, 정수 및 bool 변환, 메모리 load/store, 외부 호출 인자와 결과, variadic `float`의 `double` 승격을 같은 폭 계약으로 연결했습니다. `long double`은 target별 표현과 연산 계약을 정하지 않았으므로 계속 UNKNOWN입니다.
+
+부동소수점에서 정수로 바꾸는 C cast는 host cast 결과를 그대로 믿지 않습니다. 절단한 값이 목적 정수형에 표현 가능한 입력 범위를 ordered compare로 만들고, NaN과 범위 밖 값이 관찰되면 `UB_GUARD`에서 멈춥니다. 특히 binary32 경계 상수가 반올림되어 signed minimum과 같아지는 경우를 따로 처리해 정확한 최솟값을 잘못 거부하지 않습니다. interpreter는 binary32 연산을 매 연산 뒤 binary32로 반올림하고 binary64와의 확장 및 절단을 명시적으로 실행합니다.
+
+source signature에는 별도 `FLOAT` kind와 32/64 bit width를 기록하고 lowered IR의 float format과 다시 대조합니다. precondition schema v1에는 float expression vocabulary가 없으므로 float 인자가 있으면 명시적 type mismatch입니다. product proof encoder도 아직 float IR을 거부합니다. 따라서 이번 수치는 lowering, verifier, concrete replay 수용률이며 exact proof 수용률로 읽지 않습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 26,350 (88.19%) | **26,985 (90.31%)** |
+| 증가 | | **+635** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_type` | 1,726 | **1,073** |
+| verifier 통과 | 26,350 / 26,350 | **26,985 / 26,985** |
+| status 실패 | 0 | **0** |
+
+기존 generic unknown-type 715개 중 707개가 `float` 또는 `double`, 8개가 `long double`을 포함했습니다. 직접 대상 715개를 먼저 재측정해 612개가 성공했고 나머지는 array, control-flow, pointer, call 등 기존의 다음 제한으로 이동했습니다. 전수 train 함수별 비교는 새 성공 635개, 기존 성공 회귀 0개, 누락과 추가 행 0개였습니다.
+
+`tests/test_c_lower_types.cpp`는 binary32 및 binary64 산술, literal 폭, NaN 비교, 정수 변환 경계를 실행합니다. `tests/test_c_lower_pointers.cpp`는 실제 float object의 load/store와 final image를 compiled C와 대조합니다. `tests/test_c_lower_calls.cpp`는 float 인자, double 결과, variadic 승격을 같은 compiled callee와 대조하고, `tests/test_signature.cpp`는 artifact round trip과 IR binding 및 precondition 거부를 고정합니다. 직접 묶음 71/71과 공용 C lowering, IR, verifier, interpreter 영향 범위 163/163이 통과했습니다. EGraph와 plugin은 영향을 받지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 G9 성공률과 기존 성공 회귀를 확인하기 위한 필수 측정으로만 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1891,10 +1912,10 @@ CALL 결과 순서는 관찰 상태, 일반 반환값, out-local의 값과 write
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 1,726
-- `unsupported_control_flow` 661
-- `unsupported_pointer` 402
-- `unsupported_call` 364
+- `unsupported_type` 1,073
+- `unsupported_control_flow` 674
+- `unsupported_pointer` 415
+- `unsupported_call` 372
 - `undeclared_identifier` 136
 
 ## 조율자에게 요청할 것
@@ -1911,7 +1932,7 @@ CALL 결과 순서는 관찰 상태, 일반 반환값, out-local의 값과 write
 
 ## 다음에 할 것
 
-1. 남은 타입 철자와 선언 형태를 실제 source spelling별로 다시 나누고, 부동소수점은 IR 타입과 연산 계약을 먼저 설계합니다.
+1. 남은 `unsupported_type`을 array declarator와 record by-value로 나눠 큰 단위부터 닫습니다.
 2. runtime-bound local array는 object size와 loop access guard를 함께 표현하는 경우에만 수용합니다.
 3. 남은 uninitialized address escape는 직접 out-local보다 넓은 alias와 수명 계약을 먼저 고정합니다.
 4. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.

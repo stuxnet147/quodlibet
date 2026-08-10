@@ -5,7 +5,9 @@
 
 #include "quodlibet/ir_interp.h"
 
+#include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3026,6 +3028,12 @@ static ql_status ensure_ir_type(lower_context *context, lower_type *type,
   } else if (type->kind == QL_C_SCALAR_BOOL) {
     ql_ir_type_definition_init(&definition, QL_IR_TYPE_BOOL);
     definition.bit_width = 1u;
+  } else if (type->kind == QL_C_SCALAR_FLOAT &&
+             (type->width == 32u || type->width == 64u)) {
+    ql_ir_type_definition_init(&definition, QL_IR_TYPE_FLOAT);
+    definition.bit_width = type->width;
+    definition.float_format = type->width == 32u ? QL_IR_FLOAT_IEEE_BINARY32
+                                                  : QL_IR_FLOAT_IEEE_BINARY64;
   } else if (type->kind == QL_C_SCALAR_INTEGER && type->width != 0u &&
              type->width <= 128u) {
     ql_ir_type_definition_init(&definition, QL_IR_TYPE_BIT_VECTOR);
@@ -3183,6 +3191,36 @@ static ql_status add_uint_constant(lower_context *context, lower_type type,
   }
   if (type.kind == QL_C_SCALAR_BOOL) {
     bytes[0] = bytes[0] != 0u ? 1u : 0u;
+  }
+  return add_constant_bytes(context, &type, bytes, size, output, error);
+}
+
+static ql_status add_float_constant(lower_context *context, lower_type type,
+                                    double value, ql_ir_value_id *output,
+                                    ql_error *error) {
+  uint8_t bytes[8];
+  uint64_t raw = 0u;
+  size_t size;
+  size_t index;
+
+  if (type.kind != QL_C_SCALAR_FLOAT ||
+      (type.width != 32u && type.width != 64u)) {
+    ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                 "floating constant has no binary32 or binary64 type");
+    return QL_STATUS_INTERNAL_ERROR;
+  }
+  if (type.width == 32u) {
+    float narrowed = (float)value;
+    uint32_t bits;
+    memcpy(&bits, &narrowed, sizeof(bits));
+    raw = bits;
+    size = sizeof(bits);
+  } else {
+    memcpy(&raw, &value, sizeof(raw));
+    size = sizeof(raw);
+  }
+  for (index = 0u; index < size; ++index) {
+    bytes[index] = (uint8_t)((raw >> (index * 8u)) & UINT64_C(0xff));
   }
   return add_constant_bytes(context, &type, bytes, size, output, error);
 }
@@ -3868,6 +3906,79 @@ static int literal_digit(char ch, uint32_t base, uint32_t *digit) {
   return 1;
 }
 
+static int number_literal_is_floating(const char *text) {
+  size_t index = 0u;
+  int hexadecimal;
+
+  if (text[index] == '+' || text[index] == '-') {
+    ++index;
+  }
+  hexadecimal = text[index] != '\0' && text[index + 1u] != '\0' &&
+                text[index] == '0' &&
+                (text[index + 1u] == 'x' || text[index + 1u] == 'X');
+  for (; text[index] != '\0'; ++index) {
+    if (text[index] == '.') {
+      return 1;
+    }
+    if (hexadecimal != 0) {
+      if (text[index] == 'p' || text[index] == 'P') {
+        return 1;
+      }
+    } else if (text[index] == 'e' || text[index] == 'E') {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static ql_status lower_float_literal(lower_context *context, size_t node,
+                                     const char *text, lower_value *output,
+                                     ql_error *error) {
+  char *end = NULL;
+  size_t length = strlen(text);
+  int is_float = 0;
+  double value;
+  lower_type type;
+  ql_status status;
+
+  if (length != 0u && (text[length - 1u] == 'l' || text[length - 1u] == 'L')) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                         "long double literals are outside the binary32 and "
+                         "binary64 profile",
+                         error);
+  }
+  errno = 0;
+  if (length != 0u && (text[length - 1u] == 'f' || text[length - 1u] == 'F')) {
+    float parsed = strtof(text, &end);
+    is_float = 1;
+    value = (double)parsed;
+  } else {
+    value = strtod(text, &end);
+  }
+  if (end == text ||
+      (is_float != 0 ? end != text + length - 1u : end != text + length) ||
+      (errno == ERANGE && !isfinite(value))) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_INTEGER_LITERAL_OUT_OF_RANGE, node,
+        "floating literal is invalid or outside binary32/binary64", error);
+  }
+  type = type_from_scalar(
+      ql_c_scalar_make_float(is_float != 0 ? 32u : 64u,
+                             is_float != 0 ? 6u : 7u));
+  status = add_float_constant(context, type, value, &output->value, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  status = ensure_bool_constants(context, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  output->defined = context->true_value;
+  output->type = type;
+  output->may_ub = 0u;
+  return QL_STATUS_OK;
+}
+
 static ql_status lower_integer_literal(lower_context *context, size_t node,
                                        lower_value *output, ql_error *error) {
   char *text = copy_node_text(context, node);
@@ -3889,6 +4000,11 @@ static ql_status lower_integer_literal(lower_context *context, size_t node,
   if (text == NULL) {
     ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
     return QL_STATUS_OUT_OF_MEMORY;
+  }
+  if (number_literal_is_floating(text)) {
+    status = lower_float_literal(context, node, text, output, error);
+    context->allocator->deallocate(context->allocator->user_data, text);
+    return status;
   }
   length = strlen(text);
   /* Tree-sitter C folds a leading sign into a number_literal. C still
@@ -4140,6 +4256,12 @@ static ql_status convert_across_pointer(lower_context *context,
   lower_value address;
   ql_status status;
 
+  if (input.type.kind == QL_C_SCALAR_FLOAT ||
+      target.kind == QL_C_SCALAR_FLOAT) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+                         "floating values do not convert to pointers", error);
+  }
+
   if (input.type.kind == QL_C_SCALAR_POINTER) {
     status = emit_address_of_pointer(context, input, &address, error);
     if (status != QL_STATUS_OK) {
@@ -4234,6 +4356,21 @@ static ql_status convert_value(lower_context *context, lower_value input,
       output->type = target;
       return QL_STATUS_OK;
     }
+    if (input.type.kind == QL_C_SCALAR_FLOAT) {
+      ql_ir_value_id equal;
+      status = add_float_constant(context, input.type, 0.0, &zero, error);
+      if (status == QL_STATUS_OK) {
+        status = emit_compare(context, QL_IR_OPCODE_FOEQ, input.value, zero,
+                              &equal, error);
+      }
+      if (status == QL_STATUS_OK) {
+        status = emit_bool_not(context, equal, &output->value, error);
+      }
+      if (status == QL_STATUS_OK) {
+        output->type = target;
+      }
+      return status;
+    }
     status = add_uint_constant(context, input.type, 0u, &zero, error);
     if (status != QL_STATUS_OK) {
       return status;
@@ -4248,11 +4385,17 @@ static ql_status convert_value(lower_context *context, lower_value input,
   }
   if (input.type.kind == QL_C_SCALAR_BOOL) {
     ql_ir_value_id operands[3];
-    status = add_uint_constant(context, target, 1u, &operands[1], error);
+    status = target.kind == QL_C_SCALAR_FLOAT
+                 ? add_float_constant(context, target, 1.0, &operands[1],
+                                      error)
+                 : add_uint_constant(context, target, 1u, &operands[1], error);
     if (status != QL_STATUS_OK) {
       return status;
     }
-    status = add_uint_constant(context, target, 0u, &operands[2], error);
+    status = target.kind == QL_C_SCALAR_FLOAT
+                 ? add_float_constant(context, target, 0.0, &operands[2],
+                                      error)
+                 : add_uint_constant(context, target, 0u, &operands[2], error);
     if (status != QL_STATUS_OK) {
       return status;
     }
@@ -4264,6 +4407,82 @@ static ql_status convert_value(lower_context *context, lower_value input,
       output->type = target;
     }
     return status;
+  } else if (input.type.kind == QL_C_SCALAR_FLOAT &&
+             target.kind == QL_C_SCALAR_FLOAT) {
+    opcode = input.type.width < target.width ? QL_IR_OPCODE_FP_EXT
+                                             : QL_IR_OPCODE_FP_TRUNC;
+  } else if (input.type.kind == QL_C_SCALAR_FLOAT) {
+    ql_ir_value_id lower_bound;
+    ql_ir_value_id upper_bound;
+    ql_ir_value_id above_lower;
+    ql_ir_value_id below_upper;
+    ql_ir_value_id conversion_defined;
+    double lower;
+    double upper;
+
+    if (target.kind != QL_C_SCALAR_INTEGER) {
+      return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
+                           "floating conversion needs an arithmetic target",
+                           error);
+    }
+    opcode = target.is_signed != 0u ? QL_IR_OPCODE_FP_TO_SBV
+                                    : QL_IR_OPCODE_FP_TO_UBV;
+    status = emit_instruction(context, opcode, &target, &input.value, 1u,
+                              NULL, 0u, QL_IR_EFFECT_NONE, &output->value,
+                              error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    if (target.is_signed != 0u) {
+      const double minimum = -ldexp(1.0, (int)target.width - 1);
+      double encoded_lower;
+      lower = minimum - 1.0;
+      upper = ldexp(1.0, (int)target.width - 1);
+      encoded_lower = input.type.width == 32u ? (double)(float)lower : lower;
+      status = add_float_constant(context, input.type, lower, &lower_bound,
+                                  error);
+      if (status == QL_STATUS_OK && encoded_lower < minimum) {
+        status = emit_compare(context, QL_IR_OPCODE_FOLT, lower_bound,
+                              input.value, &above_lower, error);
+      } else if (status == QL_STATUS_OK) {
+        status = emit_compare(context, QL_IR_OPCODE_FOLE, lower_bound,
+                              input.value, &above_lower, error);
+      }
+    } else {
+      lower = -1.0;
+      upper = ldexp(1.0, (int)target.width);
+      status = add_float_constant(context, input.type, lower, &lower_bound,
+                                  error);
+      if (status == QL_STATUS_OK) {
+        status = emit_compare(context, QL_IR_OPCODE_FOLT, lower_bound,
+                              input.value, &above_lower, error);
+      }
+    }
+    if (status == QL_STATUS_OK) {
+      status = add_float_constant(context, input.type, upper, &upper_bound,
+                                  error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = emit_compare(context, QL_IR_OPCODE_FOLT, input.value,
+                            upper_bound, &below_upper, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = emit_bool_and(context, above_lower, below_upper,
+                             &conversion_defined, error);
+    }
+    if (status == QL_STATUS_OK && input.may_ub != 0u) {
+      status = emit_bool_and(context, input.defined, conversion_defined,
+                             &conversion_defined, error);
+    }
+    if (status == QL_STATUS_OK) {
+      output->type = target;
+      output->defined = conversion_defined;
+      output->may_ub = 1u;
+    }
+    return status;
+  } else if (target.kind == QL_C_SCALAR_FLOAT) {
+    opcode = input.type.is_signed != 0u ? QL_IR_OPCODE_SBV_TO_FP
+                                        : QL_IR_OPCODE_UBV_TO_FP;
   } else if (input.type.width < target.width) {
     opcode = input.type.is_signed != 0u ? QL_IR_OPCODE_SEXT : QL_IR_OPCODE_ZEXT;
   } else if (input.type.width > target.width) {
@@ -4786,6 +5005,9 @@ static ql_status ensure_variable_value(lower_context *context,
       variable->has_object = 0u;
       variable->may_admit_object = 1u;
     }
+  } else if (variable->type.kind == QL_C_SCALAR_FLOAT) {
+    status = add_float_constant(context, variable->type, 0.0,
+                                &variable->value, error);
   } else {
     status = add_uint_constant(context, variable->type, 0u, &variable->value,
                                error);
@@ -4905,21 +5127,33 @@ static ql_status lower_unary_expression(lower_context *context, size_t node,
     if (status == QL_STATUS_OK && strcmp(operator_text, "+") == 0) {
       *output = promoted;
     } else if (status == QL_STATUS_OK && strcmp(operator_text, "~") == 0) {
-      status = emit_instruction(context, QL_IR_OPCODE_BV_NOT, &promoted.type,
-                                &promoted.value, 1u, NULL, 0u,
-                                QL_IR_EFFECT_NONE, &output->value, error);
-      output->type = promoted.type;
-      output->defined = promoted.defined;
-      output->may_ub = promoted.may_ub;
+      if (promoted.type.kind == QL_C_SCALAR_FLOAT) {
+        status = lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                               "bitwise complement needs an integer operand",
+                               error);
+      } else {
+        status = emit_instruction(context, QL_IR_OPCODE_BV_NOT,
+                                  &promoted.type, &promoted.value, 1u, NULL, 0u,
+                                  QL_IR_EFFECT_NONE, &output->value, error);
+        output->type = promoted.type;
+        output->defined = promoted.defined;
+        output->may_ub = promoted.may_ub;
+      }
     } else if (status == QL_STATUS_OK && strcmp(operator_text, "-") == 0) {
       ql_ir_value_id operation_defined;
-      status = emit_instruction(context, QL_IR_OPCODE_BV_NEG, &promoted.type,
+      status = emit_instruction(context,
+                                promoted.type.kind == QL_C_SCALAR_FLOAT
+                                    ? QL_IR_OPCODE_FNEG
+                                    : QL_IR_OPCODE_BV_NEG,
+                                &promoted.type,
                                 &promoted.value, 1u, NULL, 0u,
                                 QL_IR_EFFECT_NONE, &output->value, error);
       output->type = promoted.type;
       output->defined = promoted.defined;
       output->may_ub = promoted.may_ub;
-      if (status == QL_STATUS_OK && promoted.type.is_signed != 0u) {
+      if (status == QL_STATUS_OK &&
+          promoted.type.kind == QL_C_SCALAR_INTEGER &&
+          promoted.type.is_signed != 0u) {
         ql_ir_value_id minimum;
         status = signed_min_constant(context, promoted.type, &minimum, error);
         if (status == QL_STATUS_OK) {
@@ -5248,6 +5482,11 @@ static ql_status apply_binary_operator(lower_context *context,
                                     error);
   }
   if (strcmp(operator_text, "<<") == 0 || strcmp(operator_text, ">>") == 0) {
+    if (left.type.kind == QL_C_SCALAR_FLOAT ||
+        right.type.kind == QL_C_SCALAR_FLOAT) {
+      return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+                           "shift operands must have integer type", error);
+    }
     return emit_shift_result(context, strcmp(operator_text, "<<") == 0, left,
                              right, output, error);
   }
@@ -5267,6 +5506,74 @@ static ql_status apply_binary_operator(lower_context *context,
     return status;
   }
   inherited_may_ub = converted_left.may_ub | converted_right.may_ub;
+
+  if (common.kind == QL_C_SCALAR_FLOAT) {
+    ql_ir_value_id operands[2];
+    operands[0] = converted_left.value;
+    operands[1] = converted_right.value;
+    if (strcmp(operator_text, "+") == 0 || strcmp(operator_text, "-") == 0 ||
+        strcmp(operator_text, "*") == 0 || strcmp(operator_text, "/") == 0) {
+      ql_ir_opcode float_opcode =
+          strcmp(operator_text, "+") == 0
+              ? QL_IR_OPCODE_FADD
+              : (strcmp(operator_text, "-") == 0
+                     ? QL_IR_OPCODE_FSUB
+                     : (strcmp(operator_text, "*") == 0 ? QL_IR_OPCODE_FMUL
+                                                          : QL_IR_OPCODE_FDIV));
+      status = emit_instruction(context, float_opcode, &common, operands, 2u,
+                                NULL, 0u, QL_IR_EFFECT_NONE, &output->value,
+                                error);
+      if (status == QL_STATUS_OK) {
+        output->type = common;
+        output->defined = inherited_defined;
+        output->may_ub = inherited_may_ub;
+      }
+      return status;
+    }
+    if (strcmp(operator_text, "==") == 0 ||
+        strcmp(operator_text, "!=") == 0 ||
+        strcmp(operator_text, "<") == 0 ||
+        strcmp(operator_text, "<=") == 0 ||
+        strcmp(operator_text, ">") == 0 ||
+        strcmp(operator_text, ">=") == 0) {
+      lower_value boolean;
+      lower_type int_type = make_integer_type(32u, 3u, 1u);
+      ql_ir_opcode float_opcode;
+      ql_ir_value_id compare_left = converted_left.value;
+      ql_ir_value_id compare_right = converted_right.value;
+
+      memset(&boolean, 0, sizeof(boolean));
+      boolean.type = make_bool_type();
+      boolean.defined = inherited_defined;
+      boolean.may_ub = inherited_may_ub;
+      if (strcmp(operator_text, "==") == 0 ||
+          strcmp(operator_text, "!=") == 0) {
+        float_opcode = QL_IR_OPCODE_FOEQ;
+      } else if (strcmp(operator_text, "<") == 0 ||
+                 strcmp(operator_text, ">") == 0) {
+        float_opcode = QL_IR_OPCODE_FOLT;
+      } else {
+        float_opcode = QL_IR_OPCODE_FOLE;
+      }
+      if (strcmp(operator_text, ">") == 0 ||
+          strcmp(operator_text, ">=") == 0) {
+        compare_left = converted_right.value;
+        compare_right = converted_left.value;
+      }
+      status = emit_compare(context, float_opcode, compare_left, compare_right,
+                            &boolean.value, error);
+      if (status == QL_STATUS_OK && strcmp(operator_text, "!=") == 0) {
+        status = emit_bool_not(context, boolean.value, &boolean.value, error);
+      }
+      if (status == QL_STATUS_OK) {
+        status = convert_value(context, boolean, int_type, output, error);
+      }
+      return status;
+    }
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, node,
+        "operator does not apply to a floating value", error);
+  }
 
   if (strcmp(operator_text, "+") == 0 || strcmp(operator_text, "-") == 0) {
     status = emit_arithmetic_result(
@@ -5461,6 +5768,29 @@ static ql_status query_designator_type(lower_context *context, size_t node,
     if (text == NULL) {
       ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
       return QL_STATUS_OUT_OF_MEMORY;
+    }
+    if (number_literal_is_floating(text)) {
+      size_t length = strlen(text);
+      if (length != 0u &&
+          (text[length - 1u] == 'l' || text[length - 1u] == 'L')) {
+        context->allocator->deallocate(context->allocator->user_data, text);
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+            "sizeof(long double literal) is outside the binary32 and "
+            "binary64 profile",
+            error);
+      }
+      *output = type_from_scalar(ql_c_scalar_make_float(
+          length != 0u &&
+                  (text[length - 1u] == 'f' || text[length - 1u] == 'F')
+              ? 32u
+              : 64u,
+          length != 0u &&
+                  (text[length - 1u] == 'f' || text[length - 1u] == 'F')
+              ? 6u
+              : 7u));
+      context->allocator->deallocate(context->allocator->user_data, text);
+      return QL_STATUS_OK;
     }
     if (text[0] == '\0') {
       is_small_integer = 0;
@@ -6794,11 +7124,15 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     }
     if (is_variadic_argument != 0) {
       /* C's default argument promotions are the only type contract the
-         ellipsis supplies. This slice has no floating values, so the
-         rule is integer promotion or an unchanged data pointer. */
+         ellipsis supplies: narrow integers promote to int, float promotes
+         to double, and pointers retain their type. */
       if (argument.type.kind == QL_C_SCALAR_POINTER) {
         converted = argument;
         status = QL_STATUS_OK;
+      } else if (argument.type.kind == QL_C_SCALAR_FLOAT) {
+        lower_type promoted = type_from_scalar(ql_c_scalar_make_float(
+            64u, 7u));
+        status = convert_value(context, argument, promoted, &converted, error);
       } else if (argument.type.kind == QL_C_SCALAR_BOOL ||
                  argument.type.kind == QL_C_SCALAR_INTEGER) {
         status = integer_promote(context, argument, &converted, error);
@@ -8121,6 +8455,9 @@ static ql_status make_zero_scalar(lower_context *context, lower_type type,
     }
     return status;
   }
+  if (type.kind == QL_C_SCALAR_FLOAT) {
+    return add_float_constant(context, type, 0.0, &output->value, error);
+  }
   return add_uint_constant(context, type, 0u, &output->value, error);
 }
 
@@ -8202,6 +8539,7 @@ static ql_status initialize_object(lower_context *context, size_t node,
   if (type.array_length == 0u && type.kind != QL_C_SCALAR_RECORD) {
     size_t value_node = node;
     lower_value value;
+    lower_value converted;
     if (is_list) {
       size_t end = subtree_end(context, node);
       size_t child;
@@ -8228,7 +8566,15 @@ static ql_status initialize_object(lower_context *context, size_t node,
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
-    return emit_store(context, address, value, error);
+    status = convert_value(context, value, type, &converted, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    status = emit_ub_guard(context, &converted, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    return emit_store(context, address, converted, error);
   }
 
   if (type.array_length != 0u && !is_list) {

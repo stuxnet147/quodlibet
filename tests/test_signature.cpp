@@ -292,13 +292,53 @@ TEST(SourceSignature, TypeChecksAPreconditionAgainstItsOwnArguments) {
     ql_precondition_destroy(precondition);
 }
 
-TEST(SourceSignature, RejectsUnknownTypeSpellingsInsteadOfGuessing) {
+TEST(SourceSignature, PreservesFloatingKindWidthAndIrBinding) {
     w2::CFunction function;
+    SignatureHandle signature;
+    ql_source_type_v1 argument{};
+    ql_ir *ir = nullptr;
     ql_error error{};
 
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(
+        &function, "double scale(float x){ return (double)x; }", "scale"));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_source_signature_open(nullptr, function.signature_artifact(),
+                                       signature.output(), &error))
+        << error.message;
+    const ql_source_signature_view_v1 view = View(signature.get());
+    EXPECT_EQ(QL_SOURCE_TYPE_FLOAT, view.return_type.kind);
+    EXPECT_EQ(64u, view.return_type.bit_width);
+    ASSERT_EQ(QL_STATUS_OK, ql_source_signature_argument_at(
+                                signature.get(), 0u, &argument, &error));
+    EXPECT_EQ(QL_SOURCE_TYPE_FLOAT, argument.kind);
+    EXPECT_EQ(32u, argument.bit_width);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_ir_open(nullptr, function.ir_artifact(), &ir, &error))
+        << error.message;
+    EXPECT_EQ(QL_STATUS_OK,
+              ql_source_signature_bind_ir(signature.get(), ir, &error))
+        << error.message;
+    ql_ir_release(ir);
+}
+
+TEST(SourceSignature, RefusesFloatingArgumentsInPreconditionSchemaV1) {
+    w2::CFunction function;
+    SignatureHandle signature;
+    ql_signature_view_v1 precondition_signature{};
+    ql_signature_argument_v1 storage[QL_SOURCE_SIGNATURE_MAX_ARGUMENTS];
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(
+        &function, "double scale(double x){ return x; }", "scale"));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_source_signature_open(nullptr, function.signature_artifact(),
+                                       signature.output(), &error))
+        << error.message;
     EXPECT_EQ(QL_STATUS_TYPE_MISMATCH,
-              function.Build("double scale(double x){ return x; }", "scale",
-                             &error));
+              ql_source_signature_precondition_view(
+                  signature.get(), &precondition_signature, storage,
+                  QL_SOURCE_SIGNATURE_MAX_ARGUMENTS, &error));
+    EXPECT_NE(nullptr, std::strstr(error.message, "floating argument 0"));
 }
 
 /* The corpus this profile serves spells every scalar through a typedef chain,

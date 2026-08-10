@@ -52,6 +52,14 @@ int CALLEE_write_out(int *output, int value) {
     *output = value * 3;
     return value - 5;
 }
+double CALLEE_scale(float value) { return (double)value * 2.5; }
+double CALLEE_variadic_float(int tag, ...) {
+    va_list arguments;
+    va_start(arguments, tag);
+    const double value = va_arg(arguments, double);
+    va_end(arguments);
+    return (double)tag + value;
+}
 }
 
 QL_CALL_FUNCTION(single, int CALLEE_double(int);
@@ -108,6 +116,12 @@ QL_CALL_FUNCTION(outlocal, int CALLEE_write_out(int *, int);
         int output;
         int status = CALLEE_write_out(&output, value);
         return output + status;
+    });
+QL_CALL_FUNCTION(float_result, double CALLEE_scale(float);
+    double call_float(float value) { return CALLEE_scale(value) + 0.25; });
+QL_CALL_FUNCTION(variadic_float, double CALLEE_variadic_float(int, ...);
+    double call_variadic_float(float value) {
+        return CALLEE_variadic_float(2, value);
     });
 QL_CALL_FUNCTION(indirect, struct CALL_VTABLE {
         int (*callback)(int);
@@ -242,6 +256,37 @@ int QL_CALL Invoke(void *user_data, const char *symbol,
             }
         }
         bytes[8] = log->out_local_was_written ? 1u : 0u;
+        log->symbols.push_back(symbol);
+        log->arguments.push_back(seen);
+        return 1;
+    }
+    if (std::strcmp(symbol, "CALLEE_scale") == 0 && argument_count == 1u) {
+        if (arguments[0].size != sizeof(float) ||
+            result_size != sizeof(double)) {
+            ADD_FAILURE() << "float call widths are " << arguments[0].size
+                          << " and " << result_size;
+            return 0;
+        }
+        float input = 0.0f;
+        std::memcpy(&input, arguments[0].data, sizeof(input));
+        const double returned = CALLEE_scale(input);
+        std::memcpy(result, &returned, sizeof(returned));
+        log->symbols.push_back(symbol);
+        log->arguments.push_back(seen);
+        return 1;
+    }
+    if (std::strcmp(symbol, "CALLEE_variadic_float") == 0 &&
+        argument_count == 2u) {
+        if (arguments[0].size != sizeof(int32_t) ||
+            arguments[1].size != sizeof(double) ||
+            result_size != sizeof(double)) {
+            ADD_FAILURE() << "variadic float was not promoted to double";
+            return 0;
+        }
+        double promoted = 0.0;
+        std::memcpy(&promoted, arguments[1].data, sizeof(promoted));
+        const double returned = (double)seen[0] + promoted;
+        std::memcpy(result, &returned, sizeof(returned));
         log->symbols.push_back(symbol);
         log->arguments.push_back(seen);
         return 1;
@@ -481,6 +526,21 @@ uint64_t Widen(int32_t value) {
     return static_cast<uint64_t>(static_cast<uint32_t>(value));
 }
 
+uint64_t FloatBits(float value) {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+double ReturnedDouble(const ql_ir_interp_result_v1 &result) {
+    double value = 0.0;
+    EXPECT_EQ(sizeof(value), result.value_size);
+    if (result.value_size == sizeof(value)) {
+        std::memcpy(&value, result.value, sizeof(value));
+    }
+    return value;
+}
+
 TEST(CLowerCalls, MatchesCompiledExecutionIncludingTheCallSequence) {
     struct Case {
         const char *name;
@@ -574,6 +634,34 @@ TEST(CLowerCalls, MatchesCompiledExecutionForACalleeThatReturnsAPointer) {
     EXPECT_EQ(call_ptr_result(), Returned(run.result));
     EXPECT_EQ(std::vector<std::string>{"CALLEE_high"}, log.symbols);
     EXPECT_EQ(1u, run.result.events);
+}
+
+TEST(CLowerCalls, CarriesFloatingArgumentsResultsAndVariadicPromotion) {
+    for (float input : {-3.25f, 0.0f, 7.5f}) {
+        Lowered direct;
+        CallLog direct_log;
+        ASSERT_TRUE(direct.Open(float_result_source, "call_float"));
+        const Outcome direct_run =
+            Execute(direct.ir(), {FloatBits(input)}, &direct_log);
+        ASSERT_EQ(QL_STATUS_OK, direct_run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, direct_run.result.outcome);
+        EXPECT_EQ(call_float(input), ReturnedDouble(direct_run.result));
+        EXPECT_EQ(std::vector<std::string>{"CALLEE_scale"},
+                  direct_log.symbols);
+
+        Lowered variadic;
+        CallLog variadic_log;
+        ASSERT_TRUE(variadic.Open(variadic_float_source,
+                                  "call_variadic_float"));
+        const Outcome variadic_run =
+            Execute(variadic.ir(), {FloatBits(input)}, &variadic_log);
+        ASSERT_EQ(QL_STATUS_OK, variadic_run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, variadic_run.result.outcome);
+        EXPECT_EQ(call_variadic_float(input),
+                  ReturnedDouble(variadic_run.result));
+        EXPECT_EQ(std::vector<std::string>{"CALLEE_variadic_float"},
+                  variadic_log.symbols);
+    }
 }
 
 TEST(CLowerCalls, FollowsAPointerTheCalleeReturned) {

@@ -176,6 +176,32 @@ spelling 3,998 times and no other spelling of it. A name absent from this
 table stays unresolved and is refused, and a unit that declares the name
 itself overrides the table.
 
+#### Binary floating-point profile
+
+The profile carries C `float` and `double` as IEC 60559 binary32 and binary64
+values. `long double`, decimal floating types, complex values, and vector
+types remain outside the lowering. Literals are rounded to their suffix-selected
+format and stored as exact little-endian object bytes. Source signatures keep
+the floating kind and width independently of the IR, just as they retain
+integer signedness.
+
+The accepted expression slice includes unary negation, the four basic
+arithmetic operations, ordered comparisons with C's unordered `!=` behavior,
+integer and boolean conversions, assignments, memory access, call arguments
+and results, and the default `float`-to-`double` variadic promotion. A
+floating-to-integer conversion emits an explicit definedness predicate for
+the values whose truncation is representable; NaN and out-of-range values
+therefore reach `UB_GUARD` rather than being assigned a host-dependent integer.
+
+Concrete execution uses the host's default round-to-nearest floating
+environment at the declared precision. The profile does not model dynamic
+rounding modes, floating exception flags, trapping math, excess precision, or
+contraction. The schema-v1 precondition expression language has no floating
+terms and refuses a source signature with a floating argument. The current
+product proof encoder also refuses floating IR. Thus a floating function can
+be lowered, verified, and concretely replayed, but it cannot yet receive an
+exact product-method proof verdict.
+
 #### An uninitialised aggregate starts from a shared unknown image
 
 An array or record local with no initialiser gets an object whose initial
