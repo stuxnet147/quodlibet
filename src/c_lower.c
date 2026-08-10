@@ -5335,6 +5335,13 @@ static ql_status lower_sizeof_type(lower_context *context, size_t node,
       return status;
     }
   }
+  if (measured.kind == QL_C_SCALAR_RECORD) {
+    status = ensure_record_layout(context, measured.record, diagnostic_node,
+                                  error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+  }
   size = measured.kind == QL_C_SCALAR_VOID
              ? 1u
              : type_byte_width(context, measured);

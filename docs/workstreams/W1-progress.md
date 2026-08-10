@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,473 / 29,880 (78.56%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,301, `unsupported_type` 2,094, `unsupported_pointer` 634입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **23,478 / 29,880 (78.57%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,301, `unsupported_type` 2,089, `unsupported_pointer` 634입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1656,6 +1656,23 @@ null은 새 object authority를 요구하지 않습니다. 따라서 다른 arm�
 
 해당 첫 차단 3개를 좁게 재측정해 1개가 성공했고 중복 소스 2개는 뒤의 기존 uninitialized address escape로 이동했습니다. `tests/test_c_lower_expressions.cpp`는 literal과 cast된 record pointer의 array member를 포함한 `sizeof` 값을 compiled 함수와 대조하고, 일반 산술식 operand는 계속 UNKNOWN으로 고정합니다. 영향 범위의 `CLowerExpressions.*` 4/4와 `CLower*` 89/89가 통과했고 전체 train 함수별 비교에서 누락과 기존 성공 회귀가 없었습니다. 변경은 `sizeof`의 정적 expression type query에 한정되므로 전체 CTest는 실행하지 않았습니다.
 
+### 51. 역참조한 완전한 record의 `sizeof` 전에 layout을 확정한다
+
+`sizeof(*record_pointer)`의 정적 query는 pointer target을 올바른 record type으로 되돌렸지만, 그 record가 다른 record의 pointer member를 통해 처음 발견된 경우 layout을 아직 계산하지 않았습니다. 그 상태에서 크기 필드를 바로 읽어 완전한 record도 크기 0인 불완전 타입으로 잘못 진단했습니다. 최종 측정 타입이 record이면 기존 `ensure_record_layout()`을 먼저 호출한 뒤 target ABI 크기를 사용합니다.
+
+정의가 없는 record pointer는 resolver 또는 layout 단계에서 계속 UNKNOWN이고, self-by-value record도 기존 재귀 layout 검사가 거부합니다. 따라서 불완전 타입에 임의 크기를 주지 않습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,473 (78.56%) | **23,478 (78.57%)** |
+| 증가 | | **+5** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_type` | 2,094 | **2,089** |
+| verifier 통과 | 23,473 / 23,473 | **23,478 / 23,478** |
+| status 실패 | 0 | **0** |
+
+해당 첫 차단 5개는 같은 소스 계열의 `sizeof(*ARG_0->FLD_21)`이었고 모두 성공했습니다. `tests/test_c_lower_expressions.cpp`는 null record pointer 역참조가 unevaluated인 `sizeof(*(struct S *)0)` 값을 compiled 함수와 대조합니다. 영향 범위의 `CLowerExpressions.*` 4/4와 `CLower*` 89/89가 통과했고 전체 train 함수별 비교에서 누락, 다른 진단 이동, 기존 성공 회귀가 없었습니다. 변경은 `sizeof`의 record layout 확정에 한정되므로 전체 CTest는 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1665,7 +1682,7 @@ null은 새 object authority를 요구하지 않습니다. 따라서 다른 arm�
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
 - `uninitialized_read` 2,301
-- `unsupported_type` 2,094
+- `unsupported_type` 2,089
 - `unsupported_pointer` 634
 - `unsupported_control_flow` 545
 - `unsupported_call` 397

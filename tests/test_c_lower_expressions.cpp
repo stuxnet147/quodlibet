@@ -121,7 +121,8 @@ QL_EXPR_FUNCTION(sizeof_values,
     struct expr_size_value { char bytes[7]; int tail; };
     int expr_sizeof_values(int a, int b) {
         return (int)(sizeof(32) +
-                     sizeof(((struct expr_size_value *)0)->bytes)) +
+                     sizeof(((struct expr_size_value *)0)->bytes) +
+                     sizeof(*(struct expr_size_value *)0)) +
                (a - a) + (b - b);
     });
 /* Tree-sitter includes a literal's leading sign in number_literal. The
