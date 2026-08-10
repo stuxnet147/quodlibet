@@ -3,6 +3,11 @@
 #include <limits.h>
 #include <string.h>
 
+/* Compiles to nothing unless QL_STAGE_TIMING is defined. The one hook in this
+   file brackets the tree-sitter parse so that a stage breakdown can tell the
+   parse apart from the analysis that follows it; W8 added it and owns it. */
+#include "stage_timer.h"
+
 typedef struct ql_c_syntax_record {
     ql_c_syntax_node_view view;
     size_t parent;
@@ -1015,7 +1020,11 @@ ql_status QL_CALL ql_c_frontend_analyze_with_parser(
         }
         parser = owned_parser;
     }
-    status = ql_c_parser_parse(parser, source, source_size, &tree, error);
+    {
+        QL_STAGE_MARK(stage_parse);
+        status = ql_c_parser_parse(parser, source, source_size, &tree, error);
+        QL_STAGE_ADD(QL_STAGE_PARSE_FRONTEND, stage_parse);
+    }
     if (status != QL_STATUS_OK) {
         goto cleanup;
     }

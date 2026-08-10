@@ -9,6 +9,12 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Compiles to nothing unless QL_STAGE_TIMING is defined. The one hook in this
+   file brackets the parse this path does when it was not handed a tree, so a
+   stage breakdown can tell that parse apart from the lowering; W8 added it and
+   owns it. */
+#include "stage_timer.h"
+
 typedef struct ql_c_lower_diagnostic_record {
     ql_c_lower_diagnostic_code code;
     ql_source_range range;
@@ -7461,12 +7467,14 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
         context.owns_tree = 0u;
         status = QL_STATUS_OK;
     } else {
+        QL_STAGE_MARK(stage_parse);
         context.owns_tree = 1u;
         status = ql_c_parser_create(selected, &context.parser, error);
         if (status == QL_STATUS_OK) {
             status = ql_c_parser_parse(context.parser, source, source_size,
                                        &context.tree, error);
         }
+        QL_STAGE_ADD(QL_STAGE_PARSE_LOWER, stage_parse);
     }
     if (status == QL_STATUS_OK &&
         ql_c_syntax_tree_has_errors(context.tree) != 0u) {

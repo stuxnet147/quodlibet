@@ -11,6 +11,11 @@
 
 #include "yyjson.h"
 
+/* This translation unit owns the stage-timing storage. Every other includer of
+   stage_timer.h sees the extern declaration; see that header for why. */
+#define QL_STAGE_TIMER_DEFINE
+#include "stage_timer.h"
+
 #define QL_SMT_PRODUCT_CATEGORY "proof.smt-product"
 
 typedef struct smt_product_instance {
@@ -316,23 +321,34 @@ static ql_status lower_side(const ql_allocator *allocator,
     ql_c_lower_result_view_v1 view;
     ql_status status;
 
+    QL_STAGE_MARK(stage_frontend);
+
     memset(side, 0, sizeof(*side));
     *supported = 0u;
     status = ql_c_frontend_analyze(allocator, source, source_size,
                                    &side->unit, error);
+    QL_STAGE_ADD(QL_STAGE_FRONTEND, stage_frontend);
     if (status != QL_STATUS_OK) {
         return status;
     }
-    memset(&function, 0, sizeof(function));
-    function.struct_size = sizeof(function);
-    status = ql_c_frontend_select_function(side->unit, name, name_size,
-                                           &function, error);
+    {
+        QL_STAGE_MARK(stage_select);
+        memset(&function, 0, sizeof(function));
+        function.struct_size = sizeof(function);
+        status = ql_c_frontend_select_function(side->unit, name, name_size,
+                                               &function, error);
+        QL_STAGE_ADD(QL_STAGE_FRONTEND, stage_select);
+    }
     if (status != QL_STATUS_OK) {
         return status;
     }
-    status = ql_c_lower_selected_function(allocator, source, source_size,
-                                          side->unit, &function,
-                                          &side->result, error);
+    {
+        QL_STAGE_MARK(stage_lower);
+        status = ql_c_lower_selected_function(allocator, source, source_size,
+                                              side->unit, &function,
+                                              &side->result, error);
+        QL_STAGE_ADD(QL_STAGE_LOWER, stage_lower);
+    }
     if (status != QL_STATUS_OK) {
         return status;
     }
@@ -345,7 +361,11 @@ static ql_status lower_side(const ql_allocator *allocator,
     if (view.support != QL_C_LOWER_SUPPORTED || view.ir_artifact == NULL) {
         return QL_STATUS_OK;
     }
-    status = ql_ir_open(allocator, view.ir_artifact, &side->ir, error);
+    {
+        QL_STAGE_MARK(stage_ir);
+        status = ql_ir_open(allocator, view.ir_artifact, &side->ir, error);
+        QL_STAGE_ADD(QL_STAGE_IR_OPEN, stage_ir);
+    }
     if (status != QL_STATUS_OK) {
         return status;
     }
@@ -413,6 +433,7 @@ static ql_status run_check(const ql_allocator *allocator,
     ql_solver_check_request_v1 request;
     ql_solver *solver = NULL;
     ql_status status;
+    QL_STAGE_MARK(stage_setup);
 
     if (descriptor->capability.availability == QL_SOLVER_UNAVAILABLE) {
         ql_error_set(error, QL_STATUS_NOT_FOUND,
@@ -460,8 +481,19 @@ static ql_status run_check(const ql_allocator *allocator,
         request.is_cancelled = context->is_cancelled;
     }
     ql_solver_check_result_init(result);
-    status = ql_solver_check(solver, &request, result, error);
-    ql_solver_destroy(solver);
+    QL_STAGE_ADD(QL_STAGE_SOLVER_SETUP, stage_setup);
+    {
+        QL_STAGE_MARK(stage_check);
+        status = ql_solver_check(solver, &request, result, error);
+        QL_STAGE_ADD(QL_STAGE_SOLVER_CHECK, stage_check);
+    }
+    {
+        /* Teardown belongs with setup: both are the cost of having a backend
+           rather than the cost of asking it something. */
+        QL_STAGE_MARK(stage_teardown);
+        ql_solver_destroy(solver);
+        QL_STAGE_ADD(QL_STAGE_SOLVER_SETUP, stage_teardown);
+    }
     return status;
 }
 
@@ -927,9 +959,11 @@ static ql_status decide(const ql_allocator *allocator,
                            "the backend answered sat without a model, so no witness could be decoded");
             goto finish;
         }
+        QL_STAGE_MARK(stage_replay);
         status = ql_replay_decode_model(allocator, query,
                                         violation.model_artifact, &witness,
                                         error);
+        QL_STAGE_ADD(QL_STAGE_REPLAY, stage_replay);
         if (status != QL_STATUS_OK) {
             QL_LOGE(QL_SMT_PRODUCT_CATEGORY,
                     "solver model could not be decoded: %s", error->message);
@@ -940,8 +974,12 @@ static ql_status decide(const ql_allocator *allocator,
         }
         memset(&replay, 0, sizeof(replay));
         replay.struct_size = sizeof(replay);
-        status = ql_replay_execute(allocator, problem, query, left_ir,
-                                   right_ir, witness, &replay, error);
+        {
+            QL_STAGE_MARK(stage_execute);
+            status = ql_replay_execute(allocator, problem, query, left_ir,
+                                       right_ir, witness, &replay, error);
+            QL_STAGE_ADD(QL_STAGE_REPLAY, stage_execute);
+        }
         if (status != QL_STATUS_OK) {
             goto finish;
         }
@@ -1052,7 +1090,9 @@ static ql_status QL_CALL smt_product_run(void *instance,
     uint32_t left_supported = 0u;
     uint32_t right_supported = 0u;
     ql_status status;
+    QL_STAGE_MARK(stage_total);
 
+    QL_STAGE_RESET();
     memset(&left, 0, sizeof(left));
     memset(&right, 0, sizeof(right));
     memset(&decision, 0, sizeof(decision));
@@ -1069,14 +1109,20 @@ static ql_status QL_CALL smt_product_run(void *instance,
         return status;
     }
     allocator = &owned->allocator;
-    status = ql_problem_open(allocator, inputs[0], &problem, error);
-    if (status != QL_STATUS_OK) {
-        return status;
+    {
+        QL_STAGE_MARK(stage_problem);
+        status = ql_problem_open(allocator, inputs[0], &problem, error);
+        if (status == QL_STATUS_OK) {
+            memset(&problem_view, 0, sizeof(problem_view));
+            problem_view.struct_size = sizeof(problem_view);
+            status = ql_problem_get_view_v2(problem, &problem_view, error);
+        }
+        QL_STAGE_ADD(QL_STAGE_PROBLEM, stage_problem);
     }
-    memset(&problem_view, 0, sizeof(problem_view));
-    problem_view.struct_size = sizeof(problem_view);
-    status = ql_problem_get_view_v2(problem, &problem_view, error);
     if (status != QL_STATUS_OK) {
+        if (problem == NULL) {
+            return status;
+        }
         goto cleanup;
     }
 
@@ -1104,13 +1150,22 @@ static ql_status QL_CALL smt_product_run(void *instance,
         query_view.ub_policy = problem_view.contract.ub_policy;
         query_view.covered_observations =
             problem_view.contract.observations;
-        status = build_outcome(allocator, owned, &problem_view, &query_view,
-                               &decision, NULL, output, error);
+        {
+            QL_STAGE_MARK(stage_outcome);
+            status = build_outcome(allocator, owned, &problem_view,
+                                   &query_view, &decision, NULL, output,
+                                   error);
+            QL_STAGE_ADD(QL_STAGE_OUTCOME, stage_outcome);
+        }
         goto cleanup;
     }
 
-    status = ql_product_query_build(allocator, problem, left.ir, right.ir,
-                                    &query, error);
+    {
+        QL_STAGE_MARK(stage_product);
+        status = ql_product_query_build(allocator, problem, left.ir, right.ir,
+                                        &query, error);
+        QL_STAGE_ADD(QL_STAGE_PRODUCT, stage_product);
+    }
     if (status == QL_STATUS_TYPE_MISMATCH) {
         /* An axis the miter cannot state is a boundary of this method, not a
            statement about the functions. */
@@ -1121,8 +1176,13 @@ static ql_status QL_CALL smt_product_run(void *instance,
         query_view.ub_policy = problem_view.contract.ub_policy;
         query_view.covered_observations =
             problem_view.contract.observations;
-        status = build_outcome(allocator, owned, &problem_view, &query_view,
-                               &decision, NULL, output, error);
+        {
+            QL_STAGE_MARK(stage_outcome);
+            status = build_outcome(allocator, owned, &problem_view,
+                                   &query_view, &decision, NULL, output,
+                                   error);
+            QL_STAGE_ADD(QL_STAGE_OUTCOME, stage_outcome);
+        }
         goto cleanup;
     }
     if (status != QL_STATUS_OK) {
@@ -1139,8 +1199,12 @@ static ql_status QL_CALL smt_product_run(void *instance,
     if (status != QL_STATUS_OK) {
         goto cleanup;
     }
-    status = build_outcome(allocator, owned, &problem_view, &query_view,
-                           &decision, counterexample, output, error);
+    {
+        QL_STAGE_MARK(stage_outcome);
+        status = build_outcome(allocator, owned, &problem_view, &query_view,
+                               &decision, counterexample, output, error);
+        QL_STAGE_ADD(QL_STAGE_OUTCOME, stage_outcome);
+    }
 
 cleanup:
     ql_artifact_release(counterexample);
@@ -1151,6 +1215,10 @@ cleanup:
     if (status == QL_STATUS_OK) {
         ql_error_clear(error);
     }
+    /* The total covers the teardown above, which is where the two lowered
+       sides and the query are freed. Leaving it out would hide a stage. */
+    QL_STAGE_ADD(QL_STAGE_TOTAL, stage_total);
+    QL_STAGE_EMIT();
     return status;
 }
 

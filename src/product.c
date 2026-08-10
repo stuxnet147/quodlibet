@@ -6,6 +6,13 @@
 
 #include "quodlibet/precondition.h"
 
+/* Compiles to nothing unless QL_STAGE_TIMING is defined. The hooks below
+   bracket the four points where the accumulated encoding is rendered into
+   SMT-LIB text and hashed into an artifact, which is the only place in this
+   file where serialisation is separable from the encoding that feeds it.
+   W8 added them and owns them. */
+#include "stage_timer.h"
+
 #define QL_PRODUCT_SYMBOL_CAPACITY 40u
 #define QL_PRODUCT_MAX_BV_WIDTH 1024u
 /* The ASM2C_GNU_V1 profile is a flat 64-bit address space of bytes. */
@@ -3166,15 +3173,17 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
         status = encode_violation(&encoder, &problem_view.contract);
     }
     if (status == QL_STATUS_OK) {
+        QL_STAGE_MARK(stage_smt2);
         status = ql_smt2_builder_build(encoder.builder, &query->prefix,
                                        error);
-    }
-    if (status == QL_STATUS_OK) {
-        status = ql_artifact_create(
-            selected, QL_ARTIFACT_KIND_SMTLIB2, QL_SMTLIB2_SCHEMA_VERSION,
-            product_violation_assertion,
-            sizeof(product_violation_assertion) - 1u, &query->violation,
-            error);
+        if (status == QL_STATUS_OK) {
+            status = ql_artifact_create(
+                selected, QL_ARTIFACT_KIND_SMTLIB2, QL_SMTLIB2_SCHEMA_VERSION,
+                product_violation_assertion,
+                sizeof(product_violation_assertion) - 1u, &query->violation,
+                error);
+        }
+        QL_STAGE_ADD(QL_STAGE_SMT2, stage_smt2);
     }
     if (status == QL_STATUS_OK && query->object_count != 0u) {
         buffer_reset(&encoder.term);
@@ -3192,17 +3201,21 @@ ql_status QL_CALL ql_product_query_build(const ql_allocator *allocator,
             status = term_add(&encoder, "))\n");
         }
         if (status == QL_STATUS_OK) {
+            QL_STAGE_MARK(stage_smt2);
             status = ql_artifact_create(
                 selected, QL_ARTIFACT_KIND_SMTLIB2, QL_SMTLIB2_SCHEMA_VERSION,
                 buffer_text(&encoder.term), encoder.term.size,
                 &query->bounded_violation, error);
+            QL_STAGE_ADD(QL_STAGE_SMT2, stage_smt2);
         }
     }
     if (status == QL_STATUS_OK) {
+        QL_STAGE_MARK(stage_smt2);
         status = ql_artifact_create(
             selected, QL_ARTIFACT_KIND_SMTLIB2, QL_SMTLIB2_SCHEMA_VERSION,
             product_domain_assertion, sizeof(product_domain_assertion) - 1u,
             &query->domain, error);
+        QL_STAGE_ADD(QL_STAGE_SMT2, stage_smt2);
     }
     if (status != QL_STATUS_OK) {
         goto cleanup;
