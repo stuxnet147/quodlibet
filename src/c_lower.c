@@ -146,6 +146,9 @@ typedef struct lower_variable {
   /* The address of that storage, typed as a pointer to the variable. */
   ql_ir_value_id address;
   ql_ir_value_id value;
+  /* A path-sensitive predicate saying whether `value` or the stack bytes
+     came from an initialization before this point. */
+  ql_ir_value_id defined;
   uint32_t initialized;
   uint32_t is_const;
   size_t scope_depth;
@@ -218,6 +221,7 @@ typedef struct lower_stack_slot {
 
 typedef struct lower_state {
   ql_ir_value_id *values;
+  ql_ir_value_id *defined;
   uint8_t *initialized;
   uint8_t *has_object;
   uint8_t *may_admit_object;
@@ -3121,6 +3125,7 @@ static ql_status add_variable(lower_context *context, const char *name,
   variable->name_size = name_size;
   variable->type = type;
   variable->value = value;
+  variable->defined = QL_IR_INVALID_VALUE_ID;
   {
     size_t slot;
     for (slot = 0u; slot < context->stack_slot_count; ++slot) {
@@ -3191,9 +3196,15 @@ static void pop_variables(lower_context *context, size_t marker) {
   }
 }
 
+static ql_status ensure_variable_value(lower_context *context,
+                                       lower_variable *variable,
+                                       ql_error *error);
+static void destroy_state(lower_context *context, lower_state *state);
+
 static ql_status save_state(lower_context *context, size_t count,
                             lower_state *state, ql_error *error) {
   size_t index;
+  ql_status status;
   memset(state, 0, sizeof(*state));
   state->count = count;
   state->memory = context->memory_value;
@@ -3203,16 +3214,21 @@ static ql_status save_state(lower_context *context, size_t count,
   }
   state->values = context->allocator->allocate(context->allocator->user_data,
                                                count * sizeof(*state->values));
+  state->defined = context->allocator->allocate(
+      context->allocator->user_data, count * sizeof(*state->defined));
   state->initialized = context->allocator->allocate(
       context->allocator->user_data, count * sizeof(*state->initialized));
   state->has_object = context->allocator->allocate(
       context->allocator->user_data, count * sizeof(*state->has_object));
   state->may_admit_object = context->allocator->allocate(
       context->allocator->user_data, count * sizeof(*state->may_admit_object));
-  if (state->values == NULL || state->initialized == NULL ||
+  if (state->values == NULL || state->defined == NULL ||
+      state->initialized == NULL ||
       state->has_object == NULL || state->may_admit_object == NULL) {
     context->allocator->deallocate(context->allocator->user_data,
                                    state->values);
+    context->allocator->deallocate(context->allocator->user_data,
+                                   state->defined);
     context->allocator->deallocate(context->allocator->user_data,
                                    state->initialized);
     context->allocator->deallocate(context->allocator->user_data,
@@ -3224,7 +3240,13 @@ static ql_status save_state(lower_context *context, size_t count,
     return QL_STATUS_OUT_OF_MEMORY;
   }
   for (index = 0u; index < count; ++index) {
+    status = ensure_variable_value(context, &context->variables[index], error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      destroy_state(context, state);
+      return status;
+    }
     state->values[index] = context->variables[index].value;
+    state->defined[index] = context->variables[index].defined;
     state->initialized[index] = (uint8_t)context->variables[index].initialized;
     state->has_object[index] = (uint8_t)context->variables[index].has_object;
     state->may_admit_object[index] =
@@ -3239,6 +3261,7 @@ static void restore_state(lower_context *context, const lower_state *state) {
   context->trace_value = state->trace;
   for (index = 0u; index < state->count; ++index) {
     context->variables[index].initialized = state->initialized[index];
+    context->variables[index].defined = state->defined[index];
     context->variables[index].has_object = state->has_object[index];
     context->variables[index].may_admit_object = state->may_admit_object[index];
     if (context->variables[index].is_stack != 0u) {
@@ -3250,6 +3273,8 @@ static void restore_state(lower_context *context, const lower_state *state) {
 
 static void destroy_state(lower_context *context, lower_state *state) {
   context->allocator->deallocate(context->allocator->user_data, state->values);
+  context->allocator->deallocate(context->allocator->user_data,
+                                 state->defined);
   context->allocator->deallocate(context->allocator->user_data,
                                  state->initialized);
   context->allocator->deallocate(context->allocator->user_data,
@@ -4067,6 +4092,52 @@ static ql_status emit_shift_result(lower_context *context,
 static ql_status lower_expression(lower_context *context, size_t node,
                                   lower_value *output, ql_error *error);
 
+/* Every scalar has a value even on a path where C left it indeterminate, so
+   SSA joins remain well formed. The accompanying predicate is false on that
+   path and makes any observation UB. Zero is only a typed placeholder and is
+   never an answer. Stack variables already have arbitrary input bytes, so
+   only their predicate needs materializing here. */
+static ql_status ensure_variable_value(lower_context *context,
+                                       lower_variable *variable,
+                                       ql_error *error) {
+  ql_status status = ensure_bool_constants(context, error);
+
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  if (variable->defined == QL_IR_INVALID_VALUE_ID) {
+    variable->defined = variable->initialized != 0u ? context->true_value
+                                                    : context->false_value;
+  }
+  if (variable->is_stack != 0u || variable->type.array_length != 0u ||
+      variable->type.kind == QL_C_SCALAR_RECORD ||
+      variable->value != QL_IR_INVALID_VALUE_ID) {
+    return QL_STATUS_OK;
+  }
+  if (variable->type.kind == QL_C_SCALAR_POINTER) {
+    lower_value address;
+    lower_value pointer;
+    memset(&address, 0, sizeof(address));
+    address.type = address_type();
+    address.defined = context->true_value;
+    status = add_uint_constant(context, address.type, 0u, &address.value,
+                               error);
+    if (status == QL_STATUS_OK) {
+      status = emit_pointer_of_address(context, address, variable->type,
+                                       &pointer, error);
+    }
+    if (status == QL_STATUS_OK) {
+      variable->value = pointer.value;
+      variable->has_object = 0u;
+      variable->may_admit_object = 1u;
+    }
+  } else {
+    status = add_uint_constant(context, variable->type, 0u, &variable->value,
+                               error);
+  }
+  return status;
+}
+
 static ql_status lower_identifier(lower_context *context, size_t node,
                                   lower_value *output, ql_error *error) {
   char *name = copy_node_text(context, node);
@@ -4099,13 +4170,8 @@ static ql_status lower_identifier(lower_context *context, size_t node,
         "identifier does not name a parameter, local, or enumerator", error);
   }
   context->allocator->deallocate(context->allocator->user_data, name);
-  if (variable->initialized == 0u) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, node,
-        "read of an uninitialized local has no modeled value", error);
-  }
-  status = ensure_bool_constants(context, error);
-  if (status != QL_STATUS_OK) {
+  status = ensure_variable_value(context, variable, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
   }
   if (variable->type.array_length != 0u) {
@@ -4123,12 +4189,19 @@ static ql_status lower_identifier(lower_context *context, size_t node,
         error);
   }
   if (variable->is_stack != 0u) {
-    return emit_load(context, stack_address(context, variable), output, error);
+    status = emit_load(context, stack_address(context, variable), output,
+                       error);
+    if (status == QL_STATUS_OK && context->unknown == 0u &&
+        variable->initialized == 0u) {
+      output->defined = variable->defined;
+      output->may_ub = 1u;
+    }
+    return status;
   }
   output->value = variable->value;
-  output->defined = context->true_value;
+  output->defined = variable->defined;
   output->type = variable->type;
-  output->may_ub = 0u;
+  output->may_ub = variable->initialized == 0u;
   output->has_object = variable->has_object;
   output->may_admit_object = variable->may_admit_object;
   return QL_STATUS_OK;
@@ -6170,6 +6243,7 @@ static ql_status write_assignment_target(lower_context *context, size_t node,
     }
     target->variable->value = converted.value;
     target->variable->initialized = 1u;
+    target->variable->defined = context->true_value;
     target->variable->has_object = converted.has_object;
     target->variable->may_admit_object = converted.may_admit_object;
     if (stored != NULL) {
@@ -6191,6 +6265,7 @@ static ql_status write_assignment_target(lower_context *context, size_t node,
   if (status == QL_STATUS_OK && context->unknown == 0u &&
       target->stack_variable != NULL) {
     target->stack_variable->initialized = 1u;
+    target->stack_variable->defined = context->true_value;
   }
   return status;
 }
@@ -6222,32 +6297,33 @@ static ql_status lower_read_modify_write(lower_context *context, size_t node,
                                    error);
   }
   if (target.variable != NULL) {
-    if (target.variable->initialized == 0u) {
-      return lower_unknown(
-          context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, left_node,
-          "a compound assignment reads its target before writing it", error);
+    status = ensure_variable_value(context, target.variable, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
     }
     memset(&old, 0, sizeof(old));
     old.value = target.variable->value;
     old.type = target.variable->type;
     old.has_object = target.variable->has_object;
     old.may_admit_object = target.variable->may_admit_object;
-    status = ensure_bool_constants(context, error);
-    if (status != QL_STATUS_OK) {
-      return status;
-    }
-    old.defined = context->true_value;
+    old.defined = target.variable->defined;
+    old.may_ub = target.variable->initialized == 0u;
   } else {
-    if (target.stack_variable != NULL &&
-        target.stack_variable->initialized == 0u) {
-      return lower_unknown(
-          context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, left_node,
-          "a compound assignment reads its target before writing it", error);
+    if (target.stack_variable != NULL) {
+      status = ensure_variable_value(context, target.stack_variable, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
     }
     status = load_at_address(context, left_node, target.address,
                              target.declared, &old, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
+    }
+    if (target.stack_variable != NULL &&
+        target.stack_variable->initialized == 0u) {
+      old.defined = target.stack_variable->defined;
+      old.may_ub = 1u;
     }
   }
   status = apply_binary_operator(context, operator_text, node, old, operand,
@@ -6882,6 +6958,7 @@ static ql_status lower_declaration(lower_context *context, size_t node,
          bits, so preserve the previous storage contract for that case.
          Explicit initialization is fully written above. */
       variable->initialized = 1u;
+      variable->defined = context->true_value;
       continue;
     }
     if (value_node != SIZE_MAX) {
@@ -6909,9 +6986,11 @@ static ql_status lower_declaration(lower_context *context, size_t node,
         }
         variable = &context->variables[context->variable_count - 1u];
         variable->initialized = 1u;
+        variable->defined = context->true_value;
       } else {
         variable->value = converted.value;
         variable->initialized = 1u;
+        variable->defined = context->true_value;
         /* A pointer local is only as well-founded as what was put in
            it. */
         variable->has_object = converted.has_object;
@@ -7028,6 +7107,7 @@ static ql_status merge_states_many(lower_context *context,
     uint32_t all_have_object = 1u;
     uint32_t all_can_name_object = 1u;
     uint32_t same_value = 1u;
+    uint32_t same_defined = 1u;
 
     for (incoming = 0u; incoming < state_count; ++incoming) {
       all_initialized &= states[incoming].initialized[index] != 0u;
@@ -7039,31 +7119,40 @@ static ql_status merge_states_many(lower_context *context,
         same_value = 0u;
       }
     }
+    variable->initialized = all_initialized;
     if (variable->is_stack != 0u) {
       /* Memory already carries it, and the memory PHI below merges
          that. A second PHI over a value it does not have would be
-         wrong. Definite initialization still has to hold on both live
-         paths before a later read or address escape is allowed. */
-      variable->initialized = all_initialized;
-      continue;
-    }
-    if (all_initialized == 0u) {
-      variable->initialized = 0u;
-      variable->value = QL_IR_INVALID_VALUE_ID;
-      variable->has_object = 0u;
-      variable->may_admit_object = 0u;
-      continue;
-    }
-    variable->initialized = 1u;
-    variable->has_object = all_have_object;
-    variable->may_admit_object =
-        all_have_object == 0u && all_can_name_object != 0u;
-    if (same_value != 0u) {
-      variable->value = operands[0];
+         wrong. Its initialization predicate is still an ordinary SSA
+         value and is merged below. */
     } else {
-      status = emit_instruction(context, QL_IR_OPCODE_PHI, &variable->type,
-                                operands, state_count, blocks, state_count,
-                                QL_IR_EFFECT_NONE, &variable->value, error);
+      variable->has_object = all_have_object;
+      variable->may_admit_object =
+          all_have_object == 0u && all_can_name_object != 0u;
+      if (same_value != 0u) {
+        variable->value = operands[0];
+      } else {
+        status = emit_instruction(context, QL_IR_OPCODE_PHI, &variable->type,
+                                  operands, state_count, blocks, state_count,
+                                  QL_IR_EFFECT_NONE, &variable->value, error);
+        if (status != QL_STATUS_OK) {
+          goto cleanup;
+        }
+      }
+    }
+    for (incoming = 0u; incoming < state_count; ++incoming) {
+      operands[incoming] = states[incoming].defined[index];
+      if (incoming != 0u && operands[incoming] != operands[0]) {
+        same_defined = 0u;
+      }
+    }
+    if (same_defined != 0u) {
+      variable->defined = operands[0];
+    } else {
+      lower_type boolean = make_bool_type();
+      status = emit_instruction(context, QL_IR_OPCODE_PHI, &boolean, operands,
+                                state_count, blocks, state_count,
+                                QL_IR_EFFECT_NONE, &variable->defined, error);
       if (status != QL_STATUS_OK) {
         goto cleanup;
       }
@@ -7791,6 +7880,7 @@ cleanup:
 
 typedef struct lower_loop_phis {
   ql_ir_instruction_id *variables;
+  ql_ir_instruction_id *defined;
   size_t variable_count;
   ql_ir_instruction_id memory;
   ql_ir_instruction_id trace;
@@ -7799,6 +7889,8 @@ typedef struct lower_loop_phis {
 static void destroy_loop_phis(lower_context *context, lower_loop_phis *phis) {
   context->allocator->deallocate(context->allocator->user_data,
                                  phis->variables);
+  context->allocator->deallocate(context->allocator->user_data,
+                                 phis->defined);
   memset(phis, 0, sizeof(*phis));
 }
 
@@ -7826,6 +7918,7 @@ static ql_status begin_loop_phis(lower_context *context,
                                  ql_ir_block_id predecessor,
                                  lower_loop_phis *phis, ql_error *error) {
   size_t index;
+  lower_type boolean = make_bool_type();
   ql_status status = QL_STATUS_OK;
 
   memset(phis, 0, sizeof(*phis));
@@ -7835,29 +7928,43 @@ static ql_status begin_loop_phis(lower_context *context,
   if (entry->count != 0u) {
     phis->variables = context->allocator->allocate(
         context->allocator->user_data, entry->count * sizeof(*phis->variables));
-    if (phis->variables == NULL) {
+    phis->defined = context->allocator->allocate(
+        context->allocator->user_data, entry->count * sizeof(*phis->defined));
+    if (phis->variables == NULL || phis->defined == NULL) {
       ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+      destroy_loop_phis(context, phis);
       return QL_STATUS_OUT_OF_MEMORY;
     }
     for (index = 0u; index < entry->count; ++index) {
       phis->variables[index] = QL_IR_INVALID_INSTRUCTION_ID;
+      phis->defined[index] = QL_IR_INVALID_INSTRUCTION_ID;
     }
+  }
+  status = ensure_ir_type(context, &boolean, error);
+  if (status != QL_STATUS_OK) {
+    destroy_loop_phis(context, phis);
+    return status;
   }
   restore_state(context, entry);
   for (index = 0u; index < entry->count; ++index) {
     lower_variable *variable = &context->variables[index];
-    if (variable->is_stack != 0u || entry->initialized[index] == 0u) {
-      continue;
-    }
-    if (entry->values[index] == QL_IR_INVALID_VALUE_ID) {
-      ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
-                   "initialized loop variable has no SSA value");
-      status = QL_STATUS_INTERNAL_ERROR;
-      goto failure;
+    if (variable->is_stack == 0u) {
+      if (entry->values[index] == QL_IR_INVALID_VALUE_ID) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "loop variable has no SSA placeholder value");
+        status = QL_STATUS_INTERNAL_ERROR;
+        goto failure;
+      }
+      status = emit_initial_loop_phi(
+          context, variable->type.ir_type, entry->values[index], predecessor,
+          &phis->variables[index], &variable->value, error);
+      if (status != QL_STATUS_OK) {
+        goto failure;
+      }
     }
     status = emit_initial_loop_phi(
-        context, variable->type.ir_type, entry->values[index], predecessor,
-        &phis->variables[index], &variable->value, error);
+        context, boolean.ir_type, entry->defined[index], predecessor,
+        &phis->defined[index], &variable->defined, error);
     if (status != QL_STATUS_OK) {
       goto failure;
     }
@@ -7899,10 +8006,11 @@ append_loop_backedge(lower_context *context, const lower_loop_phis *phis,
     return QL_STATUS_INTERNAL_ERROR;
   }
   for (index = 0u; index < phis->variable_count; ++index) {
-    if (entry->initialized[index] != 0u && backedge->initialized[index] == 0u) {
-      return lower_unknown(
-          context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, node,
-          "loop back-edge loses a definitely initialized local", error);
+    status = ql_ir_builder_append_phi_incoming(
+        context->builder, phis->defined[index], backedge->defined[index],
+        block, error);
+    if (status != QL_STATUS_OK) {
+      return status;
     }
     if (phis->variables[index] == QL_IR_INVALID_INSTRUCTION_ID) {
       continue;
@@ -9635,6 +9743,7 @@ static ql_status materialize_globals(lower_context *context, ql_error *error) {
     variable->address = global->address;
     variable->has_object = 1u;
     variable->initialized = 1u;
+    variable->defined = context->true_value;
     /* File scope, so a local of the same name shadows it: find_variable
        searches from the most recent entry backwards. */
     variable->scope_depth = 0u;

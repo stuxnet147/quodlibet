@@ -468,10 +468,6 @@ TEST(CLowerExpressions, RefusesWhatItCannotState) {
         int expected;
     };
     const Refused cases[] = {
-        /* Reading a target before it is written stays a refusal, and a
-           compound assignment reads its target. */
-        {"int f(int a) { int c; c += a; return c; }", "f",
-         -1},
         /* A const local is not writable, whatever the operator. */
         {"int f(int a) { const int c = a; c += 1; return c; }", "f",
          -1},

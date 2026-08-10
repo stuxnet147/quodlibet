@@ -1335,6 +1335,24 @@ ASM2C_GNU_V1의 plain `char`는 signed이므로 ordinary character constant는 8
 
 `tests/test_c_lower_expressions.cpp`는 ordinary character escape를 실제 컴파일된 C와 대조하고 범위를 넘는 escape를 UNKNOWN으로 고정합니다. `tests/test_c_lower_aggregates.cpp`는 string escape가 정확한 memory byte를 요구하는지 확인합니다. 전체 train 측정은 단일 `coverage` 프로세스가 순차 실행이라는 점을 고려해 6개 샤드로 병렬화한 뒤 카운터와 29,880개 상세 행을 합쳤습니다.
 
+### 32. 초기화되지 않은 scalar 읽기를 경로별 UB로 표현한다
+
+커밋: (이 단위)
+
+초기화되지 않은 scalar에는 임의의 답을 주지 않습니다. SSA value와 별도로 그 값이 현재 경로에서 초기화되었는지를 나타내는 boolean predicate를 운반하고, 읽는 순간 predicate가 거짓이면 explicit UB guard가 실행됩니다. 분기 합류에서는 값과 predicate를 각각 PHI로 합치고, loop header와 back-edge도 두 PHI를 함께 갱신합니다. 아직 초기화되지 않은 경로의 typed zero는 PHI를 구성하기 위한 placeholder일 뿐이며 predicate가 거짓인 경로에서 관찰 가능한 반환값이 되지 않습니다.
+
+따라서 `int x; if (take) x = 7; return x;`는 `take != 0`에서 7을 반환하고 반대 경로에서 UB입니다. `x += 1`처럼 쓰기 전에 읽는 연산도 같은 규칙을 사용합니다. 반면 초기화되지 않은 지역의 주소가 외부 호출로 escape하는 경우는 callee가 그 저장소를 쓸 수 있으므로 계속 UNKNOWN입니다. 이를 지원하려면 외부 호출의 memory-write 계약이 먼저 필요합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 20,279 (67.87%) | **20,688 (69.24%)** |
+| 증가 | | **+409** |
+| `uninitialized_read` | 2,448 | **1,972** |
+| verifier 통과 | 20,279 / 20,279 | **20,688 / 20,688** |
+| status 실패 | 0 | **0** |
+
+`uninitialized_read`는 476개 줄었지만 그중 67개는 뒤에 있던 다른 미지원 의미론으로 이동했으므로 최종 성공 순증은 409개입니다. `tests/test_c_lower_locals.cpp`는 초기화된 분기와 UB 분기, compound assignment를 interpreter로 고정합니다. 기존 UNKNOWN 목록도 새 계약에 맞게 갱신했습니다. 전체 검증은 Windows 530/530, Linux Clang 529/529, Linux ASan/UBSan 529/529입니다. `fuzz_c_lower`는 60초 동안 269,343회, `cov: 2833`, crash 0으로 끝났습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1343,11 +1361,11 @@ ASM2C_GNU_V1의 plain `char`는 signed이므로 ordinary character constant는 8
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 4,499
-- `uninitialized_read` 2,448
+- `unsupported_type` 4,508
+- `uninitialized_read` 1,972
 - `type_error` 702
-- `unsupported_pointer` 607
-- `unsupported_control_flow` 423
+- `unsupported_pointer` 649
+- `unsupported_control_flow` 435
 
 ## 조율자에게 요청할 것
 
@@ -1363,7 +1381,7 @@ ASM2C_GNU_V1의 plain `char`는 signed이므로 ordinary character constant는 8
 
 ## 다음에 할 것
 
-1. 최신 9,601개 UNKNOWN을 diagnostic message까지 다시 분류합니다. 요약 코드만으로는 타입과 definite-initialization 범주의 독립 원인을 정할 수 없습니다.
+1. 최신 9,192개 UNKNOWN을 diagnostic message까지 다시 분류합니다. 요약 코드만으로는 타입과 definite-initialization 범주의 독립 원인을 정할 수 없습니다.
 2. 남은 타입 철자와 선언 형태를 빈도순으로 닫고, uninitialized address escape는 외부 호출의 memory-write 계약을 먼저 고정합니다.
 3. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.
 4. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.

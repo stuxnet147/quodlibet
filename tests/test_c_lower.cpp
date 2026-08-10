@@ -301,10 +301,8 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
   }
 }
 
-TEST(CLower, RejectsUninitializedReadAndReachableMissingReturn) {
+TEST(CLower, RejectsReachableMissingReturn) {
   const UnsupportedCase cases[] = {
-      {"int uninit(int x) { int y; if (x) y = 1; return y; }", "uninit",
-       QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, "identifier"},
       {"int partial(int x) { if (x) return 1; }", "partial",
        QL_C_LOWER_DIAGNOSTIC_MISSING_RETURN, "compound_statement"},
   };

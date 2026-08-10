@@ -367,8 +367,8 @@ TEST(CLowerLocals, SizesTheSlotFromTheDeclaredTypeNotAWord) {
 
 TEST(CLowerLocals, RefusesStorageWithNothingPutInIt) {
     const char *source = "int f(int a) { int v; int *p = &v; return *p; }";
-    /* Storage without an initialiser holds an indeterminate value, which C
-       does not let you read. Refusing beats inventing one. */
+    /* The address may escape to code that initializes the object. Modeling
+       that requires a callee memory-write contract, not an eager UB guard. */
     ExpectUnknown(source, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ);
 }
 
@@ -376,6 +376,32 @@ TEST(CLowerLocals, RefusesStorageInitializedOnOnlyOneBranch) {
     const char *source =
         "int f(int a) { int v; if (a) v = 1; return *&v; }";
     ExpectUnknown(source, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ);
+}
+
+TEST(CLowerLocals, IndeterminateSsaAndCompoundReadsAreUndefined) {
+    const char *conditional_source =
+        "int f(int take) { int value; if (take) value = 7; return value; }";
+    Lowered conditional;
+    std::vector<std::vector<uint8_t>> images;
+    ASSERT_TRUE(conditional.Open(conditional_source, "f"));
+    const Outcome defined = Execute(conditional.ir(), {Widen(1)}, {}, &images);
+    ASSERT_EQ(QL_STATUS_OK, defined.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, defined.result.outcome);
+    EXPECT_EQ(7, Returned(defined.result));
+    const Outcome undefined =
+        Execute(conditional.ir(), {Widen(0)}, {}, &images);
+    ASSERT_EQ(QL_STATUS_OK, undefined.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+              undefined.result.outcome);
+
+    const char *compound_source =
+        "int compound(void) { int value; return value += 1; }";
+    Lowered compound;
+    ASSERT_TRUE(compound.Open(compound_source, "compound"));
+    const Outcome compound_run = Execute(compound.ir(), {}, {}, &images);
+    ASSERT_EQ(QL_STATUS_OK, compound_run.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+              compound_run.result.outcome);
 }
 
 TEST(CLowerLocals, RefusesShadowedAddressTakenNamesWithoutAStatusFailure) {
