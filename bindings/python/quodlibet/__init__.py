@@ -503,7 +503,10 @@ def check_batch(
 
     def run(spec: CheckSpec | Mapping[str, Any]) -> CheckResult | QuodlibetError:
         kwargs = spec.as_kwargs() if isinstance(spec, CheckSpec) else dict(spec)
-        kwargs.setdefault("session", worker_session())
+        # A spec that names its own session keeps it, and no worker session is
+        # opened for it: setdefault would have built one either way.
+        if kwargs.get("session") is None:
+            kwargs["session"] = worker_session()
         try:
             return check(**kwargs)
         except QuodlibetError as error:
