@@ -188,11 +188,13 @@ static void coverage_count_lower(ql_coverage_totals *totals,
 }
 
 static void coverage_measure_unit(ql_coverage_totals *totals,
-                                  const char *path, FILE *detail) {
+                                  ql_c_parser *parser, const char *path,
+                                  FILE *detail) {
     char *source = NULL;
     size_t source_size = 0u;
     ql_c_frontend_unit *unit = NULL;
     ql_c_frontend_unit_view unit_view = { 0 };
+    ql_c_syntax_tree *tree = NULL;
     ql_error error;
     ql_status status;
     size_t index;
@@ -208,7 +210,8 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
        QL_STATUS_PARSE_ERROR, so a separate syntax-check parse here would just
        parse every unit twice. VTune showed parsing dominating this tool. */
     ql_error_clear(&error);
-    status = ql_c_frontend_analyze(NULL, source, source_size, &unit, &error);
+    status = ql_c_frontend_analyze_with_parser(NULL, parser, source,
+                                               source_size, &unit, &error);
     if (status == QL_STATUS_PARSE_ERROR) {
         totals->units_syntax_error += 1u;
         free(source);
@@ -226,6 +229,15 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
         ql_c_frontend_unit_destroy(unit);
         free(source);
         return;
+    }
+    /* Lend the frontend's own parse to the lowering. Without this the source
+       is parsed twice per definition: once here and once inside the lowering,
+       and parsing is most of what this tool does. Borrowed from the unit, so
+       it stays valid for as long as the unit does and is not destroyed here.
+       A refusal is not fatal; a null tree makes the lowering parse for
+       itself, which is the behaviour this replaces. */
+    if (ql_c_frontend_unit_borrow_tree(unit, &tree, &error) != QL_STATUS_OK) {
+        tree = NULL;
     }
 
     for (index = 0u; index < unit_view.function_count; ++index) {
@@ -253,9 +265,10 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
                                     function.diagnostic_count);
         }
 
-        if (ql_c_lower_selected_function(NULL, source, source_size, unit,
-                                         &function, &lowered,
-                                         &error) != QL_STATUS_OK) {
+        if (ql_c_lower_selected_function_with_tree(NULL, source, source_size,
+                                                   unit, &function, tree,
+                                                   &lowered,
+                                                   &error) != QL_STATUS_OK) {
             totals->definitions_lower_failed_status += 1u;
         } else {
             lower_view.struct_size = sizeof(lower_view);
@@ -343,6 +356,7 @@ static void coverage_print_json(const ql_coverage_totals *totals) {
 
 int ql_cli_coverage(const char *list_path, const char *detail_path) {
     ql_coverage_totals totals;
+    ql_c_parser *parser = NULL;
     ql_error error;
     FILE *list = NULL;
     FILE *detail = NULL;
@@ -350,6 +364,14 @@ int ql_cli_coverage(const char *list_path, const char *detail_path) {
 
     memset(&totals, 0, sizeof(totals));
     ql_error_clear(&error);
+
+    /* One parser for the whole corpus. Creating a Tree-sitter parser costs
+       more than parsing a short function, and this tool runs over 188,432
+       records on the train split. */
+    if (ql_c_parser_create(NULL, &parser, &error) != QL_STATUS_OK) {
+        (void)fprintf(stderr, "error: cannot create C parser\n");
+        return 1;
+    }
 
 #if defined(_WIN32)
     if (fopen_s(&list, list_path, "rb") != 0) {
@@ -359,6 +381,7 @@ int ql_cli_coverage(const char *list_path, const char *detail_path) {
     list = fopen(list_path, "rb");
 #endif
     if (list == NULL) {
+        ql_c_parser_destroy(parser);
         (void)fprintf(stderr, "error: cannot open list '%s'\n", list_path);
         return 1;
     }
@@ -372,6 +395,7 @@ int ql_cli_coverage(const char *list_path, const char *detail_path) {
 #endif
         if (detail == NULL) {
             (void)fclose(list);
+            ql_c_parser_destroy(parser);
             (void)fprintf(stderr, "error: cannot write detail '%s'\n",
                           detail_path);
             return 1;
@@ -386,13 +410,14 @@ int ql_cli_coverage(const char *list_path, const char *detail_path) {
         if (length == 0u) {
             continue;
         }
-        coverage_measure_unit(&totals, line, detail);
+        coverage_measure_unit(&totals, parser, line, detail);
     }
 
     (void)fclose(list);
     if (detail != NULL) {
         (void)fclose(detail);
     }
+    ql_c_parser_destroy(parser);
     coverage_print_json(&totals);
     return 0;
 }
