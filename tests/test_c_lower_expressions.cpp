@@ -110,6 +110,16 @@ QL_EXPR_FUNCTION(sizeof_types,
         return (int)(sizeof(TYP_SIZE_WORD) + sizeof(int *) +
                      sizeof(struct expr_size_pair)) + (a - a) + (b - b);
     });
+/* Tree-sitter includes a literal's leading sign in number_literal. The
+   lowering must still select the type of the magnitude before applying the
+   unary minus, including the unsigned-wrap case. */
+QL_EXPR_FUNCTION(signed_literals, int expr_signed_literals(int a, int b) {
+    return -1 + (+7 - 7) + (a - a) + (b - b);
+});
+QL_EXPR_FUNCTION(unsigned_negative_literal,
+    unsigned expr_unsigned_negative_literal(unsigned a, unsigned b) {
+        return -1u + (a - a) + (b - b);
+    });
 
 namespace {
 
@@ -330,6 +340,16 @@ const Case kCases[] = {
      &Always},
     {"sizeof-types", sizeof_types_source, "expr_sizeof_types",
      [](int32_t a, int32_t b) { return expr_sizeof_types(a, b); },
+     &Always},
+    {"signed-literals", signed_literals_source, "expr_signed_literals",
+     [](int32_t a, int32_t b) { return expr_signed_literals(a, b); },
+     &Always},
+    {"unsigned-negative-literal", unsigned_negative_literal_source,
+     "expr_unsigned_negative_literal",
+     [](int32_t a, int32_t b) {
+         return static_cast<int32_t>(expr_unsigned_negative_literal(
+             static_cast<unsigned>(a), static_cast<unsigned>(b)));
+     },
      &Always},
 };
 

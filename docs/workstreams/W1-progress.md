@@ -1114,6 +1114,23 @@ C17 에서 `bool` 은 키워드가 아니라 `<stdbool.h>` 의 매크로이므�
 3. **loop** 3,020. 닫으면 **W6 의 CHC/PDR proof method 선행이 풀립니다**
 4. `uninitialized_read` 2,350
 
+### 20. 부호 있는 정수 리터럴은 부호와 크기를 따로 내린다
+
+커밋: (이 단위)
+
+G9 전 코퍼스의 첫 차단을 메시지까지 다시 세니 `integer_literal_out_of_range` 929건이 실제 64비트 초과가 아니라 `-1`, `-99` 같은 보통 음수였습니다. Tree-sitter C는 선행 부호를 `number_literal` 노드에 포함시키지만 `lower_integer_literal`은 첫 글자부터 숫자라고 가정하여 `-`를 잘못된 자릿수로 거부하고 있었습니다.
+
+C의 의미 순서를 그대로 복구했습니다. 먼저 부호 없는 크기와 접미사로 리터럴 타입을 고르고, 그 다음 그 타입 위에서 단항 부호를 적용합니다. 이 순서가 아니면 `-2147483648`의 리터럴 부분이 64비트 타입을 골라야 하는 사실과 `-1u`가 unsigned wrap이라는 사실을 동시에 지킬 수 없습니다. 실제 컴파일된 C와 대조하는 differential에 signed, unary plus, unsigned negative 사례를 추가했습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 8,755 (29.30%) | **9,232 (30.90%)** |
+| `integer_literal_out_of_range` | 929 | **3** |
+| verifier 통과 | 8,755 / 8,755 | **9,232 / 9,232** |
+| status 실패 | 0 | **0** |
+
+Windows에서는 native CTest 510/510과 Python binding 37/37을 각각 통과했습니다.
+
 ## 막힌 것
 
 - 없음

@@ -3106,6 +3106,7 @@ static ql_status lower_integer_literal(lower_context *context, size_t node,
     uint32_t base = 10u;
     uint64_t value = 0u;
     uint32_t is_decimal = 1u;
+    uint32_t is_negative = 0u;
     lower_type candidates[6];
     size_t candidate_count = 0u;
     lower_type selected;
@@ -3116,6 +3117,16 @@ static ql_status lower_integer_literal(lower_context *context, size_t node,
         return QL_STATUS_OUT_OF_MEMORY;
     }
     length = strlen(text);
+    /* Tree-sitter C folds a leading sign into a number_literal. C still
+       chooses the literal's type from the unsigned magnitude first and then
+       applies unary plus or minus. Keep those two steps separate here: using
+       the sign as a digit rejected every corpus spelling such as `-1`, while
+       choosing a type from the signed mathematical value would get cases
+       such as `-2147483648` and `-1u` wrong. */
+    if (length != 0u && (text[0] == '-' || text[0] == '+')) {
+        is_negative = text[0] == '-';
+        digit_start = 1u;
+    }
     suffix_start = length;
     while (suffix_start != 0u) {
         char ch = text[suffix_start - 1u];
@@ -3145,45 +3156,45 @@ static ql_status lower_integer_literal(lower_context *context, size_t node,
             context, QL_C_LOWER_DIAGNOSTIC_INTEGER_LITERAL_OUT_OF_RANGE,
             node, "integer literal suffix is not supported", error);
     }
-    if (suffix_start >= 2u && text[0] == '0' &&
-        (text[1] == 'x' || text[1] == 'X')) {
+    if (suffix_start >= digit_start + 2u && text[digit_start] == '0' &&
+        (text[digit_start + 1u] == 'x' ||
+         text[digit_start + 1u] == 'X')) {
         base = 16u;
-        digit_start = 2u;
+        digit_start += 2u;
         is_decimal = 0u;
-    } else if (suffix_start >= 2u && text[0] == '0' &&
-               (text[1] == 'b' || text[1] == 'B')) {
+    } else if (suffix_start >= digit_start + 2u &&
+               text[digit_start] == '0' &&
+               (text[digit_start + 1u] == 'b' ||
+                text[digit_start + 1u] == 'B')) {
         base = 2u;
-        digit_start = 2u;
+        digit_start += 2u;
         is_decimal = 0u;
-    } else if (suffix_start > 1u && text[0] == '0') {
+    } else if (suffix_start > digit_start + 1u &&
+               text[digit_start] == '0') {
         base = 8u;
-        digit_start = 1u;
+        ++digit_start;
         is_decimal = 0u;
     }
-    if (digit_start == suffix_start && !(suffix_start == 1u && text[0] == '0')) {
+    if (digit_start == suffix_start) {
         context->allocator->deallocate(context->allocator->user_data, text);
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_INTEGER_LITERAL_OUT_OF_RANGE,
             node, "integer literal has no digits", error);
     }
-    if (suffix_start == 1u && text[0] == '0') {
-        value = 0u;
-    } else {
-        for (index = digit_start; index < suffix_start; ++index) {
-            uint32_t digit;
-            if (literal_digit(text[index], base, &digit) == 0 ||
-                value > (UINT64_MAX - digit) / base) {
-                context->allocator->deallocate(
-                    context->allocator->user_data, text);
-                return lower_unknown(
-                    context,
-                    QL_C_LOWER_DIAGNOSTIC_INTEGER_LITERAL_OUT_OF_RANGE,
-                    node,
-                    "integer literal is invalid or exceeds 64 bits",
-                    error);
-            }
-            value = value * base + digit;
+    for (index = digit_start; index < suffix_start; ++index) {
+        uint32_t digit;
+        if (literal_digit(text[index], base, &digit) == 0 ||
+            value > (UINT64_MAX - digit) / base) {
+            context->allocator->deallocate(
+                context->allocator->user_data, text);
+            return lower_unknown(
+                context,
+                QL_C_LOWER_DIAGNOSTIC_INTEGER_LITERAL_OUT_OF_RANGE,
+                node,
+                "integer literal is invalid or exceeds 64 bits",
+                error);
         }
+        value = value * base + digit;
     }
 
 #define ADD_CANDIDATE(w, r, s) \
@@ -3244,6 +3255,15 @@ static ql_status lower_integer_literal(lower_context *context, size_t node,
                                error);
     if (status != QL_STATUS_OK) {
         return status;
+    }
+    if (is_negative != 0u) {
+        ql_ir_value_id magnitude = output->value;
+        status = emit_instruction(context, QL_IR_OPCODE_BV_NEG, &selected,
+                                  &magnitude, 1u, NULL, 0u,
+                                  QL_IR_EFFECT_NONE, &output->value, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
     }
     status = ensure_bool_constants(context, error);
     if (status != QL_STATUS_OK) {
