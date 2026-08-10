@@ -6,11 +6,11 @@
 
 ## 워크스트림 현황
 
-갱신일: 2026-08-10 (통합 4회차, `main` 시험 239/239)
+갱신일: 2026-08-10 (G8 완료, Windows 511/511, Linux ASan+UBSan 510/510)
 
 | 코드 | 이름 | GOAL | 상태 | 담당 |
 |---|---|---|---|---|
-| W1 | semantic-c-frontend | G5 전반, G8, G9 | 진행. 정확성 장치(verifier/interpreter/differential/fuzz)와 타입 확장 통합됨. 지금은 포인터 로어링(flat memory model 로 확정) | 병렬 세션 |
+| W1 | semantic-c-frontend | G5 전반, G8, G9 | G8 완료. G9의 포인터 provenance와 남은 C 로어링 범위 진행 | 병렬 세션 |
 | W2 | exact-backend | G5 후반 | **지시서 완료.** WU1..WU6 전부 main 에. 세션 정리됨. IR 이 넓어지면 miter 확장 작업 단위를 새로 연다 | 완료 |
 | W3 | runtime-services | G1, G2, G3 | **지시서 완료.** 세 GOAL 전부 닫힘. 세션 정리됨 | 완료 |
 | W4 | python-bindings | G4 | **지시서 완료.** G4 닫힘. 세션 정리됨 | 완료 |
@@ -22,7 +22,7 @@
 
 **닫힌 백로그: W6(증거 파이프라인), W7(안정성/배포, 원격 CI 재설계만 사용자 승인 대기).**
 
-**닫힌 GOAL: G1, G2, G3, G4, G5(현 슬라이스 기준).** 열린 것: G6, G7(VM 검증 진행 중), G8, G9, 그리고 **W6/W7 백로그 전부**(2026-08-10 사용자 지시로 todo 전 항목이 완료 범위).
+**닫힌 GOAL: G1부터 G8까지.** 열린 목표는 G9의 asm2c 데이터셋 99% 커버리지입니다.
 
 ## 완료한 기반 마일스톤
 
@@ -54,9 +54,9 @@
 - [ ] `switch`, `goto`, 레이블, 중첩 제어 흐름
 - [ ] 전역 변수와 정적 저장 기간
 - [ ] `volatile`, `_Atomic`, I/O 관찰 의미론
-- [ ] IR verifier 확장: 타입, SSA 지배관계, effect, UB guard
-- [ ] IR concrete interpreter (G8 differential 시험의 기준)
-- [ ] 새 C 구문 추가 절차 문서화와 그 절차를 따른 예시 커밋
+- [x] IR verifier 확장: 타입, SSA 지배관계, effect, UB guard. train 로어링 8,755/8,755 통과
+- [x] IR concrete interpreter와 실제 컴파일 C differential 시험. 무작위 입력 포함
+- [x] 새 C 구문 추가 절차 문서화와 `sizeof(type)` 예시 커밋 `3f96cb7`
 
 ## W2: 첫 exact backend
 

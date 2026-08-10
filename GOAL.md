@@ -108,12 +108,14 @@
 
 **종료 조건**
 
-- [ ] **정확성**: 로어링한 IR 을 concrete 하게 실행하는 인터프리터가 있고, 같은 입력에 대해 실제 컴파일 실행 결과와 일치한다(differential 시험, 무작위 입력 포함)
-- [ ] **건전성**: IR verifier 가 타입, SSA 지배관계, effect, UB guard 를 검사하고 로어링 출력에 대해 항상 통과한다
-- [ ] **퍼징**: 파서, 로어링, IR 디코더, precondition 파서에 퍼저를 걸고 크래시 0 을 확인한다
-- [ ] **속도**: 로어링 처리량(함수/초)을 코퍼스에서 측정해 기록한다
-- [ ] **확장성**: 새 C 구문 하나를 추가하는 절차가 문서에 있고, 그 절차대로 추가한 예가 커밋에 있다
-- [ ] 지원하지 않는 의미론은 좁게 해석해 통과시키지 않고 `UNKNOWN` 으로 남는다
+- [x] **정확성**: concrete IR interpreter와 실제 컴파일 C의 differential 시험. 경계값 및 사례당 2,000개 무작위 입력 포함
+- [x] **건전성**: 독립 IR verifier가 타입, SSA 지배관계, effect, UB guard를 검사. val 365/365, train 8,755/8,755 통과
+- [x] **퍼징**: 파서, 로어링, IR 디코더, precondition 파서를 포함한 9개 target을 ASan+UBSan으로 각 60초 실행, 크래시 0
+- [x] **속도**: verifier를 포함한 코퍼스 처리량 기록. val 1,155.12 함수/초, train 1,549.23 함수/초
+- [x] **확장성**: `docs/lowering/adding-a-construct.md`와 그 절차를 적용한 `sizeof(type)` 커밋 `3f96cb7`
+- [x] 지원하지 않는 의미론은 좁게 해석해 통과시키지 않고 구체적인 진단의 `UNKNOWN`으로 남음
+
+완료 감사와 재현 근거는 `docs/g8/completion-20260810.md`에 있다.
 
 ## G9. asm2c 데이터셋 99% 커버
 

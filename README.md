@@ -54,7 +54,8 @@ the implemented proof slice.
 The current lowering handles a useful loop-free slice that includes fixed-width
 integer and `_Bool` expressions, conversions, short-circuit control flow,
 conditionals, assignments, increments, pointers, selected arrays and records,
-locals, selected globals, and calls to declared callees. The exact accepted
+locals, selected globals, calls to declared callees, and selected
+`sizeof(type)` forms. The exact accepted
 surface is intentionally narrower than the syntax frontend.
 
 ### Proof, refutation, and evidence
@@ -99,13 +100,14 @@ The latest checked corpus report uses 29,893 distinct training C bodies from
 | --- | ---: |
 | Tree-sitter parse without recovery nodes | 29,880 / 29,893, 99.96% |
 | Restricted-C frontend eligibility | 29,822 / 29,880, 99.81% |
-| Semantic IR lowering | 8,541 / 29,880, 28.58% |
-| Verdicts on lowerable validation self-pairs | 337 / 349, 96.6% |
+| Semantic IR lowering | 8,755 / 29,880, 29.30% |
+| Verdicts on the earlier 349 lowerable validation self-pairs | 337 / 349, 96.6% |
 
 The lowering number is the relevant completeness limit. The largest remaining
 groups include pointers loaded from memory whose object provenance cannot yet
-be recovered, `sizeof`, loops, uninitialized-read analysis, additional record
-and function types, variadic calls, and unsupported control flow. Preprocessor
+be recovered, `sizeof(expression)` and array/function type descriptors, loops,
+uninitialized-read analysis, additional record and function types, variadic
+calls, and unsupported control flow. Preprocessor
 directives are detected but not expanded, so callers must supply preprocessed
 source. Volatile and atomic behavior is represented in the contract and IR
 vocabulary but is not yet lowered from general C.
@@ -115,7 +117,9 @@ registered implementations. The AIG/SAT path is currently scalar and refuses
 array sorts. The Python `check` API uses the SMT product path; other registered
 methods are available through the native C API and pipelines.
 
-The detailed measurement and remaining diagnostic distribution are in
+The latest lowering and verifier measurement is in
+[`docs/coverage/coverage-20260810-g8-sizeof.md`](docs/coverage/coverage-20260810-g8-sizeof.md).
+The preceding diagnostic distribution is in
 [`docs/coverage/coverage-20260812b.md`](docs/coverage/coverage-20260812b.md).
 The bounded libFuzzer campaign ran all nine current targets for one minute each
 under ASan and UBSan with zero crashes after fixing the defect found by the
