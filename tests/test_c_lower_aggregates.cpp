@@ -56,6 +56,27 @@ QL_AGG_FUNCTION(record, struct AGG_PAIR { int first; int second; };
         p.second = b;
         return p.first * 2 + p.second;
     });
+QL_AGG_FUNCTION(anonymous_struct,
+    size_t agg_anonymous_struct_size(void) {
+        struct { char tag; int value; } object;
+        return sizeof(object);
+    }
+    int agg_anonymous_struct(int a, int b) {
+        struct { char tag; int value; } object;
+        object.tag = (char)a;
+        object.value = b;
+        return object.tag + object.value;
+    });
+QL_AGG_FUNCTION(anonymous_union,
+    size_t agg_anonymous_union_size(void) {
+        union { unsigned char byte; unsigned int wide; } object;
+        return sizeof(object);
+    }
+    int agg_anonymous_union(int a, int b) {
+        union { unsigned char byte; unsigned int wide; } object;
+        object.wide = (unsigned int)(a + b);
+        return object.byte + (int)object.wide;
+    });
 QL_AGG_FUNCTION(nested, struct AGG_INNER { int x; int y; };
     struct AGG_OUTER { char tag; struct AGG_INNER inner; };
     int agg_nested(int a, int b) {
@@ -434,6 +455,12 @@ TEST(CLowerAggregates, MatchesCompiledExecutionOnArraysAndRecords) {
          [](int32_t a, int32_t) { return agg_bytes(a); }},
         {"record", record_source, "agg_record", 2, sizeof(struct AGG_PAIR),
          [](int32_t a, int32_t b) { return agg_record(a, b); }},
+        {"anonymous-struct", anonymous_struct_source,
+         "agg_anonymous_struct", 2, agg_anonymous_struct_size(),
+         [](int32_t a, int32_t b) { return agg_anonymous_struct(a, b); }},
+        {"anonymous-union", anonymous_union_source,
+         "agg_anonymous_union", 2, agg_anonymous_union_size(),
+         [](int32_t a, int32_t b) { return agg_anonymous_union(a, b); }},
         /* A record inside a record, where the inner one's alignment decides
            the outer offsets and the trailing padding. */
         {"nested", nested_source, "agg_nested", 2, sizeof(struct AGG_OUTER),

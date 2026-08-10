@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,075 / 29,880 (97.31%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_type` 143, `unsupported_control_flow` 123, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,105 / 29,880 (97.41%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_control_flow` 123, `unsupported_type` 112, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -2149,6 +2149,23 @@ goto와 label 사이의 선언을 실제로 건너뛰는 경우와 바깥에서 
 
 `tests/test_ir_differential.cpp`는 자식 block에서 label scope의 automatic을 운반하는 함수를 실제 compiled C와 edge 및 random 입력에서 대조합니다. `tests/test_c_lower.cpp`는 선언 우회와 loop-carried nested automatic을 계속 UNKNOWN으로 고정합니다. 직접 4개 테스트와 모든 goto 입력이 통과했습니다. 변경 분기는 goto에만 있고 공용 IR, interpreter, solver, plugin, EGraph, public API는 바뀌지 않았으므로 전체 CTest와 전체 train은 실행하지 않았습니다.
 
+### 77. 함수 안 익명 record를 specifier identity로 찾는다
+
+이름 없는 `struct`와 `union` 정의는 tag로 다시 찾을 수 없지만, 정의가 쓰인 syntax specifier node는 한 unit 안에서 유일합니다. record 인벤토리에 이 node를 보존하고 직접 익명 타입을 해석할 때 같은 node로 찾습니다. 같은 layout을 가진 서로 다른 익명 타입은 node가 다르므로 하나의 타입으로 합치지 않습니다. 기존 named record와 opaque forward tag의 조회 및 인덱스 순서는 바꾸지 않습니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 29,075 (97.31%) | **29,105 (97.41%)** |
+| 증가 | | **+30** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_type` | 143 | **112** |
+| verifier 통과 | 29,075 / 29,075 | **29,105 / 29,105** |
+| status 실패 | 0 | **0** |
+
+기존 `struct or union has no definition in this unit` 첫 차단 33개 중 30개가 성공했습니다. 2개는 익명 record 안의 비상수 배열 bound, 1개는 aggregate initializer map이라는 다음 제약으로 이동했습니다. train에서 익명 `struct` 또는 `union` 정의를 가진 입력은 이 33개가 전부이므로, 이 집합이 신규 수용과 기존 성공 회귀를 모두 포함하는 정확한 영향 상한입니다. 30개 lowered 결과가 모두 verifier를 통과했고 status 실패는 0입니다.
+
+`tests/test_c_lower_aggregates.cpp`는 익명 struct의 padding과 member offset, 익명 union의 겹친 byte를 실제 compiled C 및 concrete interpreter와 대조합니다. aggregate, record, parser reuse 영향 범위 29/29가 통과했습니다. 공개 ABI, IR 형식, interpreter, solver, plugin, EGraph는 바뀌지 않았고 익명 record 33개보다 넓은 경로도 없으므로 전체 CTest와 전체 train은 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -2158,13 +2175,13 @@ goto와 label 사이의 선언을 실제로 건너뛰는 경우와 바깥에서 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
 - `unsupported_call` 225
-- `unsupported_type` 143
 - `unsupported_control_flow` 123
+- `unsupported_type` 112
 - `undeclared_identifier` 66
 - `unsupported_pointer` 59
 - `duplicate_declaration` 58
 - `unsupported_volatile_or_atomic` 50
-- `unsupported_expression` 9
+- `unsupported_expression` 10
 
 ## 조율자에게 요청할 것
 

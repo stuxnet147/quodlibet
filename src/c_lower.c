@@ -122,6 +122,11 @@ typedef struct lower_member {
    a record that contains itself has no layout at all. */
 typedef struct lower_record {
   char *tag;
+  /* A tagless record has no spelling that can identify it. Its specifier
+     node is nevertheless unique within the parsed unit, so direct uses such
+     as `union { int x; char bytes[4]; } value` can recover the definition
+     without conflating two unrelated anonymous records. */
+  size_t specifier_node;
   size_t body_node;
   uint32_t is_union;
   uint32_t layout_state;
@@ -1734,8 +1739,7 @@ static uint32_t record_alignment(const lower_context *context, size_t record) {
                                         : 1u;
 }
 
-/* Records are looked up by tag. A tagless struct can only be named where it
-   is written, which this slice does not need. */
+/* Named records are looked up by tag. */
 static size_t find_record(const lower_context *context, const char *tag,
                           uint32_t is_union) {
   size_t index;
@@ -1746,6 +1750,23 @@ static size_t find_record(const lower_context *context, const char *tag,
     const lower_record *record = &context->records[index];
     if (record->tag != NULL && record->is_union == is_union &&
         strcmp(record->tag, tag) == 0) {
+      return index;
+    }
+  }
+  return SIZE_MAX;
+}
+
+/* A tagless record can only be named where its complete specifier is written.
+   Keep that node identity separate from the tag namespace: every anonymous
+   definition denotes a distinct C type even when its layout happens to match. */
+static size_t find_anonymous_record(const lower_context *context,
+                                    size_t specifier_node,
+                                    uint32_t is_union) {
+  size_t index;
+  for (index = 0u; index < context->record_count; ++index) {
+    const lower_record *record = &context->records[index];
+    if (record->tag == NULL && record->is_union == is_union &&
+        record->specifier_node == specifier_node) {
       return index;
     }
   }
@@ -2039,7 +2060,8 @@ static void release_callees(lower_context *context) {
 }
 
 static ql_status append_record(lower_context *context, char *tag,
-                               size_t body, uint32_t is_union,
+                               size_t specifier, size_t body,
+                               uint32_t is_union,
                                ql_error *error) {
   lower_record *record;
   ql_status status = grow_array(
@@ -2054,6 +2076,7 @@ static ql_status append_record(lower_context *context, char *tag,
   record = &context->records[context->record_count++];
   memset(record, 0, sizeof(*record));
   record->tag = tag;
+  record->specifier_node = specifier;
   record->body_node = body;
   record->is_union = is_union;
   record->layout_state = LOWER_LAYOUT_PENDING;
@@ -2094,7 +2117,7 @@ static ql_status collect_records(lower_context *context, ql_error *error) {
       context->allocator->deallocate(context->allocator->user_data, tag);
       continue;
     }
-    status = append_record(context, tag, body, is_union, error);
+    status = append_record(context, tag, index, body, is_union, error);
     if (status != QL_STATUS_OK) {
       return status;
     }
@@ -2129,7 +2152,7 @@ static ql_status collect_records(lower_context *context, ql_error *error) {
       context->allocator->deallocate(context->allocator->user_data, tag);
       continue;
     }
-    status = append_record(context, tag, SIZE_MAX, is_union, error);
+    status = append_record(context, tag, index, SIZE_MAX, is_union, error);
     if (status != QL_STATUS_OK) {
       return status;
     }
@@ -2385,7 +2408,9 @@ static ql_status resolve_type_node(lower_context *context, size_t type_node,
       ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
       return QL_STATUS_OUT_OF_MEMORY;
     }
-    record = find_record(context, tag, is_union);
+    record = tag != NULL
+                 ? find_record(context, tag, is_union)
+                 : find_anonymous_record(context, type_node, is_union);
     context->allocator->deallocate(context->allocator->user_data, tag);
     if (record == SIZE_MAX) {
       return lower_unknown(
