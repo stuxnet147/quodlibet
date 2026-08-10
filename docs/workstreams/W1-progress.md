@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,340 / 29,880 (94.85%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_control_flow` 374, `unsupported_type` 369, `unsupported_call` 259, `unsupported_pointer` 157입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **28,418 / 29,880 (95.11%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_control_flow` 382, `unsupported_type` 370, `unsupported_call` 262, `undeclared_identifier` 140입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1403,7 +1403,7 @@ mutable static은 호출 사이의 persistent state가 필요하고, `static con
 
 시그니처 inventory와 선언 type node는 포인터 깊이 2를 허용한다고 검사하면서 실제 타입에는 별표를 하나만 더하고 있었습니다. 직접 쓴 `T **`, `T *a[]`가 함수 매개변수에서 조정된 `T **`, `typedef T **P`가 각각 `T` 또는 `T *`로 잘못 내려갔습니다. 그 결과 정상적인 이중 역참조와 연속 subscript가 scalar에 적용된 것으로 오인됐고, record pointer도 record value로 잘못 분류됐습니다.
 
-`add_pointer_depth`가 base type에 선언자와 typedef가 기여한 별표를 하나씩 모두 적용합니다. 두 표면의 깊이는 합산하며 총 깊이가 이 slice의 상한 2를 넘으면 기존 진단의 UNKNOWN으로 남깁니다. 따라서 `typedef int **P; P *p`를 `int **`로 잘못 축소해 받지 않습니다. 실제 train에서 이전에 SUPPORTED였던 이 형태 한 건은 정확한 3중 포인터 UNKNOWN으로 교정됐습니다.
+`add_pointer_depth`가 base type에 선언자와 typedef가 기여한 별표를 하나씩 모두 적용합니다. 이 단위 당시에는 두 표면의 깊이를 합산해 상한 2를 넘으면 UNKNOWN으로 남겼습니다. 따라서 `typedef int **P; P *p`를 `int **`로 잘못 축소해 받지 않았고, 당시 train에서 이전에 SUPPORTED였던 이 형태 한 건을 정확한 3중 포인터 UNKNOWN으로 교정했습니다. 뒤의 68번 단위에서 같은 표현을 그대로 사용해 상한을 3으로 확장했습니다.
 
 | | 이전 | 이후 |
 |---|---:|---:|
@@ -1980,6 +1980,25 @@ loop subtree에서 직접 대입 또는 증감되는 visible SSA pointer를 head
 
 `tests/test_c_lower_calls.cpp`는 padding이 있는 실제 C record를 같은 compiled callee와 interpreter callback에 전달해 반환값과 호출 event를 대조합니다. `tests/test_proof_smt_calls.cpp`는 같은 record image를 넘기는 두 호출이 packed value로 congruent함을 증명합니다. 변경은 외부 call argument와 aggregate memory read 경로에만 닿으므로 calls, aggregates, records, interpreter, verifier, call-product 영향 범위 73/73을 실행했습니다. 공용 IR 실행기, verifier, solver 또는 plugin 구현은 바꾸지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 G9 성공률과 기존 성공 사례 회귀를 확인하기 위한 필수 측정으로 실행했습니다.
 
+### 68. 데이터 포인터의 indirection 상한을 3으로 확장한다
+
+IR pointer type은 element type을 재귀적으로 가리키므로 3단계 pointer를 이미 표현할 수 있었습니다. C type inventory, typedef, local, global, cast, `sizeof` 경로의 명시적 상한을 3으로 맞추고, 각 역참조가 한 단계씩 제거되도록 기존 `pointer_target`과 `make_pointer_to`를 그대로 사용합니다. memory에서 읽은 중간 pointer는 실제로 다음 역참조가 일어날 때만 기존 auxiliary authority region을 받습니다.
+
+2단계 local의 주소는 그 local stack object를 가리키는 3단계 pointer입니다. 이 경우도 object 주소와 정의성을 그대로 보존합니다. 4단계 이상과 다단계 function pointer는 현재 resource 및 call-contract 경계로 계속 UNKNOWN입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 28,340 (94.85%) | **28,418 (95.11%)** |
+| 증가 | | **+78** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_pointer` | 157 | **61** |
+| verifier 통과 | 28,340 / 28,340 | **28,418 / 28,418** |
+| status 실패 | 0 | **0** |
+
+기존 깊이 및 address-of 첫 차단 99개를 좁게 재측정해 78개가 성공했습니다. 나머지 21개는 control flow 8개, volatile 4개, call 3개 등 기존의 다음 제약으로 이동했습니다. 전체 train 순증도 78개였으며 기존 성공 회귀와 누락 또는 추가 행은 0개였습니다.
+
+`tests/test_c_lower_pointers.cpp`는 세 개의 서로 다른 object image에 `int ***`를 연결하고, 실제 compiled C와 concrete interpreter의 3중 역참조 결과를 비교합니다. 2단계 local의 주소를 3단계 pointer로 보존하는 stack-object 경로도 실행합니다. `tests/test_c_lower_types.cpp`는 typedef와 표면 별표의 합산 및 새 4단계 거부 경계를 고정합니다. 변경은 pointer type 해석과 주소 취하기 경로에 국한되므로 pointer, record, type, interpreter, verifier 영향 범위 78/78을 실행했습니다. 공용 IR, interpreter, solver 또는 plugin 구현은 바꾸지 않아 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 G9 성공률과 기존 성공 사례 회귀를 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1988,11 +2007,12 @@ loop subtree에서 직접 대입 또는 증감되는 visible SSA pointer를 head
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_control_flow` 374
-- `unsupported_type` 369
-- `unsupported_call` 259
-- `unsupported_pointer` 157
-- `undeclared_identifier` 138
+- `unsupported_control_flow` 382
+- `unsupported_type` 370
+- `unsupported_call` 262
+- `undeclared_identifier` 140
+- `unsupported_expression` 73
+- `unsupported_pointer` 61
 
 ## 조율자에게 요청할 것
 
@@ -2011,5 +2031,5 @@ loop subtree에서 직접 대입 또는 증감되는 visible SSA pointer를 head
 1. 선택된 함수 또는 외부 callee의 record return은 source signature와 CALL result의 object-copy 계약을 함께 정한 뒤 수용합니다.
 2. 선언 없는 callee와 identifier는 추출 context에서 복구 가능한 근거가 있는지 먼저 분리합니다.
 3. 남은 nested 및 backward goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 확장합니다.
-4. 세 단계 pointer와 address-of는 실제 접근에 필요한 indirection depth를 별도로 계산해 확장합니다.
+4. function pointer의 남은 깊이 제한은 실제 call signature를 복구할 수 있는 형태만 확장합니다.
 5. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.

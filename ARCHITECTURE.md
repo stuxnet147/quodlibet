@@ -291,6 +291,21 @@ Nested labels and backward gotos remain outside the lowering. A forward goto
 that bypasses a function-scope declaration is also refused until the skipped
 initialization and definedness state can be represented explicitly.
 
+#### Data pointers retain up to three levels of indirection
+
+The lowering preserves up to three declarator and typedef stars rather than
+flattening them into one pointer-width carrier. Each dereference removes one
+level, loads the nested pointer value when another level remains, and admits
+an auxiliary authority region only when that loaded address is actually
+accessed. Taking the address of a two-level local consequently produces a
+three-level pointer to that local's stack object. Source signatures retain the
+same pointer depth even though every pointer has the target ABI's 64-bit
+representation.
+
+Four or more levels remain an explicit resource boundary. Function pointers
+keep their narrower call-specific limits and are not made into data pointers
+by this extension.
+
 #### Memory model
 
 `ASM2C_GNU_V1` gives memory a flat 64-bit address space. A pointer is an

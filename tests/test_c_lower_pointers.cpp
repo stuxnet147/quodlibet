@@ -109,6 +109,7 @@ QL_PTR_FUNCTION(cast_to_bytes, int ptr_bytes(int *p, int i) {
 QL_PTR_FUNCTION(cast_from_bits, int ptr_from_bits(unsigned long long address) {
     return ((int *)address)[0];
 });
+QL_PTR_FUNCTION(triple, int ptr_triple(int ***p) { return ***p; });
 QL_PTR_FUNCTION(linked_walk,
     struct PTR_NODE { int value; struct PTR_NODE *next; };
     int ptr_linked_walk(struct PTR_NODE *node, int limit) {
@@ -207,17 +208,42 @@ struct Outcome {
     ql_status status = QL_STATUS_INTERNAL_ERROR;
 };
 
+std::size_t ObjectIndex(const char *name, std::size_t object_count) {
+    static const char prefix[] = "__dynamic";
+    std::size_t index = 0u;
+    const char *cursor = std::strchr(name, '@');
+    bool dynamic = false;
+    if (object_count <= 1u) {
+        return 0u;
+    }
+    if (cursor != nullptr) {
+        ++cursor;
+    } else if (std::strncmp(name, prefix, sizeof(prefix) - 1u) == 0) {
+        cursor = name + sizeof(prefix) - 1u;
+        dynamic = true;
+    } else {
+        return 0u;
+    }
+    while (*cursor >= '0' && *cursor <= '9') {
+        index = index * 10u + static_cast<std::size_t>(*cursor - '0');
+        ++cursor;
+    }
+    if (dynamic) {
+        ++index;
+    }
+    return index < object_count ? index : object_count - 1u;
+}
+
 /* Binds by parameter name, which is also how this test pins the layout the
    lowering commits to: the C arguments first, then __memory, then one
-   base/size pair per pointer argument. */
-Outcome Execute(ql_ir *ir, uint64_t pointer,
-                const std::vector<uint64_t> &scalars, uint64_t object_base,
-                uint64_t object_size, const uint8_t *initial,
-                uint8_t *final_image) {
+   base/size pair per pointer argument. Dynamic regions follow in discovery
+   order. */
+Outcome ExecuteObjects(
+    ql_ir *ir, uint64_t pointer, const std::vector<uint64_t> &scalars,
+    const std::vector<ql_ir_interp_object_v1> &objects) {
     ql_ir_view_v1 view{};
     std::vector<std::vector<uint8_t>> storage;
     std::vector<ql_ir_interp_input_v1> inputs;
-    ql_ir_interp_object_v1 object{};
     ql_ir_interp_options_v1 options{};
     ql_error error{};
     Outcome run;
@@ -246,9 +272,13 @@ Outcome Execute(ql_ir *ir, uint64_t pointer,
         } else if (type.kind == QL_IR_TYPE_POINTER) {
             storage.push_back(Encode(pointer, type.bit_width));
         } else if (std::strstr(name, ".__base") != nullptr) {
-            storage.push_back(Encode(object_base, type.bit_width));
+            storage.push_back(
+                Encode(objects[ObjectIndex(name, objects.size())].base,
+                       type.bit_width));
         } else if (std::strstr(name, ".__size") != nullptr) {
-            storage.push_back(Encode(object_size, type.bit_width));
+            storage.push_back(
+                Encode(objects[ObjectIndex(name, objects.size())].size,
+                       type.bit_width));
         } else {
             EXPECT_LT(next_scalar, scalars.size());
             storage.push_back(Encode(scalars[next_scalar++],
@@ -262,20 +292,28 @@ Outcome Execute(ql_ir *ir, uint64_t pointer,
                                                     : storage[index].data();
         inputs[index].size = storage[index].size();
     }
-    ql_ir_interp_object_init(&object);
-    object.base = object_base;
-    object.size = object_size;
-    object.initial = initial;
-    object.final_image = final_image;
     ql_ir_interp_options_init(&options);
-    options.objects = &object;
-    options.object_count = 1u;
+    options.objects = objects.data();
+    options.object_count = objects.size();
     run.result.struct_size = sizeof(run.result);
     run.status = ql_ir_interp_run(nullptr, ir,
                                   inputs.empty() ? nullptr : inputs.data(),
                                   inputs.size(), &options, &run.result,
                                   &error);
     return run;
+}
+
+Outcome Execute(ql_ir *ir, uint64_t pointer,
+                const std::vector<uint64_t> &scalars, uint64_t object_base,
+                uint64_t object_size, const uint8_t *initial,
+                uint8_t *final_image) {
+    ql_ir_interp_object_v1 object{};
+    ql_ir_interp_object_init(&object);
+    object.base = object_base;
+    object.size = object_size;
+    object.initial = initial;
+    object.final_image = final_image;
+    return ExecuteObjects(ir, pointer, scalars, {object});
 }
 
 int32_t Returned(const ql_ir_interp_result_v1 &result) {
@@ -607,6 +645,68 @@ TEST(CLowerPointers, LowersADoubleIndirectionWithoutAStatusFailure) {
         "}\n";
     Lowered lowered;
     ASSERT_TRUE(lowered.Open(source, "deref_twice"));
+}
+
+TEST(CLowerPointers, LoadsThroughThreeLevelsOfIndirection) {
+    static const char address_source[] =
+        "int ptr_address_three(int **p) {\n"
+        "  int **local = p;\n"
+        "  int ***address = &local;\n"
+        "  return address != 0;\n"
+        "}\n";
+    constexpr uint64_t second_base = kBase + UINT64_C(0x1000);
+    constexpr uint64_t value_base = kBase + UINT64_C(0x2000);
+    const int32_t expected = -417;
+    uint64_t first_image = second_base;
+    uint64_t second_image = value_base;
+    std::vector<ql_ir_interp_object_v1> objects(3u);
+    Lowered lowered;
+
+    ql_ir_interp_object_init(&objects[0]);
+    objects[0].base = kBase;
+    objects[0].size = sizeof(first_image);
+    objects[0].initial = reinterpret_cast<const uint8_t *>(&first_image);
+    ql_ir_interp_object_init(&objects[1]);
+    objects[1].base = second_base;
+    objects[1].size = sizeof(second_image);
+    objects[1].initial = reinterpret_cast<const uint8_t *>(&second_image);
+    ql_ir_interp_object_init(&objects[2]);
+    objects[2].base = value_base;
+    objects[2].size = sizeof(expected);
+    objects[2].initial = reinterpret_cast<const uint8_t *>(&expected);
+
+    ASSERT_TRUE(lowered.Open(triple_source, "ptr_triple"));
+    const Outcome run = ExecuteObjects(lowered.ir(), kBase, {}, objects);
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+        << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+    EXPECT_EQ(expected, Returned(run.result));
+
+    int native_value = expected;
+    int *native_first = &native_value;
+    int **native_second = &native_first;
+    EXPECT_EQ(expected, ptr_triple(&native_second));
+
+    Lowered address_lowered;
+    uint64_t parameter_image = 0u;
+    uint64_t local_image = 0u;
+    std::vector<ql_ir_interp_object_v1> address_objects(2u);
+    ql_ir_interp_object_init(&address_objects[0]);
+    address_objects[0].base = kBase;
+    address_objects[0].size = sizeof(parameter_image);
+    address_objects[0].initial =
+        reinterpret_cast<const uint8_t *>(&parameter_image);
+    ql_ir_interp_object_init(&address_objects[1]);
+    address_objects[1].base = second_base;
+    address_objects[1].size = sizeof(local_image);
+    address_objects[1].initial =
+        reinterpret_cast<const uint8_t *>(&local_image);
+    ASSERT_TRUE(address_lowered.Open(address_source, "ptr_address_three"));
+    const Outcome address_run = ExecuteObjects(address_lowered.ir(), kBase, {},
+                                               address_objects);
+    ASSERT_EQ(QL_STATUS_OK, address_run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, address_run.result.outcome);
+    EXPECT_EQ(1, Returned(address_run.result));
 }
 
 TEST(CLowerPointers, CarriesAChangingPointerThroughALoopAuthorityRegion) {

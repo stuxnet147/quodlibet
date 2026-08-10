@@ -20,6 +20,7 @@
 
 #define LOWER_ARRAY_BOUND_FROM_INITIALIZER UINT64_MAX
 #define LOWER_ARRAY_BOUND_DYNAMIC (UINT64_MAX - UINT64_C(1))
+#define LOWER_MAX_POINTER_INDIRECTION 3u
 
 typedef struct ql_c_lower_diagnostic_record {
   ql_c_lower_diagnostic_code code;
@@ -51,7 +52,7 @@ typedef struct lower_type {
   uint32_t rank;
   uint32_t is_signed;
   /* How many stars stand between this type and `pointee`: zero when this
-     is not a pointer at all, one for `T *`, two for `T **`. */
+     is not a pointer at all, one for `T *`, two for `T **`, and so on. */
   uint32_t indirection;
   /* The type at the bottom of the stars. */
   ql_c_scalar_type pointee;
@@ -778,18 +779,18 @@ static lower_type make_function_pointer_type(lower_type return_type) {
   return type;
 }
 
-/* Adds every star a declarator contributes. Several type paths used to check
-   that two levels were allowed and then add only one, silently turning `T **`
-   into `T *` or even `T`. Keep the total-depth check beside the construction
-   so typedef and surface declarator stars cannot together exceed the slice. */
+/* Adds every star a declarator contributes. Keep the total-depth check beside
+   the construction so typedef and surface declarator stars cannot together
+   exceed the slice. */
 static ql_status add_pointer_depth(lower_context *context, size_t node,
                                    lower_type base, uint32_t pointer_depth,
                                    lower_type *output, ql_error *error) {
   while (pointer_depth-- > 0u) {
-    if (base.kind == QL_C_SCALAR_POINTER && base.indirection >= 2u) {
+    if (base.kind == QL_C_SCALAR_POINTER &&
+        base.indirection >= LOWER_MAX_POINTER_INDIRECTION) {
       return lower_unknown(
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-          "this slice carries at most two levels of indirection", error);
+          "this slice carries at most three levels of indirection", error);
     }
     base = make_pointer_to(base);
   }
@@ -2255,10 +2256,10 @@ static ql_status resolve_type_node(lower_context *context, size_t type_node,
   const char *kind = context->nodes[type_node].view.kind;
   ql_status status;
 
-  if (pointer_depth > 2u) {
+  if (pointer_depth > LOWER_MAX_POINTER_INDIRECTION) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, type_node,
-        "this slice carries at most two levels of indirection", error);
+        "this slice carries at most three levels of indirection", error);
   }
   if (strcmp(kind, "struct_specifier") == 0 ||
       strcmp(kind, "union_specifier") == 0) {
@@ -2932,10 +2933,10 @@ static ql_status parse_type_spelling(lower_context *context,
       if (resolved != QL_STATUS_OK || context->unknown != 0u) {
         return resolved;
       }
-      if (entry->pointer_depth > 2u) {
+      if (entry->pointer_depth > LOWER_MAX_POINTER_INDIRECTION) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-            "this slice carries at most two levels of indirection", error);
+            "this slice carries at most three levels of indirection", error);
       }
       return add_pointer_depth(context, node, base, entry->pointer_depth,
                                output, error);
@@ -3008,10 +3009,10 @@ static ql_status type_from_inventory(lower_context *context,
     return type_from_inventory(context, &adjusted, node, allow_void, output,
                                error);
   }
-  if (inventory->pointer_depth > 2u) {
+  if (inventory->pointer_depth > LOWER_MAX_POINTER_INDIRECTION) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-        "this slice carries at most two levels of indirection", error);
+        "this slice carries at most three levels of indirection", error);
   }
   if (inventory->pointer_depth != 0u) {
     lower_type pointee;
@@ -6058,10 +6059,10 @@ static ql_status query_designator_type(lower_context *context, size_t node,
             "this type query",
             error);
       }
-      if (pointer_depth > 2u) {
+      if (pointer_depth > LOWER_MAX_POINTER_INDIRECTION) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
-            "this slice carries at most two levels of indirection", error);
+            "this slice carries at most three levels of indirection", error);
       }
       break;
     }
@@ -6218,10 +6219,10 @@ static ql_status lower_sizeof_type(lower_context *context, size_t node,
             "type-descriptor query",
             error);
       }
-      if (pointer_depth > 2u) {
+      if (pointer_depth > LOWER_MAX_POINTER_INDIRECTION) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
-            "this slice carries at most two levels of indirection", error);
+            "this slice carries at most three levels of indirection", error);
       }
       break;
     }
@@ -6298,10 +6299,10 @@ static ql_status lower_cast_expression(lower_context *context, size_t node,
           "slice",
           error);
     }
-    if (pointer_depth > 2u) {
+    if (pointer_depth > LOWER_MAX_POINTER_INDIRECTION) {
       return lower_unknown(
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
-          "this slice carries at most two levels of indirection", error);
+          "this slice carries at most three levels of indirection", error);
     }
     break;
   }
@@ -9259,10 +9260,10 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             "whose bound this pass cannot fold",
             error);
       }
-      if (pointer_depth > 2u) {
+      if (pointer_depth > LOWER_MAX_POINTER_INDIRECTION) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, named,
-            "this slice carries at most two levels of indirection", error);
+            "this slice carries at most three levels of indirection", error);
       }
       /* A qualifier in the declaration specifiers qualifies the base type.
          Once a declarator adds a pointer, only a const on the sole pointer
@@ -9272,11 +9273,11 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             context, declarator_root, pointer_depth);
       }
       declarator_type = base_type;
-      if (pointer_depth == 1u) {
-        declarator_type = make_pointer_to(base_type);
-      } else if (pointer_depth == 2u) {
-        declarator_type = make_pointer_to(make_pointer_to(base_type));
-      } else if (base_type.kind == QL_C_SCALAR_VOID) {
+      while (pointer_depth-- > 0u) {
+        declarator_type = make_pointer_to(declarator_type);
+      }
+      if (declarator_type.kind != QL_C_SCALAR_POINTER &&
+          base_type.kind == QL_C_SCALAR_VOID) {
         return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, named,
                              "void is not an object type here", error);
       }
@@ -11440,10 +11441,10 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
       if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
       }
-      if (pointer_depth > 2u) {
+      if (pointer_depth > LOWER_MAX_POINTER_INDIRECTION) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, named,
-            "this slice carries at most two levels of indirection", error);
+            "this slice carries at most three levels of indirection", error);
       }
       *output = base;
       while (pointer_depth-- > 0u) {
@@ -11514,14 +11515,15 @@ static ql_status add_stack_slot_objects(lower_context *context,
         return status;
       }
     }
-    if (type.kind == QL_C_SCALAR_POINTER && type.indirection >= 2u) {
+    if (type.kind == QL_C_SCALAR_POINTER &&
+        type.indirection >= LOWER_MAX_POINTER_INDIRECTION) {
       /* Its address is one level deeper than the name itself, so a
-         two-level pointer whose address is taken needs three, which is
+         three-level pointer whose address is taken needs four, which is
          past what this slice carries. */
       return lower_unknown(
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
           context->body_node,
-          "taking the address of a two-level pointer needs a third "
+          "taking the address of a three-level pointer needs a fourth "
           "level of indirection",
           error);
     }
@@ -11632,11 +11634,11 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
-    if (pointer_depth > 2u) {
+    if (pointer_depth > LOWER_MAX_POINTER_INDIRECTION) {
       return lower_unknown(
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
           global->declaration_node,
-          "this slice carries at most two levels of indirection", error);
+          "this slice carries at most three levels of indirection", error);
     }
     while (pointer_depth-- > 0u) {
       type = make_pointer_to(type);
