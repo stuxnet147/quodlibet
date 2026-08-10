@@ -44,7 +44,23 @@ typedef struct ql_run_context_v1 {
        solver.h; methods that use it cast to ql_solver_session*. Read it only
        when struct_size reaches past it. */
     void *solver_session;
-    void *reserved[7];
+    /* Nanoseconds left before the tightest deadline that applies to this run,
+       read through the same state `is_cancelled` uses. UINT64_MAX when no time
+       axis applies; zero when the deadline has already passed.
+
+       `is_cancelled` alone tells a method only that time is up, which it can
+       act on no sooner than its next poll. A method that hands work to
+       something it cannot poll -- a solver subprocess, say -- needs the
+       remaining time in advance so it can pass a deadline down instead of
+       discovering the overrun afterwards. Without it a one-millisecond budget
+       and a hundred-millisecond budget cost the same, because both are only
+       noticed when the stage ends (docs/perf/concurrency.md).
+
+       Appended in place of one reserved slot: same structure size, no existing
+       field moved. Null when the host supplies no clock. Read it only when
+       struct_size reaches past it. */
+    uint64_t (QL_CALL *remaining_ns)(const void *cancel_state);
+    void *reserved[6];
 } ql_run_context_v1;
 
 typedef enum ql_method_flag {

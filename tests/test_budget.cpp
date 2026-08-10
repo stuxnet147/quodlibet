@@ -1,5 +1,6 @@
 #include "quodlibet/budget.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -484,12 +485,25 @@ ql_status QL_CALL slow_create(const ql_host_v1 *host, const char *options_json,
     return QL_STATUS_OK;
 }
 
+/* What the running method saw through the run context, for the tests below
+   that assert a method can learn how long it has left rather than only that
+   time is already up. */
+std::atomic<std::uint64_t> observed_remaining_ns{UINT64_MAX};
+std::atomic<bool> observed_remaining_present{false};
+
 ql_status QL_CALL slow_run(void *instance, const ql_run_context_v1 *context,
                            ql_artifact *const *inputs, std::size_t input_count,
                            ql_artifact **output, ql_error *error) {
     SlowMethodState *state = static_cast<SlowMethodState *>(instance);
     (void)inputs;
     (void)input_count;
+
+    if (context->struct_size >= offsetof(ql_run_context_v1, reserved) &&
+        context->remaining_ns != nullptr) {
+        observed_remaining_present.store(true);
+        observed_remaining_ns.store(
+            context->remaining_ns(context->cancel_state));
+    }
 
     for (std::uint32_t elapsed = 0u; elapsed < state->milliseconds;
          elapsed += 2u) {
@@ -669,6 +683,83 @@ TEST(PipelineBudgetLeak, AnAbortedRunReleasesEverythingItAllocated) {
     ql_budget_usage_v1 teardown = usage_of(budget.get());
     EXPECT_EQ(0u, teardown.live_allocation_count);
     EXPECT_EQ(0u, teardown.memory_current_bytes);
+}
+
+/* A method can only stop itself at a poll. When it hands work to something it
+   cannot poll -- a solver subprocess is the case that motivated this -- it has
+   to bound that work up front, and for that it needs the time remaining, not
+   just a cancelled flag. */
+TEST_F(PipelineBudgetTest, ARunningMethodCanReadHowLongItHasLeft) {
+    ql_budget_limits_v1 limits = no_limits();
+    limits.total_wall_clock_ns = 30ull * 1000ull * 1000ull * 1000ull;
+    BudgetHandle budget(limits);
+    ql_pipeline_result *result = nullptr;
+    ql_error error{};
+
+    observed_remaining_present.store(false);
+    observed_remaining_ns.store(UINT64_MAX);
+    ql_budget_start(budget.get());
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_pipeline_run_with_budget(pipeline_, scheduler_, input_,
+                                          nullptr, budget.get(), &result,
+                                          &error))
+        << error.message;
+    ql_pipeline_result_destroy(result);
+
+    EXPECT_TRUE(observed_remaining_present.load());
+    const std::uint64_t remaining = observed_remaining_ns.load();
+    /* Bounded by the limit that was set, and not yet spent. Asserting a range
+       rather than a value: the exact figure depends on when the node started. */
+    EXPECT_GT(remaining, 0u);
+    EXPECT_LE(remaining, limits.total_wall_clock_ns);
+}
+
+TEST_F(PipelineBudgetTest, ATighterBudgetIsReportedAsLessTimeLeft) {
+    ql_pipeline_result *result = nullptr;
+    ql_error error{};
+    std::uint64_t seen[2] = {0u, 0u};
+    const std::uint64_t totals[2] = {30ull * 1000ull * 1000ull * 1000ull,
+                                     5ull * 1000ull * 1000ull * 1000ull};
+
+    for (int index = 0; index < 2; ++index) {
+        ql_budget_limits_v1 limits = no_limits();
+        limits.total_wall_clock_ns = totals[index];
+        BudgetHandle budget(limits);
+
+        observed_remaining_present.store(false);
+        observed_remaining_ns.store(UINT64_MAX);
+        ql_budget_start(budget.get());
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_pipeline_run_with_budget(pipeline_, scheduler_, input_,
+                                              nullptr, budget.get(), &result,
+                                              &error))
+            << error.message;
+        ql_pipeline_result_destroy(result);
+        result = nullptr;
+        ASSERT_TRUE(observed_remaining_present.load());
+        seen[index] = observed_remaining_ns.load();
+    }
+    /* The reported figure follows the budget rather than being a constant.
+       Both runs do the same work, so the gap is the budget. */
+    EXPECT_LT(seen[1], seen[0]);
+}
+
+/* Without a budget there is no deadline to report, and a method must be able
+   to tell that apart from "no time left". */
+TEST_F(PipelineBudgetTest, NoBudgetReportsNoDeadlineRatherThanZero) {
+    ql_pipeline_result *result = nullptr;
+    ql_error error{};
+
+    observed_remaining_present.store(false);
+    observed_remaining_ns.store(0u);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_pipeline_run(pipeline_, scheduler_, input_, nullptr, &result,
+                              &error))
+        << error.message;
+    ql_pipeline_result_destroy(result);
+
+    EXPECT_TRUE(observed_remaining_present.load());
+    EXPECT_EQ(UINT64_MAX, observed_remaining_ns.load());
 }
 
 TEST_F(PipelineBudgetTest, ANullBudgetBehavesLikeTheUnbudgetedRun) {

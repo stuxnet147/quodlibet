@@ -555,6 +555,15 @@ static uint32_t QL_CALL cancellation_requested(const void *state) {
     return ql_budget_scope_is_cancelled(combined->scope);
 }
 
+/* The counterpart to cancellation_requested: how long is left, rather than
+   whether time is already up. A method that delegates to something it cannot
+   poll needs this before it delegates. */
+static uint64_t QL_CALL remaining_nanoseconds(const void *state) {
+    const ql_pipeline_cancel_state *combined = state;
+
+    return ql_budget_scope_remaining_ns(combined->scope);
+}
+
 static ql_status QL_CALL run_pipeline_node(void *user_data, ql_error *error) {
     ql_pipeline_task *task = user_data;
     ql_pipeline_node *node = &task->pipeline->nodes[task->node_index];
@@ -640,6 +649,7 @@ static ql_status QL_CALL run_pipeline_node(void *user_data, ql_error *error) {
     context.host = ql_default_host();
     context.cancel_state = &cancel_state;
     context.is_cancelled = cancellation_requested;
+    context.remaining_ns = remaining_nanoseconds;
     context.run_id = task->run_id;
     context.solver_session = task->pipeline->solver_session;
     status = node->method->run(instance, &context, inputs, input_count,

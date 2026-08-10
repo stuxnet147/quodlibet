@@ -1,5 +1,6 @@
 #include "quodlibet/proof_smt.h"
 
+#include <stddef.h>
 #include <string.h>
 
 #include "quodlibet/c_lower.h"
@@ -354,6 +355,51 @@ static ql_status lower_side(const ql_allocator *allocator,
 
 /* --- Solving -------------------------------------------------------------- */
 
+/* The deadline this check may actually use: the method's own timeout and
+   whatever the run has left, whichever is tighter.
+
+   Cancellation alone cannot do this. The budget guard is polled between
+   stages, so a run that goes over is noticed only when the solver returns,
+   and the overrun is as long as the round trip. Measured: a one-millisecond
+   deadline and a hundred-millisecond deadline both came back at ~0.41 s,
+   which is where the first solver round trip ends, not where either deadline
+   fell (docs/perf/concurrency.md). Handing the remaining time down as the
+   subprocess deadline is what makes a tight budget cost less than a loose
+   one.
+
+   This can only tighten. A method that asked for a shorter timeout than the
+   budget keeps it, and neither value can be widened by the other. */
+static uint64_t solver_deadline_ms(uint64_t method_timeout_ms,
+                                   const ql_run_context_v1 *context) {
+    uint64_t remaining_ns;
+    uint64_t remaining_ms;
+
+    if (context == NULL ||
+        context->struct_size < offsetof(ql_run_context_v1, reserved) ||
+        context->remaining_ns == NULL) {
+        return method_timeout_ms;
+    }
+    remaining_ns = context->remaining_ns(context->cancel_state);
+    if (remaining_ns == UINT64_MAX) {
+        /* No time axis applies to this run. */
+        return method_timeout_ms;
+    }
+    /* Round up, and never to zero while any time remains: the request reads
+       zero as "no deadline", so truncating a live sub-millisecond budget would
+       remove the limit rather than tighten it. budget.h states the same rule
+       for ql_budget_remaining_ms. A budget already spent gets the smallest
+       positive deadline instead, so the solver gives up at once rather than
+       running unbounded; the guard turns that run into budget-exhausted
+       regardless of what the solver answers. */
+    remaining_ms = remaining_ns == 0u
+                       ? 1u
+                       : (remaining_ns + UINT64_C(999999)) / UINT64_C(1000000);
+    if (method_timeout_ms == 0u || remaining_ms < method_timeout_ms) {
+        return remaining_ms;
+    }
+    return method_timeout_ms;
+}
+
 static ql_status run_check(const ql_allocator *allocator,
                            const smt_product_instance *instance,
                            const ql_run_context_v1 *context,
@@ -401,7 +447,7 @@ static ql_status run_check(const ql_allocator *allocator,
     }
     ql_solver_check_request_init(&request, query_view->logic);
     request.maximum_bv_width = query_view->maximum_bv_width;
-    request.timeout_ms = instance->timeout_ms;
+    request.timeout_ms = solver_deadline_ms(instance->timeout_ms, context);
     if (instance->memory_limit_mb != 0u) {
         request.memory_limit_mb = instance->memory_limit_mb;
         request.required_features = QL_SOLVER_FEATURE_MEMORY_LIMIT;
