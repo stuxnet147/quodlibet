@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,056 / 29,880 (97.24%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_type` 143, `unsupported_control_flow` 142, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **29,075 / 29,880 (97.31%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_call` 225, `unsupported_type` 143, `unsupported_control_flow` 123, `undeclared_identifier` 66입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -2130,6 +2130,25 @@ label entry에서 보이던 변수만 cycle에 운반합니다. 선언 초기화
 
 solver, plugin, EGraph, public API는 바뀌지 않아 전체 CTest는 실행하지 않았습니다. 전체 train도 반복하지 않았습니다. 불완전 record 51개, 모든 goto 2,153개, 모든 record 포함 입력 22,227개가 각각 신규 수용 경로와 기존 성공 회귀를 포함하는 영향 상한이기 때문입니다.
 
+### 76. 전방 goto에 target scope의 automatic 상태를 운반한다
+
+전방 goto가 target label과 같은 compound 안에 있거나 그 compound의 자식 block에서 나올 때, label의 lexical scope에 실제로 남아 있는 automatic만 pending state에 포함합니다. 각 변수의 선언 노드에서 가장 가까운 compound 또는 `for` scope를 찾아 target label을 포함하는지 확인하므로, goto가 빠져나온 자식 block의 수명이 끝난 변수는 운반하지 않습니다. label은 첫 pending state의 변수 prefix를 기준으로 정상 fallthrough와 scalar value, definedness, memory, call trace를 합칩니다.
+
+goto와 label 사이의 선언을 실제로 건너뛰는 경우와 바깥에서 선언이 있는 nested scope로 들어가는 경우는 계속 UNKNOWN입니다. loop body 안에서 nested automatic을 운반하는 forward label은 loop header PHI에 뒤늦게 생긴 label PHI를 통합해야 하므로 별도 진단으로 거부합니다. 이 경계를 느슨하게 하지 않고 cyclic SSA 통합이 있을 때만 확장합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 29,056 (97.24%) | **29,075 (97.31%)** |
+| 증가 | | **+19** |
+| 기존 성공 회귀 | | **0** |
+| `unsupported_control_flow` | 142 | **123** |
+| verifier 통과 | 29,056 / 29,056 | **29,075 / 29,075** |
+| status 실패 | 0 | **0** |
+
+기존 nested automatic 첫 차단 73개를 먼저 재측정해 19개가 성공했습니다. 42개는 선언 우회 또는 다른 lexical state가 계속 필요했고, 12개는 loop의 cyclic SSA 통합 경계에서 명시적으로 UNKNOWN입니다. goto를 포함한 train 입력 2,153개를 영향 범위의 상한으로 비교한 결과도 순증 19개, 기존 성공 회귀 0개, verifier 실패 0개, status 실패 0개였습니다.
+
+`tests/test_ir_differential.cpp`는 자식 block에서 label scope의 automatic을 운반하는 함수를 실제 compiled C와 edge 및 random 입력에서 대조합니다. `tests/test_c_lower.cpp`는 선언 우회와 loop-carried nested automatic을 계속 UNKNOWN으로 고정합니다. 직접 4개 테스트와 모든 goto 입력이 통과했습니다. 변경 분기는 goto에만 있고 공용 IR, interpreter, solver, plugin, EGraph, public API는 바뀌지 않았으므로 전체 CTest와 전체 train은 실행하지 않았습니다.
+
 ## 막힌 것
 
 - 없음
@@ -2140,7 +2159,7 @@ solver, plugin, EGraph, public API는 바뀌지 않아 전체 CTest는 실행하
 
 - `unsupported_call` 225
 - `unsupported_type` 143
-- `unsupported_control_flow` 142
+- `unsupported_control_flow` 123
 - `undeclared_identifier` 66
 - `unsupported_pointer` 59
 - `duplicate_declaration` 58

@@ -201,6 +201,7 @@ typedef struct lower_variable {
   uint32_t initialized;
   uint32_t is_const;
   size_t scope_depth;
+  size_t declaration_node;
 } lower_variable;
 
 /* One descriptor for a storage region the function may touch. Pointer
@@ -4013,6 +4014,7 @@ static ql_status add_variable(lower_context *context, const char *name,
   variable->initialized = initialized;
   variable->is_const = is_const;
   variable->scope_depth = context->scope_depth;
+  variable->declaration_node = node;
   ++context->variable_count;
   return QL_STATUS_OK;
 }
@@ -11502,7 +11504,6 @@ static int goto_skips_declaration(const lower_context *context,
   size_t node;
   uint32_t begin = context->nodes[goto_node].view.range.end_byte;
   uint32_t finish = context->nodes[label_node].view.range.start_byte;
-  const int backward = finish <= begin;
 
   for (node = context->body_node + 1u; node < end; ++node) {
     uint32_t at;
@@ -11516,17 +11517,64 @@ static int goto_skips_declaration(const lower_context *context,
         strcmp(context->nodes[scope].view.kind, "compound_statement") == 0 &&
         node_contains(context, scope, label_node)) {
       if (scope != context->body_node && at < finish &&
-          (backward == 0 || !node_contains(context, scope, goto_node))) {
+          !node_contains(context, scope, goto_node)) {
         /* Pending goto states currently carry function-scope variables.
            Entering a nested scope with a live automatic still requires a
-           second lexical state map. A backward edge that starts inside the
-           same scope already has that automatic in its label-entry state. */
+           second lexical state map. An edge that starts inside the same
+           scope can carry that automatic in its label-entry state. */
         return 1;
       }
       if (at > begin && at < finish) {
         return 1;
       }
     }
+  }
+  return 0;
+}
+
+/* A goto leaving child blocks keeps the automatic variables declared in the
+   target label's enclosing compound. Variables from the child blocks have
+   ended their lifetime and must not enter the pending state. An edge entering
+   a sibling compound still uses only function-scope state; the declaration
+   check above admits that case only when no target-scope automatic is live. */
+static size_t goto_target_variable_count(const lower_context *context,
+                                         size_t label_node) {
+  size_t count = 0u;
+
+  while (count < context->variable_count) {
+    const lower_variable *variable = &context->variables[count];
+    size_t scope = variable->declaration_node;
+    if (variable->scope_depth == 0u || scope == SIZE_MAX) {
+      ++count;
+      continue;
+    }
+    while (scope != SIZE_MAX && scope != context->body_node) {
+      const char *kind = context->nodes[scope].view.kind;
+      if (strcmp(kind, "compound_statement") == 0 ||
+          strcmp(kind, "for_statement") == 0) {
+        break;
+      }
+      scope = context->nodes[scope].parent;
+    }
+    if (scope == SIZE_MAX || !node_contains(context, scope, label_node)) {
+      break;
+    }
+    ++count;
+  }
+  return count;
+}
+
+static int label_is_inside_loop(const lower_context *context,
+                                size_t label_node) {
+  size_t ancestor = context->nodes[label_node].parent;
+  while (ancestor != SIZE_MAX && ancestor != context->body_node) {
+    const char *kind = context->nodes[ancestor].view.kind;
+    if (strcmp(kind, "for_statement") == 0 ||
+        strcmp(kind, "while_statement") == 0 ||
+        strcmp(kind, "do_statement") == 0) {
+      return 1;
+    }
+    ancestor = context->nodes[ancestor].parent;
   }
   return 0;
 }
@@ -11615,7 +11663,15 @@ static ql_status lower_goto_statement(lower_context *context, size_t node,
     context->current_terminated = 1u;
     return QL_STATUS_OK;
   }
-  variable_count = function_scope_variable_count(context);
+  variable_count = goto_target_variable_count(context, label->node);
+  if (variable_count > function_scope_variable_count(context) &&
+      label_is_inside_loop(context, label->node)) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+        "goto carrying nested automatic state through a loop needs cyclic "
+        "SSA integration",
+        error);
+  }
   if (label->incoming.count != 0u &&
       label->incoming.states[0].count != variable_count) {
     return lower_unknown(
@@ -11658,7 +11714,9 @@ static ql_status lower_labeled_statement(lower_context *context, size_t node,
   }
   variable_count = label->has_backward_incoming != 0u
                        ? context->variable_count
-                       : function_scope_variable_count(context);
+                       : label->incoming.count != 0u
+                             ? label->incoming.states[0].count
+                             : function_scope_variable_count(context);
   for (index = 0u; index < label->incoming.count; ++index) {
     if (label->incoming.states[index].count != variable_count) {
       return lower_unknown(
