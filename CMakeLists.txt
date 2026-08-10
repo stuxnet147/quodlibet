@@ -124,15 +124,53 @@ endif()
 if(QL_BUILD_SHARED)
     target_compile_definitions(quodlibet PUBLIC QL_BUILD_SHARED)
 endif()
-target_link_libraries(quodlibet
-    PRIVATE
-        ql_vendor_uv
-        ql_vendor_yyjson
-        ql_vendor_xxhash
-        ql_vendor_blake3
-        ql_vendor_tree_sitter
-        ql_vendor_tree_sitter_c
+# The vendored dependencies are folded into libquodlibet rather than linked
+# beside it, so the installed library is self-contained: a consumer links one
+# thing and does not need libuv, yyjson, tree-sitter, BLAKE3 or xxHash on its
+# own link line. The Python extension already had to be self-contained for the
+# same reason - one importable file with no companion to place on a loader
+# path - and this puts the C consumer on the same footing.
+#
+# Folding the objects rather than linking the archives is what makes the
+# export possible at all. A PRIVATE link to a static library is still recorded
+# in the interface as $<LINK_ONLY:...>, and install(EXPORT) refuses a target
+# whose interface names targets that are not themselves exported. These are
+# vendored build-time targets that will never be installed, so the objects go
+# in and the targets stay out.
+target_sources(quodlibet PRIVATE
+    $<TARGET_OBJECTS:ql_vendor_uv>
+    $<TARGET_OBJECTS:ql_vendor_yyjson>
+    $<TARGET_OBJECTS:ql_vendor_xxhash>
+    $<TARGET_OBJECTS:ql_vendor_blake3>
+    $<TARGET_OBJECTS:ql_vendor_tree_sitter>
+    $<TARGET_OBJECTS:ql_vendor_tree_sitter_c>
 )
+# The headers still have to be found while compiling this library's own
+# sources. Reading each vendored target's usage requirements keeps that in one
+# place without creating the link dependency the export cannot carry.
+foreach(ql_vendor_target IN ITEMS
+    ql_vendor_uv
+    ql_vendor_yyjson
+    ql_vendor_xxhash
+    ql_vendor_blake3
+    ql_vendor_tree_sitter
+    ql_vendor_tree_sitter_c)
+    target_include_directories(quodlibet SYSTEM PRIVATE
+        $<TARGET_PROPERTY:${ql_vendor_target},INTERFACE_INCLUDE_DIRECTORIES>)
+endforeach()
+
+# What the folded objects still need from the operating system. These are
+# plain system libraries, so naming them in the exported interface is safe:
+# a consumer resolves them from its own toolchain rather than from us.
+if(WIN32)
+    target_link_libraries(quodlibet PUBLIC
+        psapi user32 advapi32 iphlpapi userenv ws2_32 dbghelp ole32 shell32)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(quodlibet PUBLIC pthread dl rt m)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(quodlibet PUBLIC Threads::Threads)
+endif()
 set_target_properties(quodlibet PROPERTIES
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN YES
@@ -205,12 +243,43 @@ if(QL_BUILD_FUZZERS)
     endforeach()
 endif()
 
-install(TARGETS quodlibet quodlibet_cli
+# Only the library is exported. The CLI is installed as a program, not as
+# something a consumer links, and exporting it would put an executable named
+# quodlibet into the same namespace as the library target.
+install(TARGETS quodlibet
+    EXPORT quodlibetTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(TARGETS quodlibet_cli
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY include/quodlibet
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# find_package(quodlibet) gives a consumer quodlibet::quodlibet and nothing
+# else to think about. No find_dependency call appears in the generated
+# config: every vendored dependency is inside the library, and the system
+# libraries travel in the exported interface.
+set(QL_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/quodlibet")
+install(EXPORT quodlibetTargets
+    FILE quodlibet-targets.cmake
+    NAMESPACE quodlibet::
+    DESTINATION "${QL_INSTALL_CMAKEDIR}")
+
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/quodlibet-config.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/quodlibet-config.cmake"
+    INSTALL_DESTINATION "${QL_INSTALL_CMAKEDIR}")
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/quodlibet-config-version.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/quodlibet-config.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/quodlibet-config-version.cmake"
+    DESTINATION "${QL_INSTALL_CMAKEDIR}")
 if(QL_ENABLE_BITWUZLA)
     install(PROGRAMS "${QL_BITWUZLA_EXECUTABLE}"
         DESTINATION ${CMAKE_INSTALL_BINDIR}

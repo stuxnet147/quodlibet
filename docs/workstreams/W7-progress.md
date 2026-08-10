@@ -5,7 +5,7 @@
 
 ## 지금 하는 것
 
-지시서 항목 1-6 을 전부 닫았습니다. 조율자 회신 대기 중이며 대기 동안 남은 판단 항목을 정리해 둡니다.
+없습니다. 지시서 항목 1-6 과 위임받은 4건이 전부 닫혔습니다.
 
 ## 착수 시 조사한 것 (2026-08-10)
 
@@ -190,6 +190,28 @@ CTest 435/435 통과.
 
 CTest 458/458 통과.
 
+### 9. 설치 트리를 자기완결로 (조율자 위임, 루트 `CMakeLists.txt` 와 `cmake/`)
+
+항목 5 의 측정이 드러낸 두 결함 중 링크 불가 건을 조율자가 W7 에 위임했습니다. 완료 기준은 "설치 트리만으로 링크 가능" 입니다.
+
+**벤더 dependency 를 `libquodlibet` 안으로 접었습니다.** 소비자는 하나만 링크하고 libuv, yyjson, tree-sitter, BLAKE3, xxHash 를 자기 링크 줄에 적지 않습니다. 설치된 아카이브의 오브젝트가 38개에서 86개가 되었습니다.
+
+**아카이브 병합이 아니라 오브젝트 접기를 고른 이유가 있습니다.** 정적 라이브러리에 대한 PRIVATE 링크도 interface 에 `$<LINK_ONLY:...>` 로 남고 `install(EXPORT)` 는 export 되지 않은 타깃을 interface 에 담은 타깃을 거부합니다. 벤더 타깃은 설치될 일이 없으므로 오브젝트만 들어가고 타깃은 빠져야 export 가 성립합니다. `third_party/CMakeLists.txt` 를 건드리지 않고 루트에서 `$<TARGET_OBJECTS:>` 로 처리했습니다. 헤더 경로는 각 벤더 타깃의 usage requirement 를 읽어 PRIVATE 으로만 붙여 링크 의존을 만들지 않습니다.
+
+접힌 오브젝트가 운영체제에서 필요로 하는 것(Windows 9종, Linux 4종)은 평범한 시스템 라이브러리라 exported interface 로 내보냅니다. 소비자가 자기 toolchain 에서 해결합니다.
+
+**`find_package(quodlibet)` 이 `quodlibet::quodlibet` 을 줍니다.** `cmake/quodlibet-config.cmake.in` 에 `find_dependency` 호출이 없습니다. 전부 접었으므로 부를 것이 없습니다.
+
+`scripts/check-install.sh` 를 두 검사로 넓혔습니다. 설치된 라이브러리와 시스템 라이브러리만으로 링크되는지, 그리고 세 줄짜리 CMake 프로젝트가 `find_package` 로 실제 configure 되고 build 되는지입니다. 이동 후 탐색 probe 도 이제 `find_package` 로 만든 소비자를 씁니다. 실제 소비 경로로 재는 것이 맞습니다.
+
+**양쪽 플랫폼 실측입니다.** Windows 9개 검사 전부 통과, WSL Ubuntu 24.04 의 `linux-clang` 도 전부 통과. CTest 는 Windows 459/459, Linux 458/458.
+
+**rpath 는 기본 구성에 재배치할 것이 없습니다.** `QL_BUILD_SHARED` 기본 OFF 라 설치되는 것은 정적 아카이브이고 설치된 CLI 에 `RPATH` 도 `RUNPATH` 도 없으며 동적 의존은 libc 와 libm 뿐입니다. `QL_BUILD_SHARED=ON` 설치는 별도 축이라 재지 않았고 문서에 그렇게 적었습니다.
+
+**prefix 뿌리의 `quodlibet/` 는 결함이 아닙니다.** 배포 경로가 `cmake --install` 이 아니라 pip 이라는 조율자 판단을 따라 검사에서 예상된 예외로 두고 note 로만 적습니다. 그 밖의 것이 뿌리에 생기면 여전히 실패합니다.
+
+부수적으로 `tests/test_target_matrix.cpp` 의 기본 경로에 WSL 철자를 더했습니다. 드라이브 문자 하나 때문에 Linux 실행마다 skip 되고 있었는데, 그 침묵을 막으려고 만든 검사가 침묵하고 있었습니다. 이제 양쪽에서 실제로 돕니다.
+
 ## 내린 설계 결정
 
 - **새 target 을 `fuzz_targets.h` 가 아니라 별도 `fuzz_contract_targets.h` 에 둡니다.** 근거: `fuzz_targets.h` 와 `tests/test_fuzz.cpp` 는 W1 이 소유하는 표면(파서/로어링/IR)의 기록이고, W7 이 더하는 것은 계약 표면이라 소유가 다릅니다. `QL_FUZZ_REQUIRE`/`QL_FUZZ_REACHED` 규약은 그대로 따라서 두 헤더가 같은 규율 아래 있습니다.
@@ -277,7 +299,7 @@ campaign 은 그동안 두 번째 serialize 부터의 고정점을 검사합니�
 2. (완료) solver fault-injection 확대. in-process 와 process transport 양쪽
 3. (완료) 동시성 측정 -> `docs/perf/concurrency.md`
 4. (완료) ABI 호환 시험과 plugin SDK 예제
-5. (부분 완료) 설치 패키지. 측정과 문서화는 끝났고 relocatable 탐색은 통과. 남은 두 결함은 루트 `CMakeLists.txt`(조율자)와 `bindings/python`(W4) 소유라 판단 대기
+5. (완료) 설치 패키지. 자기완결 라이브러리, `find_package`, relocatable 탐색, Linux 실측, rpath 확인까지
 6. (완료) compiler/target matrix 자동 검증
 
 지시서 항목은 전부 닫혔습니다. 남은 것은 다른 워크스트림 소유라 판단이 필요한 두 건뿐입니다(설치 패키지의 package config, 파이썬 확장의 install 위치). 원격 CI 재설계는 지시서가 명시적으로 범위 밖으로 두었습니다.

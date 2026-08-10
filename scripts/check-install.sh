@@ -91,7 +91,14 @@ else
     fail "missing bin/$bw; the relocatable lookup has nothing to find"
 fi
 
-library=$(ls "$stage"/lib/*quodlibet* 2>/dev/null | head -1)
+config=$(ls "$stage"/lib/cmake/quodlibet/quodlibet-config.cmake 2>/dev/null)
+if [ -n "$config" ]; then
+    pass "installed a CMake package configuration"
+else
+    fail "no lib/cmake/quodlibet/quodlibet-config.cmake; find_package(quodlibet) cannot work"
+fi
+
+library=$(ls "$stage"/lib/*quodlibet*.lib "$stage"/lib/*quodlibet*.a 2>/dev/null | head -1)
 if [ -n "$library" ]; then
     pass "installed $(basename "$library")"
 else
@@ -101,12 +108,18 @@ fi
 # Anything installed outside the three standard directories is worth naming:
 # a prefix is shared with other packages and a stray directory at its root is
 # a collision waiting to happen.
-stray=$(cd "$stage" && find . -mindepth 1 -maxdepth 1 -type d \
-    ! -name bin ! -name lib ! -name include 2>/dev/null)
+# The Python package directory is the known exception and is not a defect:
+# the extension is delivered by pip, which installs into site-packages, and it
+# appears here only because it was built in the same tree. Anything else at the
+# root of a shared prefix is a collision waiting to happen.
+stray=$(cd "$stage" && find . -mindepth 1 -maxdepth 1 -type d     ! -name bin ! -name lib ! -name include ! -name quodlibet 2>/dev/null)
 if [ -z "$stray" ]; then
-    pass "nothing installed outside bin, lib and include"
+    pass "nothing unexpected installed outside bin, lib and include"
 else
     fail "installed outside the standard directories: $(echo $stray)"
+fi
+if [ -d "$stage/quodlibet" ]; then
+    note "the Python package directory is present; pip is its delivery path"
 fi
 echo
 
@@ -120,21 +133,50 @@ echo
 echo "== a consumer built against the installed artifacts"
 consumer_src="$root/scripts/install/consumer.c"
 installed_link=0
+# The installed library plus the platform's own system libraries, and nothing
+# else. No libuv, no yyjson, no tree-sitter: if any of those is still needed on
+# the link line then the library is not self-contained. The system libraries
+# are the ones the exported interface names, and a consumer resolves those from
+# its own toolchain rather than from this install.
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        system="-lpsapi -luser32 -ladvapi32 -liphlpapi -luserenv -lws2_32
+                -ldbghelp -lole32 -lshell32" ;;
+    *) system="-lpthread -ldl -lrt -lm" ;;
+esac
 if [ -n "$library" ]; then
     library="$moved/lib/$(basename "$library")"
-    if "${CC:-clang}" -std=c17 -I "$moved/include" "$consumer_src" \
-        -o "$work/consumer-installed$exe" "$library" \
-        > "$work/link-installed.log" 2>&1; then
+    if "${CC:-clang}" -std=c17 -I "$moved/include" "$consumer_src"         -o "$work/consumer-installed$exe" "$library" $system         > "$work/link-installed.log" 2>&1; then
         installed_link=1
-        pass "links against the installed library alone"
+        pass "links against the installed library and system libraries alone"
     else
-        fail "does not link against the installed library alone"
-        note "the vendored dependencies are neither bundled into the archive"
-        note "nor installed beside it, and no CMake package config names them"
+        fail "the installed library is not self-contained"
+        note "no vendored dependency may be needed on a consumer's link line"
         note "first undefined symbols:"
-        grep -o "undefined symbol: [^ ]*" "$work/link-installed.log" \
-            | head -5 | sed 's/^/      /'
+        grep -o "undefined symbol: [^ ]*" "$work/link-installed.log"             | sort -u | head -5 | sed 's/^/      /'
     fi
+fi
+echo
+
+# --------------------------------------------------------------------------
+# The way a real consumer is meant to find it. A direct link can be made to
+# work by hand; find_package working is what makes the install usable without
+# knowing anything about how Quodlibet was built.
+echo "== a consumer that uses find_package(quodlibet)"
+mkdir -p "$work/pkg"
+cat > "$work/pkg/CMakeLists.txt" <<'PKGEOF'
+cmake_minimum_required(VERSION 3.21)
+project(quodlibet_consumer C)
+find_package(quodlibet REQUIRED)
+add_executable(consumer consumer.c)
+target_link_libraries(consumer PRIVATE quodlibet::quodlibet)
+PKGEOF
+cp "$consumer_src" "$work/pkg/consumer.c"
+if cmake -S "$work/pkg" -B "$work/pkg/build" -G Ninja         -DCMAKE_PREFIX_PATH="$moved" > "$work/pkg-configure.log" 2>&1     && cmake --build "$work/pkg/build" > "$work/pkg-build.log" 2>&1; then
+    pass "find_package(quodlibet) configures and links a consumer"
+else
+    fail "find_package(quodlibet) does not produce a usable consumer"
+    tail -8 "$work/pkg-configure.log" "$work/pkg-build.log" 2>/dev/null         | sed 's/^/      /'
 fi
 echo
 
@@ -144,7 +186,10 @@ echo
 # probe is then built against the build tree and run from the moved prefix.
 echo "== relocatable Bitwuzla lookup"
 probe=""
-if [ "$installed_link" -eq 1 ]; then
+if [ -x "$work/pkg/build/consumer$exe" ]; then
+    probe="$work/pkg/build/consumer$exe"
+    note "built through find_package, which is how a consumer would get it"
+elif [ "$installed_link" -eq 1 ]; then
     probe="$work/consumer-installed$exe"
 else
     vendored=$(find "$build/third_party" -name '*.lib' -o -name '*.a' 2>/dev/null)

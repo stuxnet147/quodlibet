@@ -1,0 +1,17 @@
+@PACKAGE_INIT@
+
+# Quodlibet installs one library and that library is self-contained: every
+# vendored dependency is folded into it, so there is no find_dependency call
+# here and a consumer never has to name libuv, yyjson, tree-sitter, BLAKE3 or
+# xxHash. The system libraries the folded objects need travel in the exported
+# interface and are resolved from the consumer's own toolchain.
+#
+#   find_package(quodlibet REQUIRED)
+#   target_link_libraries(my_target PRIVATE quodlibet::quodlibet)
+#
+# A plugin does not need this at all: it includes quodlibet/plugin.h, exports
+# one symbol, and the host resolves its calls at load time.
+
+include("${CMAKE_CURRENT_LIST_DIR}/quodlibet-targets.cmake")
+
+check_required_components(quodlibet)

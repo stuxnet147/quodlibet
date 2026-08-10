@@ -7,25 +7,53 @@ cmake --build --preset windows-clang --parallel
 bash scripts/check-install.sh windows-clang
 ```
 
-Linux 는 인자 없이 돌리면 `linux-clang` 을 고릅니다.
+Linux 는 인자 없이 돌리면 `linux-clang` 을 고릅니다. 스크립트는 하나라도 실패하면 exit 이 0 이 아닙니다.
 
-## 지금 상태 (2026-08-10, Windows, `windows-clang`)
+## 지금 상태 (2026-08-10)
 
-| 항목 | 결과 |
-|---|---|
-| `cmake --install` 자체 | 통과 |
-| `bin/quodlibet`, 공개 헤더 전부 | 통과 |
-| `bin/bitwuzla` 를 실행 파일 옆에 설치 | 통과 |
-| `lib/quodlibet_static` | 통과 |
-| bin, lib, include 밖에 설치되는 것 없음 | **실패** |
-| 설치된 산출물만으로 소비자가 링크 | **실패** |
-| prefix 를 옮긴 뒤 relocatable Bitwuzla 탐색 | 통과 |
+| 항목 | Windows | Linux |
+|---|---|---|
+| `cmake --install` 자체 | 통과 | 통과 |
+| `bin/quodlibet`, 공개 헤더 전부 | 통과 | 통과 |
+| `bin/bitwuzla` 를 실행 파일 옆에 설치 | 통과 | 통과 |
+| CMake package configuration 설치 | 통과 | 통과 |
+| 코어 라이브러리 설치 | 통과 (`quodlibet_static.lib`) | 통과 (`libquodlibet.a`) |
+| bin, lib, include 밖에 예상 밖의 것 없음 | 통과 | 통과 |
+| **설치된 라이브러리 + 시스템 라이브러리만으로 링크** | 통과 | 통과 |
+| **`find_package(quodlibet)` 로 소비** | 통과 | 통과 |
+| prefix 를 옮긴 뒤 relocatable Bitwuzla 탐색 | 통과 | 통과 |
 
-## 통과한 것: relocatable Bitwuzla 탐색
+Windows 는 `windows-clang`, Linux 는 WSL Ubuntu 24.04 의 `linux-clang` 입니다.
 
-prefix 전체를 다른 경로로 옮긴 뒤 그 안의 `bin/` 에서 프로그램을 돌리면 Bitwuzla 를 **자기 옆에서** 찾습니다.
+## 자기완결 라이브러리
 
-이 확인에는 함정이 하나 있습니다. 개발 기계에는 빌드 시점에 박힌 절대 경로가 아직 살아 있어서, 옆을 보지 않고 그 절대 경로로 조용히 되돌아가도 성공처럼 보입니다. 그래서 검사가 음성 방향으로도 갑니다. **옆의 복사본을 Bitwuzla 가 아닌 것으로 바꾸면 실행이 실패해야 합니다.** 실측 결과는 이렇습니다.
+벤더링한 dependency 를 `libquodlibet` **안으로 접어 넣습니다.** 소비자는 하나만 링크하며 libuv, yyjson, tree-sitter, BLAKE3, xxHash 를 자기 링크 줄에 적지 않습니다. 파이썬 확장이 같은 이유로 이미 자기완결이었고(로더 경로에 놓을 동반 파일이 없는 단일 import 파일) C 소비자를 같은 자리에 세웠습니다.
+
+아카이브를 병합하는 대신 오브젝트를 접는 방식을 골랐습니다. **이것이 export 를 가능하게 하는 조건이기도 합니다.** 정적 라이브러리에 대한 PRIVATE 링크도 interface 에 `$<LINK_ONLY:...>` 로 남고, `install(EXPORT)` 는 export 되지 않은 타깃을 interface 에 담은 타깃을 거부합니다. 벤더 타깃은 설치될 일이 없으므로 오브젝트만 들어가고 타깃은 빠집니다.
+
+접힌 오브젝트가 운영체제에서 필요로 하는 것은 exported interface 로 따라갑니다. 전부 평범한 시스템 라이브러리라 소비자가 자기 toolchain 에서 해결합니다.
+
+- Windows: `psapi user32 advapi32 iphlpapi userenv ws2_32 dbghelp ole32 shell32`
+- Linux: `pthread dl rt m`
+
+확인은 실제 링크로 합니다. 설치된 라이브러리와 위 시스템 라이브러리만 주고 소비자를 링크하며, **벤더 dependency 를 하나라도 링크 줄에 요구하면 실패입니다.**
+
+## find_package
+
+```cmake
+find_package(quodlibet REQUIRED)
+target_link_libraries(my_target PRIVATE quodlibet::quodlibet)
+```
+
+`cmake/quodlibet-config.cmake.in` 에서 생성되며 `find_dependency` 호출이 없습니다. 전부 접었으므로 부를 것이 없습니다. 검사는 이 세 줄짜리 프로젝트를 실제로 configure 하고 build 합니다.
+
+**플러그인은 이것이 필요 없습니다.** `quodlibet/plugin.h` 를 include 하고 심볼 하나를 export 하면 host 가 적재 시점에 호출을 해결합니다. `examples/plugin/README.md` 가 그렇게 적습니다.
+
+## relocatable Bitwuzla 탐색
+
+prefix 전체를 다른 경로로 옮긴 뒤 그 안의 `bin/` 에서 돌리면 Bitwuzla 를 **자기 옆에서** 찾습니다.
+
+이 확인에는 함정이 하나 있습니다. 개발 기계에는 빌드 시점에 박힌 절대 경로가 아직 살아 있어서, 옆을 보지 않고 그 절대 경로로 조용히 되돌아가도 성공처럼 보입니다. 그래서 검사가 음성 방향으로도 갑니다. **옆의 복사본을 Bitwuzla 가 아닌 것으로 바꾸면 실행이 실패해야 합니다.** 양쪽 플랫폼 실측입니다.
 
 ```
 PASS  the probe runs from the moved prefix
@@ -34,42 +62,28 @@ PASS  the lookup uses the adjacent copy, not the build-time default
       create failed: configured solver is not the pinned Bitwuzla 0.9.1 executable
 ```
 
-옆의 것을 바꾸자 실패했으므로 실제로 옆의 것을 쓴 것입니다. 우선순위는 `options_json` 의 `executable`, 그다음 실행 파일 옆, 그다음 빌드 시점 기본값입니다.
+우선순위는 `options_json` 의 `executable`, 그다음 실행 파일 옆, 그다음 빌드 시점 기본값입니다.
 
-## 실패 1: 설치된 산출물만으로는 링크할 수 없습니다
+## rpath
 
-설치된 헤더로 컴파일하고 설치된 라이브러리로 링크하면 이렇게 끝납니다.
+**기본 구성에는 재배치할 것이 없습니다.** `QL_BUILD_SHARED` 가 기본 OFF 라 설치되는 것은 정적 아카이브이고, 설치된 CLI 에는 `RPATH` 도 `RUNPATH` 도 없습니다. 동적 의존은 libc 와 libm 뿐입니다.
 
 ```
-undefined symbol: yyjson_read_opts
-undefined symbol: uv_exepath
-undefined symbol: uv_os_getpid
-undefined symbol: uv_os_tmpdir
-undefined symbol: uv_fs_mkdtemp
+--- RUNPATH/RPATH on the installed CLI ---
+(none: nothing to relocate at load time)
+--- dynamic deps ---
+    linux-vdso.so.1
+    libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6
+    libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
 ```
 
-원인은 둘입니다.
+`QL_BUILD_SHARED=ON` 설치는 재지 않았습니다. 그 구성에서는 `libquodlibet.so` 를 찾는 문제가 생기므로 별도 축입니다.
 
-- **벤더링한 dependency 가 설치되지 않고 아카이브에 합쳐지지도 않았습니다.** 설치된 `quodlibet_static` 은 Quodlibet 자기 오브젝트 38개만 담습니다. libuv, yyjson, tree-sitter, BLAKE3, xxHash 는 `lib/` 에도 없습니다.
-- **CMake package config 가 없습니다.** `install(TARGETS ...)` 만 있고 `install(EXPORT ...)` 나 `quodlibet-config.cmake` 가 없어 `find_package(quodlibet)` 이 존재하지 않습니다. 그래서 소비자가 어떤 라이브러리를 어떤 순서로 링크해야 하는지 알아낼 방법도 없습니다.
+## 결함이 아닌 것: prefix 의 `quodlibet/` 디렉터리
 
-`AGENTS.MD` 의 디렉터리 설명은 "`cmake/`: package와 빌드 지원 모듈" 을 적고 있지만 저장소에 `cmake/` 디렉터리가 없습니다. 계획은 있었고 구현이 없는 상태입니다.
-
-**플러그인 작성자는 이것에 막히지 않습니다.** 플러그인은 `quodlibet/plugin.h` 를 include 하고 심볼 하나를 export 하면 되며 host 가 적재 시점에 호출을 해결하므로 Quodlibet 을 링크할 필요가 없습니다. 막히는 것은 Quodlibet 을 라이브러리로 링크하려는 소비자입니다.
-
-고치는 방법은 셋 중 하나입니다.
-
-1. `install(EXPORT)` 와 `quodlibet-config.cmake` 를 내고 벤더링한 아카이브도 같이 설치해 `find_package` 가 링크 순서를 알려 주게 합니다. 정공법입니다.
-2. 벤더링한 오브젝트를 `quodlibet_static` 하나로 합쳐 자기완결 아카이브로 만듭니다. 소비자는 단순해지지만 심볼 충돌 위험이 옮겨 갑니다.
-3. 공유 라이브러리(`QL_BUILD_SHARED=ON`)를 설치 기본으로 삼습니다. 파이썬 확장이 이미 반대 방향(정적 링크로 단일 파일)을 택한 이유가 있으므로 그 결정과 충돌합니다.
-
-**루트 `CMakeLists.txt` 가 조율자 소유라 W7 이 고르지 않았습니다.**
-
-## 실패 2: prefix 뿌리에 `quodlibet/` 이 생깁니다
-
-파이썬 확장이 `<prefix>/quodlibet/_quodlibet.pyd` 로 설치됩니다. prefix 는 다른 패키지와 공유하는 자리이고 그 뿌리에 이름 하나를 차지하는 디렉터리가 생기는 것은 충돌을 기다리는 상태입니다. site-packages 상대 경로이거나, 애초에 루트 install 에 들어가지 않는 것이 맞습니다. `bindings/python` 은 W4 소유입니다.
+파이썬 확장이 `<prefix>/quodlibet/_quodlibet.pyd` 로 나타납니다. **배포 경로가 `cmake --install` 이 아니라 pip 이므로 결함이 아닙니다.** 같은 트리에서 같이 빌드되기 때문에 보이는 것뿐입니다. 검사는 이 디렉터리를 예상된 예외로 두고 note 로만 적으며, 그 밖의 것이 prefix 뿌리에 생기면 실패합니다.
 
 ## 아직 재지 않은 것
 
-- **Linux 실측.** 스크립트는 `linux-clang` 을 그대로 받지만 이 문서의 표는 Windows 결과입니다. Linux 는 `rpath` 가 추가로 걸리는 축이라 별도로 재야 합니다.
+- **`QL_BUILD_SHARED=ON` 의 설치와 rpath.** 위에 적은 대로 별도 축입니다.
 - **설치된 CLI 는 solver 를 쓰지 않습니다.** `version`, `methods`, `parse-c`, `validate`, `coverage` 중 어느 것도 판정을 돌리지 않으므로 CLI 만으로는 Bitwuzla 탐색을 확인할 수 없습니다. 위 확인이 작은 소비자 프로그램(`scripts/install/consumer.c`)을 쓰는 이유입니다.
