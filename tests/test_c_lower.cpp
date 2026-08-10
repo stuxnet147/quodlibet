@@ -286,6 +286,12 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
          "declared_no_return",
          QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
          "type_qualifier"},
+        {"int backward(int x) { again: if (x) goto again; return x; }",
+         "backward", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
+         "goto_statement"},
+        {"int bypass(int x) { goto done; int y = x; done: return x; }",
+         "bypass", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
+         "goto_statement"},
     };
 
     for (const UnsupportedCase &test_case : cases) {

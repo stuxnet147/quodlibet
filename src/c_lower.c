@@ -241,6 +241,14 @@ typedef struct lower_break_scope {
     size_t block_capacity;
 } lower_break_scope;
 
+typedef struct lower_label {
+    char *name;
+    size_t node;
+    size_t body_node;
+    lower_break_scope incoming;
+    uint32_t lowered;
+} lower_label;
+
 typedef struct lower_context {
     const ql_allocator *allocator;
     const char *source;
@@ -272,6 +280,9 @@ typedef struct lower_context {
     ql_ir_block_id entry_block;
     uint32_t current_terminated;
     lower_break_scope *break_scope;
+    lower_label *labels;
+    size_t label_count;
+    size_t label_capacity;
     ql_ir_type_id memory_type;
     lower_type_binding *type_cache;
     size_t type_cache_count;
@@ -1591,6 +1602,94 @@ static const lower_enumerator *find_enumerator(const lower_context *context,
     for (index = 0u; index < context->enumerator_count; ++index) {
         if (strcmp(context->enumerators[index].name, name) == 0) {
             return &context->enumerators[index];
+        }
+    }
+    return NULL;
+}
+
+/* Labels have function scope in C. The acyclic v1 lowering admits direct
+   labels in the function body and forward jumps to them; nested labels and
+   backward edges remain outside this pass. Recording the nodes before body
+   lowering lets a goto resolve its target without creating an unreachable IR
+   block prematurely. */
+static ql_status collect_labels(lower_context *context, size_t body,
+                                ql_error *error) {
+    size_t end = subtree_end(context, body);
+    size_t node;
+
+    for (node = body + 1u; node < end; ++node) {
+        size_t label_node;
+        size_t statement_node;
+        char *name;
+        size_t existing;
+        lower_label *entry;
+        ql_status status;
+
+        if (context->nodes[node].parent != body ||
+            strcmp(context->nodes[node].view.kind,
+                   "labeled_statement") != 0) {
+            continue;
+        }
+        label_node = direct_field_child(context, node, "label");
+        statement_node = SIZE_MAX;
+        {
+            size_t label_end = subtree_end(context, node);
+            size_t child;
+            for (child = node + 1u; child < label_end; ++child) {
+                if (context->nodes[child].parent == node &&
+                    (context->nodes[child].view.flags &
+                     QL_C_SYNTAX_NODE_NAMED) != 0u &&
+                    child != label_node) {
+                    statement_node = child;
+                    break;
+                }
+            }
+        }
+        if (label_node == SIZE_MAX || statement_node == SIZE_MAX) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
+                node, "label is missing its name or statement", error);
+        }
+        name = copy_node_text(context, label_node);
+        if (name == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        for (existing = 0u; existing < context->label_count; ++existing) {
+            if (strcmp(context->labels[existing].name, name) == 0) {
+                context->allocator->deallocate(
+                    context->allocator->user_data, name);
+                return lower_unknown(
+                    context,
+                    QL_C_LOWER_DIAGNOSTIC_DUPLICATE_DECLARATION,
+                    label_node,
+                    "label is declared more than once in the function",
+                    error);
+            }
+        }
+        status = grow_array(context->allocator, (void **)&context->labels,
+                            &context->label_capacity,
+                            sizeof(*context->labels),
+                            context->label_count + 1u, error);
+        if (status != QL_STATUS_OK) {
+            context->allocator->deallocate(context->allocator->user_data,
+                                           name);
+            return status;
+        }
+        entry = &context->labels[context->label_count++];
+        memset(entry, 0, sizeof(*entry));
+        entry->name = name;
+        entry->node = node;
+        entry->body_node = statement_node;
+    }
+    return QL_STATUS_OK;
+}
+
+static lower_label *find_label(lower_context *context, const char *name) {
+    size_t index;
+    for (index = 0u; index < context->label_count; ++index) {
+        if (strcmp(context->labels[index].name, name) == 0) {
+            return &context->labels[index];
         }
     }
     return NULL;
@@ -7111,7 +7210,16 @@ static ql_status lower_compound(lower_context *context, size_t node,
             continue;
         }
         if (context->current_terminated != 0u) {
-            break;
+            if (node != context->body_node) {
+                break;
+            }
+            /* A forward goto can make a later direct label live even though
+               ordinary fallthrough is dead. Skip intervening statements and
+               let the label restore its pending predecessor states. */
+            if (strcmp(context->nodes[index].view.kind,
+                       "labeled_statement") != 0) {
+                continue;
+            }
         }
         status = lower_statement(context, index, error);
         if (status != QL_STATUS_OK || context->unknown != 0u) {
@@ -7449,11 +7557,11 @@ static void destroy_break_scope(lower_context *context,
 }
 
 /* Takes ownership of state when it succeeds. */
-static ql_status append_switch_exit(lower_context *context,
-                                    lower_break_scope *scope,
-                                    ql_ir_block_id block,
-                                    lower_state *state,
-                                    ql_error *error) {
+static ql_status append_pending_state(lower_context *context,
+                                      lower_break_scope *scope,
+                                      ql_ir_block_id block,
+                                      lower_state *state,
+                                      ql_error *error) {
     ql_status status = grow_array(
         context->allocator, (void **)&scope->states,
         &scope->state_capacity, sizeof(*scope->states), scope->count + 1u,
@@ -7488,8 +7596,8 @@ static ql_status lower_break_statement(lower_context *context, size_t node,
     status = save_state(context, context->break_scope->variable_count,
                         &state, error);
     if (status == QL_STATUS_OK) {
-        status = append_switch_exit(context, context->break_scope,
-                                    context->current_block, &state, error);
+        status = append_pending_state(context, context->break_scope,
+                                      context->current_block, &state, error);
     }
     if (status != QL_STATUS_OK) {
         destroy_state(context, &state);
@@ -7885,8 +7993,8 @@ static ql_status lower_switch_statement(lower_context *context, size_t node,
     }
     context->break_scope = parent_scope;
     if (fallthrough_live != 0u) {
-        status = append_switch_exit(context, &scope, fallthrough_block,
-                                    &fallthrough_state, error);
+        status = append_pending_state(context, &scope, fallthrough_block,
+                                      &fallthrough_state, error);
         fallthrough_live = 0u;
         if (status != QL_STATUS_OK) {
             goto cleanup;
@@ -7917,9 +8025,9 @@ static ql_status lower_switch_statement(lower_context *context, size_t node,
                                     &no_match_state, error);
             }
             if (status == QL_STATUS_OK) {
-                status = append_switch_exit(context, &scope,
-                                            pending_dispatch,
-                                            &no_match_state, error);
+                status = append_pending_state(context, &scope,
+                                              pending_dispatch,
+                                              &no_match_state, error);
             }
             if (status != QL_STATUS_OK) {
                 destroy_state(context, &no_match_state);
@@ -7947,6 +8055,164 @@ cleanup:
     destroy_break_scope(context, &scope);
     context->allocator->deallocate(context->allocator->user_data, cases);
     return status;
+}
+
+static size_t function_scope_variable_count(const lower_context *context) {
+    size_t count = 0u;
+    while (count < context->variable_count &&
+           context->variables[count].scope_depth == 0u) {
+        ++count;
+    }
+    return count;
+}
+
+static int goto_skips_declaration(const lower_context *context,
+                                  size_t goto_node, size_t label_node) {
+    size_t end = subtree_end(context, context->body_node);
+    size_t node;
+    uint32_t begin = context->nodes[goto_node].view.range.end_byte;
+    uint32_t finish = context->nodes[label_node].view.range.start_byte;
+
+    for (node = context->body_node + 1u; node < end; ++node) {
+        uint32_t at;
+        if (context->nodes[node].parent != context->body_node ||
+            strcmp(context->nodes[node].view.kind, "declaration") != 0) {
+            continue;
+        }
+        at = context->nodes[node].view.range.start_byte;
+        if (at > begin && at < finish) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static ql_status lower_goto_statement(lower_context *context, size_t node,
+                                      ql_error *error) {
+    size_t label_node = direct_field_child(context, node, "label");
+    char *name;
+    lower_label *label;
+    lower_state state;
+    size_t variable_count;
+    ql_status status;
+
+    memset(&state, 0, sizeof(state));
+    if (label_node == SIZE_MAX) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+            "goto statement has no label", error);
+    }
+    name = copy_node_text(context, label_node);
+    if (name == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+    }
+    label = find_label(context, name);
+    context->allocator->deallocate(context->allocator->user_data, name);
+    if (label == NULL) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
+            label_node,
+            "goto target must be a direct label in the function body",
+            error);
+    }
+    if (label->lowered != 0u ||
+        context->nodes[label->node].view.range.start_byte <=
+            context->nodes[node].view.range.start_byte) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+            "a backward goto would introduce a cycle in IR schema v1",
+            error);
+    }
+    if (goto_skips_declaration(context, node, label->node)) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+            "goto across a function-scope declaration needs bypassed "
+            "initialization state", error);
+    }
+    variable_count = function_scope_variable_count(context);
+    if (label->incoming.count != 0u &&
+        label->incoming.states[0].count != variable_count) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+            "goto paths disagree on the variables visible at the label",
+            error);
+    }
+    status = save_state(context, variable_count, &state, error);
+    if (status == QL_STATUS_OK) {
+        status = append_pending_state(context, &label->incoming,
+                                      context->current_block, &state, error);
+    }
+    if (status != QL_STATUS_OK) {
+        destroy_state(context, &state);
+        return status;
+    }
+    context->current_terminated = 1u;
+    return QL_STATUS_OK;
+}
+
+static ql_status lower_labeled_statement(lower_context *context, size_t node,
+                                         ql_error *error) {
+    lower_label *label = NULL;
+    lower_state fallthrough;
+    size_t index;
+    size_t variable_count = function_scope_variable_count(context);
+    ql_ir_block_id block;
+    ql_status status = QL_STATUS_OK;
+
+    memset(&fallthrough, 0, sizeof(fallthrough));
+    for (index = 0u; index < context->label_count; ++index) {
+        if (context->labels[index].node == node) {
+            label = &context->labels[index];
+            break;
+        }
+    }
+    if (label == NULL) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+            "nested labels are outside the direct forward-goto slice",
+            error);
+    }
+    label->lowered = 1u;
+    if (context->current_terminated == 0u) {
+        status = save_state(context, variable_count, &fallthrough, error);
+        if (status == QL_STATUS_OK) {
+            status = append_pending_state(context, &label->incoming,
+                                          context->current_block,
+                                          &fallthrough, error);
+        }
+        if (status != QL_STATUS_OK) {
+            destroy_state(context, &fallthrough);
+            return status;
+        }
+    }
+    if (label->incoming.count == 0u) {
+        /* No syntactic CFG edge reaches this label. Its body is unreachable
+           too, and no IR block should be created for it. */
+        context->current_terminated = 1u;
+        return QL_STATUS_OK;
+    }
+    status = add_block(context, "goto.label", &block, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    for (index = 0u; index < label->incoming.count; ++index) {
+        status = set_branch(context, label->incoming.blocks[index], block,
+                            error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+    context->current_block = block;
+    context->current_terminated = 0u;
+    status = merge_states_many(context, label->incoming.states,
+                               label->incoming.blocks,
+                               label->incoming.count, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    destroy_break_scope(context, &label->incoming);
+    return lower_statement(context, label->body_node, error);
 }
 
 /* Falling off the end of a void function returns, so the same terminator
@@ -8042,6 +8308,12 @@ static ql_status lower_statement(lower_context *context, size_t node,
     if (strcmp(kind, "break_statement") == 0) {
         return lower_break_statement(context, node, error);
     }
+    if (strcmp(kind, "goto_statement") == 0) {
+        return lower_goto_statement(context, node, error);
+    }
+    if (strcmp(kind, "labeled_statement") == 0) {
+        return lower_labeled_statement(context, node, error);
+    }
     if (strcmp(kind, "return_statement") == 0) {
         return lower_return_statement(context, node, error);
     }
@@ -8070,9 +8342,7 @@ static ql_status lower_statement(lower_context *context, size_t node,
             "loops require invariants, unrolling, or a recurrence proof method",
             error);
     }
-    if (strcmp(kind, "goto_statement") == 0 ||
-        strcmp(kind, "labeled_statement") == 0 ||
-        strcmp(kind, "continue_statement") == 0) {
+    if (strcmp(kind, "continue_statement") == 0) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
             "control-flow construct is outside the acyclic if/return slice",
@@ -9350,6 +9620,15 @@ static void cleanup_context(lower_context *context) {
     size_t index;
 
     pop_variables(context, 0u);
+    for (index = 0u; index < context->label_count; ++index) {
+        context->allocator->deallocate(context->allocator->user_data,
+                                       context->labels[index].name);
+        destroy_break_scope(context, &context->labels[index].incoming);
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   context->labels);
+    context->labels = NULL;
+    context->label_count = 0u;
     release_typedefs(context);
     release_address_taken(context);
     release_callees(context);
@@ -9534,6 +9813,12 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
     }
 
     context.body_node = body_node;
+    status = collect_labels(&context, body_node, error);
+    if (status != QL_STATUS_OK) {
+        cleanup_context(&context);
+        ql_c_lower_result_destroy(result);
+        return status;
+    }
     collect_calls(&context, body_node);
     collect_global_uses(&context, body_node);
     status = collect_string_literals(&context, body_node, error);

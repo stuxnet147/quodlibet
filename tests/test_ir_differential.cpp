@@ -134,6 +134,22 @@ QL_DIFF_FUNCTION(switch_flow,
                      }
                      return seed;
                  });
+QL_DIFF_FUNCTION(goto_flow,
+                 unsigned int diff_goto(unsigned int x,
+                                        unsigned int seed) {
+                     if ((x & 1u) != 0u) {
+                         seed += 3u;
+                         goto out;
+                     }
+                     seed ^= 5u;
+                     if (x == 2u)
+                         goto late;
+                     seed += 7u;
+                 late:
+                     seed ^= 11u;
+                 out:
+                     return seed;
+                 });
 
 namespace {
 
@@ -489,6 +505,11 @@ const Case kCases[] = {
      AlwaysDefined,
      [](uint64_t a, uint64_t b) {
          return FromU32(diff_switch(AsU32(a), AsU32(b)));
+     }},
+    {"goto_flow", goto_flow_source, "diff_goto", 32u, 32u, 32u,
+     AlwaysDefined,
+     [](uint64_t a, uint64_t b) {
+         return FromU32(diff_goto(AsU32(a), AsU32(b)));
      }},
 };
 

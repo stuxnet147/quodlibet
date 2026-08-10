@@ -202,6 +202,37 @@ TEST(ProductMiter, SwitchFallthroughMatchesItsIfChain) {
     EXPECT_EQ(QL_SOLVER_CHECK_SAT, SolveDomain(query.get()));
 }
 
+TEST(ProductMiter, ForwardGotoCleanupMatchesStructuredControlFlow) {
+    constexpr char left[] =
+        "unsigned cleanup(unsigned x, unsigned value) {"
+        "  if ((x & 1u) != 0u) { value += 3u; goto out; }"
+        "  value ^= 5u;"
+        "  if (x == 2u) goto late;"
+        "  value += 7u;"
+        "late: value ^= 11u;"
+        "out: return value;"
+        "}";
+    constexpr char right[] =
+        "unsigned cleanup_structured(unsigned x, unsigned value) {"
+        "  if ((x & 1u) != 0u) return value + 3u;"
+        "  value ^= 5u;"
+        "  if (x != 2u) value += 7u;"
+        "  return value ^ 11u;"
+        "}";
+    w2::Pair pair;
+    QueryHandle query;
+
+    ASSERT_NO_FATAL_FAILURE(BuildQuery(&pair, &query, left, "cleanup",
+                                       right, "cleanup_structured",
+                                       w2::DefaultContract()));
+    const ql_solver_check_kind violation = SolveViolation(query.get());
+    if (violation == QL_SOLVER_CHECK_INVALID) {
+        GTEST_SKIP() << "Bitwuzla backend is unavailable";
+    }
+    EXPECT_EQ(QL_SOLVER_CHECK_UNSAT, violation);
+    EXPECT_EQ(QL_SOLVER_CHECK_SAT, SolveDomain(query.get()));
+}
+
 TEST(ProductMiter, DifferentReturnValuesProduceASatisfiableViolation) {
     w2::Pair pair;
     QueryHandle query;

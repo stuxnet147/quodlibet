@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **15,751 / 29,880 (52.71%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_loop` 4,749, `unsupported_type` 4,210, `uninitialized_read` 1,765, `unsupported_control_flow` 1,145입니다. 다음 단위는 전방 `goto`와 남은 진단의 메시지별 재분류로 정합니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train IR 로어링은 **16,388 / 29,880 (54.85%)**이고 전부 verifier를 통과했으며 status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_loop` 4,962, `unsupported_type` 4,221, `uninitialized_read` 1,865입니다. `unsupported_control_flow`는 118까지 줄었습니다. 다음 단위는 타입과 definite initialization의 메시지별 큰 원인을 닫습니다.
 
 ## 기준선
 
@@ -1275,6 +1275,26 @@ switch body나 case에 직접 선언되어 뒤 case와 scope를 공유하는 형
 | status 실패 | 0 | **0** |
 
 `tests/test_ir_differential.cpp`는 unsigned 입력의 match, fallthrough, 중첩 조건 안 break, default를 실제 컴파일된 C와 edge 및 random 입력에서 대조합니다. interpreter 시험은 중간 `default`, all-return switch, 문자와 계산 상수를 고정합니다. product miter는 switch와 같은 if chain의 위반식이 UNSAT이고 domain이 SAT인지 Bitwuzla로 확인합니다.
+
+### 29. 전방 goto의 지연 edge와 label 합류를 내린다
+
+커밋: (이 단위)
+
+함수 body의 direct label을 본문 lowering 전에 수집하되 IR block은 만들지 않습니다. 전방 `goto`를 만나면 현재 source block과 함수 scope 변수, memory, call trace 상태를 target label에 보관하고 그 경로를 종료합니다. top-level body scanner는 죽은 평문을 건너뛰다가 pending predecessor가 있는 label에서 다시 시작합니다.
+
+label에 정상 fallthrough도 도달하면 goto 상태들과 함께 임의 predecessor PHI로 병합합니다. goto가 `if`나 중첩 compound 안에 있어도 안쪽 지역을 버리고 label에서 보이는 함수 scope prefix만 운반합니다. 여러 cleanup jump와 정상 경로가 한 label에 모이는 형태도 같은 규칙입니다. label block과 branch terminator는 실제 predecessor가 있을 때만 만들므로 도달 불가능 block을 남기지 않습니다.
+
+후방 goto는 v1 CFG에 cycle을 만들므로 계속 UNKNOWN입니다. goto와 label 사이에 함수 scope 선언이 있으면 그 선언의 초기화를 우회한 상태를 별도로 만들어야 하므로 이번 단위에서는 명시적으로 거부합니다. nested label도 direct-label slice 밖입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 15,751 (52.71%) | **16,388 (54.85%)** |
+| 증가 | | **+637** |
+| `unsupported_control_flow` | 1,145 | **118** |
+| verifier 통과 | 15,751 / 15,751 | **16,388 / 16,388** |
+| status 실패 | 0 | **0** |
+
+compiled differential은 두 전방 label, 중첩 block의 goto, 여러 합류 경로를 실제 C 실행과 edge 및 random 입력에서 대조합니다. product miter는 같은 cleanup을 early return과 structured if로 쓴 함수와 동치임을 증명합니다. 후방 edge와 선언 우회는 UNKNOWN 회귀 시험으로 고정합니다.
 
 ## 막힌 것
 
