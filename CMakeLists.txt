@@ -77,6 +77,7 @@ file(GLOB QL_OPTIONAL_CORE_SOURCES CONFIGURE_DEPENDS LIST_DIRECTORIES false
     "${CMAKE_CURRENT_SOURCE_DIR}/src/combine.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/egraph.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/egraph_check.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/egraph_method.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/evidence.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ir.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ir_interp.c"

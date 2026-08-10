@@ -109,6 +109,7 @@
 
 - [x] e-graph merge log 의 독립 replay checker (증거: `src/egraph_check.c` 가 엔진을 부르지 않고 자체 union-find 로 재생, `tests/test_egraph_check.cpp` 15개, `JustifiesEveryMergeAWideSaturationProduces`, `ReportsEveryRejectionNotOnlyTheFirst`)
 - [x] rewrite rule 별 soundness 조건과 side condition 을 versioned evidence 에 기록 (증거: `ql_egraph_rule_descriptor_v1` 과 36개 rule catalogue, `QL_EGRAPH_RULE_CATALOGUE_DIGEST_HEX`, `tests/test_egraph_rules.cpp` 13개, `DescribesEveryRewriteTheEngineRecords`)
+- [x] e-graph 정규화를 등록되는 method 로 배선 (증거: `src/egraph_method.c` 의 `normalize.egraph`, `src/builtins.c:50` 등록, `tests/test_egraph_method.cpp` 3개. 파이프라인에서 `add x, 0` 이 사라지고 인터프리터 결과가 보존되는 것까지 고정. proof method 로는 등록되지 않는다. 현재 수용 범위와 opaque leaf 대체 규칙은 `METHODS.md` 의 "The shipped `normalize.egraph` method")
 - [x] AIG/SAT backend 와 certificate checker (증거: `src/aig.c`, `src/proof_aigsat.c`, CaDiCaL `--lrat` + `third_party/drat-trim` 의 `lrat-check`, `tests/test_proof_aigsat.cpp` 의 `AProvedEquivalenceCarriesACheckedProof` 가 이 저장소 첫 `checked_proof=true` 를 고정. folded-false 는 승격하지 않고 `UNKNOWN`)
 - [x] concrete differential refutation method (등록되는 method 로) (증거: `src/proof_diff.c` 의 `refute.concrete-differential`, `src/builtins.c:58` 등록, `tests/test_proof_diff.cpp` 13개. 아무것도 못 찾으면 `BOUNDED_CLEAN` 이 아니라 `UNKNOWN`)
 - [x] 여러 method 의 병렬 실행을 투표가 아니라 증거 우선 규칙으로 결합 (증거: `src/combine.c`, `tests/test_combine.cpp` 24개, `ThreeAgreeingUncheckedProofsStillDecideNothing`, `OneCheckedProofOutweighsAnyNumberOfUncheckedDisagreements`)

@@ -161,6 +161,46 @@ extraction cost model, proof reconstruction, and whether conditional rewrites
 may invoke a side-condition solver. The rewrite-set digest belongs in evidence
 and cache keys.
 
+#### The shipped `normalize.egraph` method
+
+`src/egraph_method.c` registers `normalize.egraph` as a built-in. It is a
+normalizer and never an oracle. `ql_registry_find_proof_method` does not find
+it, and it emits a `quodlibet.ir` artifact rather than a verdict.
+
+What it accepts today is narrower than the interface above, and every narrowing
+is enforced rather than assumed.
+
+- One `quodlibet.ir` input holding a single acyclic basic block. Anything else
+  fails `validate` with `QL_STATUS_TYPE_MISMATCH` instead of passing through
+  unnormalized.
+- The input is re-verified with `ql_ir_verify` before a term is built.
+- `reconstruct_proof` must be true. There is no unchecked mode to select.
+- `rewrite_set` must be `pure-bitvector-v1`, the built-in catalogue.
+- An unknown option name is an error, so a misspelt limit cannot silently keep
+  its default.
+
+Only bool and bit-vector values within `max_bit_width` enter the graph, and only
+effect-free single-result instructions whose opcode has a pure term operator:
+`IDENTITY`, `BOOL_NOT`, `BV_NOT`, `BV_NEG`, `ADD`, `SUB`, `MUL`, `BV_AND`,
+`BV_OR`, `BV_XOR`, `EQ`, `NE`, and `SELECT`. `BV_NEG` and `NE` are expressed
+through `BV_SUB` and a `BOOL_NOT` of `EQUAL` because the engine has no operator
+of its own for them.
+
+Everything else becomes an opaque leaf variable and is copied to the output
+verbatim: comparisons, shifts, division and remainder, width casts, floating
+point, memory, calls, and every effectful instruction. That is a loss of
+normalization power, not of soundness. An opaque leaf denotes whatever the
+instruction denotes, so the surrounding expression still normalizes around it.
+Two textually identical such instructions stay distinct, because the leaf is
+keyed by the value it defines rather than by the expression that produced it.
+
+Extraction is not trusted. Every extracted term must be established equal to its
+root by `src/egraph_check.c` replaying the merge log, every record in that log
+must be `JUSTIFIED` with no assumed and no rejected merges, and the replacement
+is kept only when the extracted term is available strictly earlier in the block
+than the value it replaces. The output IR is verified again before it leaves the
+method.
+
 #### The rewrite rule catalogue
 
 A merge record carries only the rule name that fired. The premises that make
