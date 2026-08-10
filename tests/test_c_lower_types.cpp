@@ -388,8 +388,13 @@ TEST(CLowerTypes, LetsAVisibleObjectShadowTheTypedefName) {
 }
 
 TEST(CLowerTypes, RefusesCastsItCannotRepresent) {
-    ExpectUnknown("int to_pointer(int a) { return (int *)a != 0; }",
-                  "to_pointer", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
+    /* A cast to a pointer is a reinterpretation this profile does carry: a
+       pointer is its address. What it still cannot carry is a target with no
+       value of its own, or more indirection than the slice holds. */
+    ExpectUnknown("int to_array(int a) { return (int (*)[4])a != 0; }",
+                  "to_array", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
+    ExpectUnknown("int to_deep(int a) { return (int ***)a != 0; }", "to_deep",
+                  QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
     ExpectUnknown("int to_void(int a) { return (void)a; }", "to_void",
                   QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION);
 }

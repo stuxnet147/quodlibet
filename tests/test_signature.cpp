@@ -324,6 +324,57 @@ TEST(SourceSignature, ATypedefOfAPointerIsAPointerArgument) {
 
 /* A name nobody declared has no meaning to recover, and inventing one would be
    a guess about a type. */
+/* `scalar_t__` is not a name a unit declares. Record extraction drops the
+   preamble that declares it, so the profile carries it as a fact about the
+   corpus, and this table reads the same one the lowering reads. A name that
+   is not in that table and not declared here is still refused, which the test
+   above pins. */
+TEST(SourceSignature, ResolvesTheProfilePreambleTypedefTheUnitCannotDeclare) {
+    ql_c_frontend_unit *unit = nullptr;
+    ql_c_function_view function{};
+    ql_artifact *artifact = nullptr;
+    ql_source_signature *signature = nullptr;
+    ql_source_signature_view_v1 view{};
+    ql_source_type_v1 argument{};
+    constexpr char source[] =
+        "scalar_t__ FUN_0(scalar_t__ ARG_0){ return ARG_0; }";
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_analyze(nullptr, source, sizeof(source) - 1u,
+                                    &unit, &error));
+    function.struct_size = sizeof(function);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_c_frontend_select_function(unit, "FUN_0", 5u, &function,
+                                            &error));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_source_signature_from_c_function_v2(
+                  nullptr, unit, &function, source, sizeof(source) - 1u,
+                  QL_C_DIALECT_ASM2C_GNU_V1,
+                  QL_TARGET_ABI_X86_64_LINUX_SYSV_LP64, &artifact, &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_source_signature_open(nullptr, artifact, &signature,
+                                       &error));
+    view.struct_size = sizeof(view);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_source_signature_get_view(signature, &view, &error));
+    ASSERT_EQ(1u, view.argument_count);
+    argument.struct_size = sizeof(argument);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_source_signature_argument_at(signature, 0u, &argument,
+                                              &error));
+    /* The profile's LP64 target, which is what the lowering resolves it to
+       as well. A width of 32 here would mean the two models had drifted. */
+    EXPECT_EQ(QL_SOURCE_TYPE_SIGNED_INTEGER, argument.kind);
+    EXPECT_EQ(64u, argument.bit_width);
+    EXPECT_EQ(QL_SOURCE_TYPE_SIGNED_INTEGER, view.return_type.kind);
+    EXPECT_EQ(64u, view.return_type.bit_width);
+    ql_source_signature_release(signature);
+    ql_artifact_release(artifact);
+    ql_c_frontend_unit_destroy(unit);
+}
+
 TEST(SourceSignature, RefusesATypedefNameThisUnitNeverDeclared) {
     ql_c_frontend_unit *unit = nullptr;
     ql_c_function_view function{};

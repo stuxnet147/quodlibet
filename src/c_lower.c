@@ -4404,8 +4404,27 @@ static ql_status lower_binary_expression(lower_context *context, size_t node,
    indirection, which the scalar slice cannot represent, so it is reported as
    a pointer obstacle rather than a type one. */
 static ql_status lower_named_cast(lower_context *context, size_t type_node,
-                                  size_t value_node, lower_value *output,
-                                  ql_error *error);
+                                  size_t value_node, uint32_t pointer_depth,
+                                  lower_value *output, ql_error *error);
+
+/* Counts the stars an abstract declarator spells. Fails when it spells
+   something else, which is an array or a function type. */
+static int abstract_pointer_depth(const lower_context *context,
+                                  size_t declarator, uint32_t *depth) {
+    size_t guard = 0u;
+
+    *depth = 0u;
+    while (declarator != SIZE_MAX && guard++ < 64u) {
+        const char *kind = context->nodes[declarator].view.kind;
+        if (strcmp(kind, "abstract_pointer_declarator") == 0) {
+            ++(*depth);
+        } else if (strcmp(kind, "abstract_parenthesized_declarator") != 0) {
+            return 0;
+        }
+        declarator = direct_field_child(context, declarator, "declarator");
+    }
+    return declarator == SIZE_MAX;
+}
 
 static ql_status lower_cast_expression(lower_context *context, size_t node,
                                        lower_value *output,
@@ -4415,6 +4434,7 @@ static ql_status lower_cast_expression(lower_context *context, size_t node,
     size_t type_node;
     size_t end;
     size_t child;
+    uint32_t pointer_depth = 0u;
 
     if (descriptor == SIZE_MAX || value_node == SIZE_MAX) {
         return lower_unknown(
@@ -4435,10 +4455,19 @@ static ql_status lower_cast_expression(lower_context *context, size_t node,
                    "declarator") != 0) {
             continue;
         }
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
-            "cast to a pointer, array, or function type requires memory "
-            "semantics", error);
+        if (!abstract_pointer_depth(context, child, &pointer_depth)) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
+                "a cast to an array or function type has no value in this "
+                "slice", error);
+        }
+        if (pointer_depth > 2u) {
+            return lower_unknown(
+                context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
+                "this slice carries at most two levels of indirection",
+                error);
+        }
+        break;
     }
     if (strcmp(context->nodes[type_node].view.kind,
                "atomic_type_specifier") == 0) {
@@ -4447,25 +4476,42 @@ static ql_status lower_cast_expression(lower_context *context, size_t node,
             type_node, "cast to an atomic type requires observable-event "
             "semantics", error);
     }
-    return lower_named_cast(context, type_node, value_node, output, error);
+    return lower_named_cast(context, type_node, value_node, pointer_depth,
+                            output, error);
 }
 
 /* Converts `value_node` to the scalar type `type_node` spells. */
 static ql_status lower_named_cast(lower_context *context, size_t type_node,
-                                  size_t value_node, lower_value *output,
-                                  ql_error *error) {
+                                  size_t value_node, uint32_t pointer_depth,
+                                  lower_value *output, ql_error *error) {
     lower_value value;
     lower_type target;
-    char *spelling = copy_node_text(context, type_node);
     ql_status status;
 
-    if (spelling == NULL) {
-        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
-        return QL_STATUS_OUT_OF_MEMORY;
+    if (pointer_depth == 0u) {
+        /* A scalar target, where `void` still has to reach the report below
+           rather than being refused as a type that cannot stand alone. */
+        char *spelling = copy_node_text(context, type_node);
+        if (spelling == NULL) {
+            ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+            return QL_STATUS_OUT_OF_MEMORY;
+        }
+        status = parse_type_spelling(context, spelling, type_node, 1u,
+                                     &target, error);
+        context->allocator->deallocate(context->allocator->user_data,
+                                       spelling);
+    } else {
+        /* A pointer target. resolve_type_node already knows how to name a
+           struct or a union and how to put stars on a base type, which is
+           exactly what this is. The cast changes nothing about the value
+           under this profile: a pointer is its address, so the conversion is
+           a reinterpretation and the object that address came from travels
+           with it. Whether that object is one this slice declared is what
+           decides a later dereference, and nothing about the cast changes
+           the answer. */
+        status = resolve_type_node(context, type_node, pointer_depth, &target,
+                                   error);
     }
-    status = parse_type_spelling(context, spelling, type_node, 1u, &target,
-                                 error);
-    context->allocator->deallocate(context->allocator->user_data, spelling);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
     }
@@ -5187,7 +5233,7 @@ static ql_status lower_expression(lower_context *context, size_t node,
         size_t operand = SIZE_MAX;
         size_t type_node = disguised_cast_type(context, node, &operand);
         if (type_node != SIZE_MAX) {
-            return lower_named_cast(context, type_node, operand, output,
+            return lower_named_cast(context, type_node, operand, 0u, output,
                                     error);
         }
         return lower_call_expression(context, node, output, error);

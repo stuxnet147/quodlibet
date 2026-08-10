@@ -60,6 +60,16 @@ QL_PTR_FUNCTION(address_of_element, int ptr_address(int *p, int i) {
     return *slot + 1;
 });
 
+QL_PTR_FUNCTION(cast_through_void, int ptr_cast(int *p, int i) {
+    void *raw = (void *)p;
+    int *back = (int *)raw;
+    return back[i] + 1;
+});
+QL_PTR_FUNCTION(cast_to_bytes, int ptr_bytes(int *p, int i) {
+    char *bytes = (char *)p;
+    return bytes[i * 4] + 1;
+});
+
 namespace {
 
 const uint64_t kBase = QL_IR_INTERP_FIRST_OBJECT_ADDRESS;
@@ -487,6 +497,55 @@ TEST(CLowerPointers, RefusesADoubleIndirectionWithoutAStatusFailure) {
     EXPECT_EQ(QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, diagnostic.code);
     ql_c_lower_result_destroy(result);
     ql_c_frontend_unit_destroy(unit);
+}
+
+/* A cast to a pointer is a reinterpretation, not a computation: under this
+   profile a pointer is its address, so the bytes reached through the cast
+   type are the bytes at the same address. Compiled execution is what says
+   that, since the element width of the cast type is what moves a subscript.
+
+   The object the address came from travels with it, which is why the
+   dereference after the cast is still allowed: nothing about the cast makes
+   the storage less known than it was. */
+TEST(CLowerPointers, PointerCastsReinterpretWithoutMovingTheAddress) {
+    struct Case {
+        const char *name;
+        const char *source;
+        const char *function;
+        int32_t (*reference)(int32_t *, int32_t);
+    };
+    const Case cases[] = {
+        {"through-void", cast_through_void_source, "ptr_cast",
+         [](int32_t *p, int32_t i) { return ptr_cast(p, i); }},
+        /* char elements: the cast type is what makes the subscript step one
+           byte instead of four. */
+        {"to-bytes", cast_to_bytes_source, "ptr_bytes",
+         [](int32_t *p, int32_t i) { return ptr_bytes(p, i); }},
+    };
+    uint64_t state = UINT64_C(0x2f9d4c1b7a63e850);
+    for (const Case &item : cases) {
+        Lowered lowered;
+        SCOPED_TRACE(item.name);
+        ASSERT_TRUE(lowered.Open(item.source, item.function));
+        for (std::size_t round = 0u; round < 64u; ++round) {
+            int32_t data[kElements];
+            const int32_t index =
+                static_cast<int32_t>(NextRandom(&state) % kElements);
+            for (std::size_t at = 0u; at < kElements; ++at) {
+                data[at] = static_cast<int32_t>(NextRandom(&state) & 0x3fu);
+            }
+            const Outcome run =
+                Execute(lowered.ir(), kBase,
+                        {static_cast<uint64_t>(
+                            static_cast<uint32_t>(index))},
+                        kBase, sizeof(data),
+                        reinterpret_cast<const uint8_t *>(data), nullptr);
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            EXPECT_EQ(item.reference(data, index), Returned(run.result));
+        }
+    }
 }
 
 }  // namespace

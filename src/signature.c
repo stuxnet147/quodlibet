@@ -5,6 +5,8 @@
 
 #include "yyjson.h"
 
+#include "c_types.h"
+
 /* The precondition vocabulary and this artifact must agree on argument kinds
    or a typed precondition could be checked against a different meaning. */
 _Static_assert((int)QL_SOURCE_TYPE_BOOL == (int)QL_SIGNATURE_ARGUMENT_BOOL,
@@ -1094,6 +1096,24 @@ static ql_status type_from_inventory(const ql_c_type_inventory_v1 *inventory,
            wrong guess about a type is a wrong answer about the function. */
         entry = typedefs == NULL ? NULL : typedefs_find(typedefs, normalized);
         if (entry == NULL) {
+            /* Except for the profile's own preamble typedefs, which the unit
+               cannot declare because record extraction dropped the preamble.
+               That table is a fact about the corpus, not a modelling choice,
+               so this reads the same one the lowering reads rather than
+               keeping a second copy that could drift from it. What this table
+               does keep to itself is every spelling above: the point of
+               writing the signature's type model separately from the
+               lowering's is to check the modelling twice, not to write the
+               same corpus fact down twice. */
+            ql_c_scalar_type corpus;
+            if (ql_c_scalar_from_corpus_typedef(normalized, &corpus) != 0 &&
+                corpus.kind == QL_C_SCALAR_INTEGER) {
+                output->kind = corpus.is_signed != 0u
+                                   ? QL_SOURCE_TYPE_SIGNED_INTEGER
+                                   : QL_SOURCE_TYPE_UNSIGNED_INTEGER;
+                output->bit_width = corpus.width;
+                return QL_STATUS_OK;
+            }
             break;
         }
         if (entry->is_indirect != 0u) {
