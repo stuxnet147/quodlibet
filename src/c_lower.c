@@ -992,6 +992,31 @@ static ql_status remember_storage_name(lower_context *context, const char *text,
   return QL_STATUS_OK;
 }
 
+/* Static storage is written down on the declaration rather than on an
+   address expression. It still needs an object even when the body only names
+   the scalar directly: the incoming bytes are the persistent state left by a
+   previous invocation, and writes must reach the final memory observation. */
+static int declaration_has_static_storage(const lower_context *context,
+                                          size_t declaration) {
+  size_t end = subtree_end(context, declaration);
+  size_t child;
+
+  for (child = declaration + 1u; child < end; ++child) {
+    const ql_source_range range = context->nodes[child].view.range;
+    if (context->nodes[child].parent != declaration ||
+        strcmp(context->nodes[child].view.kind,
+               "storage_class_specifier") != 0 ||
+        range.end_byte - range.start_byte != 6u ||
+        range.end_byte > context->source_size) {
+      continue;
+    }
+    if (memcmp(context->source + range.start_byte, "static", 6u) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* An array or a record local is storage whether or not its address is ever
    written down. `a[i]` and `v.f` are addresses into it just as `&a` is, and
    neither has a value that could live in an SSA register instead: an array
@@ -1008,6 +1033,7 @@ static ql_status collect_storage_locals(lower_context *context,
     size_t declaration_end;
     size_t child;
     int base_is_record;
+    int has_static_storage;
 
     if (strcmp(context->nodes[index].view.kind, "declaration") != 0) {
       continue;
@@ -1016,10 +1042,15 @@ static ql_status collect_storage_locals(lower_context *context,
     if (type_node == SIZE_MAX) {
       continue;
     }
-    base_is_record =
-        strcmp(context->nodes[type_node].view.kind, "struct_specifier") == 0 ||
-        strcmp(context->nodes[type_node].view.kind, "union_specifier") == 0;
-    if (!base_is_record &&
+    has_static_storage = declaration_has_static_storage(context, index);
+    base_is_record = 0;
+    if (!has_static_storage) {
+      base_is_record =
+          strcmp(context->nodes[type_node].view.kind, "struct_specifier") ==
+              0 ||
+          strcmp(context->nodes[type_node].view.kind, "union_specifier") == 0;
+    }
+    if (!has_static_storage && !base_is_record &&
         strcmp(context->nodes[type_node].view.kind, "type_identifier") == 0) {
       char *spelling = copy_node_text(context, type_node);
       lower_type resolved;
@@ -1063,7 +1094,8 @@ static ql_status collect_storage_locals(lower_context *context,
       if (named == SIZE_MAX || rejected != 0) {
         continue;
       }
-      if (array_length == 0u && (pointer_depth != 0u || !base_is_record)) {
+      if (!has_static_storage && array_length == 0u &&
+          (pointer_depth != 0u || !base_is_record)) {
         continue;
       }
       text = copy_node_text(context, named);
@@ -8553,13 +8585,6 @@ static ql_status lower_declaration(lower_context *context, size_t node,
         object_is_const = (uint32_t)single_pointer_object_is_const(
             context, declarator_root, pointer_depth);
       }
-      if (is_static != 0u && object_is_const == 0u) {
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, named,
-            "mutable static locals and static pointer objects require "
-            "persistent function state",
-            error);
-      }
       declarator_type = base_type;
       if (pointer_depth == 1u) {
         declarator_type = make_pointer_to(base_type);
@@ -8614,6 +8639,24 @@ static ql_status lower_declaration(lower_context *context, size_t node,
       return status;
     }
     variable = &context->variables[context->variable_count - 1u];
+    if (is_static != 0u && object_is_const == 0u) {
+      /* A mutable static's declaration does not execute its initializer on
+         each function invocation. Its slot begins with the caller-supplied
+         persistent image, shared by the two sides of a comparison, and this
+         invocation carries every update through memory. */
+      if (variable->is_stack == 0u) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "mutable static local has no persistent object");
+        return QL_STATUS_INTERNAL_ERROR;
+      }
+      status = ensure_bool_constants(context, error);
+      if (status != QL_STATUS_OK) {
+        return status;
+      }
+      variable->initialized = 1u;
+      variable->defined = context->true_value;
+      continue;
+    }
     if (declarator_type.array_length != 0u ||
         declarator_type.kind == QL_C_SCALAR_RECORD) {
       if (value_node != SIZE_MAX) {

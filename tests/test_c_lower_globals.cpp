@@ -83,6 +83,19 @@ static const char shadow_source[] =
     "extern int GLOBAL_a;\n"
     "int global_shadow(int GLOBAL_a) { return GLOBAL_a + 1; }\n";
 
+/* A function is interpreted at an arbitrary invocation, so a mutable static
+   begins with the persistent image supplied by the caller. Its source
+   initializer ran before that invocation and must not be replayed here. */
+static const char persistent_static_source[] =
+    "int persistent_static(int rounds) {\n"
+    "  while (rounds-- > 0) {\n"
+    "    static int value = 1;\n"
+    "    ++value;\n"
+    "    if (rounds == 0) return value;\n"
+    "  }\n"
+    "  return 0;\n"
+    "}\n";
+
 namespace {
 
 constexpr uint64_t kBase = UINT64_C(0x20000);
@@ -476,6 +489,27 @@ TEST(CLowerGlobals, AParameterOfTheSameNameHidesTheGlobal) {
         /* The body never reaches the global, so it gets no object at all. */
         EXPECT_TRUE(run.images.empty());
         EXPECT_EQ(x + 1, Returned(run.result));
+    }
+}
+
+TEST(CLowerGlobals, CarriesMutableStaticStateWithoutReplayingItsInitializer) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(persistent_static_source, "persistent_static"));
+    for (int32_t start : {-9, 0, 41}) {
+        for (int32_t rounds : {1, 2, 5}) {
+            CallLog log;
+            SCOPED_TRACE(start);
+            SCOPED_TRACE(rounds);
+            const Outcome run = Execute(lowered.ir(), {Widen(rounds)},
+                                        {{"value", start}}, &log);
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            EXPECT_EQ(start + rounds, Returned(run.result));
+            ASSERT_EQ(1u, run.images.count("value"));
+            EXPECT_EQ(start + rounds,
+                      ImageValue(run.images.find("value")->second));
+        }
     }
 }
 

@@ -209,6 +209,17 @@ the profile leaves such an object's initial contents unknown rather than
 assuming a zero the program never promised. A declaration that does state a
 value is honoured, and the lowering writes it before the body runs.
 
+#### Mutable block-scope static objects carry persistent input state
+
+A mutable local declared `static` also has static storage duration, but its
+initializer is not replayed at every function call. The function model starts
+at an arbitrary invocation, so the object's incoming bytes are a caller-
+supplied persistent image shared by both sides of a comparison. The body reads
+and updates that memory object, and final-memory observation exposes the new
+image. This represents effects left by earlier invocations without inventing
+an invocation count. Immutable static objects may still state their invariant
+initializer bytes because no defined execution can change them.
+
 #### Memory model
 
 `ASM2C_GNU_V1` gives memory a flat 64-bit address space. A pointer is an

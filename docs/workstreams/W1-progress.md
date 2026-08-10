@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **26,086 / 29,880 (87.30%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 2,021, `unsupported_control_flow` 655, `unsupported_pointer` 392입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **26,350 / 29,880 (88.19%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 1,726, `unsupported_control_flow` 661, `unsupported_pointer` 402입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1864,6 +1864,25 @@ CALL 결과 순서는 관찰 상태, 일반 반환값, out-local의 값과 write
 
 `tests/test_c_lower_calls.cpp`는 실제 out-local 값을 compiled C와 대조하고 callback이 write predicate를 false로 돌려준 실행이 `UB_GUARD_FAILED`인지 확인합니다. `tests/test_proof_smt_calls.cpp`는 반환값, out 값, write predicate가 하나의 CALL tuple로 congruence에 참여하는지 증명합니다. 공용 CALL 표현, 인터프리터 callback, product miter가 함께 바뀌었으므로 이 세 경로의 영향권 26개 suite, 254개 테스트를 실행해 전부 통과했습니다. EGraph와 plugin 등 무관한 subsystem은 바뀌지 않았고 사용자 작업도 진행 중이므로 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 일반 회귀 테스트가 아니라 G9 성공률과 기존 성공 사례 회귀를 확인하는 필수 측정으로 실행했습니다.
 
+### 62. mutable static local을 persistent memory object로 내린다
+
+함수 안의 mutable `static`은 자동 지역처럼 호출마다 initializer를 다시 실행해서는 안 되고, 이전 호출이 남긴 상태를 다음 호출이 읽을 수 있어야 합니다. 이 함수 모델은 임의의 한 invocation을 비교하므로 static object의 초기 bytes를 caller-supplied memory image로 받고, 양쪽 실행이 그 image를 공유합니다. 선언의 initializer는 이미 과거의 프로그램 초기화 때 실행된 것이므로 현재 invocation의 entry나 loop body에서 재실행하지 않습니다.
+
+사전 수집이 모든 local static 이름을 storage object로 올리고, 선언 지점에서는 lexical binding만 만듭니다. 읽기와 쓰기는 기존 global 및 address-taken local과 같은 memory state를 통과하며 final-memory 관찰에 남습니다. `const int *p`처럼 pointee만 const인 static pointer object도 mutable persistent state로 취급합니다. 실제로 immutable인 static object의 기존 initializer image 계약은 유지합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 26,086 (87.30%) | **26,350 (88.19%)** |
+| 증가 | | **+264** |
+| 기존 성공 회귀 | | **0** |
+| mutable-static 첫 차단 | 316 | **0** |
+| verifier 통과 | 26,086 / 26,086 | **26,350 / 26,350** |
+| status 실패 | 0 | **0** |
+
+기존 첫 차단 316개를 좁게 재측정해 264개가 성공했습니다. 나머지 52개는 array declarator 19개, backward goto 6개, 64비트 밖 integer literal 6개, dynamic object 상한 5개 등 기존의 다음 제약으로 이동했습니다. 전수 함수별 비교는 변경 행 316개, 누락 0개, 기존 성공 회귀 0개입니다.
+
+`tests/test_c_lower_globals.cpp`는 loop 안의 static 선언에 caller-supplied 초기 image를 주고, initializer가 반복 실행되지 않은 채 loop 횟수만큼 값과 final image가 증가하는지 확인합니다. 선언 사전 수집이 공용 C-lowering 경로이므로 `CLower*` 99/99를 실행했습니다. 인터프리터, solver, plugin, EGraph는 바뀌지 않아 전체 CTest는 실행하지 않았고, 전체 train coverage는 G9 수치와 기존 성공 회귀를 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1872,11 +1891,11 @@ CALL 결과 순서는 관찰 상태, 일반 반환값, out-local의 값과 write
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `unsupported_type` 2,021
-- `unsupported_control_flow` 655
-- `unsupported_pointer` 392
-- `unsupported_call` 361
-- `undeclared_identifier` 133
+- `unsupported_type` 1,726
+- `unsupported_control_flow` 661
+- `unsupported_pointer` 402
+- `unsupported_call` 364
+- `undeclared_identifier` 136
 
 ## 조율자에게 요청할 것
 
