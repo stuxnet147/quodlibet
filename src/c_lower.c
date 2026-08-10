@@ -328,6 +328,10 @@ typedef struct lower_context {
      one new object in an execution. */
   size_t dynamic_object_count;
   size_t dynamic_object_start;
+  /* Set only while lowering a direct call argument whose spelling is the
+     address of an uninitialised scalar local. The call result supplies the
+     value and path predicate that make a later read honest. */
+  uint32_t allow_uninitialized_call_address;
   /* Names this function takes the address of, so their locals get storage
      instead of an SSA value. */
   char **address_taken;
@@ -6219,7 +6223,8 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
                            error);
     }
     if (variable->initialized == 0u &&
-        variable->type.kind != QL_C_SCALAR_RECORD) {
+        variable->type.kind != QL_C_SCALAR_RECORD &&
+        context->allow_uninitialized_call_address == 0u) {
       /* A plain assignment to the local reaches its stack address
          through resolve_assignment_target instead of this path. Any
          other address use can escape to a read before the lowering has
@@ -6527,6 +6532,78 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
   return QL_STATUS_OK;
 }
 
+/* Recognises only a direct `&local` call argument, modulo parentheses and a
+   cast. Broader pointer escape analysis belongs in a separate contract: this
+   narrow shape lets the same CALL return the exact local value and its
+   initialisation predicate without guessing what an arbitrary pointer aliases. */
+static ql_status direct_uninitialized_call_local(
+    lower_context *context, size_t node, lower_variable **output,
+    ql_error *error) {
+  const char *kind;
+  size_t argument;
+  char *operator_text;
+  char *name;
+
+  *output = NULL;
+  while (node != SIZE_MAX) {
+    kind = context->nodes[node].view.kind;
+    if (strcmp(kind, "parenthesized_expression") == 0) {
+      node = first_named_child(context, node);
+      continue;
+    }
+    if (strcmp(kind, "cast_expression") == 0) {
+      node = direct_field_child(context, node, "value");
+      continue;
+    }
+    break;
+  }
+  if (node == SIZE_MAX ||
+      strcmp(context->nodes[node].view.kind, "pointer_expression") != 0) {
+    return QL_STATUS_OK;
+  }
+  argument = direct_field_child(context, node, "argument");
+  node = direct_field_child(context, node, "operator");
+  if (argument == SIZE_MAX || node == SIZE_MAX) {
+    return QL_STATUS_OK;
+  }
+  operator_text = copy_node_text(context, node);
+  if (operator_text == NULL) {
+    ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+    return QL_STATUS_OUT_OF_MEMORY;
+  }
+  if (strcmp(operator_text, "&") != 0) {
+    context->allocator->deallocate(context->allocator->user_data,
+                                   operator_text);
+    return QL_STATUS_OK;
+  }
+  context->allocator->deallocate(context->allocator->user_data, operator_text);
+  while (argument != SIZE_MAX &&
+         strcmp(context->nodes[argument].view.kind,
+                "parenthesized_expression") == 0) {
+    argument = first_named_child(context, argument);
+  }
+  if (argument == SIZE_MAX ||
+      strcmp(context->nodes[argument].view.kind, "identifier") != 0) {
+    return QL_STATUS_OK;
+  }
+  name = copy_node_text(context, argument);
+  if (name == NULL) {
+    ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+    return QL_STATUS_OUT_OF_MEMORY;
+  }
+  *output = find_variable(context, name, strlen(name));
+  context->allocator->deallocate(context->allocator->user_data, name);
+  if (*output == NULL || (*output)->is_stack == 0u ||
+      (*output)->initialized != 0u ||
+      (*output)->type.kind == QL_C_SCALAR_RECORD ||
+      (*output)->type.array_length != 0u) {
+    *output = NULL;
+  }
+  return QL_STATUS_OK;
+}
+
+#define LOWER_MAX_CALL_RESULTS 64u
+
 /* An external call is uninterpreted: it may read and write memory and it is
    itself observable, so it consumes and produces both the memory state and
    the event trace. Whether the trace is compared is the contract's business,
@@ -6540,13 +6617,18 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
   const char *symbol = NULL;
   char *name;
   ql_ir_value_id operands[32];
-  ql_ir_type_id result_types[3];
-  ql_ir_value_id results[3];
+  ql_ir_type_id result_types[LOWER_MAX_CALL_RESULTS];
+  ql_ir_value_id results[LOWER_MAX_CALL_RESULTS];
+  lower_variable *out_variables[30];
+  lower_value previous_out_values[30];
   ql_ir_instruction_definition_v1 definition;
   ql_ir_instruction_id instruction;
   size_t operand_count = 0u;
   size_t result_count = 0u;
+  size_t value_result = SIZE_MAX;
+  size_t out_result_start = SIZE_MAX;
   size_t argument_index = 0u;
+  size_t out_variable_count = 0u;
   size_t end;
   size_t child;
   uint32_t is_indirect = 0u;
@@ -6645,6 +6727,9 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
   for (child = arguments_node + 1u; child < end; ++child) {
     lower_value argument;
     lower_value converted;
+    lower_variable *out_variable = NULL;
+    uint32_t saved_allow_uninitialized;
+    size_t out_index;
     const int is_variadic_argument = argument_index >= callee->parameter_count;
 
     if (context->nodes[child].parent != arguments_node ||
@@ -6662,7 +6747,16 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
           "the call has more arguments than this slice carries", error);
     }
+    status = direct_uninitialized_call_local(context, child, &out_variable,
+                                             error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    saved_allow_uninitialized = context->allow_uninitialized_call_address;
+    context->allow_uninitialized_call_address =
+        out_variable != NULL ? 1u : saved_allow_uninitialized;
     status = lower_expression(context, child, &argument, error);
+    context->allow_uninitialized_call_address = saved_allow_uninitialized;
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
@@ -6696,6 +6790,24 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
       return status;
     }
     operands[operand_count++] = converted.value;
+    if (out_variable != NULL) {
+      for (out_index = 0u; out_index < out_variable_count; ++out_index) {
+        if (out_variables[out_index] == out_variable) {
+          break;
+        }
+      }
+      if (out_index == out_variable_count) {
+        if (out_variable_count >=
+            sizeof(out_variables) / sizeof(out_variables[0])) {
+          return lower_unknown(
+              context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, child,
+              "the call exposes more uninitialised scalar locals than this "
+              "slice carries",
+              error);
+        }
+        out_variables[out_variable_count++] = out_variable;
+      }
+    }
     ++argument_index;
   }
   if (argument_index < callee->parameter_count) {
@@ -6725,6 +6837,16 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
       return status;
     }
   }
+  for (child = 0u; child < out_variable_count; ++child) {
+    status = ensure_variable_value(context, out_variables[child], error);
+    if (status == QL_STATUS_OK) {
+      status = emit_load(context, stack_address(context, out_variables[child]),
+                         &previous_out_values[child], error);
+    }
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+  }
   operands[0] = context->trace_value;
   operands[1] = context->memory_value;
 
@@ -6735,7 +6857,30 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     if (status != QL_STATUS_OK) {
       return status;
     }
+    value_result = result_count;
     result_types[result_count++] = callee->return_type.ir_type;
+  }
+  if (out_variable_count != 0u) {
+    lower_type boolean = make_bool_type();
+    if (result_count + out_variable_count * 2u > LOWER_MAX_CALL_RESULTS) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
+          "the call produces more scalar results than this slice carries",
+          error);
+    }
+    status = ensure_ir_type(context, &boolean, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    out_result_start = result_count;
+    for (child = 0u; child < out_variable_count; ++child) {
+      status = ensure_ir_type(context, &out_variables[child]->type, error);
+      if (status != QL_STATUS_OK) {
+        return status;
+      }
+      result_types[result_count++] = out_variables[child]->type.ir_type;
+      result_types[result_count++] = boolean.ir_type;
+    }
   }
   ql_ir_instruction_definition_init(&definition, QL_IR_OPCODE_CALL);
   definition.operands = operands;
@@ -6754,6 +6899,45 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
   }
   context->trace_value = results[0];
   context->memory_value = results[1];
+  for (child = 0u; child < out_variable_count; ++child) {
+    lower_variable *variable = out_variables[child];
+    lower_value selected;
+    ql_ir_value_id select_operands[3];
+    ql_ir_value_id now_defined;
+    const ql_ir_value_id supplied = results[out_result_start + child * 2u];
+    const ql_ir_value_id wrote = results[out_result_start + child * 2u + 1u];
+
+    memset(&selected, 0, sizeof(selected));
+    selected.type = variable->type;
+    selected.defined = context->true_value;
+    selected.may_ub = 0u;
+    if (selected.type.kind == QL_C_SCALAR_POINTER) {
+      selected.may_admit_object = 1u;
+    }
+    select_operands[0] = wrote;
+    select_operands[1] = supplied;
+    select_operands[2] = previous_out_values[child].value;
+    status = emit_instruction(context, QL_IR_OPCODE_SELECT, &selected.type,
+                              select_operands, 3u, NULL, 0u,
+                              QL_IR_EFFECT_NONE, &selected.value, error);
+    if (status == QL_STATUS_OK) {
+      status = emit_store(context, stack_address(context, variable), selected,
+                          error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = emit_bool_or(context, variable->defined, wrote, &now_defined,
+                            error);
+    }
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    variable->initialized = 0u;
+    variable->defined = now_defined;
+    if (variable->type.kind == QL_C_SCALAR_POINTER) {
+      variable->has_object = 0u;
+      variable->may_admit_object = 1u;
+    }
+  }
   memset(output, 0, sizeof(*output));
   status = ensure_bool_constants(context, error);
   if (status != QL_STATUS_OK) {
@@ -6767,7 +6951,7 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     return QL_STATUS_OK;
   }
   output->type = callee->return_type;
-  output->value = results[2];
+  output->value = results[value_result];
   if (output->type.kind == QL_C_SCALAR_POINTER) {
     /* The callee may return an existing or newly exposed live object.
        Its region is not part of the source signature, so a later access

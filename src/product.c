@@ -44,6 +44,11 @@
 #define QL_PRODUCT_MAX_CALL_SITES 32u
 /* The lowering already refuses a call with more arguments than this. */
 #define QL_PRODUCT_MAX_CALL_ARGUMENTS 32u
+/* Results are the outgoing state, an optional return value, and any
+   call-specific auxiliary values. Keep them bounded for the same reason as
+   arguments, but do not silently drop results past the old three-value C
+   lowering convention: every result participates in call congruence. */
+#define QL_PRODUCT_MAX_CALL_RESULTS 64u
 /* One free address constant states the whole final-memory comparison. In the
    violation query a free constant is existential, which is exactly "some
    address differs"; in the same query answered UNSAT it is universal, which is
@@ -91,7 +96,7 @@ typedef struct product_call {
   ql_ir_block_id block;
   ql_ir_value_id operands[QL_PRODUCT_MAX_CALL_ARGUMENTS + 2u];
   size_t operand_count;
-  ql_ir_value_id results[3];
+  ql_ir_value_id results[QL_PRODUCT_MAX_CALL_RESULTS];
   size_t result_count;
 } product_call;
 
@@ -423,6 +428,13 @@ static ql_status check_ir_fragment(const ql_ir *ir, const ql_ir_view_v1 *view,
       if (instruction.operand_count > QL_PRODUCT_MAX_CALL_ARGUMENTS + 2u) {
         ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
                      "%s IR call passes more arguments than this miter states",
+                     side);
+        return QL_STATUS_TYPE_MISMATCH;
+      }
+      if (instruction.result_count > QL_PRODUCT_MAX_CALL_RESULTS) {
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "%s IR call produces more results than this miter "
+                     "states",
                      side);
         return QL_STATUS_TYPE_MISMATCH;
       }
@@ -1117,7 +1129,7 @@ static ql_status declare_call_results(product_encoder *encoder,
     call->operands[index] = view->operands[index];
   }
   call->result_count = view->result_count;
-  for (index = 0u; index < view->result_count && index < 3u; ++index) {
+  for (index = 0u; index < view->result_count; ++index) {
     const ql_ir_value_id result = view->results[index];
     const char *symbol = side_value_symbol(side, result);
     call->results[index] = result;
@@ -2207,8 +2219,7 @@ static ql_status term_call_congruence(product_encoder *encoder,
     status = term_add(encoder, ") (and true");
   }
   for (index = 0u;
-       index < left->result_count && index < 3u && status == QL_STATUS_OK;
-       ++index) {
+       index < left->result_count && status == QL_STATUS_OK; ++index) {
     status = term_add(encoder, " (= ");
     if (status == QL_STATUS_OK) {
       status = term_add(encoder, side_value_symbol((product_side *)left_side,

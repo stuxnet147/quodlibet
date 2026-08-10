@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,953 / 29,880 (80.16%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,339, `unsupported_type` 1,989, `unsupported_control_flow` 579입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **26,086 / 29,880 (87.30%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `unsupported_type` 2,021, `unsupported_control_flow` 655, `unsupported_pointer` 392입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1840,6 +1840,30 @@ generic unknown-type 진단 777개를 source spelling으로 나누면 704개가 
 
 수정 전에 `duplicate_declaration` 첫 차단 47개도 별도로 확인했습니다. `extern` 호환 재선언은 하나도 없었고, 같은 이름의 서로 다른 타입, 중복 initializer, 서로 다른 배열 크기 같은 실제 C 제약 위반이었습니다. 첫 선언을 덮어쓰면 원문 의미를 발명하게 되므로 이 범주는 수용하지 않았습니다.
 
+### 61. 미초기화 scalar out-local을 같은 외부 호출의 결과로 묶는다
+
+`int x; CALLEE_fill(&x); return x;` 형태는 주소가 외부로 나간다는 이유로 모두 거부하고 있었습니다. 단순히 호출 뒤 `x`를 초기화됐다고 표시하면 콜리가 쓰지 않은 실행까지 정의하게 되므로 그렇게 넓힐 수는 없습니다. 직접 호출 인자의 `&x`만, 괄호와 포인터 cast를 허용하는 좁은 형태로 인식하고 그 CALL이 다음 두 auxiliary result를 함께 내놓게 했습니다.
+
+- 콜리가 `x`에 제공한 scalar 값
+- 콜리가 `x` 전체를 실제로 썼는지를 나타내는 `_Bool`
+
+호출 뒤 값은 `select(wrote, supplied, previous)`이고 definedness는 `old_defined || wrote`입니다. 따라서 콜리가 쓰지 않았다고 명세한 실행의 후속 읽기는 계속 UB이며, 임의의 포인터 escape와 호출 바깥의 미초기화 주소 사용은 계속 UNKNOWN입니다. 같은 지역을 여러 인자로 넘겨도 한 쌍의 결과만 만들고, 서로 다른 out-local은 30개로 제한합니다.
+
+CALL 결과 순서는 관찰 상태, 일반 반환값, out-local의 값과 write predicate 쌍입니다. 인터프리터 callback은 memory와 event trace를 제외한 모든 scalar 결과를 정확한 폭의 little-endian byte열로 이어 받습니다. 기존 0개 또는 1개 scalar 결과의 layout은 바뀌지 않았습니다. product miter도 과거의 첫 3개 결과만 다루던 묵시적 제한을 없애고 최대 64개 결과 전부를 선언하고 call congruence에 포함합니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,953 (80.16%) | **26,086 (87.30%)** |
+| 증가 | | **+2,133** |
+| 기존 성공 회귀 | | **0** |
+| `uninitialized_read` 첫 차단 | 2,339 | **31** |
+| verifier 통과 | 23,953 / 23,953 | **26,086 / 26,086** |
+| status 실패 | 0 | **0** |
+
+기존 `uninitialized_read` 2,339개를 먼저 좁게 재측정해 2,133개가 성공했습니다. 남은 206개 중 31개는 같은 진단이고, 175개는 loop label 43개, backward goto 27개, loop pointer authority 24개, array 또는 function local 19개, 선언 없는 callee 18개 등 기존의 다음 제약으로 이동했습니다. 전수 함수별 비교는 변경 행 2,308개, 누락 0개, 기존 성공 회귀 0개입니다.
+
+`tests/test_c_lower_calls.cpp`는 실제 out-local 값을 compiled C와 대조하고 callback이 write predicate를 false로 돌려준 실행이 `UB_GUARD_FAILED`인지 확인합니다. `tests/test_proof_smt_calls.cpp`는 반환값, out 값, write predicate가 하나의 CALL tuple로 congruence에 참여하는지 증명합니다. 공용 CALL 표현, 인터프리터 callback, product miter가 함께 바뀌었으므로 이 세 경로의 영향권 26개 suite, 254개 테스트를 실행해 전부 통과했습니다. EGraph와 plugin 등 무관한 subsystem은 바뀌지 않았고 사용자 작업도 진행 중이므로 전체 CTest는 실행하지 않았습니다. 전체 train coverage는 일반 회귀 테스트가 아니라 G9 성공률과 기존 성공 사례 회귀를 확인하는 필수 측정으로 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1848,11 +1872,11 @@ generic unknown-type 진단 777개를 source spelling으로 나누면 704개가 
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `uninitialized_read` 2,339
-- `unsupported_type` 1,989
-- `unsupported_control_flow` 579
-- `unsupported_pointer` 358
-- `unsupported_call` 337
+- `unsupported_type` 2,021
+- `unsupported_control_flow` 655
+- `unsupported_pointer` 392
+- `unsupported_call` 361
+- `undeclared_identifier` 133
 
 ## 조율자에게 요청할 것
 
@@ -1870,6 +1894,6 @@ generic unknown-type 진단 777개를 source spelling으로 나누면 704개가 
 
 1. 남은 타입 철자와 선언 형태를 실제 source spelling별로 다시 나누고, 부동소수점은 IR 타입과 연산 계약을 먼저 설계합니다.
 2. runtime-bound local array는 object size와 loop access guard를 함께 표현하는 경우에만 수용합니다.
-3. uninitialized address escape는 외부 호출의 memory-write 계약을 먼저 고정합니다.
+3. 남은 uninitialized address escape는 직접 out-local보다 넓은 alias와 수명 계약을 먼저 고정합니다.
 4. 루프 안 ordinary label/goto와 후방 goto는 scope, lifetime, loop-carried 상태를 보존하는 경우에만 순환 CFG로 확장합니다.
 5. 각 단위마다 compiled differential, source-signature binding, verifier 전수 통과, status 실패 0을 유지하고 전체 train을 다시 측정합니다.

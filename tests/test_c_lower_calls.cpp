@@ -48,6 +48,10 @@ char *CALLEE_high(void) {
 static int CALLEE_storage = 73;
 int *CALLEE_cell(void) { return &CALLEE_storage; }
 void CALLEE_sink(int value) { CALLEE_storage = value; }
+int CALLEE_write_out(int *output, int value) {
+    *output = value * 3;
+    return value - 5;
+}
 }
 
 QL_CALL_FUNCTION(single, int CALLEE_double(int);
@@ -99,6 +103,12 @@ QL_CALL_FUNCTION(pointerfollow, int *CALLEE_cell(void);
     int call_ptr_follow(void) { return *CALLEE_cell(); });
 QL_CALL_FUNCTION(voidreturn, void CALLEE_sink(int);
     void call_void_return(int value) { return CALLEE_sink(value); });
+QL_CALL_FUNCTION(outlocal, int CALLEE_write_out(int *, int);
+    int call_out_local(int value) {
+        int output;
+        int status = CALLEE_write_out(&output, value);
+        return output + status;
+    });
 QL_CALL_FUNCTION(indirect, struct CALL_VTABLE {
         int (*callback)(int);
         char *(*pointer_callback)(void);
@@ -146,6 +156,7 @@ namespace {
 struct CallLog {
     std::vector<std::string> symbols;
     std::vector<std::vector<int32_t>> arguments;
+    bool out_local_was_written = true;
 };
 
 int32_t Read(const ql_ir_interp_argument_v1 &argument) {
@@ -210,6 +221,29 @@ int QL_CALL Invoke(void *user_data, const char *symbol,
             static_cast<uint8_t *>(result)[index] =
                 static_cast<uint8_t>((address >> (index * 8u)) & 0xffu);
         }
+        return 1;
+    }
+    if (std::strcmp(symbol, "CALLEE_write_out") == 0 &&
+        argument_count == 2u) {
+        if (result_size != 9u) {
+            ADD_FAILURE() << "return, out value, and definedness need 9 bytes, "
+                          << "not " << result_size;
+            return 0;
+        }
+        int32_t supplied = 0;
+        const int32_t returned = CALLEE_write_out(&supplied, seen[1]);
+        const uint32_t values[2] = {static_cast<uint32_t>(returned),
+                                    static_cast<uint32_t>(supplied)};
+        uint8_t *bytes = static_cast<uint8_t *>(result);
+        for (std::size_t value_index = 0u; value_index < 2u; ++value_index) {
+            for (std::size_t byte = 0u; byte < 4u; ++byte) {
+                bytes[value_index * 4u + byte] = static_cast<uint8_t>(
+                    (values[value_index] >> (byte * 8u)) & 0xffu);
+            }
+        }
+        bytes[8] = log->out_local_was_written ? 1u : 0u;
+        log->symbols.push_back(symbol);
+        log->arguments.push_back(seen);
         return 1;
     }
     if (std::strcmp(symbol, "CALLEE_double") == 0 && argument_count == 1u) {
@@ -562,6 +596,46 @@ TEST(CLowerCalls, FollowsAPointerTheCalleeReturned) {
     EXPECT_EQ(call_ptr_follow(), Returned(run.result));
     EXPECT_EQ(std::vector<std::string>{"CALLEE_cell"}, log.symbols);
     EXPECT_EQ(1u, run.result.events);
+}
+
+TEST(CLowerCalls, CarriesOutLocalValueAndDefinednessFromTheSameCall) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(outlocal_source, "call_out_local"));
+
+    for (int32_t value : {-91, 0, 37, 1000}) {
+        int32_t initial = 0x12345678;
+        int32_t final_image = 0;
+        ql_ir_interp_object_v1 object{};
+        ql_ir_interp_object_init(&object);
+        object.base = QL_IR_INTERP_FIRST_OBJECT_ADDRESS;
+        object.size = sizeof(initial);
+        object.initial = &initial;
+        object.final_image = &final_image;
+        CallLog log;
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(value)}, &log, &object);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(call_out_local(value), Returned(run.result));
+        EXPECT_EQ(value * 3, final_image);
+        EXPECT_EQ(std::vector<std::string>{"CALLEE_write_out"}, log.symbols);
+    }
+
+    int32_t initial = 73;
+    ql_ir_interp_object_v1 object{};
+    ql_ir_interp_object_init(&object);
+    object.base = QL_IR_INTERP_FIRST_OBJECT_ADDRESS;
+    object.size = sizeof(initial);
+    object.initial = &initial;
+    CallLog no_write;
+    no_write.out_local_was_written = false;
+    const Outcome undefined =
+        Execute(lowered.ir(), {Widen(11)}, &no_write, &object);
+    ASSERT_EQ(QL_STATUS_OK, undefined.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+              undefined.result.outcome);
+    EXPECT_EQ(QL_IR_INTERP_UB_GUARD_FAILED, undefined.result.ub_reason);
 }
 
 TEST(CLowerCalls, AReturnOfAVoidExpressionStillRunsTheCall) {

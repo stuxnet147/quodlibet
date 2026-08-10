@@ -189,8 +189,13 @@ this model, and it is the right one for the profile's source material: two
 translations of one function run on one machine state, so the frame really is
 shared. It is stated here because it is an assumption rather than a fact about
 C, and because a proof that rests on it is a proof about programs paired that
-way. An address-taken *scalar* local with no initialiser is still refused, so
-this widening reaches only storage the slice never reads whole.
+way. An address-taken *scalar* local with no initialiser is generally still
+refused. The narrow exception is a direct `&local` argument to a declared
+external callee. That CALL returns both the scalar value it supplied and a
+predicate saying whether it wrote the whole local. The lowering selects the
+supplied value only on that predicate and carries the local's definedness as
+`old_defined || wrote`, so a callee that does not write still makes a later
+read undefined. Arbitrary pointer escape remains refused.
 
 #### Corpus globals carry no promised initial value
 

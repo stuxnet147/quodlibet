@@ -12,6 +12,9 @@
 /* A call with more arguments than this is not run. Nothing this profile
    lowers comes close, and the bound keeps the target free of allocation. */
 #define QL_IR_INTERP_MAX_ARGUMENTS 16u
+/* A call may return state plus several scalar values. The bound keeps the
+   callee bridge allocation-free while covering the public product fragment. */
+#define QL_IR_INTERP_MAX_CALL_RESULTS 64u
 
 typedef struct interp_bits {
   uint64_t words[INTERP_WORDS];
@@ -1034,10 +1037,13 @@ interp_execute_instruction(interp_context *context,
     ql_ir_interp_argument_v1 arguments[QL_IR_INTERP_MAX_ARGUMENTS];
     uint8_t argument_bytes[QL_IR_INTERP_MAX_ARGUMENTS]
                           [QL_IR_INTERP_VALUE_CAPACITY];
-    uint8_t result_bytes[QL_IR_INTERP_VALUE_CAPACITY];
+    uint8_t result_bytes[QL_IR_INTERP_MAX_CALL_RESULTS *
+                         QL_IR_INTERP_VALUE_CAPACITY];
+    size_t result_offsets[QL_IR_INTERP_MAX_CALL_RESULTS];
+    size_t result_sizes[QL_IR_INTERP_MAX_CALL_RESULTS];
     size_t argument_count = 0u;
     size_t state_operands = 0u;
-    size_t value_result = instruction->result_count;
+    size_t result_size = 0u;
     size_t operand;
     size_t slot;
 
@@ -1080,23 +1086,33 @@ interp_execute_instruction(interp_context *context,
       arguments[argument_count].data = argument_bytes[argument_count];
       ++argument_count;
     }
-    /* Results mirror the states, then the returned value if there is
-       one. */
+    if (instruction->result_count > QL_IR_INTERP_MAX_CALL_RESULTS) {
+      return interp_stop(context, QL_IR_INTERP_OUTCOME_UNSUPPORTED,
+                         QL_IR_INTERP_UB_NONE, block, id);
+    }
+    /* State results are threaded by the interpreter. Every other result is
+       supplied by the callee in one tightly packed little-endian byte run. */
     for (slot = 0u; slot < instruction->result_count; ++slot) {
       const interp_value *target = &context->values[instruction->results[slot]];
-      if (target->kind != QL_IR_TYPE_MEMORY &&
-          target->kind != QL_IR_TYPE_EVENT_TRACE) {
-        value_result = slot;
-        break;
+      size_t width;
+      result_offsets[slot] = 0u;
+      result_sizes[slot] = 0u;
+      if (target->kind == QL_IR_TYPE_MEMORY ||
+          target->kind == QL_IR_TYPE_EVENT_TRACE) {
+        continue;
       }
+      width = interp_byte_width(target->width);
+      if (width > QL_IR_INTERP_VALUE_CAPACITY ||
+          result_size > sizeof(result_bytes) - width) {
+        return interp_stop(context, QL_IR_INTERP_OUTCOME_UNSUPPORTED,
+                           QL_IR_INTERP_UB_NONE, block, id);
+      }
+      result_offsets[slot] = result_size;
+      result_sizes[slot] = width;
+      result_size += width;
     }
     memset(result_bytes, 0, sizeof(result_bytes));
     {
-      size_t result_size =
-          value_result < instruction->result_count
-              ? interp_byte_width(
-                    context->values[instruction->results[value_result]].width)
-              : 0u;
       if (!context->callees->invoke(
               context->callees->user_data, instruction->symbol, arguments,
               argument_count, result_bytes, result_size)) {
@@ -1124,7 +1140,8 @@ interp_execute_instruction(interp_context *context,
         } else if (target->kind == QL_IR_TYPE_EVENT_TRACE) {
           target->defined = 1u;
         } else {
-          if (!interp_bits_from_bytes(result_bytes, result_size, target->width,
+          if (!interp_bits_from_bytes(result_bytes + result_offsets[slot],
+                                      result_sizes[slot], target->width,
                                       &target->bits)) {
             return interp_stop(context, QL_IR_INTERP_OUTCOME_UNSUPPORTED,
                                QL_IR_INTERP_UB_NONE, block, id);

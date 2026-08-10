@@ -176,6 +176,30 @@ TEST(SmtProductCalls, MatchingPointerResultsNameTheSameDynamicObject) {
     EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, view.verdict) << view.diagnostic;
 }
 
+TEST(SmtProductCalls, MatchingOutLocalResultsCancelAsOneCallTuple) {
+    /* The return, the value written through the pointer, and the predicate
+       saying whether that write happened are separate scalar CALL results.
+       All of them must participate in congruence for the two reads to agree
+       on both value and defined domain. */
+    constexpr char left[] =
+        "int CALLEE_out(int *, int);"
+        " int f(int a){ int x; int r = CALLEE_out(&x, a); return x + r; }";
+    constexpr char right[] =
+        "int CALLEE_out(int *, int);"
+        " int g(int b){ int x; int r = CALLEE_out(&x, b); return r + x; }";
+    w2::Pair pair;
+    OutcomeRun run;
+
+    if (!BackendAvailable()) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
+    const ql_smt_product_outcome_view_v1 view =
+        Decide(left, "f", right, "g", OrderedCallObservations(), &pair, &run);
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_UNSAT, view.violation_answer);
+    EXPECT_EQ(QL_SMT_PRODUCT_ANSWER_SAT, view.domain_answer);
+    EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, view.verdict) << view.diagnostic;
+}
+
 TEST(SmtProductCalls, VariadicArgumentsUseDefaultPromotions) {
     constexpr char left[] =
         "int CALLEE_v(int, ...);"

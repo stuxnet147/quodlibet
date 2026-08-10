@@ -118,10 +118,16 @@ typedef struct ql_ir_interp_argument_v1 {
    the honest outcome for a callee nobody specified. Returning non-zero
    asserts three things about that callee, because the interpreter models
    them and cannot check them: it does not write memory, it does not trap,
-   and its result depends only on the arguments given here. A callee that
+   and its results depend only on the arguments given here. A callee that
    breaks any of those must be refused instead. The IR itself stays
    conservative and lets the call write memory; this narrower model is a
-   property of the specification the caller supplies, not of the IR. */
+   property of the specification the caller supplies, not of the IR.
+
+   `result` concatenates every non-memory, non-event-trace result in IR result
+   order. Each value uses its exact-width little-endian constant encoding and
+   starts immediately after the preceding value. `result_size` is the total
+   byte count. Existing calls with zero or one scalar result retain their
+   original layout. */
 typedef int(QL_CALL *ql_ir_interp_callee_fn)(
     void *user_data, const char *symbol,
     const ql_ir_interp_argument_v1 *arguments, size_t argument_count,
