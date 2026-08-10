@@ -66,6 +66,14 @@ cake_lpr(경로 C, HOL4 로 기계어까지 검증)은 첫 절단에 넣지 않�
 3. 파서를 `tests/fuzz/` 표면에 추가 (닫힘)
 4. envelope 에 AIG 경로의 query digest 가 SMT 경로의 그것과 같은 값으로 기록 (method 본체에서)
 
+### 9. shift 회로의 정의되지 않은 동작 수정
+
+`src/aig.c` 의 `width_constant` 가 `uint32_t width` 를 `index` 만큼 오른쪽으로 밀었고, `index` 는 피연산자 폭까지 갑니다. 폭 64 이상이면 32비트 값을 32칸 이상 미는 것이라 **정의되지 않은 동작**입니다. 폭 32 까지만 시험이 닿아 있어서 드러나지 않았습니다.
+
+`index < 32u` 를 앞에 두어 상위 비트는 실제 값인 0 으로 씁니다. `width` 는 256 이하라 32번째 비트 위는 전부 0 이므로 의미는 그대로입니다.
+
+**폭 64 shift 시험을 추가했습니다**(`ShiftsAtSixtyFourBitsStayInRangeOfTheirOwnWidthConstant`). 다만 정직하게 적자면, **이 시험은 이 컴파일러에서는 결함을 잡지 못합니다.** 고치기 전 코드로 되돌려 다시 빌드해도 통과합니다. UB 라 컴파일러가 무엇을 해도 되고 오늘은 우연히 맞는 답이 나옵니다. 그래서 이 시험은 결함을 재현하는 장치가 아니라 그 폭을 계속 밟아 두는 장치이고, 결함 자체는 sanitizer 가 잡는 종류입니다.
+
 ### 8. SAT 배정 -> replay 매핑 (러너 비의존부)
 
 `ql_aig_blast_model_artifact_create`. solver 가 낸 DIMACS 배정을 `quodlibet.solver-model` artifact 로 되돌립니다. **typed value 가 아니라 model artifact 를 내는 것이 핵심입니다.** 그래야 AIG 경로의 witness 가 Bitwuzla model 과 똑같이 `ql_replay_decode_model` 과 `ql_replay_execute` 를 지납니다. 비트 패턴의 뜻을 아는 곳이 둘이면 어긋날 수 있고, 하나면 어긋날 수 없습니다.

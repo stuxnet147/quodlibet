@@ -323,6 +323,85 @@ TEST(AigBitVector, MatchesCArithmeticExhaustivelyAtFourBits) {
     }
 }
 
+/* The shift circuits build the operand's width as a constant of that width,
+   and a 64-bit operand indexes past the end of a 32-bit value while doing it.
+   Nothing narrower reaches that path, so this is the width that has to be
+   exercised on purpose. */
+TEST(AigBitVector, ShiftsAtSixtyFourBitsStayInRangeOfTheirOwnWidthConstant) {
+    constexpr std::uint32_t kWidth = 64u;
+    Graph aig;
+    ql_error error{};
+
+    const Word a = MakeInput(aig, kWidth);
+    const Word b = MakeInput(aig, kWidth);
+    Word left_shift(kWidth);
+    Word logical_shift(kWidth);
+    Word arithmetic_shift(kWidth);
+
+    ASSERT_EQ(QL_STATUS_OK, ql_aig_bv_shl(aig, a.data(), b.data(), kWidth,
+                                          left_shift.data(), &error))
+        << error.message;
+    ASSERT_EQ(QL_STATUS_OK, ql_aig_bv_lshr(aig, a.data(), b.data(), kWidth,
+                                           logical_shift.data(), &error));
+    ASSERT_EQ(QL_STATUS_OK, ql_aig_bv_ashr(aig, a.data(), b.data(), kWidth,
+                                           arithmetic_shift.data(), &error));
+
+    struct Case {
+        std::uint64_t value;
+        std::uint64_t amount;
+    };
+    const Case cases[] = {
+        {1u, 0u},   {1u, 1u},   {1u, 63u},  {1u, 64u},
+        {1u, 65u},  {~0ull, 1u}, {~0ull, 63u}, {~0ull, 64u},
+        {0x8000000000000000ull, 1u}, {0x8000000000000000ull, 63u},
+        {0x8000000000000000ull, 64u}, {0x0123456789abcdefull, 31u},
+        {0x0123456789abcdefull, 32u}, {0x0123456789abcdefull, 33u},
+    };
+    for (const Case &current : cases) {
+        std::vector<std::uint8_t> values;
+        for (std::uint32_t bit = 0u; bit < kWidth; ++bit) {
+            values.push_back(
+                static_cast<std::uint8_t>((current.value >> bit) & 1u));
+        }
+        for (std::uint32_t bit = 0u; bit < kWidth; ++bit) {
+            values.push_back(
+                static_cast<std::uint8_t>((current.amount >> bit) & 1u));
+        }
+        std::uint64_t expected_shl = 0u;
+        std::uint64_t expected_lshr = 0u;
+        std::uint64_t expected_ashr =
+            (current.value >> 63) != 0u ? ~0ull : 0ull;
+        if (current.amount < kWidth) {
+            const int shift = static_cast<int>(current.amount);
+            expected_shl = current.value << shift;
+            expected_lshr = current.value >> shift;
+            expected_ashr = static_cast<std::uint64_t>(
+                static_cast<std::int64_t>(current.value) >> shift);
+        }
+
+        std::uint64_t got_shl = 0u;
+        std::uint64_t got_lshr = 0u;
+        std::uint64_t got_ashr = 0u;
+        for (std::uint32_t bit = 0u; bit < kWidth; ++bit) {
+            got_shl |= static_cast<std::uint64_t>(
+                           EvaluateBit(aig, left_shift[bit], values))
+                       << bit;
+            got_lshr |= static_cast<std::uint64_t>(
+                            EvaluateBit(aig, logical_shift[bit], values))
+                        << bit;
+            got_ashr |= static_cast<std::uint64_t>(
+                            EvaluateBit(aig, arithmetic_shift[bit], values))
+                        << bit;
+        }
+        EXPECT_EQ(expected_shl, got_shl)
+            << std::hex << current.value << " << " << current.amount;
+        EXPECT_EQ(expected_lshr, got_lshr)
+            << std::hex << current.value << " >> " << current.amount;
+        EXPECT_EQ(expected_ashr, got_ashr)
+            << std::hex << current.value << " ashr " << current.amount;
+    }
+}
+
 TEST(AigBitVector, SignedDivisionOverflowWrapsLikeSmtLib) {
     constexpr std::uint32_t kWidth = 8u;
     Graph aig;

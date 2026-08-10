@@ -1111,8 +1111,12 @@ static void width_constant(uint32_t width, ql_aig_lit *output) {
     uint32_t index;
 
     for (index = 0u; index < width; ++index) {
-        output[index] = ((width >> index) & 1u) != 0u ? QL_AIG_LIT_TRUE
-                                                      : QL_AIG_LIT_FALSE;
+        /* The loop runs to the operand's width, which reaches 64 and beyond,
+           while `width` is a 32-bit value. Shifting it by 32 or more is
+           undefined, so the high bits are written as the zeros they are
+           rather than read out of a shift the language does not define. */
+        const int set = index < 32u && ((width >> index) & 1u) != 0u;
+        output[index] = set ? QL_AIG_LIT_TRUE : QL_AIG_LIT_FALSE;
     }
 }
 
