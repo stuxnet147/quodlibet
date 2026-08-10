@@ -119,6 +119,11 @@ QL_CALL_FUNCTION(parameter_indirect,
     int call_parameter_indirect_parenthesized(int (*callback)(int), int value) {
         return (*callback)(value) + 1;
     });
+QL_CALL_FUNCTION(typedef_parameter_indirect,
+    typedef int (*CALL_INT_TYPEDEF)(int);
+    int call_typedef_parameter(CALL_INT_TYPEDEF callback, int value) {
+        return callback(value) - 2;
+    });
 static const char callback_argument_source[] =
     "int CALLEE_accept(int (*)(int), int);\n"
     "int pass_callback(int (*callback)(int), int value) {\n"
@@ -127,6 +132,12 @@ static const char callback_argument_source[] =
     "int select_callback(int (*left)(int), int (*right)(int), int choose) {\n"
     "  if (choose) left = right; else left = 0;\n"
     "  return left != 0;\n"
+    "}\n";
+static const char callback_typedef_argument_source[] =
+    "typedef int (*CALL_INT_TYPEDEF)(int);\n"
+    "int CALLEE_accept(CALL_INT_TYPEDEF, int);\n"
+    "int pass_typedef_callback(CALL_INT_TYPEDEF callback, int value) {\n"
+    "  return CALLEE_accept(callback, value);\n"
     "}\n";
 
 namespace {
@@ -637,6 +648,10 @@ TEST(CLowerCalls, CarriesAFunctionPointerAsAnOpaqueExternalArgument) {
 
     Lowered assigned;
     ASSERT_TRUE(assigned.Open(callback_argument_source, "select_callback"));
+
+    Lowered typed;
+    ASSERT_TRUE(typed.Open(callback_typedef_argument_source,
+                           "pass_typedef_callback"));
 }
 
 TEST(CLowerCalls, CallsAFunctionPointerParameterWithItsDeclaredSignature) {
@@ -699,6 +714,43 @@ TEST(CLowerCalls, CallsAParenthesizedFunctionPointerParameter) {
         ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
             << ql_ir_interp_ub_reason_string(run.result.ub_reason);
         EXPECT_EQ(call_parameter_indirect_parenthesized(CALLEE_double, value),
+                  Returned(run.result));
+        EXPECT_EQ(std::vector<std::string>{"__ql_indirect_call_v1"},
+                  log.symbols);
+    }
+
+    CallLog null_log;
+    const Outcome null_run =
+        Execute(lowered.ir(), {0u, Widen(7)}, &null_log, &object);
+    ASSERT_EQ(QL_STATUS_OK, null_run.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+              null_run.result.outcome);
+    EXPECT_TRUE(null_log.symbols.empty());
+}
+
+TEST(CLowerCalls, CallsAFunctionPointerTypedefParameter) {
+    Lowered lowered;
+    uint8_t dummy = 0u;
+    ql_ir_interp_object_v1 object{};
+    ql_ir_interp_object_init(&object);
+    object.base = QL_IR_INTERP_FIRST_OBJECT_ADDRESS;
+    object.size = 1u;
+    object.initial = &dummy;
+
+    ASSERT_TRUE(lowered.Open(typedef_parameter_indirect_source,
+                             "call_typedef_parameter"));
+    for (int32_t value : {-91, 0, 37, 1000}) {
+        CallLog log;
+        const Outcome run = Execute(
+            lowered.ir(),
+            {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                 &CALLEE_double)),
+             Widen(value)},
+            &log, &object);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(call_typedef_parameter(CALLEE_double, value),
                   Returned(run.result));
         EXPECT_EQ(std::vector<std::string>{"__ql_indirect_call_v1"},
                   log.symbols);

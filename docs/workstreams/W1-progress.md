@@ -7,7 +7,7 @@
 
 ## 지금 하는 것
 
-G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,662 / 29,880 (79.19%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,314, `unsupported_type` 2,061, `unsupported_pointer` 666입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
+G9 로어링 커버리지를 버킷 단위로 좁히는 중입니다. train 프런트엔드 수용은 **29,877 / 29,880 (99.99%)**이고, IR 로어링은 **23,695 / 29,880 (79.30%)**이며 전부 verifier를 통과했습니다. status 실패는 0입니다. 최신 큰 첫 차단 버킷은 `uninitialized_read` 2,325, `unsupported_type` 1,989, `unsupported_pointer` 667입니다. 다음 단위는 메시지별 큰 원인을 계속 닫습니다.
 
 ## 기준선
 
@@ -1803,6 +1803,24 @@ ASM2C_GNU_V1의 `\\e`는 GCC와 Clang의 GNU escape 규칙대로 byte 27로 deco
 
 `tests/test_c_lower_aggregates.cpp`는 320-byte 전역 문자열의 bound, memory image와 indexed byte를 compiled C와 대조하고 `\\e`의 실제 byte image도 확인합니다. 변경은 공용 literal decoder에 한정되어 `CLower*` 95/95를 영향 범위 테스트로 실행했습니다. parser reuse, public ABI, solver, plugin은 바뀌지 않아 전체 CTest는 필요하지 않았고, 전체 train coverage만 G9 수치와 기존 성공 회귀를 확인하기 위해 실행했습니다.
 
+### 59. function-pointer typedef의 선언과 호출 서명을 보존한다
+
+`typedef int (*CALLBACK)(int)`의 top-level declarator는 function declarator이고, 이름으로 가는 괄호 node는 tree-sitter에서 named child지만 `declarator` field가 아닙니다. 기존 typedef collector가 field만 따라가 callback typedef 자체를 inventory에서 빠뜨렸습니다. 괄호 declarator의 named child fallback을 추가하고 typedef가 선언된 node와 원래 function declarator를 함께 보존합니다.
+
+function layer 바깥의 star는 callback 반환형, 안쪽 괄호의 star는 callback 값의 indirection으로 따로 셉니다. callback parameter는 typedef의 원래 parameter list에서 반환형, 인자형, variadic 여부를 복원하므로 단순히 pointer width만 보고 호출하지 않습니다. bare function typedef, function pointer를 data pointer나 integer로 바꾸는 경우, 두 단계 callback value는 계속 UNKNOWN입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| train 로어링 (29,880) | 23,662 (79.19%) | **23,695 (79.30%)** |
+| 증가 | | **+33** |
+| 기존 성공 회귀 | | **0** |
+| verifier 통과 | 23,662 / 23,662 | **23,695 / 23,695** |
+| status 실패 | 0 | **0** |
+
+generic unknown-type 진단 777개를 source spelling으로 나누면 704개가 float 또는 double을 포함하고, 나머지 73개는 모두 function-pointer typedef를 포함했습니다. 그 73개를 좁게 재측정해 33개가 성공했습니다. 나머지 40개는 기존 uninitialized, control-flow, undeclared identifier, function-pointer conversion 등의 제약으로 이동했습니다. 전수 함수별 비교는 새 성공 33개, 기존 성공 회귀 0개, 변경 행 73개, 누락과 추가 행 0개입니다.
+
+`tests/test_c_lower_calls.cpp`는 typedef callback parameter의 직접 호출과 null UB를 compiled C 및 indirect-call event와 대조하고, 같은 typedef를 외부 callee 인자로 전달하는 prototype도 lower되는지 확인합니다. 변경은 typedef inventory와 parameter 초기화에 닿으므로 `CLower*`와 `CReuse*` 102/102를 영향 범위 테스트로 실행했습니다. public ABI와 다른 subsystem은 바뀌지 않아 전체 CTest는 필요하지 않았고, 전체 train coverage만 G9 수치와 기존 성공 회귀를 확인하기 위해 실행했습니다.
+
 ## 막힌 것
 
 - 없음
@@ -1811,11 +1829,11 @@ ASM2C_GNU_V1의 `\\e`는 GCC와 Clang의 GNU escape 규칙대로 byte 27로 deco
 
 현재 train 재측정으로 순위를 정한 큰 범주입니다. 각 범주 안의 독립 원인은 메시지별로 다시 나눕니다.
 
-- `uninitialized_read` 2,314
-- `unsupported_type` 2,061
-- `unsupported_pointer` 666
-- `unsupported_control_flow` 555
-- `unsupported_call` 333
+- `uninitialized_read` 2,325
+- `unsupported_type` 1,989
+- `unsupported_pointer` 667
+- `unsupported_control_flow` 566
+- `unsupported_call` 335
 
 ## 조율자에게 요청할 것
 

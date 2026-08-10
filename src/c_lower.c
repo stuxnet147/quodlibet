@@ -159,7 +159,10 @@ typedef struct lower_typedef {
      resolve to a pointer instead of being refused for being one. */
   uint32_t pointer_depth;
   uint32_t is_array_or_function;
+  uint32_t is_function;
   uint32_t is_aggregate;
+  size_t declaration_node;
+  size_t declarator_node;
 } lower_typedef;
 
 typedef struct lower_variable {
@@ -876,11 +879,13 @@ static uint32_t natural_alignment(uint64_t byte_width) {
 static size_t typedef_declarator_name(const lower_context *context,
                                       size_t declarator,
                                       uint32_t *pointer_depth,
-                                      uint32_t *is_array_or_function) {
+                                      uint32_t *is_array_or_function,
+                                      uint32_t *is_function) {
   size_t guard = 0u;
 
   *pointer_depth = 0u;
   *is_array_or_function = 0u;
+  *is_function = 0u;
   while (declarator != SIZE_MAX && guard++ < 64u) {
     const char *kind = context->nodes[declarator].view.kind;
     if (strcmp(kind, "type_identifier") == 0 ||
@@ -895,11 +900,18 @@ static size_t typedef_declarator_name(const lower_context *context,
     if (strcmp(kind, "array_declarator") == 0 ||
         strcmp(kind, "function_declarator") == 0) {
       *is_array_or_function = 1u;
+      if (strcmp(kind, "function_declarator") == 0) {
+        *is_function = 1u;
+      }
       declarator = direct_field_child(context, declarator, "declarator");
       continue;
     }
     if (strcmp(kind, "parenthesized_declarator") == 0) {
-      declarator = direct_field_child(context, declarator, "declarator");
+      size_t next = direct_field_child(context, declarator, "declarator");
+      if (next == SIZE_MAX) {
+        next = first_named_child(context, declarator);
+      }
+      declarator = next;
       continue;
     }
     return SIZE_MAX;
@@ -916,6 +928,9 @@ static ql_status parse_type_spelling(lower_context *context,
                                      const char *spelling, size_t node,
                                      uint32_t allow_void, lower_type *output,
                                      ql_error *error);
+static ql_status resolve_type_node_allowing_void(
+    lower_context *context, size_t type_node, uint32_t pointer_depth,
+    lower_type *output, ql_error *error);
 static size_t member_declarator_name(const lower_context *context,
                                      size_t declarator, uint32_t *pointer_depth,
                                      uint64_t *array_length, int *rejected);
@@ -1584,6 +1599,7 @@ static ql_status collect_typedefs(lower_context *context, ql_error *error) {
       size_t name_node;
       uint32_t pointer_depth;
       uint32_t is_array_or_function;
+      uint32_t is_function;
       lower_typedef *entry;
       ql_status status;
 
@@ -1593,7 +1609,8 @@ static ql_status collect_typedefs(lower_context *context, ql_error *error) {
         continue;
       }
       name_node = typedef_declarator_name(context, child, &pointer_depth,
-                                          &is_array_or_function);
+                                          &is_array_or_function,
+                                          &is_function);
       if (name_node == SIZE_MAX) {
         continue;
       }
@@ -1610,7 +1627,10 @@ static ql_status collect_typedefs(lower_context *context, ql_error *error) {
       entry->underlying = copy_node_text(context, type_node);
       entry->pointer_depth = pointer_depth;
       entry->is_array_or_function = is_array_or_function;
+      entry->is_function = is_function;
       entry->is_aggregate = is_aggregate;
+      entry->declaration_node = index;
+      entry->declarator_node = child;
       if (entry->name == NULL || entry->underlying == NULL) {
         context->allocator->deallocate(context->allocator->user_data,
                                        entry->name);
@@ -2003,6 +2023,160 @@ static const lower_typedef *find_typedef(const lower_context *context,
     }
   }
   return NULL;
+}
+
+/* Follow plain aliases until one names a function declarator. A pointer added
+   by an alias would instead be a pointer to the callback value, so it is not
+   skipped here. */
+static const lower_typedef *find_function_typedef(
+    const lower_context *context, const char *name) {
+  size_t hops = 0u;
+
+  while (name != NULL && hops++ < 64u) {
+    const lower_typedef *entry = find_typedef(context, name);
+    if (entry == NULL) {
+      return NULL;
+    }
+    if (entry->is_function != 0u) {
+      return entry;
+    }
+    if (entry->pointer_depth != 0u || entry->is_array_or_function != 0u) {
+      return NULL;
+    }
+    name = entry->underlying;
+  }
+  return NULL;
+}
+
+/* Splits `typedef R *(*F)(A)` at the function layer. Stars outside that
+   layer belong to the return type; stars inside its parenthesized declarator
+   name the callback value itself. */
+static size_t typedef_function_shape(const lower_context *context,
+                                     const lower_typedef *entry,
+                                     uint32_t *return_pointer_depth,
+                                     uint32_t *value_pointer_depth) {
+  size_t current = entry != NULL ? entry->declarator_node : SIZE_MAX;
+  size_t function = SIZE_MAX;
+  size_t guard = 0u;
+
+  *return_pointer_depth = 0u;
+  *value_pointer_depth = 0u;
+  while (current != SIZE_MAX && guard++ < 64u) {
+    const char *kind = context->nodes[current].view.kind;
+    size_t next;
+    if (strcmp(kind, "function_declarator") == 0) {
+      function = current;
+      break;
+    }
+    if (strcmp(kind, "pointer_declarator") == 0) {
+      ++(*return_pointer_depth);
+    } else if (strcmp(kind, "identifier") == 0 ||
+               strcmp(kind, "type_identifier") == 0) {
+      return SIZE_MAX;
+    }
+    next = direct_field_child(context, current, "declarator");
+    if (next == SIZE_MAX &&
+        strcmp(kind, "parenthesized_declarator") == 0) {
+      next = first_named_child(context, current);
+    }
+    current = next;
+  }
+  if (function == SIZE_MAX) {
+    return SIZE_MAX;
+  }
+
+  current = direct_field_child(context, function, "declarator");
+  guard = 0u;
+  while (current != SIZE_MAX && guard++ < 64u) {
+    const char *kind = context->nodes[current].view.kind;
+    size_t next;
+    if (strcmp(kind, "pointer_declarator") == 0) {
+      ++(*value_pointer_depth);
+    } else if (strcmp(kind, "identifier") == 0 ||
+               strcmp(kind, "type_identifier") == 0) {
+      return function;
+    } else if (strcmp(kind, "function_declarator") == 0) {
+      return SIZE_MAX;
+    }
+    next = direct_field_child(context, current, "declarator");
+    if (next == SIZE_MAX &&
+        strcmp(kind, "parenthesized_declarator") == 0) {
+      next = first_named_child(context, current);
+    }
+    current = next;
+  }
+  return SIZE_MAX;
+}
+
+static ql_status resolve_function_typedef_type(
+    lower_context *context, const lower_typedef *entry, size_t node,
+    lower_type *output, ql_error *error) {
+  size_t type_node;
+  size_t function;
+  uint32_t return_pointer_depth;
+  uint32_t value_pointer_depth;
+  lower_type return_type;
+  ql_status status;
+
+  function = typedef_function_shape(context, entry, &return_pointer_depth,
+                                    &value_pointer_depth);
+  if (function == SIZE_MAX) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
+                         node,
+                         "function typedef has no recoverable declarator",
+                         error);
+  }
+  if (value_pointer_depth != 1u || return_pointer_depth > 1u) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+        "only one-level function-pointer typedefs and returns are in this "
+        "call slice",
+        error);
+  }
+  type_node = direct_field_child(context, entry->declaration_node, "type");
+  if (type_node == SIZE_MAX) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+                         "function typedef has no declared return type",
+                         error);
+  }
+  status = resolve_type_node_allowing_void(
+      context, type_node, return_pointer_depth, &return_type, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  *output = make_function_pointer_type(return_type);
+  return QL_STATUS_OK;
+}
+
+static ql_status attach_function_typedef_signature(
+    lower_context *context, const char *spelling, lower_variable *variable,
+    ql_error *error) {
+  const lower_typedef *entry = find_function_typedef(context, spelling);
+  uint32_t return_pointer_depth;
+  uint32_t value_pointer_depth;
+  size_t function;
+
+  if (entry == NULL) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL,
+                         SIZE_MAX,
+                         "a callback typedef has no recoverable declaration",
+                         error);
+  }
+  function = typedef_function_shape(context, entry, &return_pointer_depth,
+                                    &value_pointer_depth);
+  if (function == SIZE_MAX || value_pointer_depth != 1u ||
+      return_pointer_depth > 1u) {
+    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL,
+                         SIZE_MAX,
+                         "a callback typedef has no supported function "
+                         "declarator",
+                         error);
+  }
+  variable->function.declaration_node = entry->declaration_node;
+  variable->function.declarator_node = function;
+  variable->function.return_pointer_depth = return_pointer_depth;
+  variable->has_function_signature = 1u;
+  return QL_STATUS_OK;
 }
 
 static void release_typedefs(lower_context *context) {
@@ -2638,6 +2812,10 @@ static ql_status parse_type_spelling(lower_context *context,
           error);
     }
     if (entry->is_array_or_function != 0u) {
+      if (entry->is_function != 0u) {
+        return resolve_function_typedef_type(context, entry, node, output,
+                                             error);
+      }
       return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
                            node, "typedef names an array or function type",
                            error);
@@ -11326,10 +11504,22 @@ static ql_status initialize_parameters(lower_context *context,
     if (type.is_function_pointer != 0u) {
       lower_variable *variable =
           &context->variables[context->variable_count - 1u];
+      const lower_typedef *function_typedef =
+          find_function_typedef(context, parameter.type.base_spelling);
       size_t parameter_node = SIZE_MAX;
       size_t declarator_node = SIZE_MAX;
       size_t node;
       uint32_t return_pointer_depth = 0u;
+
+      if (function_typedef != NULL &&
+          (parameter.type.shape & QL_C_TYPE_SHAPE_FUNCTION) == 0u) {
+        status = attach_function_typedef_signature(
+            context, parameter.type.base_spelling, variable, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          return status;
+        }
+        continue;
+      }
 
       for (node = 0u; node < context->node_count; ++node) {
         if (parameter_node == SIZE_MAX &&
