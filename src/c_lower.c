@@ -98,6 +98,12 @@ typedef struct lower_callee {
   uint32_t return_pointer_depth;
   uint32_t is_variadic;
   uint32_t resolved;
+  /* Set when this entry came from a definition in the unit rather than from a
+     prototype. In this corpus that is the selected function itself, so the
+     entry is a call target and nothing else: its designator is not an external
+     token, because a token both sides share would say the two definitions
+     under comparison are the same function. */
+  uint32_t is_definition;
   lower_type return_type;
   lower_type *parameters;
   size_t parameter_count;
@@ -661,6 +667,27 @@ static size_t subtree_end(const lower_context *context, size_t root) {
   }
   return end;
 }
+
+/* An operand C may never evaluate. `?:`, `&&`, and `||` lower both operands
+   and select afterwards, which is why definedness has to short-circuit
+   separately. That works only while an operand is a pure computation: a call,
+   an assignment, or an increment lowered this way runs on the path C skips.
+   Nothing downstream can put that back, because the IR no longer records that
+   the effect was conditional, so the construct is refused here instead. */
+static int subtree_has_effect(const lower_context *context, size_t node) {
+  const size_t end = subtree_end(context, node);
+  size_t index;
+  for (index = node; index < end; ++index) {
+    const char *kind = context->nodes[index].view.kind;
+    if (strcmp(kind, "call_expression") == 0 ||
+        strcmp(kind, "assignment_expression") == 0 ||
+        strcmp(kind, "update_expression") == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 
 static size_t direct_field_child(const lower_context *context, size_t parent,
                                  const char *field) {
@@ -2001,9 +2028,17 @@ static ql_status collect_callees(lower_context *context, ql_error *error) {
   for (index = 0u; index < context->node_count; ++index) {
     size_t end;
     size_t child;
+    uint32_t is_definition = 0u;
 
     if (strcmp(context->nodes[index].view.kind, "declaration") != 0) {
-      continue;
+      /* A definition is a declaration too, and the name it declares is in
+         scope inside its own body. Leaving it out is what made every
+         directly recursive function in the corpus look like a call to
+         something nobody declared. */
+      if (strcmp(context->nodes[index].view.kind, "function_definition") != 0) {
+        continue;
+      }
+      is_definition = 1u;
     }
     end = subtree_end(context, index);
     for (child = index + 1u; child < end; ++child) {
@@ -2055,6 +2090,7 @@ static ql_status collect_callees(lower_context *context, ql_error *error) {
       entry->declaration_node = index;
       entry->declarator_node = declarator;
       entry->return_pointer_depth = return_pointer_depth;
+      entry->is_definition = is_definition;
       ++context->callee_count;
     }
   }
@@ -5365,8 +5401,8 @@ static ql_status lower_identifier(lower_context *context, size_t node,
         errno = 0;
         ordinal = strtoull(digits, &stop, 10);
       }
-      if (callee != NULL && digits != NULL && stop != digits &&
-          stop != NULL && *stop == '\0' && errno == 0 &&
+      if (callee != NULL && callee->is_definition == 0u && digits != NULL &&
+          stop != digits && stop != NULL && *stop == '\0' && errno == 0 &&
           ordinal <= UINT64_C(0xffffffff)) {
         lower_value address;
         lower_type function_type;
@@ -6042,6 +6078,23 @@ static ql_status lower_binary_expression(lower_context *context, size_t node,
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
         "binary expression is missing an operand or operator", error);
+  }
+  if (subtree_has_effect(context, right_node)) {
+    char *text = copy_node_text(context, operator_node);
+    int short_circuit;
+    if (text == NULL) {
+      ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+      return QL_STATUS_OUT_OF_MEMORY;
+    }
+    short_circuit = strcmp(text, "&&") == 0 || strcmp(text, "||") == 0;
+    context->allocator->deallocate(context->allocator->user_data, text);
+    if (short_circuit) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+          "the right operand of a short-circuit operator has an effect this "
+          "slice would run on the path C skips",
+          error);
+    }
   }
   status = lower_expression(context, left_node, &left, error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
@@ -8194,6 +8247,14 @@ static ql_status lower_conditional_expression(lower_context *context,
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
         "conditional expression is missing one of its three operands", error);
+  }
+  if (subtree_has_effect(context, consequence_node) ||
+      subtree_has_effect(context, alternative_node)) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+        "an arm of a conditional expression has an effect this slice would "
+        "run on the path C skips",
+        error);
   }
   status = lower_expression(context, condition_node, &condition, error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {

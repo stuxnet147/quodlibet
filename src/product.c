@@ -425,6 +425,24 @@ static ql_status check_ir_fragment(const ql_ir *ir, const ql_ir_view_v1 *view,
                      side);
         return QL_STATUS_TYPE_MISMATCH;
       }
+      /* A call to the function being compared is not an external call. The
+         two sides name the same symbol but denote their own definitions, so
+         the congruence this encoding states over matching call sites would
+         say the recursive results agree, which is the equivalence under
+         proof. Proving it from itself is the one thing this miter must not
+         do, so the fragment is refused and the verdict stays UNKNOWN. An
+         assume-guarantee rule could admit it, but only by recording the
+         assumption and the termination side condition it needs. */
+      if (view->function_name != NULL &&
+          instruction.symbol_size == view->function_name_size &&
+          memcmp(instruction.symbol, view->function_name,
+                 instruction.symbol_size) == 0) {
+        ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                     "%s IR calls the function under comparison, and this "
+                     "miter has no assume-guarantee rule for recursion",
+                     side);
+        return QL_STATUS_TYPE_MISMATCH;
+      }
       if (instruction.operand_count > QL_PRODUCT_MAX_CALL_ARGUMENTS + 2u) {
         ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
                      "%s IR call passes more arguments than this miter states",

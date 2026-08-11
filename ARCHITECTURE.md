@@ -291,6 +291,41 @@ declaration is still `UNKNOWN`, and the selected function's own definition is
 not turned into an external token. In particular, recursive `FUN_0` calls do
 not silently acquire uninterpreted external-call semantics.
 
+#### A direct recursive call lowers, and the miter refuses it
+
+A definition is a declaration, and the name it declares is in scope inside its
+own body, so `FUN_0` calling `FUN_0` is a call to a declared function and
+lowers as one. The IR records the callee symbol, which is the function's own
+name.
+
+What that name means is where the two sides part. The miter states congruence
+between call sites that name the same symbol: same history, same memory, same
+arguments, therefore same result. For a genuinely external callee that is a
+fact about the environment. For the function under comparison it is not, because
+each side's `FUN_0` denotes its own definition, and the congruence would say
+the two recursive results agree, which is the equivalence under proof.
+
+So `src/product.c` refuses a fragment whose call symbol equals the function
+name rather than encoding it, and every method built on the product query
+inherits that refusal. An assume-guarantee rule could admit it, by induction on
+recursion depth, but only as a recorded assumption carrying the termination
+side condition that induction needs. Until that exists, these bodies have IR
+and no verdict.
+
+#### An operand on a path the condition skips carries no effect
+
+`?:`, `&&`, and `||` lower both operands and select between the results.
+Definedness short-circuits separately, so a pure operand whose undefined
+behaviour C never reaches does not poison the result. An operand with an effect
+is a different question: a call, an assignment, or an increment lowered this
+way runs on the path C skips, and the selected IR no longer records that the
+effect was conditional. Nothing downstream can recover it.
+
+Such an operand is refused. This is a real boundary rather than a conservative
+one: with `return n <= 0 ? 0 : n + FUN_0(n - 1)`, evaluating the arm the base
+case skips is unbounded recursion, not a wrong value. Closing it means lowering
+the operands through real control flow, which the IR already has for loops.
+
 #### Corpus globals carry no promised initial value
 
 A file-scope object with no initialiser is, in ISO C, a tentative definition

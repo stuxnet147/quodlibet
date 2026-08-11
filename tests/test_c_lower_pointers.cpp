@@ -118,11 +118,15 @@ QL_PTR_FUNCTION(cast_from_bits, int ptr_from_bits(unsigned long long address) {
 QL_PTR_FUNCTION(triple, int ptr_triple(int ***p) { return ***p; });
 QL_PTR_FUNCTION(linked_walk,
     struct PTR_NODE { int value; struct PTR_NODE *next; };
+    /* The decrement is a statement rather than the right operand of `&&`.
+       C does not evaluate that operand when the left one is false, and this
+       lowering has no way to say a decrement is conditional. */
     int ptr_linked_walk(struct PTR_NODE *node, int limit) {
         int sum = 0;
-        while (node != 0 && limit-- > 0) {
+        while (node != 0 && limit > 0) {
             sum += node->value;
             node = node->next;
+            limit--;
         }
         return sum;
     });

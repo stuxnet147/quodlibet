@@ -45,6 +45,9 @@
 
 목표는 G9 의 99% 수용률과 G8 의 정확성 증명입니다. 수용률을 정확성보다 앞세우지 않습니다.
 
+- [ ] **`?:`, `&&`, `||` 의 피연산자를 실제 분기로 내린다** (상한 3,181. 지금은 양쪽을 다 평가하고 `SELECT` 로 고르므로 효과가 있는 피연산자는 거부한다. G9 의 지배적 잔여이고, 재귀 본문 다수가 여기에 걸려 있다. 측정과 근거는 `docs/coverage/coverage-20260811-recursion.md`)
+- [ ] 재귀에 assume-guarantee 규칙을 준다 (로어링은 열렸고 miter 가 거부한다. 재귀 깊이 귀납이지만 종료 side condition 을 가정으로 기록해야 한다. 증거와 policy 까지 걸리는 별개 작업)
+- [x] 직접 재귀 호출 로어링 (증거: `collect_callees` 가 `function_definition` 도 훑는다, `tests/test_c_lower_recursion.cpp` 6개, 컴파일된 같은 함수를 callee 명세로 준 differential 포함. 정의 항목은 호출 대상일 뿐이고 값으로 쓰면 거부된다)
 - [ ] 커버리지 측정으로 드러난 미수용 구문을 진단 코드별 빈도순으로 정리
 - [ ] 포인터: 연산, object identity, provenance, 유효 범위, alignment 를 IR 로 하강
 - [ ] 배열, 구조체, 공용체, 비트필드, enum

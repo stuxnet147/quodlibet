@@ -401,4 +401,32 @@ TEST(SmtProductCalls, TheQueryDeclaresCallResultsRatherThanDefiningThem) {
     ql_product_query_destroy(query);
 }
 
+/* A recursive call names the function under comparison. Both sides name the
+   same symbol, so the congruence this encoding states over matching call sites
+   would say the two recursive results agree, and that is the equivalence being
+   proved. The fragment is refused rather than encoded, because the alternative
+   is a proof of the claim from itself. */
+TEST(SmtProductCalls, RefusesAFragmentThatCallsTheFunctionUnderComparison) {
+    constexpr char source[] =
+        "int REC_sum(int n) {\n"
+        "  if (n <= 0) return 0;\n"
+        "  return n + REC_sum(n - 1);\n"
+        "}\n";
+    w2::Pair pair;
+    ql_product_query *query = nullptr;
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build(source, "REC_sum", source, "REC_sum",
+                         w2::ContractObserving(OrderedCallObservations()),
+                         &error))
+        << error.message;
+    EXPECT_EQ(QL_STATUS_TYPE_MISMATCH,
+              ql_product_query_build(nullptr, pair.problem(), pair.left_ir(),
+                                     pair.right_ir(), &query, &error));
+    EXPECT_EQ(nullptr, query);
+    EXPECT_NE(std::string::npos,
+              std::string(error.message).find("assume-guarantee"));
+}
+
 }  // namespace
