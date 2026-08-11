@@ -291,9 +291,9 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
        "int y = x; if (x & 1) goto done; y += 2; done: x += y; } return x; }",
        "loop_goto_state", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
        "goto_statement"},
-      {"int multidimensional(void) { int values[2][3]; values[0][0] = 1; "
-       "return values[0][0]; }",
-       "multidimensional", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+      {"int three_dimensional(void) { int values[2][3][4]; "
+       "values[0][0][0] = 1; return values[0][0][0]; }",
+       "three_dimensional", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
        "array_declarator"},
   };
 

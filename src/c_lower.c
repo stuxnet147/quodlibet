@@ -68,6 +68,13 @@ typedef struct lower_type {
      of its own, it is never loaded or stored whole, and every use of its name
      decays to a pointer to its first element. */
   uint64_t array_length;
+  /* Elements per row when this is a two-dimensional array, zero when it is
+     not. `array_length` stays the total element count, so storage sizing and
+     the element type are unchanged; the row length is what the first
+     subscript has to scale by. A pointer that came from decaying such an
+     array carries it too, because the subscript sees the pointer and not the
+     declaration. */
+  uint64_t array_row_length;
   /* Function pointers share the target ABI's pointer representation but not
      data-pointer operations. Keeping that distinction here prevents an
      opaque callback argument from becoming dereferenceable storage merely
@@ -921,6 +928,7 @@ static uint64_t pointee_byte_width(const lower_context *context,
 static lower_type array_element(lower_type array) {
   lower_type element = array;
   element.array_length = 0u;
+  element.array_row_length = 0u;
   element.ir_type = QL_IR_INVALID_TYPE_ID;
   return element;
 }
@@ -928,6 +936,7 @@ static lower_type array_element(lower_type array) {
 static lower_type make_array_of(lower_type element, uint64_t length) {
   lower_type array = element;
   array.array_length = length;
+  array.array_row_length = 0u;
   array.ir_type = QL_IR_INVALID_TYPE_ID;
   return array;
 }
@@ -1052,9 +1061,26 @@ static const char *declarator_reason_text(int rejected) {
   }
 }
 
+static size_t member_declarator_shape(const lower_context *context,
+                                      size_t declarator,
+                                      uint32_t *pointer_depth,
+                                      uint64_t *array_length,
+                                      uint64_t *row_length, int *rejected);
+
+/* The callers that have no use for a second dimension. A shape they cannot
+   carry is a refusal for them, which is what it was before. */
 static size_t member_declarator_name(const lower_context *context,
                                      size_t declarator, uint32_t *pointer_depth,
-                                     uint64_t *array_length, int *rejected);
+                                     uint64_t *array_length, int *rejected) {
+  uint64_t row_length = 0u;
+  size_t named = member_declarator_shape(context, declarator, pointer_depth,
+                                         array_length, &row_length, rejected);
+  if (named != SIZE_MAX && row_length != 0u) {
+    *rejected = LOWER_DECLARATOR_SECOND_BOUND;
+    return SIZE_MAX;
+  }
+  return named;
+}
 
 /* In call position C treats `f(...)` and `(*f)(...)` as the same function
    designator. Strip only that exact parenthesized unary-star shell here; a
@@ -1224,6 +1250,7 @@ static ql_status collect_storage_locals(lower_context *context,
       size_t declarator = child;
       uint32_t pointer_depth;
       uint64_t array_length;
+      uint64_t row_length;
       int rejected;
       size_t named;
       char *text;
@@ -1241,8 +1268,8 @@ static ql_status collect_storage_locals(lower_context *context,
       if (declarator == SIZE_MAX) {
         continue;
       }
-      named = member_declarator_name(context, declarator, &pointer_depth,
-                                     &array_length, &rejected);
+      named = member_declarator_shape(context, declarator, &pointer_depth,
+                                      &array_length, &row_length, &rejected);
       if (named == SIZE_MAX || rejected != 0) {
         continue;
       }
@@ -2751,13 +2778,16 @@ static int constant_array_bound(const lower_context *context, size_t node,
   return constant_array_bound_value(context, node, length) && *length != 0u;
 }
 
-static size_t member_declarator_name(const lower_context *context,
-                                     size_t declarator, uint32_t *pointer_depth,
-                                     uint64_t *array_length, int *rejected) {
+static size_t member_declarator_shape(const lower_context *context,
+                                      size_t declarator,
+                                      uint32_t *pointer_depth,
+                                      uint64_t *array_length,
+                                      uint64_t *row_length, int *rejected) {
   size_t guard = 0u;
 
   *pointer_depth = 0u;
   *array_length = 0u;
+  *row_length = 0u;
   *rejected = 0;
   while (declarator != SIZE_MAX && guard++ < 64u) {
     const char *kind = context->nodes[declarator].view.kind;
@@ -2778,10 +2808,24 @@ static size_t member_declarator_name(const lower_context *context,
     if (strcmp(kind, "array_declarator") == 0) {
       size_t size_node = direct_field_child(context, declarator, "size");
       if (*array_length != 0u) {
-        /* A second bound is a multidimensional array, which is one
-           object with a shape this slice does not carry. */
-        *rejected = LOWER_DECLARATOR_SECOND_BOUND;
-        return SIZE_MAX;
+        /* A second bound. The walk runs outermost first, so what is already
+           here is the row length and this one is the number of rows. The
+           object is their product, and the shape is what the first subscript
+           scales by. A third bound, or a row length that is not a constant,
+           is still outside this slice. */
+        uint64_t rows = 0u;
+        if (*row_length != 0u || *array_length == LOWER_ARRAY_BOUND_DYNAMIC ||
+            *array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER ||
+            size_node == SIZE_MAX ||
+            !constant_array_bound(context, size_node, &rows) || rows == 0u ||
+            rows > UINT64_MAX / *array_length) {
+          *rejected = LOWER_DECLARATOR_SECOND_BOUND;
+          return SIZE_MAX;
+        }
+        *row_length = *array_length;
+        *array_length = rows * *row_length;
+        declarator = direct_field_child(context, declarator, "declarator");
+        continue;
       }
       if (size_node != SIZE_MAX &&
           !constant_array_bound(context, size_node, array_length)) {
@@ -4086,8 +4130,19 @@ static ql_status emit_pointer_offset(lower_context *context, size_t node,
       return status;
     }
   }
-  status = add_uint_constant(
-      context, u64, pointee_byte_width(context, pointer.type), &scale, error);
+  {
+    uint64_t stride = pointee_byte_width(context, pointer.type);
+    if (pointer.type.array_row_length != 0u) {
+      if (pointer.type.array_row_length > UINT64_MAX / stride) {
+        return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+                             node, "an array row is wider than the address "
+                                   "space this slice states",
+                             error);
+      }
+      stride *= pointer.type.array_row_length;
+    }
+    status = add_uint_constant(context, u64, stride, &scale, error);
+  }
   if (status != QL_STATUS_OK) {
     return status;
   }
@@ -4099,6 +4154,7 @@ static ql_status emit_pointer_offset(lower_context *context, size_t node,
     return status;
   }
   *output = pointer;
+  output->type.array_row_length = 0u;
   output->has_object = pointer.has_object;
   operands[0] = pointer.value;
   operands[1] = scaled;
@@ -7169,6 +7225,11 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
       return status;
     }
     *declared = pointer_target(base.type);
+    /* `a[i]` on a two-dimensional array names a row, and a row is storage
+       rather than a value. The declared type says so, and the load below
+       hands the address on instead of reading an object that has no whole
+       value. */
+    declared->array_length = base.type.array_row_length;
     return QL_STATUS_OK;
   }
   if (strcmp(kind, "identifier") == 0) {
@@ -7340,6 +7401,12 @@ static ql_status lower_designator_load(lower_context *context, size_t node,
 
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
+  }
+  if (declared.array_length != 0u) {
+    /* An array designator decays. There is no value of array type to read,
+       so the address its name gives is the value. */
+    *output = address;
+    return QL_STATUS_OK;
   }
   return load_at_address(context, node, address, declared, output, error);
 }
@@ -10409,12 +10476,13 @@ static ql_status lower_declaration(lower_context *context, size_t node,
       size_t declarator_root = declarator;
       uint32_t pointer_depth = 0u;
       uint64_t array_length = 0u;
+      uint64_t row_length = 0u;
       int rejected = 0;
       size_t named =
           declarator == SIZE_MAX
               ? SIZE_MAX
-              : member_declarator_name(context, declarator, &pointer_depth,
-                                       &array_length, &rejected);
+              : member_declarator_shape(context, declarator, &pointer_depth,
+                                        &array_length, &row_length, &rejected);
       if (named == SIZE_MAX || rejected != 0) {
         return lower_unknown(
             context,
@@ -10480,6 +10548,7 @@ static ql_status lower_declaration(lower_context *context, size_t node,
           }
         }
         declarator_type = make_array_of(declarator_type, array_length);
+        declarator_type.array_row_length = row_length;
       }
       if (declarator_type.kind == QL_C_SCALAR_RECORD) {
         status =
@@ -12906,6 +12975,7 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
       size_t initializer = SIZE_MAX;
       uint32_t pointer_depth;
       uint64_t array_length;
+      uint64_t row_length = 0u;
       int rejected;
       size_t named;
       char *candidate;
@@ -12924,8 +12994,8 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
       if (declarator == SIZE_MAX) {
         continue;
       }
-      named = member_declarator_name(context, declarator, &pointer_depth,
-                                     &array_length, &rejected);
+      named = member_declarator_shape(context, declarator, &pointer_depth,
+                                      &array_length, &row_length, &rejected);
       if (named == SIZE_MAX || rejected != 0) {
         continue;
       }
@@ -12964,6 +13034,7 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
                                error);
         }
         *output = make_array_of(*output, array_length);
+        output->array_row_length = row_length;
       }
       return QL_STATUS_OK;
     }
@@ -13620,6 +13691,9 @@ static lower_value stack_address(const lower_context *context,
   address.type = variable->type.array_length != 0u
                      ? make_pointer_to(array_element(variable->type))
                      : make_pointer_to(variable->type);
+  /* `a` in `a[i][j]` advances a row at a time. The element type is still the
+     element type, so the second subscript needs no help. */
+  address.type.array_row_length = variable->type.array_row_length;
   address.defined = context->true_value;
   address.may_ub = 0u;
   address.has_object = 1u;

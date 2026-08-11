@@ -25,6 +25,19 @@
     static const char name##_source[] = #__VA_ARGS__
 
 QL_LOCAL_FUNCTION(echo, int loc_echo(int x) { return *&x; });
+/* One object with a shape. The first subscript advances a row and the second
+   an element, which is the only thing a second bound changes. */
+QL_LOCAL_FUNCTION(grid, int loc_grid(int x, int y) {
+    int cells[3][4];
+    int row;
+    int column;
+    for (row = 0; row < 3; row++) {
+        for (column = 0; column < 4; column++) {
+            cells[row][column] = row * 10 + column + x;
+        }
+    }
+    return cells[2][3] + cells[0][0] + cells[1][2] + y;
+});
 /* Three reads and two writes, in that order. A lowering that kept the object
    in an SSA value would fold the reads into one and the compiled reference
    would stop agreeing about how many accesses happened. */
@@ -444,6 +457,23 @@ TEST(CLowerLocals, CarriesTheQualifierThroughAPointerToTheObject) {
         ASSERT_EQ(QL_STATUS_OK, run.status);
         ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
         EXPECT_EQ(loc_volatile_pointee(input), Returned(run.result));
+    }
+}
+
+TEST(CLowerLocals, AddressesATwoDimensionalArrayByRowThenElement) {
+    Lowered lowered;
+    std::vector<std::vector<uint8_t>> images;
+    ASSERT_TRUE(lowered.Open(grid_source, "loc_grid"));
+    for (const int32_t x : {-5, 0, 7}) {
+        for (const int32_t y : {-1, 3}) {
+            SCOPED_TRACE(x * 100 + y);
+            const Outcome run = Execute(
+                lowered.ir(), {Widen(x), Widen(y)}, {3u * 4u * 4u}, &images);
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            EXPECT_EQ(loc_grid(x, y), Returned(run.result));
+        }
     }
 }
 
