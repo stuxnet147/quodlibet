@@ -12525,6 +12525,13 @@ static ql_status lower_statement(lower_context *context, size_t node,
   if (strcmp(kind, "compound_statement") == 0) {
     return lower_compound(context, node, 1u, error);
   }
+  if (strcmp(kind, "type_definition") == 0) {
+    /* A block-scope typedef, enum, or record declares a type and no object.
+       `collect_typedefs`, `collect_enumerators`, and `collect_records` walk
+       the whole unit, so the names are already known and the statement itself
+       runs nothing. */
+    return QL_STATUS_OK;
+  }
   if (strcmp(kind, "declaration") == 0) {
     return lower_declaration(context, node, error);
   }
