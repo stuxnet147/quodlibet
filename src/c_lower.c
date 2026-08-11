@@ -73,6 +73,12 @@ typedef struct lower_type {
      opaque callback argument from becoming dereferenceable storage merely
      because both are pointer-width IR values. */
   uint32_t is_function_pointer;
+  /* `volatile` on the object itself. Every access to it is an event the
+     observer counts, so it may not be folded, duplicated, or dropped. The
+     flag rides on the type because the access site sees a pointer, not the
+     declaration. It is deliberately not part of type equality: a volatile
+     int converts to an int like any other. */
+  uint32_t is_volatile;
   ql_ir_type_id ir_type;
 } lower_type;
 
@@ -816,10 +822,19 @@ static lower_type pointer_target(lower_type pointer) {
     target.ir_type = QL_IR_INVALID_TYPE_ID;
     return target;
   }
+  /* The qualifier belongs to the object, and this is the step that reaches
+     it. A pointer to a pointer is not itself volatile; the flag rides along
+     until the last star is spent. */
   if (pointer.pointee.kind == QL_C_SCALAR_RECORD) {
-    return make_record_type(pointer.record);
+    lower_type target = make_record_type(pointer.record);
+    target.is_volatile = pointer.is_volatile;
+    return target;
   }
-  return type_from_scalar(pointer.pointee);
+  {
+    lower_type target = type_from_scalar(pointer.pointee);
+    target.is_volatile = pointer.is_volatile;
+    return target;
+  }
 }
 
 /* One star on. */
@@ -830,10 +845,19 @@ static lower_type make_pointer_to(lower_type target) {
     type.ir_type = QL_IR_INVALID_TYPE_ID;
     return type;
   }
+  /* The qualifier says something about the object at the bottom of the stars,
+     so adding a star carries it along. `pointer_target` hands it back when the
+     last star is spent, which is where the access happens. */
   if (target.kind == QL_C_SCALAR_RECORD) {
-    return make_record_pointer_type(target.record);
+    lower_type type = make_record_pointer_type(target.record);
+    type.is_volatile = target.is_volatile;
+    return type;
   }
-  return make_pointer_type(scalar_of(target));
+  {
+    lower_type type = make_pointer_type(scalar_of(target));
+    type.is_volatile = target.is_volatile;
+    return type;
+  }
 }
 
 static lower_type make_function_pointer_type(lower_type return_type) {
@@ -1129,6 +1153,28 @@ static int declaration_has_extern_storage(const lower_context *context,
    decays to a pointer wherever it is named, and a record is only ever reached
    through its members. So both get an object up front, on the same footing as
    an address-taken scalar. */
+/* `volatile` stated in a declaration's specifiers, which qualifies the object
+   itself rather than anything a declarator points at. */
+static int declaration_is_volatile(const lower_context *context,
+                                   size_t declaration) {
+  size_t end = subtree_end(context, declaration);
+  size_t index;
+  for (index = declaration + 1u; index < end; ++index) {
+    ql_source_range range;
+    if (context->nodes[index].parent != declaration ||
+        strcmp(context->nodes[index].view.kind, "type_qualifier") != 0) {
+      continue;
+    }
+    range = context->nodes[index].view.range;
+    if (range.end_byte - range.start_byte == 8u &&
+        range.end_byte <= context->source_size &&
+        memcmp(context->source + range.start_byte, "volatile", 8u) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static ql_status collect_storage_locals(lower_context *context,
                                         size_t body_node, ql_error *error) {
   size_t end = subtree_end(context, body_node);
@@ -1201,7 +1247,11 @@ static ql_status collect_storage_locals(lower_context *context,
         continue;
       }
       if (!has_static_storage && array_length == 0u &&
-          (pointer_depth != 0u || !base_is_record)) {
+          (pointer_depth != 0u || !base_is_record) &&
+          (pointer_depth != 0u || !declaration_is_volatile(context, index))) {
+        /* A volatile object is read and written where the C says, so it
+           needs storage rather than an SSA value that a later use could
+           fold away. */
         continue;
       }
       text = copy_node_text(context, named);
@@ -3833,6 +3883,36 @@ static ql_status require_pointer_object(lower_context *context, size_t node,
                        message, error);
 }
 
+/* An access to a volatile object is an event, not just a memory operation.
+   The effect bit says the access may not be folded away, and the trace append
+   says where it sits among the other events the function performs. Both sides
+   of a comparison observe the same trace, so a body that reads a volatile
+   twice is not the body that reads it once. */
+static ql_status append_volatile_event(lower_context *context,
+                                       ql_ir_value_id address,
+                                       ql_ir_value_id value, ql_error *error) {
+  ql_ir_value_id operands[3];
+  size_t count = 0u;
+  ql_ir_value_id appended;
+  ql_status status = ensure_trace_type(context, error);
+
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  operands[count++] = context->trace_value;
+  operands[count++] = address;
+  if (value != QL_IR_INVALID_VALUE_ID) {
+    operands[count++] = value;
+  }
+  status = emit_typed_instruction(
+      context, QL_IR_OPCODE_TRACE_APPEND, context->trace_type, operands, count,
+      QL_IR_EFFECT_MEMORY | QL_IR_EFFECT_VOLATILE, &appended, error);
+  if (status == QL_STATUS_OK) {
+    context->trace_value = appended;
+  }
+  return status;
+}
+
 static ql_status emit_load(lower_context *context, lower_value pointer,
                            lower_value *output, ql_error *error) {
   lower_type pointee;
@@ -3881,9 +3961,16 @@ static ql_status emit_load(lower_context *context, lower_value pointer,
   output->type = pointee;
   output->defined = context->true_value;
   output->may_ub = 0u;
-  status = emit_typed_instruction(context, QL_IR_OPCODE_LOAD, pointee.ir_type,
-                                  operands, 2u, QL_IR_EFFECT_MEMORY,
-                                  &output->value, error);
+  status = emit_typed_instruction(
+      context, QL_IR_OPCODE_LOAD, pointee.ir_type, operands, 2u,
+      pointee.is_volatile != 0u
+          ? (QL_IR_EFFECT_MEMORY | QL_IR_EFFECT_VOLATILE)
+          : QL_IR_EFFECT_MEMORY,
+      &output->value, error);
+  if (status == QL_STATUS_OK && pointee.is_volatile != 0u) {
+    status = append_volatile_event(context, pointer.value, output->value,
+                                   error);
+  }
   if (status == QL_STATUS_OK && pointee.kind == QL_C_SCALAR_POINTER) {
     output->may_admit_object = 1u;
   }
@@ -3942,9 +4029,17 @@ static ql_status emit_store(lower_context *context, lower_value pointer,
   operands[0] = context->memory_value;
   operands[1] = pointer.value;
   operands[2] = converted.value;
-  return emit_typed_instruction(
+  status = emit_typed_instruction(
       context, QL_IR_OPCODE_STORE, context->memory_type, operands, 3u,
-      QL_IR_EFFECT_MEMORY, &context->memory_value, error);
+      pointee.is_volatile != 0u
+          ? (QL_IR_EFFECT_MEMORY | QL_IR_EFFECT_VOLATILE)
+          : QL_IR_EFFECT_MEMORY,
+      &context->memory_value, error);
+  if (status == QL_STATUS_OK && pointee.is_volatile != 0u) {
+    status = append_volatile_event(context, pointer.value, converted.value,
+                                   error);
+  }
+  return status;
 }
 
 /* `p + n` moves by n elements, so the offset is scaled by the pointee's
@@ -9281,16 +9376,34 @@ static ql_status lower_update_expression(lower_context *context, size_t node,
                                  is_postfix, output, error);
 }
 
+static ql_status parse_local_type_qualified(
+    lower_context *context, size_t declaration, size_t type_node,
+    lower_type *output, uint32_t *is_const, uint32_t *is_static,
+    uint32_t *is_volatile, ql_error *error);
+
+/* The callers that have no use for the qualifier. A volatile object is
+   storage and the qualifier reaches the access through its type, so a caller
+   that only wants the base type does not need to hear about it. */
 static ql_status parse_local_type(lower_context *context, size_t declaration,
                                   size_t type_node, lower_type *output,
                                   uint32_t *is_const, uint32_t *is_static,
                                   ql_error *error) {
+  uint32_t is_volatile = 0u;
+  return parse_local_type_qualified(context, declaration, type_node, output,
+                                    is_const, is_static, &is_volatile, error);
+}
+
+static ql_status parse_local_type_qualified(
+    lower_context *context, size_t declaration, size_t type_node,
+    lower_type *output, uint32_t *is_const, uint32_t *is_static,
+    uint32_t *is_volatile, ql_error *error) {
   size_t end = subtree_end(context, declaration);
   size_t index;
   char *spelling;
 
   *is_const = 0u;
   *is_static = 0u;
+  *is_volatile = 0u;
   for (index = declaration + 1u; index < end; ++index) {
     char *text;
     const char *kind;
@@ -9329,13 +9442,16 @@ static ql_status parse_local_type(lower_context *context, size_t declaration,
         ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
         return QL_STATUS_OUT_OF_MEMORY;
       }
-      if (strcmp(text, "volatile") == 0 || strcmp(text, "_Atomic") == 0) {
+      if (strcmp(text, "_Atomic") == 0) {
         context->allocator->deallocate(context->allocator->user_data, text);
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_VOLATILE_OR_ATOMIC,
-            index,
-            "volatile and atomic locals require observable-event semantics",
+            index, "an atomic local requires an ordering this slice does not "
+                   "carry",
             error);
+      }
+      if (strcmp(text, "volatile") == 0) {
+        *is_volatile = 1u;
       }
       if (strcmp(text, "const") == 0) {
         *is_const = 1u;
@@ -10183,6 +10299,7 @@ static ql_status lower_declaration(lower_context *context, size_t node,
   lower_type declarator_type;
   uint32_t is_const;
   uint32_t is_static;
+  uint32_t is_volatile;
   uint32_t only_function_prototypes;
   size_t declarator_count = 0u;
   ql_status status;
@@ -10202,8 +10319,9 @@ static ql_status lower_declaration(lower_context *context, size_t node,
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION,
                          node, "local declaration has no type", error);
   }
-  status = parse_local_type(context, node, type_node, &base_type, &is_const,
-                            &is_static, error);
+  status = parse_local_type_qualified(context, node, type_node, &base_type,
+                                     &is_const, &is_static, &is_volatile,
+                                     error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
   }
@@ -10257,7 +10375,10 @@ static ql_status lower_declaration(lower_context *context, size_t node,
         object_is_const = (uint32_t)single_pointer_object_is_const(
             context, declarator_root, pointer_depth);
       }
+      /* The qualifier is on the object at the bottom of the stars, which is
+         what `volatile T *p` says and what `pointer_target` hands back. */
       declarator_type = base_type;
+      declarator_type.is_volatile = is_volatile;
       while (pointer_depth-- > 0u) {
         declarator_type = make_pointer_to(declarator_type);
       }
@@ -14342,6 +14463,21 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
     return status;
   }
   collect_calls(&context, body_node);
+  {
+    /* A volatile access is an observable event even in a body that calls
+       nothing, and events are threaded on the trace. Without this the trace
+       parameter would not exist and the append would have nothing to extend. */
+    size_t scan;
+    size_t scan_end = subtree_end(&context, body_node);
+    for (scan = body_node + 1u; scan < scan_end; ++scan) {
+      if (strcmp(context.nodes[scan].view.kind, "declaration") == 0 &&
+          declaration_is_volatile(&context, scan)) {
+        context.makes_calls = 1u;
+        context.uses_memory = 1u;
+        break;
+      }
+    }
+  }
   collect_global_uses(&context, body_node);
   status = collect_string_literals(&context, body_node, error);
   if (status == QL_STATUS_OK) {

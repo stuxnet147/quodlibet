@@ -270,7 +270,7 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
        "} while (x != 'ABCDE'); return x; }",
        "loop_escape", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION,
        "char_literal"},
-      {"int observe(int x) { volatile int y = x; return y; }", "observe",
+      {"int observe(int x) { _Atomic int y = x; return y; }", "observe",
        QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_VOLATILE_OR_ATOMIC, "type_qualifier"},
       {"_Noreturn int declared_no_return(int x) { return x; }",
        "declared_no_return", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,

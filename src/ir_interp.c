@@ -1371,6 +1371,35 @@ interp_execute_instruction(interp_context *context,
                          QL_IR_INTERP_UB_GUARD_FAILED, block, id);
     }
     return 1;
+  case QL_IR_OPCODE_TRACE_APPEND: {
+    /* An event the observer counts but never inspects, exactly as a call is.
+       The trace itself is threaded rather than read, so the work here is to
+       hand the incoming version on and to say that something happened. Every
+       operand still has to be defined: an event that records an undefined
+       address or an undefined value is not an event this run can claim. */
+    interp_value *target = &context->values[instruction->results[0]];
+    size_t operand;
+    for (operand = 0u; operand < instruction->operand_count; ++operand) {
+      const interp_value *source =
+          &context->values[instruction->operands[operand]];
+      if (source->kind == QL_IR_TYPE_EVENT_TRACE ||
+          source->kind == QL_IR_TYPE_MEMORY) {
+        if (source->defined == 0u) {
+          return interp_stop(context, QL_IR_INTERP_OUTCOME_UNSUPPORTED,
+                             QL_IR_INTERP_UB_NONE, block, id);
+        }
+        continue;
+      }
+      if (source->defined == 0u) {
+        return interp_stop(context, QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+                           QL_IR_INTERP_UB_GUARD_UNDEFINED, block, id);
+      }
+    }
+    ++context->events;
+    target->defined = 1u;
+    target->store = NULL;
+    return 1;
+  }
   default:
     /* Memory, calls, event traces, pointers, and floating point are not
        modelled yet. Guessing a semantics here would be a wrong answer

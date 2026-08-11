@@ -25,6 +25,21 @@
     static const char name##_source[] = #__VA_ARGS__
 
 QL_LOCAL_FUNCTION(echo, int loc_echo(int x) { return *&x; });
+/* Three reads and two writes, in that order. A lowering that kept the object
+   in an SSA value would fold the reads into one and the compiled reference
+   would stop agreeing about how many accesses happened. */
+QL_LOCAL_FUNCTION(volatile_cell, int loc_volatile(int x) {
+    volatile int cell = x;
+    int total = cell;
+    cell = cell + 1;
+    return total + cell;
+});
+QL_LOCAL_FUNCTION(volatile_pointee, int loc_volatile_pointee(int x) {
+    volatile int cell = x;
+    volatile int *p = &cell;
+    *p = *p + 1;
+    return *p;
+});
 QL_LOCAL_FUNCTION(bump, int loc_bump(int x) {
     int v = x + 1;
     int *p = &v;
@@ -212,7 +227,8 @@ Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
         inputs.push_back(ql_ir_interp_input_v1{});
         ql_ir_interp_input_init(&inputs.back());
         inputs.back().value = value.id;
-        if (type.kind == QL_IR_TYPE_MEMORY) {
+        if (type.kind == QL_IR_TYPE_MEMORY ||
+            type.kind == QL_IR_TYPE_EVENT_TRACE) {
             storage.push_back(std::vector<uint8_t>());
         } else if (std::strstr(name, ".__base") != nullptr) {
             EXPECT_LT(next_base, sizes.size());
@@ -254,6 +270,26 @@ Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
                                   inputs.size(), &options, &run.result,
                                   &error);
     return run;
+}
+
+/* Counts the instructions of one opcode, which is how a test says that an
+   access happened exactly as often as the C performs it. */
+std::size_t CountOpcode(ql_ir *ir, ql_ir_opcode opcode) {
+    ql_ir_view_v1 view{};
+    ql_error error{};
+    std::size_t count = 0u;
+    view.struct_size = sizeof(view);
+    EXPECT_EQ(QL_STATUS_OK, ql_ir_get_view(ir, &view, &error));
+    for (std::size_t index = 0u; index < view.instruction_count; ++index) {
+        ql_ir_instruction_view_v1 instruction{};
+        instruction.struct_size = sizeof(instruction);
+        EXPECT_EQ(QL_STATUS_OK,
+                  ql_ir_instruction_at(ir, index, &instruction, &error));
+        if (instruction.opcode == opcode) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 int32_t Returned(const ql_ir_interp_result_v1 &result) {
@@ -366,6 +402,48 @@ TEST(CLowerLocals, MatchesCompiledExecutionWithStorageForLocals) {
                 << ql_ir_interp_ub_reason_string(run.result.ub_reason);
             EXPECT_EQ(item.reference(a, b), Returned(run.result));
         }
+    }
+}
+
+/* A volatile object is storage, every access to it is an event, and the two
+   sides of a comparison observe the same trace. The counts below are what say
+   the accesses were neither folded together nor invented. */
+TEST(CLowerLocals, MakesEveryVolatileAccessAnObservableEvent) {
+    Lowered lowered;
+    std::vector<std::vector<uint8_t>> images;
+    ASSERT_TRUE(lowered.Open(volatile_cell_source, "loc_volatile"));
+    /* One store for the initialiser, one for the assignment; three reads. */
+    EXPECT_EQ(2u, CountOpcode(lowered.ir(), QL_IR_OPCODE_STORE));
+    EXPECT_EQ(3u, CountOpcode(lowered.ir(), QL_IR_OPCODE_LOAD));
+    EXPECT_EQ(5u, CountOpcode(lowered.ir(), QL_IR_OPCODE_TRACE_APPEND));
+
+    for (const int32_t input : {-7, 0, 1, 1000}) {
+        SCOPED_TRACE(input);
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(input)}, {4u}, &images);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
+        EXPECT_EQ(loc_volatile(input), Returned(run.result));
+    }
+}
+
+/* `volatile int *p` qualifies the object, not the pointer. The accesses
+   through p are the same events the object's own name would produce. */
+TEST(CLowerLocals, CarriesTheQualifierThroughAPointerToTheObject) {
+    Lowered lowered;
+    std::vector<std::vector<uint8_t>> images;
+    ASSERT_TRUE(lowered.Open(volatile_pointee_source, "loc_volatile_pointee"));
+    EXPECT_EQ(2u, CountOpcode(lowered.ir(), QL_IR_OPCODE_STORE));
+    EXPECT_EQ(2u, CountOpcode(lowered.ir(), QL_IR_OPCODE_LOAD));
+    EXPECT_EQ(4u, CountOpcode(lowered.ir(), QL_IR_OPCODE_TRACE_APPEND));
+
+    for (const int32_t input : {-7, 0, 1, 1000}) {
+        SCOPED_TRACE(input);
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(input)}, {4u}, &images);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
+        EXPECT_EQ(loc_volatile_pointee(input), Returned(run.result));
     }
 }
 

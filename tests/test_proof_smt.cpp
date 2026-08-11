@@ -258,12 +258,12 @@ TEST(SmtProductMethod, ReportsUnknownWhenTheLoweringCannotStateTheFunction) {
   w2::CFunction supported;
   ql_error error{};
 
-  /* The restricted-C slice refuses volatile access, and the method must
+  /* The restricted-C slice refuses an atomic access, and the method must
      inherit that as UNKNOWN rather than encode a narrower question. */
   ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(&supported, kAdd, "add"));
   w2::CFunction unmodeled;
   ASSERT_EQ(QL_STATUS_OK,
-            unmodeled.Build("int add(int x, int y){ volatile int z = x; "
+            unmodeled.Build("int add(int x, int y){ _Atomic int z = x; "
                             "return z + y; }",
                             "add", &error));
   EXPECT_EQ(QL_C_LOWER_UNKNOWN, unmodeled.support());

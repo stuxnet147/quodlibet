@@ -370,7 +370,7 @@ TEST(ConcreteDifferential, ReportsUnknownWhenTheLoweringCannotStateTheSide) {
      that as UNKNOWN instead of comparing a narrower question. */
   ASSERT_EQ(QL_STATUS_TYPE_MISMATCH,
             pair.Build(kIdentity, "f",
-                       "int g(int x){ volatile int y = x; return y; }", "g",
+                       "int g(int x){ _Atomic int y = x; return y; }", "g",
                        w2::ContractObserving(QL_OBSERVE_RETURN_VALUE), &error));
   (void)run;
 }

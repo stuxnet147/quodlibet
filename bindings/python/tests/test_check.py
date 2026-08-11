@@ -65,11 +65,11 @@ def test_a_cyclic_source_stays_unknown_for_the_loop_free_method(backend):
 
 
 def test_a_source_outside_the_lowering_slice_stays_unknown(backend):
-    volatile = (
-        "int add(int x, int y){ volatile int observed = x; "
+    atomic = (
+        "int add(int x, int y){ _Atomic int observed = x; "
         "return observed + y; }"
     )
-    result = quodlibet.check(volatile, "add", SUM, "sum")
+    result = quodlibet.check(atomic, "add", SUM, "sum")
     assert result.verdict == "unknown"
     assert result.status.kind == "unsupported"
     assert result.status.ok is False
