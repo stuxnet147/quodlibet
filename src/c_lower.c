@@ -20,7 +20,7 @@
 
 #define LOWER_ARRAY_BOUND_FROM_INITIALIZER UINT64_MAX
 #define LOWER_ARRAY_BOUND_DYNAMIC (UINT64_MAX - UINT64_C(1))
-#define LOWER_MAX_POINTER_INDIRECTION 3u
+#define LOWER_MAX_POINTER_INDIRECTION 4u
 /* A selected function carries one by-value record as one bit-vector image.
    Keep it within the concrete interpreter's existing public value capacity;
    larger records remain UNKNOWN instead of silently dropping bytes. */

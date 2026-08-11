@@ -315,9 +315,9 @@ TEST(CLowerTypes, NamesTheRealObstacleBehindATypedef) {
                   "typedef struct TYP_0 TYP_1;\n"
                   "int aggregate(TYP_1 a) { return 0; }",
                   "aggregate", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
-    /* Typedef and surface stars add together. Treating this as only three
-       levels would make the signature wrong. */
-    ExpectUnknown("typedef int ***TYP_0;\n"
+    /* Typedef and surface stars add together. Counting only the ones
+       the declarator spells would make the signature wrong. */
+    ExpectUnknown("typedef int ****TYP_0;\n"
                   "int too_deep(TYP_0 *p) { return 0; }",
                   "too_deep", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
 }
@@ -590,8 +590,8 @@ TEST(CLowerTypes, RefusesCastsItCannotRepresent) {
        a void result cannot be used where the return needs an object value. */
     ExpectUnknown("int to_array(int a) { return (int (*)[4])a != 0; }",
                   "to_array", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
-    ExpectUnknown("int to_deep(int a) { return (int ****)a != 0; }", "to_deep",
-                  QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
+    ExpectUnknown("int to_deep(int a) { return (int *****)a != 0; }",
+                  "to_deep", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
     ExpectUnknown("int to_void(int a) { return (void)a; }", "to_void",
                   QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR);
 }
