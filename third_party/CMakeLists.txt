@@ -209,6 +209,12 @@ endif()
 option(QL_ENABLE_SAT "Build the pinned CaDiCaL backend and LRAT checker" ON)
 
 if(QL_ENABLE_SAT)
+    # CaDiCaL is C++. The root project enables CXX only for its own tests, so
+    # a core-only configuration -- which is exactly what `pip install
+    # ./bindings/python` produces -- would otherwise glob the .cpp sources
+    # into a target with no C++ toolchain behind them and fail at link with
+    # an executable that contains only kitten.c.
+    enable_language(CXX)
     foreach(sat_directory IN ITEMS cadical drat-trim)
         if(NOT EXISTS
            "${CMAKE_CURRENT_SOURCE_DIR}/${sat_directory}/.quodlibet-vendor")
