@@ -1008,6 +1008,26 @@ static ql_status parse_type_spelling(lower_context *context,
 static ql_status resolve_type_node_allowing_void(
     lower_context *context, size_t type_node, uint32_t pointer_depth,
     lower_type *output, ql_error *error);
+/* Why `member_declarator_name` refused. One message for all three made the
+   residual unreadable: a second array bound, a GNU zero-sized array, and a
+   declarator this pass does not read are different work. */
+#define LOWER_DECLARATOR_OK 0
+#define LOWER_DECLARATOR_SECOND_BOUND 1
+#define LOWER_DECLARATOR_ZERO_SIZED 2
+#define LOWER_DECLARATOR_SHAPE 3
+
+static const char *declarator_reason_text(int rejected) {
+  switch (rejected) {
+  case LOWER_DECLARATOR_SECOND_BOUND:
+    return "a multidimensional array is one object with a shape this slice "
+           "does not carry";
+  case LOWER_DECLARATOR_ZERO_SIZED:
+    return "a zero-sized array is a GNU extension this slice does not carry";
+  default:
+    return "a function local, or a declarator this pass does not read";
+  }
+}
+
 static size_t member_declarator_name(const lower_context *context,
                                      size_t declarator, uint32_t *pointer_depth,
                                      uint64_t *array_length, int *rejected);
@@ -2710,7 +2730,7 @@ static size_t member_declarator_name(const lower_context *context,
       if (*array_length != 0u) {
         /* A second bound is a multidimensional array, which is one
            object with a shape this slice does not carry. */
-        *rejected = 1;
+        *rejected = LOWER_DECLARATOR_SECOND_BOUND;
         return SIZE_MAX;
       }
       if (size_node != SIZE_MAX &&
@@ -2718,7 +2738,7 @@ static size_t member_declarator_name(const lower_context *context,
         uint64_t folded = 0u;
         if (constant_array_bound_value(context, size_node, &folded) != 0) {
           /* A zero-sized array is a separate GNU extension, not a VLA. */
-          *rejected = 1;
+          *rejected = LOWER_DECLARATOR_ZERO_SIZED;
           return SIZE_MAX;
         }
         *array_length = LOWER_ARRAY_BOUND_DYNAMIC;
@@ -2732,10 +2752,10 @@ static size_t member_declarator_name(const lower_context *context,
       declarator = direct_field_child(context, declarator, "declarator");
       continue;
     }
-    *rejected = 1;
+    *rejected = LOWER_DECLARATOR_SHAPE;
     return SIZE_MAX;
   }
-  *rejected = 1;
+  *rejected = LOWER_DECLARATOR_SHAPE;
   return SIZE_MAX;
 }
 
@@ -10223,9 +10243,7 @@ static ql_status lower_declaration(lower_context *context, size_t node,
             rejected != 0 ? QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE
                           : QL_C_LOWER_DIAGNOSTIC_INVALID_DECLARATION,
             declarator != SIZE_MAX ? declarator : index,
-            "a function local, a multidimensional array, or an array "
-            "whose bound this pass cannot fold",
-            error);
+            declarator_reason_text(rejected), error);
       }
       if (pointer_depth > LOWER_MAX_POINTER_INDIRECTION) {
         return lower_unknown(
