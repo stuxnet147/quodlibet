@@ -41,6 +41,7 @@ __all__ = [
     "CheckSpec",
     "CheckResult",
     "Evidence",
+    "LoopProofStats",
     "Status",
     "PolicyResult",
     "check",
@@ -149,6 +150,43 @@ class Evidence:
 
 
 @dataclass(frozen=True)
+class LoopProofStats:
+    """Structured per-judgement loop fast-path telemetry.
+
+    Counts retain their raw denominators. A ``stage_ns`` value is meaningful
+    only when its matching ``stage_reached`` entry is true; reports must not
+    mix skipped stages in as zero-latency samples. A reached fallback with a
+    zero duration is the unavailable, unmeasured fallback boundary.
+    """
+
+    applicable: bool
+    cyclic: bool
+    natural_loop_count: int
+    noncanonical_cycle: bool
+    left_loop_count: int
+    right_loop_count: int
+    paired_loop_count: int
+    all_loops_paired: bool
+    invariant_generated_count: int
+    induction_proved_count: int
+    summary_attempted_count: int
+    summary_proved_count: int
+    reflexivity_proved_count: int
+    fallback_reached: bool
+    fallback_attempted: bool
+    proof_eligible: bool
+    concrete_domain_witness: bool
+    strategy: str
+    induction_answer: str
+    summary_answer: str
+    reflexivity_answer: str
+    failure_reason: str
+    stage_ns: Mapping[str, int] = field(default_factory=dict)
+    stage_reached: Mapping[str, bool] = field(default_factory=dict)
+    digests: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class PolicyResult:
     """The caller's own verdict policy applied to the core's evidence."""
 
@@ -177,6 +215,7 @@ class CheckResult:
     counterexample: Any | None
     policy: PolicyResult | None
     diagnostic: str
+    loop_proof: LoopProofStats
 
     @property
     def proved(self) -> bool:
@@ -328,6 +367,42 @@ def _build_result(raw: Mapping[str, Any]) -> CheckResult:
             gate_reason=entry["gate_reason"],
             checked_bound=entry["checked_bound"],
         )
+    loop = raw["loop_proof"]
+    loop_proof = LoopProofStats(
+        applicable=bool(loop["applicable"]),
+        cyclic=bool(loop["cyclic"]),
+        natural_loop_count=int(loop["natural_loop_count"]),
+        noncanonical_cycle=bool(loop["noncanonical_cycle"]),
+        left_loop_count=int(loop["left_loop_count"]),
+        right_loop_count=int(loop["right_loop_count"]),
+        paired_loop_count=int(loop["paired_loop_count"]),
+        all_loops_paired=bool(loop["all_loops_paired"]),
+        invariant_generated_count=int(loop["invariant_generated_count"]),
+        induction_proved_count=int(loop["induction_proved_count"]),
+        summary_attempted_count=int(loop["summary_attempted_count"]),
+        summary_proved_count=int(loop["summary_proved_count"]),
+        reflexivity_proved_count=int(loop["reflexivity_proved_count"]),
+        fallback_reached=bool(loop["fallback_reached"]),
+        fallback_attempted=bool(loop["fallback_attempted"]),
+        proof_eligible=bool(loop["proof_eligible"]),
+        concrete_domain_witness=bool(loop["concrete_domain_witness"]),
+        strategy=str(loop["strategy"]),
+        induction_answer=_ANSWERS[int(loop["induction_answer"])],
+        summary_answer=_ANSWERS[int(loop["summary_answer"])],
+        reflexivity_answer=_ANSWERS[int(loop["reflexivity_answer"])],
+        failure_reason=str(loop["failure_reason"]),
+        stage_ns=dict(loop["stage_ns"]),
+        stage_reached=dict(loop["stage_reached"]),
+        digests={
+            "canonical": str(loop["canonical_digest"]),
+            "base": str(loop["base_obligation_digest"]),
+            "guard": str(loop["guard_obligation_digest"]),
+            "step": str(loop["step_obligation_digest"]),
+            "exit": str(loop["exit_obligation_digest"]),
+            "reflexivity": str(loop["reflexivity_obligation_digest"]),
+            "domain_witness": str(loop["domain_witness_digest"]),
+        },
+    )
     return CheckResult(
         verdict=VERDICTS[raw["verdict"]],
         status=Status(kind=kind, message=raw["diagnostic"]),
@@ -335,6 +410,7 @@ def _build_result(raw: Mapping[str, Any]) -> CheckResult:
         counterexample=counterexample,
         policy=policy,
         diagnostic=raw["diagnostic"],
+        loop_proof=loop_proof,
     )
 
 

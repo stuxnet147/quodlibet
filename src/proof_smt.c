@@ -9,6 +9,8 @@
 #include "quodlibet/product.h"
 #include "quodlibet/replay.h"
 
+#include "loop_proof.h"
+#include "uv.h"
 #include "yyjson.h"
 
 /* This translation unit owns the stage-timing storage. Every other includer of
@@ -38,6 +40,7 @@ typedef struct smt_product_decision {
     const char *backend_name;
     const char *backend_version;
     char diagnostic[QL_ERROR_MESSAGE_CAPACITY];
+    ql_loop_proof_stats_v1 loop;
 } smt_product_decision;
 
 static void *smt_json_allocate(void *context, size_t size) {
@@ -116,6 +119,21 @@ static ql_smt_product_answer answer_from_solver(ql_solver_check_kind kind) {
 static const char *promotion_string(ql_unsat_promotion_policy policy) {
     return policy == QL_UNSAT_PROMOTION_TRUSTED_BACKEND ? "trusted-backend"
                                                         : "none";
+}
+
+static const char *loop_strategy_string(ql_loop_proof_strategy strategy) {
+    switch (strategy) {
+    case QL_LOOP_PROOF_STRATEGY_STRUCTURAL_INDUCTION:
+        return "structural-induction";
+    case QL_LOOP_PROOF_STRATEGY_AFFINE_SUMMARY:
+        return "affine-summary";
+    case QL_LOOP_PROOF_STRATEGY_CHC_PDR_UNAVAILABLE:
+        return "chc-pdr-unavailable";
+    case QL_LOOP_PROOF_STRATEGY_EXACT_REFLEXIVITY:
+        return "exact-reflexivity";
+    default:
+        return "none";
+    }
 }
 
 static ql_verdict proved_verdict_for(ql_relation relation) {
@@ -373,6 +391,43 @@ static ql_status lower_side(const ql_allocator *allocator,
     return QL_STATUS_OK;
 }
 
+/* The loop encoder pairs source parameters by their IR order. A problem may
+   legally bind a permutation, but applying that permutation without passing
+   it to the encoder would invent equal entry states. Keep this fast path to
+   positional bindings until the query API carries the full correspondence. */
+static ql_status problem_has_positional_proof_binding(
+    const ql_problem *problem, const ql_problem_view_v2 *view,
+    uint32_t *matches, ql_error *error) {
+    size_t index;
+    ql_status status;
+
+    *matches = 0u;
+    status = ql_problem_require_proof_binding(problem, error);
+    if (status != QL_STATUS_OK) {
+        /* A missing proof binding is an eligibility boundary, not a malformed
+           run. The outcome remains UNKNOWN and records that boundary. */
+        ql_error_clear(error);
+        return QL_STATUS_OK;
+    }
+    for (index = 0u; index < view->argument_binding_count; ++index) {
+        ql_problem_argument_binding_v1 binding;
+        memset(&binding, 0, sizeof(binding));
+        binding.struct_size = sizeof(binding);
+        status = ql_problem_argument_binding_at(problem, index, &binding,
+                                                error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        if (binding.left_index != binding.right_index) {
+            ql_error_clear(error);
+            return QL_STATUS_OK;
+        }
+    }
+    *matches = 1u;
+    ql_error_clear(error);
+    return QL_STATUS_OK;
+}
+
 /* --- Solving -------------------------------------------------------------- */
 
 /* The deadline this check may actually use: the method's own timeout and
@@ -506,19 +561,133 @@ static int add_digest(yyjson_mut_doc *document, yyjson_mut_val *object,
     return yyjson_mut_obj_add_strcpy(document, object, key, hex);
 }
 
+static int add_loop_stats(yyjson_mut_doc *document, yyjson_mut_val *root,
+                          const ql_loop_proof_stats_v1 *loop) {
+    yyjson_mut_val *object = yyjson_mut_obj(document);
+    yyjson_mut_val *stages = yyjson_mut_obj(document);
+    yyjson_mut_val *obligations = yyjson_mut_obj(document);
+
+    if (object == NULL || stages == NULL || obligations == NULL) {
+        return 0;
+    }
+    if (!yyjson_mut_obj_add_uint(document, object, "schema_version",
+                                 QL_LOOP_PROOF_STATS_SCHEMA_VERSION) ||
+        !yyjson_mut_obj_add_bool(document, object, "applicable",
+                                 loop->applicable != 0u) ||
+        !yyjson_mut_obj_add_bool(document, object, "cyclic",
+                                 loop->cyclic != 0u) ||
+        !yyjson_mut_obj_add_bool(document, object, "noncanonical_cycle",
+                                 loop->noncanonical_cycle != 0u) ||
+        !yyjson_mut_obj_add_bool(document, object, "all_loops_paired",
+                                 loop->all_loops_paired != 0u) ||
+        !yyjson_mut_obj_add_bool(document, object, "fallback_reached",
+                                 loop->fallback_reached != 0u) ||
+        !yyjson_mut_obj_add_bool(document, object, "fallback_attempted",
+                                 loop->fallback_attempted != 0u) ||
+        !yyjson_mut_obj_add_bool(document, object, "proof_eligible",
+                                 loop->proof_eligible != 0u) ||
+        !yyjson_mut_obj_add_str(document, object, "strategy",
+                                loop_strategy_string(loop->strategy)) ||
+        !yyjson_mut_obj_add_str(document, object, "induction_answer",
+                                answer_string(loop->induction_answer)) ||
+        !yyjson_mut_obj_add_str(document, object, "summary_answer",
+                                answer_string(loop->summary_answer)) ||
+        !yyjson_mut_obj_add_str(document, object, "reflexivity_answer",
+                                answer_string(loop->reflexivity_answer)) ||
+        !yyjson_mut_obj_add_bool(document, object,
+                                 "concrete_domain_witness",
+                                 loop->concrete_domain_witness != 0u) ||
+        !yyjson_mut_obj_add_uint(document, object, "left_loop_count",
+                                 loop->left_loop_count) ||
+        !yyjson_mut_obj_add_uint(document, object, "right_loop_count",
+                                 loop->right_loop_count) ||
+        !yyjson_mut_obj_add_uint(document, object, "natural_loop_count",
+                                 loop->natural_loop_count) ||
+        !yyjson_mut_obj_add_uint(document, object, "paired_loop_count",
+                                 loop->paired_loop_count) ||
+        !yyjson_mut_obj_add_uint(document, object,
+                                 "invariant_generated_count",
+                                 loop->invariant_generated_count) ||
+        !yyjson_mut_obj_add_uint(document, object,
+                                 "induction_proved_count",
+                                 loop->induction_proved_count) ||
+        !yyjson_mut_obj_add_uint(document, object,
+                                 "summary_attempted_count",
+                                 loop->summary_attempted_count) ||
+        !yyjson_mut_obj_add_uint(document, object, "summary_proved_count",
+                                 loop->summary_proved_count) ||
+        !yyjson_mut_obj_add_uint(document, object,
+                                 "reflexivity_proved_count",
+                                 loop->reflexivity_proved_count) ||
+        !yyjson_mut_obj_add_strcpy(document, object, "failure_reason",
+                                   loop->failure_reason)) {
+        return 0;
+    }
+    if (!yyjson_mut_obj_add_uint(document, stages, "reached",
+                                 loop->stage_reached) ||
+        !yyjson_mut_obj_add_uint(document, stages, "discover_ns",
+                                 loop->discover_ns) ||
+        !yyjson_mut_obj_add_uint(document, stages, "canonicalize_ns",
+                                 loop->canonicalize_ns) ||
+        !yyjson_mut_obj_add_uint(document, stages, "pairing_ns",
+                                 loop->pairing_ns) ||
+        !yyjson_mut_obj_add_uint(document, stages, "invariant_ns",
+                                 loop->invariant_ns) ||
+        !yyjson_mut_obj_add_uint(document, stages, "induction_ns",
+                                 loop->induction_ns) ||
+        !yyjson_mut_obj_add_uint(document, stages, "summary_ns",
+                                 loop->summary_ns) ||
+        !yyjson_mut_obj_add_uint(document, stages, "fallback_ns",
+                                 loop->fallback_ns) ||
+        !yyjson_mut_obj_add_uint(document, stages, "reflexivity_ns",
+                                 loop->reflexivity_ns) ||
+        !yyjson_mut_obj_add_val(document, object, "stages", stages)) {
+        return 0;
+    }
+    if (!add_digest(document, obligations, "canonical",
+                    &loop->canonical_digest) ||
+        !add_digest(document, obligations, "base",
+                    &loop->base_obligation_digest) ||
+        !add_digest(document, obligations, "guard",
+                    &loop->guard_obligation_digest) ||
+        !add_digest(document, obligations, "step",
+                    &loop->step_obligation_digest) ||
+        !add_digest(document, obligations, "exit",
+                    &loop->exit_obligation_digest) ||
+        !add_digest(document, obligations, "reflexivity",
+                    &loop->reflexivity_obligation_digest) ||
+        !add_digest(document, obligations, "domain_witness",
+                    &loop->domain_witness_digest) ||
+        !yyjson_mut_obj_add_val(document, object, "digests", obligations) ||
+        !yyjson_mut_obj_add_val(document, root, "loop_proof", object)) {
+        return 0;
+    }
+    return 1;
+}
+
 static ql_status compute_cache_key(const ql_digest *problem_digest,
                                    const smt_product_instance *instance,
                                    const ql_product_query_view_v1 *query,
+                                   const ql_loop_proof_stats_v1 *loop,
                                    const ql_digest *backend_digest,
                                    ql_digest *cache_key, ql_error *error) {
     /* Solver identity, exact options, and the canonical SMT-LIB bytes all
        participate, so a cached answer cannot be reused across a different
        backend, policy, or query. */
-    char identity[512];
+    char identity[2048];
     char prefix_hex[QL_DIGEST_HEX_SIZE];
     char violation_hex[QL_DIGEST_HEX_SIZE];
     char domain_hex[QL_DIGEST_HEX_SIZE];
     char backend_hex[QL_DIGEST_HEX_SIZE];
+    char canonical_hex[QL_DIGEST_HEX_SIZE];
+    char base_hex[QL_DIGEST_HEX_SIZE];
+    char guard_hex[QL_DIGEST_HEX_SIZE];
+    char step_hex[QL_DIGEST_HEX_SIZE];
+    char exit_hex[QL_DIGEST_HEX_SIZE];
+    char reflexivity_hex[QL_DIGEST_HEX_SIZE];
+    char domain_witness_hex[QL_DIGEST_HEX_SIZE];
+    char solver_options_hex[QL_DIGEST_HEX_SIZE];
+    ql_digest solver_options_digest;
     ql_cache_key_input_v1 input;
     int written;
 
@@ -526,14 +695,29 @@ static ql_status compute_cache_key(const ql_digest *problem_digest,
     ql_digest_hex(&query->violation_digest, violation_hex);
     ql_digest_hex(&query->domain_digest, domain_hex);
     ql_digest_hex(backend_digest, backend_hex);
+    ql_digest_hex(&loop->canonical_digest, canonical_hex);
+    ql_digest_hex(&loop->base_obligation_digest, base_hex);
+    ql_digest_hex(&loop->guard_obligation_digest, guard_hex);
+    ql_digest_hex(&loop->step_obligation_digest, step_hex);
+    ql_digest_hex(&loop->exit_obligation_digest, exit_hex);
+    ql_digest_hex(&loop->reflexivity_obligation_digest, reflexivity_hex);
+    ql_digest_hex(&loop->domain_witness_digest, domain_witness_hex);
+    ql_digest_data(instance->solver_options,
+                   instance->solver_options != NULL
+                       ? strlen(instance->solver_options)
+                       : 0u,
+                   &solver_options_digest);
+    ql_digest_hex(&solver_options_digest, solver_options_hex);
     written = snprintf(
         identity, sizeof(identity),
-        "{\"unsat_promotion\":\"%s\",\"timeout_ms\":%llu,\"memory_limit_mb\":%llu,\"prefix\":\"%s\",\"violation\":\"%s\",\"domain\":\"%s\",\"backend\":\"%s %s %s\"}",
+        "{\"unsat_promotion\":\"%s\",\"timeout_ms\":%llu,\"memory_limit_mb\":%llu,\"solver_options\":\"%s\",\"prefix\":\"%s\",\"violation\":\"%s\",\"domain\":\"%s\",\"loop_canonical\":\"%s\",\"loop_base\":\"%s\",\"loop_guard\":\"%s\",\"loop_step\":\"%s\",\"loop_exit\":\"%s\",\"loop_reflexivity\":\"%s\",\"loop_domain_witness\":\"%s\",\"backend\":\"%s %s %s\"}",
         promotion_string(instance->unsat_promotion),
         (unsigned long long)instance->timeout_ms,
-        (unsigned long long)instance->memory_limit_mb, prefix_hex,
-        violation_hex, domain_hex, "bitwuzla", QL_SMT_PRODUCT_METHOD_VERSION,
-        backend_hex);
+        (unsigned long long)instance->memory_limit_mb, solver_options_hex,
+        prefix_hex,
+        violation_hex, domain_hex, canonical_hex, base_hex, guard_hex,
+        step_hex, exit_hex, reflexivity_hex, domain_witness_hex, "bitwuzla",
+        QL_SMT_PRODUCT_METHOD_VERSION, backend_hex);
     if (written < 0 || (size_t)written >= sizeof(identity)) {
         ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
                      "could not format the cache identity");
@@ -583,8 +767,9 @@ static ql_status build_outcome(const ql_allocator *allocator,
         }
     }
     status = compute_cache_key(&problem_view->artifact_digest, instance,
-                               query_view, &decision->solver_binary_digest,
-                               &cache_key, error);
+                               query_view, &decision->loop,
+                               &decision->solver_binary_digest, &cache_key,
+                               error);
     if (status != QL_STATUS_OK) {
         return status;
     }
@@ -620,6 +805,11 @@ static ql_status build_outcome(const ql_allocator *allocator,
                                  query_view->covered_observations) ||
         !yyjson_mut_obj_add_strcpy(document, root, "diagnostic",
                                    decision->diagnostic)) {
+        status = QL_STATUS_OUT_OF_MEMORY;
+        ql_error_set(error, status, NULL);
+        goto cleanup;
+    }
+    if (!add_loop_stats(document, root, &decision->loop)) {
         status = QL_STATUS_OUT_OF_MEMORY;
         ql_error_set(error, status, NULL);
         goto cleanup;
@@ -1071,6 +1261,304 @@ finish:
     return status;
 }
 
+static void loop_stats_copy(smt_product_decision *decision,
+                            const ql_loop_proof_query_view_v1 *view,
+                            uint32_t declared_cyclic) {
+    ql_loop_proof_stats_v1 *stats = &decision->loop;
+    uint64_t natural_count = view->metrics.left_loop_count;
+
+    if (view->metrics.right_loop_count > natural_count) {
+        natural_count = view->metrics.right_loop_count;
+    }
+    stats->applicable =
+        natural_count != 0u ||
+        view->unsupported_reason ==
+            QL_LOOP_PROOF_UNSUPPORTED_UNCLASSIFIED_CYCLE;
+    stats->cyclic = declared_cyclic;
+    stats->noncanonical_cycle =
+        view->unsupported_reason ==
+        QL_LOOP_PROOF_UNSUPPORTED_UNCLASSIFIED_CYCLE;
+    stats->all_loops_paired = view->all_loops_paired;
+    stats->fallback_reached = view->chc_pdr_reached;
+    stats->fallback_attempted = view->chc_pdr_available;
+    stats->proof_eligible = view->promotion_eligible;
+    stats->strategy = view->strategy;
+    stats->induction_answer = view->metrics.induction_answer;
+    stats->summary_answer = view->metrics.summary_answer;
+    stats->reflexivity_answer = view->metrics.reflexivity_answer;
+    stats->concrete_domain_witness =
+        view->metrics.concrete_domain_witness;
+    stats->left_loop_count = view->metrics.left_loop_count;
+    stats->right_loop_count = view->metrics.right_loop_count;
+    stats->natural_loop_count = natural_count;
+    stats->paired_loop_count = view->metrics.paired_loop_count;
+    stats->invariant_generated_count =
+        view->metrics.invariant_generated_count;
+    stats->summary_attempted_count =
+        view->metrics.summary_attempted_count;
+    if (view->strategy == QL_LOOP_PROOF_STRATEGY_STRUCTURAL_INDUCTION &&
+        view->metrics.induction_answer == QL_SMT_PRODUCT_ANSWER_UNSAT) {
+        stats->induction_proved_count = view->metrics.paired_loop_count;
+    }
+    if (view->metrics.summary_answer == QL_SMT_PRODUCT_ANSWER_UNSAT) {
+        stats->summary_proved_count = view->metrics.paired_loop_count;
+    }
+    if (view->strategy == QL_LOOP_PROOF_STRATEGY_EXACT_REFLEXIVITY &&
+        view->metrics.reflexivity_answer == QL_SMT_PRODUCT_ANSWER_UNSAT) {
+        stats->reflexivity_proved_count = view->metrics.paired_loop_count;
+    }
+
+    stats->stage_reached = view->metrics.stage_reached;
+    stats->discover_ns = view->metrics.discover_ns;
+    stats->canonicalize_ns = view->metrics.canonicalize_ns;
+    stats->pairing_ns = view->metrics.pairing_ns;
+    stats->invariant_ns =
+        view->metrics.invariant_ns + view->metrics.query_build_ns;
+    stats->induction_ns = view->metrics.induction_solver_ns;
+    stats->summary_ns =
+        view->metrics.summary_ns + view->metrics.summary_solver_ns;
+    stats->fallback_ns = 0u;
+    stats->reflexivity_ns = view->metrics.reflexivity_solver_ns;
+    stats->canonical_digest = view->canonical_digest;
+    stats->base_obligation_digest = view->base_obligation_digest;
+    stats->guard_obligation_digest = view->guard_obligation_digest;
+    stats->step_obligation_digest = view->step_obligation_digest;
+    stats->exit_obligation_digest = view->exit_obligation_digest;
+    stats->reflexivity_obligation_digest =
+        view->reflexivity_obligation_digest;
+    stats->domain_witness_digest = view->metrics.domain_witness_digest;
+    (void)snprintf(stats->failure_reason, sizeof(stats->failure_reason), "%s",
+                   view->diagnostic);
+}
+
+static void product_view_from_loop(
+    const ql_problem_view_v2 *problem_view,
+    const ql_loop_proof_query_view_v1 *loop_view,
+    const ql_digest *terminal_digest, ql_product_query_view_v1 *view) {
+    memset(view, 0, sizeof(*view));
+    view->struct_size = sizeof(*view);
+    view->schema_version = QL_PRODUCT_SCHEMA_VERSION;
+    view->relation = problem_view->contract.relation;
+    view->ub_policy = problem_view->contract.ub_policy;
+    view->covered_observations = problem_view->contract.observations;
+    view->logic = loop_view->logic;
+    view->maximum_bv_width = loop_view->maximum_bv_width;
+    view->problem_digest = problem_view->artifact_digest;
+    view->prefix_digest = loop_view->prefix_digest;
+    view->violation_digest = *terminal_digest;
+    view->domain_digest = loop_view->domain_terminal_digest;
+}
+
+static void loop_solver_identity(smt_product_decision *decision,
+                                 const ql_solver_check_result_v1 *result) {
+    decision->solver_query_digest = result->query_digest;
+    decision->solver_binary_digest = result->backend_binary_digest;
+    decision->backend_name = result->backend_name;
+    decision->backend_version = result->backend_version;
+}
+
+/* Runs the cheap cyclic dispatcher. `handled` is false only when neither IR
+   contains an actual natural loop, in which case the ordinary acyclic product
+   gets a chance to topologically order a conservatively CYCLIC declaration.
+
+   SAT here refutes an invariant or summary candidate. It is never decoded,
+   replayed, or reported as a program counterexample. */
+static ql_status decide_loop(
+    const ql_allocator *allocator, const smt_product_instance *instance,
+    const ql_run_context_v1 *context, const ql_problem *problem,
+    const ql_problem_view_v2 *problem_view, ql_loop_proof_query *query,
+    uint32_t declared_cyclic, uint32_t *handled,
+    ql_product_query_view_v1 *product_view,
+    smt_product_decision *decision, ql_error *error) {
+    ql_loop_proof_query_view_v1 loop_view;
+    ql_solver_check_result_v1 proof;
+    ql_solver_check_result_v1 domain;
+    const ql_artifact *terminal = NULL;
+    ql_loop_proof_check_target target = QL_LOOP_PROOF_CHECK_INDUCTION;
+    ql_digest terminal_digest;
+    uint64_t started_ns;
+    ql_status status;
+
+    *handled = 0u;
+    memset(&loop_view, 0, sizeof(loop_view));
+    loop_view.struct_size = sizeof(loop_view);
+    status = ql_loop_proof_query_get_view(query, &loop_view, error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    loop_stats_copy(decision, &loop_view, declared_cyclic);
+    if (loop_view.disposition == QL_LOOP_PROOF_NOT_APPLICABLE) {
+        return QL_STATUS_OK;
+    }
+    *handled = 1u;
+    if (loop_view.disposition == QL_LOOP_PROOF_CHC_PDR_UNAVAILABLE) {
+        memset(&terminal_digest, 0, sizeof(terminal_digest));
+        product_view_from_loop(problem_view, &loop_view, &terminal_digest,
+                               product_view);
+        set_diagnostic(decision, loop_view.diagnostic);
+        return QL_STATUS_OK;
+    }
+
+    if (loop_view.strategy == QL_LOOP_PROOF_STRATEGY_EXACT_REFLEXIVITY) {
+        terminal = ql_loop_proof_query_reflexivity_artifact(query);
+        terminal_digest = loop_view.reflexivity_terminal_digest;
+        target = QL_LOOP_PROOF_CHECK_REFLEXIVITY;
+    } else {
+        terminal = ql_loop_proof_query_induction_artifact(query);
+        terminal_digest = loop_view.induction_terminal_digest;
+    }
+    if (terminal == NULL &&
+        ql_loop_proof_query_summary_artifact(query) != NULL) {
+        terminal = ql_loop_proof_query_summary_artifact(query);
+        terminal_digest = loop_view.summary_terminal_digest;
+        target = QL_LOOP_PROOF_CHECK_SUMMARY;
+    }
+    if (terminal == NULL) {
+        product_view_from_loop(problem_view, &loop_view, &terminal_digest,
+                               product_view);
+        set_diagnostic(decision, loop_view.diagnostic);
+        return QL_STATUS_OK;
+    }
+
+    product_view_from_loop(problem_view, &loop_view, &terminal_digest,
+                           product_view);
+    ql_solver_check_result_init(&proof);
+    ql_solver_check_result_init(&domain);
+    started_ns = uv_hrtime();
+    status = run_check(allocator, instance, context, product_view,
+                       ql_loop_proof_query_prefix_artifact(query), terminal,
+                       0u, &proof, error);
+    if (status != QL_STATUS_OK) {
+        goto finish;
+    }
+    loop_solver_identity(decision, &proof);
+    decision->violation_answer = answer_from_solver(proof.kind);
+    status = ql_loop_proof_query_record_check(
+        query, target, proof.kind, proof.unknown_reason,
+        uv_hrtime() - started_ns, error);
+    if (status != QL_STATUS_OK) {
+        goto finish;
+    }
+
+    memset(&loop_view, 0, sizeof(loop_view));
+    loop_view.struct_size = sizeof(loop_view);
+    status = ql_loop_proof_query_get_view(query, &loop_view, error);
+    if (status != QL_STATUS_OK) {
+        goto finish;
+    }
+
+    if (proof.kind == QL_SOLVER_CHECK_SAT &&
+        target == QL_LOOP_PROOF_CHECK_INDUCTION &&
+        ql_loop_proof_query_summary_artifact(query) != NULL) {
+        ql_solver_check_result_clear(&proof);
+        ql_solver_check_result_init(&proof);
+        target = QL_LOOP_PROOF_CHECK_SUMMARY;
+        terminal = ql_loop_proof_query_summary_artifact(query);
+        terminal_digest = loop_view.summary_terminal_digest;
+        product_view_from_loop(problem_view, &loop_view, &terminal_digest,
+                               product_view);
+        started_ns = uv_hrtime();
+        status = run_check(allocator, instance, context, product_view,
+                           ql_loop_proof_query_prefix_artifact(query), terminal,
+                           0u, &proof, error);
+        if (status != QL_STATUS_OK) {
+            goto finish;
+        }
+        loop_solver_identity(decision, &proof);
+        decision->violation_answer = answer_from_solver(proof.kind);
+        status = ql_loop_proof_query_record_check(
+            query, target, proof.kind, proof.unknown_reason,
+            uv_hrtime() - started_ns, error);
+        if (status != QL_STATUS_OK) {
+            goto finish;
+        }
+        memset(&loop_view, 0, sizeof(loop_view));
+        loop_view.struct_size = sizeof(loop_view);
+        status = ql_loop_proof_query_get_view(query, &loop_view, error);
+        if (status != QL_STATUS_OK) {
+            goto finish;
+        }
+    }
+
+    if (proof.kind != QL_SOLVER_CHECK_UNSAT) {
+        loop_stats_copy(decision, &loop_view, declared_cyclic);
+        set_diagnostic(decision, loop_view.diagnostic);
+        status = QL_STATUS_OK;
+        goto finish;
+    }
+
+    if (loop_view.promotion_eligible == 0u) {
+        loop_stats_copy(decision, &loop_view, declared_cyclic);
+        set_diagnostic(decision, loop_view.diagnostic);
+        status = QL_STATUS_OK;
+        goto finish;
+    }
+
+    if (loop_view.metrics.concrete_domain_witness != 0u) {
+        decision->domain_answer = QL_SMT_PRODUCT_ANSWER_SAT;
+    } else {
+        started_ns = uv_hrtime();
+        status = run_check(allocator, instance, context, product_view,
+                           ql_loop_proof_query_prefix_artifact(query),
+                           ql_loop_proof_query_domain_artifact(query), 0u,
+                           &domain, error);
+        if (status != QL_STATUS_OK) {
+            goto finish;
+        }
+        decision->domain_answer = answer_from_solver(domain.kind);
+        status = ql_loop_proof_query_record_check(
+            query, QL_LOOP_PROOF_CHECK_DOMAIN, domain.kind,
+            domain.unknown_reason, uv_hrtime() - started_ns, error);
+        if (status != QL_STATUS_OK) {
+            goto finish;
+        }
+    }
+    memset(&loop_view, 0, sizeof(loop_view));
+    loop_view.struct_size = sizeof(loop_view);
+    status = ql_loop_proof_query_get_view(query, &loop_view, error);
+    if (status != QL_STATUS_OK) {
+        goto finish;
+    }
+    loop_stats_copy(decision, &loop_view, declared_cyclic);
+    if (decision->domain_answer != QL_SMT_PRODUCT_ANSWER_SAT) {
+        set_diagnostic(
+            decision,
+            decision->domain_answer == QL_SMT_PRODUCT_ANSWER_UNSAT
+                ? "the loop comparison domain is empty, so the induction result is vacuous"
+                : "the backend did not decide whether the loop comparison domain is inhabited");
+        status = QL_STATUS_OK;
+        goto finish;
+    }
+    if (instance->unsat_promotion != QL_UNSAT_PROMOTION_TRUSTED_BACKEND) {
+        set_diagnostic(decision,
+                       "loop-induction UNSAT is retained as evidence only; no unsat_promotion policy was selected");
+        status = QL_STATUS_OK;
+        goto finish;
+    }
+    status = ql_problem_require_proof_binding(problem, error);
+    if (status != QL_STATUS_OK) {
+        set_diagnostic(decision, error->message);
+        ql_error_clear(error);
+        status = QL_STATUS_OK;
+        goto finish;
+    }
+    decision->verdict = proved_verdict_for(problem_view->contract.relation);
+    decision->evidence_class = QL_EVIDENCE_PROOF;
+    set_diagnostic(
+        decision,
+        target == QL_LOOP_PROOF_CHECK_SUMMARY
+            ? "an affine loop summary is unsatisfiable over an inhabited comparison domain under the selected trusted-backend policy"
+            : (target == QL_LOOP_PROOF_CHECK_REFLEXIVITY
+                   ? "exact whole-IR identity proves reflexivity and a concrete defined execution inhabits the comparison domain under the selected trusted-backend policy"
+                   : "Base, guard alignment, Step, and Exit are jointly unsatisfiable over an inhabited comparison domain under the selected trusted-backend policy"));
+    status = QL_STATUS_OK;
+
+finish:
+    ql_solver_check_result_clear(&proof);
+    ql_solver_check_result_clear(&domain);
+    return status;
+}
+
 static ql_status QL_CALL smt_product_run(void *instance,
                                          const ql_run_context_v1 *context,
                                          ql_artifact *const *inputs,
@@ -1082,6 +1570,7 @@ static ql_status QL_CALL smt_product_run(void *instance,
     ql_problem *problem = NULL;
     ql_problem_view_v2 problem_view;
     ql_product_query *query = NULL;
+    ql_loop_proof_query *loop_query = NULL;
     ql_product_query_view_v1 query_view;
     ql_artifact *counterexample = NULL;
     lowered_side left;
@@ -1089,6 +1578,7 @@ static ql_status QL_CALL smt_product_run(void *instance,
     smt_product_decision decision;
     uint32_t left_supported = 0u;
     uint32_t right_supported = 0u;
+    uint32_t loop_handled = 0u;
     ql_status status;
     QL_STAGE_MARK(stage_total);
 
@@ -1096,6 +1586,8 @@ static ql_status QL_CALL smt_product_run(void *instance,
     memset(&left, 0, sizeof(left));
     memset(&right, 0, sizeof(right));
     memset(&decision, 0, sizeof(decision));
+    decision.loop.struct_size = sizeof(decision.loop);
+    decision.loop.schema_version = QL_LOOP_PROOF_STATS_SCHEMA_VERSION;
     decision.verdict = QL_VERDICT_UNKNOWN;
     decision.evidence_class = QL_EVIDENCE_UNKNOWN;
     if (owned == NULL || context == NULL || output == NULL) {
@@ -1161,6 +1653,69 @@ static ql_status QL_CALL smt_product_run(void *instance,
     }
 
     {
+        ql_ir_view_v1 left_ir_view;
+        ql_ir_view_v1 right_ir_view;
+        uint32_t declared_cyclic;
+
+        memset(&left_ir_view, 0, sizeof(left_ir_view));
+        memset(&right_ir_view, 0, sizeof(right_ir_view));
+        left_ir_view.struct_size = sizeof(left_ir_view);
+        right_ir_view.struct_size = sizeof(right_ir_view);
+        status = ql_ir_get_view(left.ir, &left_ir_view, error);
+        if (status == QL_STATUS_OK) {
+            status = ql_ir_get_view(right.ir, &right_ir_view, error);
+        }
+        if (status != QL_STATUS_OK) {
+            goto cleanup;
+        }
+        declared_cyclic =
+            left_ir_view.cfg_kind == QL_IR_CFG_CYCLIC ||
+                    right_ir_view.cfg_kind == QL_IR_CFG_CYCLIC
+                ? 1u
+                : 0u;
+        if (declared_cyclic != 0u) {
+            ql_loop_proof_options_v1 options;
+            uint32_t binding_match = 0u;
+
+            status = problem_has_positional_proof_binding(
+                problem, &problem_view, &binding_match, error);
+            if (status != QL_STATUS_OK) {
+                goto cleanup;
+            }
+            ql_loop_proof_options_init(&options);
+            options.precondition_is_true =
+                problem_view.contract.precondition_json == NULL ? 1u : 0u;
+            options.contract_binding_match = binding_match;
+            status = ql_loop_proof_query_build(
+                allocator, left.ir, right.ir, &options, &loop_query, error);
+            if (status != QL_STATUS_OK) {
+                goto cleanup;
+            }
+            status = decide_loop(allocator, owned, context, problem,
+                                 &problem_view, loop_query, declared_cyclic,
+                                 &loop_handled, &query_view, &decision, error);
+            if (status != QL_STATUS_OK) {
+                goto cleanup;
+            }
+            if (loop_handled != 0u) {
+                if (decision.verdict == QL_VERDICT_UNKNOWN) {
+                    (void)snprintf(decision.loop.failure_reason,
+                                   sizeof(decision.loop.failure_reason), "%s",
+                                   decision.diagnostic);
+                } else {
+                    decision.loop.failure_reason[0] = '\0';
+                }
+                QL_STAGE_MARK(stage_outcome);
+                status = build_outcome(allocator, owned, &problem_view,
+                                       &query_view, &decision, NULL, output,
+                                       error);
+                QL_STAGE_ADD(QL_STAGE_OUTCOME, stage_outcome);
+                goto cleanup;
+            }
+        }
+    }
+
+    {
         QL_STAGE_MARK(stage_product);
         status = ql_product_query_build(allocator, problem, left.ir, right.ir,
                                         &query, error);
@@ -1208,6 +1763,7 @@ static ql_status QL_CALL smt_product_run(void *instance,
 
 cleanup:
     ql_artifact_release(counterexample);
+    ql_loop_proof_query_destroy(loop_query);
     ql_product_query_destroy(query);
     lowered_side_dispose(&left);
     lowered_side_dispose(&right);
@@ -1226,7 +1782,7 @@ static const ql_method_v1 smt_product_method = {
     sizeof(ql_method_v1),
     QL_ABI_VERSION,
     QL_SMT_PRODUCT_METHOD_NAME,
-    "Relational SMT product of two loop-free scalar C functions",
+    "Relational SMT product with structural loop induction",
     QL_ARTIFACT_KIND_OUTCOME,
     QL_METHOD_PROOF_PRODUCER | QL_METHOD_COUNTEREXAMPLE_PRODUCER |
         QL_METHOD_CACHEABLE,
@@ -1441,6 +1997,164 @@ ql_status QL_CALL ql_smt_product_outcome_read(
 cleanup:
     yyjson_doc_free(document);
     return status;
+}
+
+static ql_loop_proof_strategy loop_strategy_parse(const char *text) {
+    if (text == NULL) {
+        return QL_LOOP_PROOF_STRATEGY_NONE;
+    }
+    if (strcmp(text, "structural-induction") == 0) {
+        return QL_LOOP_PROOF_STRATEGY_STRUCTURAL_INDUCTION;
+    }
+    if (strcmp(text, "affine-summary") == 0) {
+        return QL_LOOP_PROOF_STRATEGY_AFFINE_SUMMARY;
+    }
+    if (strcmp(text, "chc-pdr-unavailable") == 0) {
+        return QL_LOOP_PROOF_STRATEGY_CHC_PDR_UNAVAILABLE;
+    }
+    if (strcmp(text, "exact-reflexivity") == 0) {
+        return QL_LOOP_PROOF_STRATEGY_EXACT_REFLEXIVITY;
+    }
+    return QL_LOOP_PROOF_STRATEGY_NONE;
+}
+
+ql_status QL_CALL ql_smt_product_outcome_loop_stats(
+    const ql_artifact *artifact, ql_loop_proof_stats_v1 *view,
+    ql_error *error) {
+    ql_artifact_view artifact_view;
+    yyjson_doc *document = NULL;
+    yyjson_val *object;
+    yyjson_val *stages;
+    yyjson_val *digests;
+    yyjson_val *value;
+    const char *text;
+    ql_status status;
+
+    if (artifact == NULL || view == NULL) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "outcome artifact and loop stats view are required");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    if (view->struct_size != 0u && view->struct_size < sizeof(*view)) {
+        ql_error_set(error, QL_STATUS_ABI_MISMATCH,
+                     "loop proof stats view structure is too small");
+        return QL_STATUS_ABI_MISMATCH;
+    }
+    status = open_outcome_document(artifact, &artifact_view, &document,
+                                   error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+    memset(view, 0, sizeof(*view));
+    view->struct_size = sizeof(*view);
+    view->schema_version = QL_LOOP_PROOF_STATS_SCHEMA_VERSION;
+    object = yyjson_obj_get(yyjson_doc_get_root(document), "loop_proof");
+    if (!yyjson_is_obj(object)) {
+        ql_error_clear(error);
+        yyjson_doc_free(document);
+        return QL_STATUS_OK;
+    }
+    value = yyjson_obj_get(object, "schema_version");
+    if (!yyjson_is_uint(value) ||
+        yyjson_get_uint(value) != QL_LOOP_PROOF_STATS_SCHEMA_VERSION) {
+        ql_error_set(error, QL_STATUS_SCHEMA_MISMATCH,
+                     "loop proof stats do not use schema version 1");
+        yyjson_doc_free(document);
+        return QL_STATUS_SCHEMA_MISMATCH;
+    }
+    view->applicable = yyjson_get_bool(yyjson_obj_get(object, "applicable"));
+    view->cyclic = yyjson_get_bool(yyjson_obj_get(object, "cyclic"));
+    view->noncanonical_cycle =
+        yyjson_get_bool(yyjson_obj_get(object, "noncanonical_cycle"));
+    view->all_loops_paired =
+        yyjson_get_bool(yyjson_obj_get(object, "all_loops_paired"));
+    view->fallback_reached =
+        yyjson_get_bool(yyjson_obj_get(object, "fallback_reached"));
+    view->fallback_attempted =
+        yyjson_get_bool(yyjson_obj_get(object, "fallback_attempted"));
+    view->proof_eligible =
+        yyjson_get_bool(yyjson_obj_get(object, "proof_eligible"));
+    view->concrete_domain_witness =
+        yyjson_get_bool(yyjson_obj_get(object, "concrete_domain_witness"));
+    text = yyjson_get_str(yyjson_obj_get(object, "strategy"));
+    view->strategy = loop_strategy_parse(text);
+    value = yyjson_obj_get(object, "induction_answer");
+    view->induction_answer =
+        yyjson_is_str(value)
+            ? answer_parse(yyjson_get_str(value), yyjson_get_len(value))
+            : QL_SMT_PRODUCT_ANSWER_NOT_QUERIED;
+    value = yyjson_obj_get(object, "summary_answer");
+    view->summary_answer =
+        yyjson_is_str(value)
+            ? answer_parse(yyjson_get_str(value), yyjson_get_len(value))
+            : QL_SMT_PRODUCT_ANSWER_NOT_QUERIED;
+    value = yyjson_obj_get(object, "reflexivity_answer");
+    view->reflexivity_answer =
+        yyjson_is_str(value)
+            ? answer_parse(yyjson_get_str(value), yyjson_get_len(value))
+            : QL_SMT_PRODUCT_ANSWER_NOT_QUERIED;
+#define QL_READ_LOOP_UINT(field_)                                           \
+    do {                                                                    \
+        value = yyjson_obj_get(object, #field_);                            \
+        if (yyjson_is_uint(value)) {                                        \
+            view->field_ = yyjson_get_uint(value);                          \
+        }                                                                   \
+    } while (0)
+    QL_READ_LOOP_UINT(left_loop_count);
+    QL_READ_LOOP_UINT(right_loop_count);
+    QL_READ_LOOP_UINT(natural_loop_count);
+    QL_READ_LOOP_UINT(paired_loop_count);
+    QL_READ_LOOP_UINT(invariant_generated_count);
+    QL_READ_LOOP_UINT(induction_proved_count);
+    QL_READ_LOOP_UINT(summary_attempted_count);
+    QL_READ_LOOP_UINT(summary_proved_count);
+    QL_READ_LOOP_UINT(reflexivity_proved_count);
+#undef QL_READ_LOOP_UINT
+    stages = yyjson_obj_get(object, "stages");
+    if (yyjson_is_obj(stages)) {
+#define QL_READ_STAGE_UINT(json_name_, field_)                              \
+        do {                                                                \
+            value = yyjson_obj_get(stages, json_name_);                     \
+            if (yyjson_is_uint(value)) {                                    \
+                view->field_ = yyjson_get_uint(value);                      \
+            }                                                               \
+        } while (0)
+        QL_READ_STAGE_UINT("reached", stage_reached);
+        QL_READ_STAGE_UINT("discover_ns", discover_ns);
+        QL_READ_STAGE_UINT("canonicalize_ns", canonicalize_ns);
+        QL_READ_STAGE_UINT("pairing_ns", pairing_ns);
+        QL_READ_STAGE_UINT("invariant_ns", invariant_ns);
+        QL_READ_STAGE_UINT("induction_ns", induction_ns);
+        QL_READ_STAGE_UINT("summary_ns", summary_ns);
+        QL_READ_STAGE_UINT("fallback_ns", fallback_ns);
+        QL_READ_STAGE_UINT("reflexivity_ns", reflexivity_ns);
+#undef QL_READ_STAGE_UINT
+    }
+    digests = yyjson_obj_get(object, "digests");
+    if (yyjson_is_obj(digests)) {
+        (void)read_digest_field(digests, "canonical",
+                                &view->canonical_digest);
+        (void)read_digest_field(digests, "base",
+                                &view->base_obligation_digest);
+        (void)read_digest_field(digests, "guard",
+                                &view->guard_obligation_digest);
+        (void)read_digest_field(digests, "step",
+                                &view->step_obligation_digest);
+        (void)read_digest_field(digests, "exit",
+                                &view->exit_obligation_digest);
+        (void)read_digest_field(digests, "reflexivity",
+                                &view->reflexivity_obligation_digest);
+        (void)read_digest_field(digests, "domain_witness",
+                                &view->domain_witness_digest);
+    }
+    text = yyjson_get_str(yyjson_obj_get(object, "failure_reason"));
+    if (text != NULL) {
+        (void)snprintf(view->failure_reason, sizeof(view->failure_reason),
+                       "%s", text);
+    }
+    ql_error_clear(error);
+    yyjson_doc_free(document);
+    return QL_STATUS_OK;
 }
 
 ql_status QL_CALL ql_smt_product_outcome_counterexample(

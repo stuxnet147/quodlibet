@@ -258,10 +258,11 @@ not the one the engine reports. A caller that wants to act on an e-graph
 
 Method name: `prove.smt-product`. This is the first implemented method. The
 paragraphs below the implementation notes describe the general interface; the
-implementation currently covers the loop-free fragment of that interface over
-scalars and the flat memory model, and refuses the rest.
+implementation covers the loop-free fragment over scalars and the flat memory
+model, plus a deliberately narrow structural scalar-loop fast path. It refuses
+or returns `UNKNOWN` for the rest.
 
-#### Implementation, schema v1
+#### Implementation, method version 2
 
 The method consumes one `quodlibet.problem` artifact and produces one
 `quodlibet.outcome`. It requires problem schema v2 and rejects v1 in
@@ -281,6 +282,11 @@ SMT-LIB prefix and two terminal assertions:
 - `quodlibet_violation` holds exactly when the declared relation is broken;
 - `quodlibet_domain` holds exactly when the comparison domain is inhabited.
 
+Method version 2 adds loop canonicalization, relational induction queries, and
+their query digests to the evidence and cache identity. The outcome artifact
+schema and the independently versioned loop telemetry structure remain
+append-only; a loop-free outcome reports that the loop path was not applicable.
+
 Each observation axis is encoded explicitly. The return-value axis compares
 whether a normal return happened before it compares the value, because a trap
 or a divergence produces no return value at all. The volatile, atomic, I/O, and
@@ -289,6 +295,96 @@ carries the corresponding effect; an effect the encoding cannot state is a
 `QL_STATUS_TYPE_MISMATCH` naming the axis, never a dropped obligation.
 Definedness is governed by the UB policy, as this document specifies, so
 `QL_OBSERVE_UNDEFINED_BEHAVIOR` adds no separate conjunct.
+
+#### Structural relational loop induction
+
+The frontend already lowers `for`, `while`, and `do` to cyclic typed SSA.
+`for` and `while` share a pre-test form and `do` keeps its post-test guard. The
+proof path does not compare those source constructs. It computes dominators,
+finds edges whose targets dominate their sources, merges natural backedges by
+header, and records each loop's header, preheader, latches, exits, guard,
+nesting, and leading loop-carried PHIs. A remaining cycle that is not explained
+by those dominance backedges is outside this fast path.
+
+Loop pairing uses that canonical view and the loop-carried state rather than
+source locations or block identifiers. Reducible single-entry scalar loops are
+the general target. Nested loops, mismatched loop counts, ambiguous guards,
+memory or event-trace state, calls, and unsupported effects do not get silently
+abstracted by the general relational encoder. They reach the fallback boundary
+unless the exact-self rule below applies.
+
+There are two exact-self exceptions to that scalar rule. First, a clean scalar
+self-pair may represent its complete header tuple with exactly sorted shared
+transition symbols. Congruence is sound only after exact IR digest and
+instruction-by-instruction structural matching. This shared-transition
+induction is distinct from the actual left/right expression encoder used for
+non-identical programs.
+
+Second, an exact whole-IR self-pair that reaches the guard, nesting, UB, or
+effect fallback can use a reflexivity rule. Its terminal is the disequality of
+the identical 256-bit IR artifact digests, bound with the canonicalization
+digest.
+It deliberately claims no loop invariant. A concrete interpreter execution
+with one selected zero, one, or all-ones scalar pattern, explicit object bounds
+and images, and a deterministic zero or object-base callee interpretation must
+produce a defined outcome before the domain is considered inhabited. The
+execution is only an existential domain witness,
+not the universal proof. UB, assumption rejection, unsupported semantics, or
+the step limit leaves this rule unavailable.
+
+For paired PHIs the candidate vocabulary is modular bit-vector equality,
+constant offset, and affine relation:
+
+```text
+left == right
+left == right + B
+left == A * right + B
+```
+
+The recurrence analysis independently recognizes identity, fixed addition or
+subtraction, affine multiply-add, and fixed-stride pointer updates. It records
+justified bit-vector candidate coefficients, while the first structural query
+selects the equality relation for paired header state. Pointer candidates retain
+their recognized stride as telemetry, but method version 2 does not synthesize
+a pointer-offset invariant or promote pointer state.
+
+The induction terminal is one combined disjunction of four possible failures:
+
+1. Base: the invariant does not hold at the paired loop entries.
+2. Guard alignment: under the invariant, the two continue predicates disagree.
+3. Step: under the invariant and paired continue condition, one symbolic
+   transition through a latch does not re-establish the invariant.
+4. Exit: under the invariant and paired exit condition, the shared canonical
+   exit projection disagrees.
+
+The builder first checks every latch and exit count and the exact canonical IR
+transition structure. Only an exact structural match may share the guard,
+transition, and exit symbols between sides; non-identical transitions do not
+gain a congruence assumption. An `UNSAT` answer then discharges all four
+obligations for an arbitrary number of iterations through that matched
+transition system. The query never executes the loop, constructs `N` copies of
+its body, or depends on a loop bound. A `SAT` answer only rejects this invariant
+candidate. It is not a program counterexample and is never sent to the ordinary
+counterexample replay path as one.
+
+The analyzer counts affine closed-form opportunities, but method version 2
+does not expose a summary proof terminal. A summary that is disconnected from
+a common iteration count and the actual exit observable would be unsound.
+Consequently summary attempts and proved counts remain zero. An induction
+`SAT`, an unsupported summary connection, or an unsupported loop shape reaches
+the CHC/PDR boundary. No `prove.chc-pdr` method or CHC engine is registered, so
+the fallback is recorded as reached but not attempted and the result is
+`UNKNOWN`.
+
+The promotion gate requires the problem and contract binding, literal-true
+typed precondition, and explicit `trusted-backend` selection. Actual or shared-
+transition induction additionally requires a scalar whole IR with no
+assumptions, UB guards, effects, memory, traces, or pointers, a satisfiable
+encoded domain, and induction `UNSAT`. Exact whole-IR reflexivity instead
+requires exact artifact and structural identity, a concrete defined domain
+witness, and reflexivity `UNSAT`. Other analyzed programs remain `UNKNOWN`.
+As on the loop-free SMT path, promoted Bitwuzla evidence always records
+`checked_proof: false`.
 
 #### The flat memory model in the miter
 
@@ -380,12 +476,19 @@ following hold, and the outcome envelope records every one of them:
    digest are bound into one artifact identity;
 2. the miter covers exactly the contract's relation direction, UB policy, and
    observation axes;
-3. the domain query answered `sat`, so the `unsat` is not vacuous;
+3. the domain query answered `sat`, or exact whole-IR reflexivity recorded a
+   concrete defined witness, so the `unsat` is not vacuous;
 4. the **unbounded** violation query answered `unsat`; the search-only bounded
    variant carries no proof authority at all;
 5. the backend is the pinned Bitwuzla, and its name, version, executable
    content digest, and query digest are recorded;
 6. the caller selected the policy explicitly.
+
+For the structural loop branch, item 4 is either the unbounded combined
+induction terminal or the exact-reflexivity terminal. Base, guard, Step, Exit,
+canonical-loop, reflexivity, and concrete-witness digests are recorded as
+applicable. Affine summary candidates have no terminal. A finite unroll query
+is never substituted for either proof rule.
 
 The envelope always records `checked_proof: false` for this backend. A proof
 from this path rests on trusting Bitwuzla, not on a validated certificate, and
@@ -411,12 +514,15 @@ explicit relational obligations.
 
 Quantifier-free fixed-width, loop-free programs with a finite memory encoding
 are decidable in principle. Solver resource limits can still produce `UNKNOWN`.
-Unbounded loops, recursion, unbounded allocation, quantified memory properties,
-and unrestricted external-call contracts require invariants, summaries, or
-abstraction. Loop unrolling alone yields at most `BOUNDED_CLEAN` after an UNSAT
-query. It yields `PROVED` only if the product is loop-free, the explored state
-space is otherwise complete, or separately checked invariants close every
-back-edge.
+The method-version-2 structural path also closes supported paired scalar loops
+with a separately recorded inductive invariant, and exact self-pairs with the
+whole-IR reflexivity rule described above.
+Recursion, general loop memory, unbounded allocation, quantified memory
+properties, and unrestricted external-call contracts still require a broader
+invariant, summary, or abstraction. Loop unrolling alone yields at most
+`BOUNDED_CLEAN` after an UNSAT query. It yields `PROVED` only if the product is
+loop-free, the explored state space is otherwise complete, or separately
+checked invariants close every backedge.
 
 A SAT result is a candidate counterexample and must be concretized and replayed.
 An UNSAT result supports `PROVED` only when the encoding covers the entire
@@ -426,7 +532,8 @@ a deployment trust boundary that requires checked proof.
 
 Important options include solver and logic, timeout, path alignment strategy,
 memory encoding, floating-point theory, external-call summaries, invariant
-source, proof format, and unroll bounds.
+source, and proof format. The shipped structural loop path has no unroll-bound
+option because its proof query is independent of iteration count.
 
 ### AIG/SAT miter
 
@@ -670,6 +777,11 @@ always false because this method never claims a proof.
 ### CHC/PDR
 
 Recommended method name: `prove.chc-pdr`.
+
+This is still a design contract, not a registered implementation. The
+structural SMT loop path records when it reaches this fallback, but
+`fallback_attempted` remains false because no CHC/PDR backend is available.
+The enclosing method returns `UNKNOWN` at that point.
 
 This method encodes the relational product as constrained Horn clauses and uses
 property-directed reachability or another CHC engine to infer inductive

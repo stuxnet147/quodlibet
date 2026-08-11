@@ -102,6 +102,8 @@ typedef struct ql_py_result {
     char cache_key[QL_DIGEST_HEX_SIZE];
     char counterexample_digest[QL_DIGEST_HEX_SIZE];
 
+    ql_loop_proof_stats_v1 loop_proof;
+
     /* Owned canonical counterexample bytes, or null. */
     char *counterexample_json;
     size_t counterexample_json_size;

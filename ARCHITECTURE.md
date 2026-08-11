@@ -414,6 +414,84 @@ a jump that bypasses an initialisation, and entry into a loop or switch from
 outside remain `UNKNOWN`. A loop-carried pointer must also retain compatible
 object authority across every backedge.
 
+#### Canonical natural-loop analysis feeds relational induction
+
+Structured `for` and `while` statements use the same pre-test cyclic SSA
+lowering, while `do` uses the corresponding post-test shape. Source spelling is
+not the proof identity. `src/loop_analysis.c` reconstructs a canonical CFG view
+from dominators and edges whose targets dominate their sources. Backedges with
+the same target form one natural loop. The view records its header, unique
+preheader when present, latches, exits, nesting, pre-test or post-test guard,
+and leading loop-carried PHIs. A residual cycle after removing dominance
+backedges is explicitly unclassified and cannot enter the structural fast
+path.
+
+Each PHI records its entry value and the value supplied by every latch. The
+analysis recognizes identity, constant add and subtract, affine multiply-add,
+and fixed-stride pointer recurrences. Loop pairing compares these canonical
+facts rather than source node kinds or basic-block numbers. The first
+relational candidates have the modular forms `left == right`, `left == right +
+B`, and `left == A * right + B`. A candidate is selected only when its entry
+relation and the two analyzer recurrences preserve it. Fixed-stride pointer
+recurrences are identified for telemetry, but pointer relations are not
+proof-eligible in method version 2.
+
+The actual relational encoder handles one paired reducible pre-test loop. Each
+side has an unconditional chain from function entry to the preheader, one
+latch expression per PHI, one exit, and that exit is the function's sole
+return. The encoder declares shared scalar parameters, but serializes the left
+and right PHI entries, guards, recurrence expressions, and return expressions
+separately. The selected equality, offset, or affine candidate defines Base and
+the loop invariant; the separately serialized expressions define guard
+alignment, one-step closure, and Exit. Bitwuzla receives their disjunction as
+one unbounded induction query, with no execution or unrolling.
+
+If that actual encoder cannot express an exact whole-IR self-pair, the builder
+retries structural reflexivity. It may share exactly sorted guard, transition,
+and exit symbols only after exact IR structural matching. This retry covers
+canonical self-pair shapes such as post-test and sequential loops without
+asserting that two different transition systems are congruent. Clean scalar
+self-pairs may be promoted through this induction query.
+
+An exact self-pair that needs memory, trace, pointer, UB, `ASSUME`, effects, an
+ambiguous guard, or nesting instead uses a separate whole-IR reflexivity rule.
+The rule requires both the exact IR artifact digest and an instruction-by-
+instruction structural match. Its SMT terminal states the disequality of the
+two identical 256-bit IR digests. This is not reported as a generated loop
+invariant. Before promotion, a finite concrete witness search must also return
+a defined outcome for one selected scalar pattern, object image, and
+external-callee interpretation. That run proves only that the comparison
+domain is inhabited; the universal equality comes from exact whole-IR
+identity. UB, a rejected
+assumption, unsupported interpretation, or the interpreter step limit rejects
+the witness and leaves the result `UNKNOWN`.
+
+The recurrence analyzer also counts disconnected identity and fixed-additive
+closed-form candidates. Their common iteration count and actual exit
+observable are not yet connected, so method version 2 exposes no summary proof
+terminal, never sets the summary stage, and never records a summary attempt or
+success. An induction `SAT`, unsupported shape, failed pairing, or missing
+invariant reaches the recorded CHC/PDR boundary. No CHC/PDR backend is
+registered, so it returns `UNKNOWN`.
+
+Loop induction does not weaken the ordinary proof gate. The method still binds
+the problem, signatures, correspondence, typed precondition, semantic
+contract, exact queries, backend identity, and method version. The actual and
+shared-transition induction paths require a true typed precondition, a scalar
+whole IR free of assumptions, UB, effects, memory, traces, and pointers, plus
+a satisfiable encoded comparison-domain query. The exact whole-IR reflexivity
+path instead requires its concrete defined witness. Either path also requires
+explicit trusted-Bitwuzla selection. The outcome remains
+`checked_proof=false` because Bitwuzla supplies no independently checked proof
+object. Candidate `SAT` rejects the candidate; it is not a program
+counterexample.
+
+Loop telemetry marks only stages actually reached. A solver-reaching proof has
+discover, canonicalize, pairing, invariant, and induction bits. An early
+fallback retains only its completed prefix plus fallback; an induction `SAT`
+adds fallback after induction. The summary bit is never set in method version
+2, and skipped stages do not contribute zero-valued latency samples.
+
 #### Data pointers retain up to three levels of indirection
 
 The lowering preserves up to three declarator and typedef stars rather than
@@ -560,9 +638,11 @@ path should make the trusted base smaller:
 5. Content-addressed caching stores only artifacts whose schema and contract
    identities are part of the key.
 
-The first useful vertical slice should be restricted, loop-free C lowered to
-bit vectors and memory, an AIG/SAT miter plugin, a concrete counterexample
-replayer, and a small certificate-checking boundary.
+The first vertical slice remains restricted C lowered to bit vectors and
+memory, an AIG/SAT miter, a concrete counterexample replayer, and a small
+certificate-checking boundary. The structural loop fast path extends the SMT
+branch with explicitly recorded relational invariants; it does not turn the
+host or a general loop engine into part of that checked boundary.
 
 Tree-sitter is deliberately outside the proof boundary. Its concrete syntax
 tree preserves source structure for fast filtering and later lowering, but a

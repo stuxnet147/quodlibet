@@ -76,6 +76,8 @@ void ql_py_result_init(ql_py_result *result) {
     memset(result, 0, sizeof(*result));
     result->verdict = QL_VERDICT_UNKNOWN;
     result->evidence_class = QL_EVIDENCE_UNKNOWN;
+    result->loop_proof.struct_size = sizeof(result->loop_proof);
+    result->loop_proof.schema_version = QL_LOOP_PROOF_STATS_SCHEMA_VERSION;
     ql_budget_usage_init(&result->usage);
     ql_policy_result_init(&result->policy);
 }
@@ -567,6 +569,13 @@ void ql_py_check(const ql_py_spec *spec, ql_py_result *result) {
     (void)snprintf(result->diagnostic, sizeof(result->diagnostic), "%s",
                    view.diagnostic);
     record_digests(result, &view);
+
+    status = ql_smt_product_outcome_loop_stats(
+        ql_pipeline_result_artifact(run_result, 0u), &result->loop_proof,
+        &error);
+    if (status != QL_STATUS_OK) {
+        goto failed;
+    }
 
     status = ql_smt_product_outcome_counterexample(
         allocator, ql_pipeline_result_artifact(run_result, 0u),

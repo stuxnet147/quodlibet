@@ -2,9 +2,10 @@
 
 Quodlibet 0.1.0 is a native C17 function-equivalence engine and a framework
 for composing proof and refutation methods. It has an end-to-end path for the
-currently supported subset of the `ASM2C_GNU_V1` C profile. Exact proof
-backends remain loop-free, while the lowering, verifier, and interpreter also
-carry cyclic CFGs:
+currently supported subset of the `ASM2C_GNU_V1` C profile. The SMT product
+also has a narrow unbounded relational-induction path for structurally paired
+loops; AIG/SAT and the general product encoding remain loop-free. The lowering,
+verifier, and interpreter carry cyclic CFGs:
 
 1. parse and resolve two C functions;
 2. lower them to typed SSA IR with explicit definedness and effects;
@@ -16,8 +17,8 @@ carry cyclic CFGs:
 
 Quodlibet is not yet a general C equivalence checker. Unsupported syntax or
 semantics produce an explicit `UNKNOWN` result instead of being approximated
-as a narrower problem. Loops remain outside the exact proof slice and several
-important C features remain outside the lowering.
+as a narrower problem. Loops outside the structural scalar fast path and
+several important C features remain outside the exact proof slice.
 
 ## What is implemented
 
@@ -49,6 +50,9 @@ important C features remain outside the lowering.
 - immutable typed SSA IR with acyclic or cyclic control flow, PHI nodes,
   memory objects, calls,
   traps, termination, effects, UB guards, and initial memory images;
+- dominator and natural-backedge loop analysis that identifies headers,
+  preheaders, latches, exits, guards, induction recurrences, and loop-carried
+  PHIs independently of whether the source used `for`, `while`, or `do`;
 - an independent IR verifier and a concrete interpreter;
 - differential tests that compare lowered execution with compiled C;
 - a flat 64-bit little-endian memory model for the `ASM2C_GNU_V1` profile,
@@ -69,17 +73,37 @@ The builtin registry currently contains:
 | Method | Role | Positive evidence |
 | --- | --- | --- |
 | `builtin.identity` | Pipeline and plugin plumbing | No logical claim |
-| `prove.smt-product` | Relational SMT product over loop-free IR and flat memory | Explicit trusted-Bitwuzla policy, recorded as `checked_proof=false` |
+| `prove.smt-product` | Relational SMT product over loop-free IR and a structural scalar-loop induction fast path | Explicit trusted-Bitwuzla policy, recorded as `checked_proof=false` |
 | `prove.aig-sat` | Bit-blasted scalar product using CaDiCaL | LRAT certificate accepted by the independent `lrat-check`, recorded as `checked_proof=true` |
 | `refute.concrete-differential` | Deterministic boundary and random input search | Replay-confirmed counterexample only |
 
-Both exact paths use the same product-query encoding. A SAT assignment is only
-a candidate until the shared concrete replay path reproduces the violation.
+The loop-free SMT and AIG/SAT paths use the same product-query encoding. A SAT
+assignment from that encoding is only a candidate until the shared concrete
+replay path reproduces the violation.
 The SMT method defaults to retaining raw Bitwuzla `UNSAT` as evidence while
 returning `UNKNOWN`; promotion requires the caller to select the recorded
 `trusted-backend` policy. The AIG/SAT method promotes `UNSAT` only after its
 LRAT certificate is independently checked and the comparison domain is shown
 to be inhabited.
+
+For paired scalar loops, method version 2 first compares canonical natural-loop
+structure and loop-carried state. Its non-identical fast path accepts one
+reducible pre-test loop with an unconditional entry chain and one direct-return
+exit. It selects a justified equality, constant-offset, or affine bit-vector
+relation for every header PHI, serializes the two entry, guard, one-step, and
+exit expressions separately, and checks their combined Base, guard alignment,
+Step, and Exit obligation. This query is independent of the iteration count.
+
+An exact clean scalar self-pair may retry induction with shared transition
+symbols after exact structural matching. Effectful, UB-bearing, nested, or
+ambiguous-guard exact self-pairs use a separate whole-IR reflexivity rule: the
+solver refutes
+the disequality of identical IR digests, and a concrete defined interpreter
+execution proves that the comparison domain is inhabited. This rule reports no
+generated invariant. Fixed-stride pointers and disconnected fixed-additive
+closed forms are telemetry-only. No summary proof terminal is exposed or
+attempted. If neither unbounded rule applies, the unavailable CHC/PDR fallback
+leaves `UNKNOWN`; finite unrolling is never used as proof.
 
 The core also provides:
 
@@ -109,7 +133,7 @@ The latest checked corpus report uses 29,893 distinct training C bodies from
 
 The lowering number is the relevant completeness limit. The largest remaining
 groups include pointers loaded from memory whose object provenance cannot yet
-be recovered, `sizeof(expression)` and array/function type descriptors, loops,
+be recovered, `sizeof(expression)` and array/function type descriptors,
 uninitialized-read analysis, additional record and function types, variadic
 calls, and unsupported control flow. Preprocessor
 directives are detected but not expanded, so callers must supply preprocessed
@@ -117,12 +141,21 @@ source. Volatile and atomic behavior is represented in the contract and IR
 vocabulary but is not yet lowered from general C.
 
 CHC/PDR and bounded symbolic execution are documented future methods, not
-registered implementations. The AIG/SAT path is currently scalar and refuses
-array sorts. The Python `check` API uses the SMT product path; other registered
-methods are available through the native C API and pipelines.
+registered implementations. The actual relational loop path is deliberately
+limited to one paired reducible pre-test scalar loop. Exact self-pairs can use
+shared-transition induction for clean canonical shapes or whole-IR
+reflexivity, including effectful, UB-bearing, nested, and ambiguous-guard
+shapes, when a concrete defined domain witness exists. Irreducible, unmatched,
+non-self nested, and exact pairs whose finite witness candidates all reach UB,
+unsupported semantics, assumption rejection, or the step limit remain
+`UNKNOWN`. The AIG/SAT path is currently scalar and refuses array sorts.
+The Python `check` API uses the SMT product path; other registered methods are
+available through the native C API and pipelines.
 
 The latest lowering and verifier measurement is in
 [`docs/coverage/coverage-20260810-g8-sizeof.md`](docs/coverage/coverage-20260810-g8-sizeof.md).
+The worker-1 loop self-pair proof and recovery measurement is in
+[`docs/perf/loop-proof-self-pair-20260811.md`](docs/perf/loop-proof-self-pair-20260811.md).
 The preceding diagnostic distribution is in
 [`docs/coverage/coverage-20260812b.md`](docs/coverage/coverage-20260812b.md).
 The bounded libFuzzer campaign ran all nine current targets for one minute each

@@ -214,6 +214,36 @@ TEST(SmtProductMethod, ProvesEquivalenceOnlyUnderTheRecordedTrustPolicy) {
   EXPECT_EQ(0u, ql_digest_equal(&proved.cache_key, &unproved.cache_key));
 }
 
+TEST(SmtProductMethod, CacheIdentityBindsExactSolverOptions) {
+  w2::Pair pair;
+  OutcomeRun defaults;
+  OutcomeRun explicit_options;
+  ql_error error{};
+
+  if (!BackendAvailable()) {
+    GTEST_SKIP() << "Bitwuzla support is disabled";
+  }
+  ASSERT_EQ(QL_STATUS_OK,
+            pair.Build(kAdd, "add", kSum, "sum", w2::DefaultContract(),
+                       &error))
+      << error.message;
+  ASSERT_EQ(QL_STATUS_OK, defaults.Run(pair, kTrusted, &error))
+      << error.message;
+  ASSERT_EQ(QL_STATUS_OK,
+            explicit_options.Run(
+                pair,
+                "{\"unsat_promotion\":\"trusted-backend\","
+                "\"solver_options\":\"{}\"}",
+                &error))
+      << error.message;
+
+  const ql_smt_product_outcome_view_v1 left = defaults.view();
+  const ql_smt_product_outcome_view_v1 right = explicit_options.view();
+  EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, left.verdict);
+  EXPECT_EQ(QL_VERDICT_PROVED_EQUIVALENT, right.verdict);
+  EXPECT_EQ(0u, ql_digest_equal(&left.cache_key, &right.cache_key));
+}
+
 TEST(SmtProductMethod, EmitsAReplayedCounterexample) {
   w2::Pair pair;
   OutcomeRun run;

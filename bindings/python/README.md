@@ -52,6 +52,7 @@ result.verdict              # "proved-equivalent" | "counterexample" | "unknown"
 result.status               # how the run ended, separately from what it concluded
 result.evidence             # the envelope summary, including checked_proof=False
 result.counterexample       # the replayed inputs and observations, or None
+result.loop_proof           # loop pairing, induction, summary, fallback telemetry
 ```
 
 A batch for a training loop. The extension releases the GIL for the whole
@@ -75,13 +76,29 @@ The binding does not soften any of the core's boundaries.
   checker to validate.
 * `counterexample` is reported only after the SAT model was decoded into typed
   inputs and replayed concretely. `result.evidence.replay_confirmed` records it.
-* A source outside the loop-free scalar restricted-C slice is `unknown` with
-  `result.status.kind == "unsupported"`, never a narrower question answered.
+* Loop-free scalar code and the finite flat-memory slice use the ordinary SMT
+  product. Paired reducible scalar loops may use the structural fast path.
+  Exact whole-IR self-pairs may separately use digest-bound reflexivity when a
+  concrete defined interpreter run establishes an inhabited domain.
+* The induction path proves Base, guard alignment, Step, and Exit with one
+  symbolic transition. It does not execute or finitely unroll the loop. A
+  failed structural candidate records the unavailable CHC/PDR fallback and
+  remains `unknown`. Affine summary opportunities are telemetry-only and no
+  summary terminal is attempted.
 * An exhausted budget is `unknown` with `result.evidence.budget_exhausted` set.
   Exhaustion is a run state, not a logical verdict.
 * A verdict policy that would manufacture a proof, promote a verdict, or accept
   an unreplayed SAT model is rejected before the run starts, as a
   `QuodlibetError`.
+
+`result.loop_proof` preserves raw per-judgement counts for loop discovery,
+pairing, invariant generation, induction, summary, and fallback. Its
+`stage_reached` map distinguishes a skipped stage from a measured zero; use
+only applicable samples that actually reached and measured a stage when
+computing latency percentiles. An unmeasured fallback duration is not zero.
+A promoted loop proof still requires the explicit trusted-Bitwuzla policy and
+either a satisfiable encoded comparison-domain query or the exact path's
+concrete defined witness, and still reports `checked_proof=False`.
 
 ## The SMT backend
 

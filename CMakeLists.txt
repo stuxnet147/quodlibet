@@ -83,6 +83,8 @@ file(GLOB QL_OPTIONAL_CORE_SOURCES CONFIGURE_DEPENDS LIST_DIRECTORIES false
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ir_interp.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ir_verify.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/log.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/loop_analysis.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/loop_proof.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/policy.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/precondition.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/problem.c"

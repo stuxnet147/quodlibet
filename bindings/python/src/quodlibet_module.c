@@ -206,11 +206,153 @@ static PyObject *build_usage_dict(const ql_budget_usage_v1 *usage) {
     return dict;
 }
 
+static const char *loop_strategy_name(ql_loop_proof_strategy strategy) {
+    switch (strategy) {
+    case QL_LOOP_PROOF_STRATEGY_STRUCTURAL_INDUCTION:
+        return "structural-induction";
+    case QL_LOOP_PROOF_STRATEGY_AFFINE_SUMMARY:
+        return "affine-summary";
+    case QL_LOOP_PROOF_STRATEGY_CHC_PDR_UNAVAILABLE:
+        return "chc-pdr-unavailable";
+    case QL_LOOP_PROOF_STRATEGY_EXACT_REFLEXIVITY:
+        return "exact-reflexivity";
+    default:
+        return "none";
+    }
+}
+
+static PyObject *build_loop_proof_dict(
+    const ql_loop_proof_stats_v1 *loop) {
+    PyObject *dict = PyDict_New();
+    PyObject *stage_ns = PyDict_New();
+    PyObject *stage_reached = PyDict_New();
+    char canonical[QL_DIGEST_HEX_SIZE];
+    char base[QL_DIGEST_HEX_SIZE];
+    char guard[QL_DIGEST_HEX_SIZE];
+    char step[QL_DIGEST_HEX_SIZE];
+    char exit_digest[QL_DIGEST_HEX_SIZE];
+    char reflexivity[QL_DIGEST_HEX_SIZE];
+    char domain_witness[QL_DIGEST_HEX_SIZE];
+
+    if (dict == NULL || stage_ns == NULL || stage_reached == NULL) {
+        Py_XDECREF(dict);
+        Py_XDECREF(stage_ns);
+        Py_XDECREF(stage_reached);
+        return NULL;
+    }
+#define QL_LOOP_BOOL(name_, value_)                                         \
+    if (dict_set(dict, name_, PyBool_FromLong((long)((value_) != 0u))) != 0) \
+        goto failure
+#define QL_LOOP_UINT(name_, value_)                                         \
+    if (dict_set_u64(dict, name_, (uint64_t)(value_)) != 0) goto failure
+    QL_LOOP_BOOL("applicable", loop->applicable);
+    QL_LOOP_BOOL("cyclic", loop->cyclic);
+    QL_LOOP_BOOL("noncanonical_cycle", loop->noncanonical_cycle);
+    QL_LOOP_BOOL("all_loops_paired", loop->all_loops_paired);
+    QL_LOOP_BOOL("fallback_reached", loop->fallback_reached);
+    QL_LOOP_BOOL("fallback_attempted", loop->fallback_attempted);
+    QL_LOOP_BOOL("proof_eligible", loop->proof_eligible);
+    QL_LOOP_BOOL("concrete_domain_witness",
+                 loop->concrete_domain_witness);
+    if (dict_set_str(dict, "strategy", loop_strategy_name(loop->strategy)) !=
+            0 ||
+        dict_set_i(dict, "induction_answer",
+                   (long)loop->induction_answer) != 0 ||
+        dict_set_i(dict, "summary_answer", (long)loop->summary_answer) != 0)
+        goto failure;
+    if (dict_set_i(dict, "reflexivity_answer",
+                   (long)loop->reflexivity_answer) != 0)
+        goto failure;
+    QL_LOOP_UINT("left_loop_count", loop->left_loop_count);
+    QL_LOOP_UINT("right_loop_count", loop->right_loop_count);
+    QL_LOOP_UINT("natural_loop_count", loop->natural_loop_count);
+    QL_LOOP_UINT("paired_loop_count", loop->paired_loop_count);
+    QL_LOOP_UINT("invariant_generated_count",
+                 loop->invariant_generated_count);
+    QL_LOOP_UINT("induction_proved_count", loop->induction_proved_count);
+    QL_LOOP_UINT("summary_attempted_count", loop->summary_attempted_count);
+    QL_LOOP_UINT("summary_proved_count", loop->summary_proved_count);
+    QL_LOOP_UINT("reflexivity_proved_count",
+                 loop->reflexivity_proved_count);
+    if (dict_set_u64(stage_ns, "discover", loop->discover_ns) != 0 ||
+        dict_set_u64(stage_ns, "canonicalize", loop->canonicalize_ns) != 0 ||
+        dict_set_u64(stage_ns, "pairing", loop->pairing_ns) != 0 ||
+        dict_set_u64(stage_ns, "invariant", loop->invariant_ns) != 0 ||
+        dict_set_u64(stage_ns, "induction", loop->induction_ns) != 0 ||
+        dict_set_u64(stage_ns, "summary", loop->summary_ns) != 0 ||
+        dict_set_u64(stage_ns, "fallback", loop->fallback_ns) != 0 ||
+        dict_set_u64(stage_ns, "reflexivity", loop->reflexivity_ns) != 0 ||
+        dict_set(stage_reached, "discover",
+                 PyBool_FromLong((loop->stage_reached &
+                                  QL_LOOP_STAGE_DISCOVER) != 0u)) != 0 ||
+        dict_set(stage_reached, "canonicalize",
+                 PyBool_FromLong((loop->stage_reached &
+                                  QL_LOOP_STAGE_CANONICALIZE) != 0u)) != 0 ||
+        dict_set(stage_reached, "pairing",
+                 PyBool_FromLong((loop->stage_reached &
+                                  QL_LOOP_STAGE_PAIRING) != 0u)) != 0 ||
+        dict_set(stage_reached, "invariant",
+                 PyBool_FromLong((loop->stage_reached &
+                                  QL_LOOP_STAGE_INVARIANT) != 0u)) != 0 ||
+        dict_set(stage_reached, "induction",
+                 PyBool_FromLong((loop->stage_reached &
+                                  QL_LOOP_STAGE_INDUCTION) != 0u)) != 0 ||
+        dict_set(stage_reached, "summary",
+                 PyBool_FromLong((loop->stage_reached &
+                                  QL_LOOP_STAGE_SUMMARY) != 0u)) != 0 ||
+        dict_set(stage_reached, "fallback",
+                 PyBool_FromLong((loop->stage_reached &
+                                  QL_LOOP_STAGE_FALLBACK) != 0u)) != 0)
+        goto failure;
+    if (dict_set(stage_reached, "reflexivity",
+                 PyBool_FromLong((loop->stage_reached &
+                                  QL_LOOP_STAGE_REFLEXIVITY) != 0u)) != 0)
+        goto failure;
+    if (dict_set(dict, "stage_ns", stage_ns) != 0) {
+        stage_ns = NULL;
+        goto failure;
+    }
+    stage_ns = NULL;
+    if (dict_set(dict, "stage_reached", stage_reached) != 0) {
+        stage_reached = NULL;
+        goto failure;
+    }
+    stage_reached = NULL;
+    ql_digest_hex(&loop->canonical_digest, canonical);
+    ql_digest_hex(&loop->base_obligation_digest, base);
+    ql_digest_hex(&loop->guard_obligation_digest, guard);
+    ql_digest_hex(&loop->step_obligation_digest, step);
+    ql_digest_hex(&loop->exit_obligation_digest, exit_digest);
+    ql_digest_hex(&loop->reflexivity_obligation_digest, reflexivity);
+    ql_digest_hex(&loop->domain_witness_digest, domain_witness);
+    if (dict_set_str(dict, "canonical_digest", canonical) != 0 ||
+        dict_set_str(dict, "base_obligation_digest", base) != 0 ||
+        dict_set_str(dict, "guard_obligation_digest", guard) != 0 ||
+        dict_set_str(dict, "step_obligation_digest", step) != 0 ||
+        dict_set_str(dict, "exit_obligation_digest", exit_digest) != 0 ||
+        dict_set_str(dict, "reflexivity_obligation_digest", reflexivity) != 0 ||
+        dict_set_str(dict, "domain_witness_digest", domain_witness) != 0 ||
+        dict_set_str(dict, "failure_reason", loop->failure_reason) != 0)
+        goto failure;
+#undef QL_LOOP_BOOL
+#undef QL_LOOP_UINT
+    return dict;
+
+failure:
+#undef QL_LOOP_BOOL
+#undef QL_LOOP_UINT
+    Py_XDECREF(stage_ns);
+    Py_XDECREF(stage_reached);
+    Py_DECREF(dict);
+    return NULL;
+}
+
 static PyObject *build_result_dict(const ql_py_result *result) {
     PyObject *dict = PyDict_New();
     PyObject *counterexample;
     PyObject *policy;
     PyObject *usage;
+    PyObject *loop_proof;
 
     if (dict == NULL) {
         return NULL;
@@ -277,6 +419,11 @@ static PyObject *build_result_dict(const ql_py_result *result) {
 
     usage = build_usage_dict(&result->usage);
     if (dict_set(dict, "usage", usage) != 0) {
+        Py_DECREF(dict);
+        return NULL;
+    }
+    loop_proof = build_loop_proof_dict(&result->loop_proof);
+    if (dict_set(dict, "loop_proof", loop_proof) != 0) {
         Py_DECREF(dict);
         return NULL;
     }

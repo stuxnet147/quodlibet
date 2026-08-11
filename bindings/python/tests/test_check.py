@@ -55,13 +55,129 @@ def test_counterexample_is_replayed_before_it_is_reported(backend):
     assert result.evidence.counterexample_digest != ""
 
 
-def test_a_cyclic_source_stays_unknown_for_the_loop_free_method(backend):
+def test_unpaired_cyclic_sources_reach_the_explicit_fallback(backend):
     result = quodlibet.check(LOOPING, "add", SUM, "sum")
     assert result.verdict == "unknown"
     assert result.status.kind == "method"
     assert result.status.ok is True
-    assert "loop-free" in result.diagnostic
     assert result.counterexample is None
+    assert result.loop_proof.applicable is True
+    assert result.loop_proof.cyclic is True
+    assert result.loop_proof.all_loops_paired is False
+    assert result.loop_proof.fallback_reached is True
+    assert result.loop_proof.fallback_attempted is False
+    assert result.loop_proof.strategy == "chc-pdr-unavailable"
+    assert result.loop_proof.stage_reached == {
+        "discover": True,
+        "canonicalize": False,
+        "pairing": False,
+        "invariant": False,
+        "induction": False,
+        "summary": False,
+        "fallback": True,
+        "reflexivity": False,
+    }
+
+
+def test_unsigned_scalar_self_pair_is_proved_by_loop_induction(backend):
+    loop = (
+        "unsigned f(unsigned x, unsigned n) {"
+        " while (n != 0u) { x += 3u; --n; }"
+        " return x; }"
+    )
+    raw = quodlibet.check(loop, "f", loop, "f", observations=["return-value"])
+    assert raw.verdict == "unknown"
+    assert raw.evidence.violation_answer == "unsat"
+    assert raw.evidence.domain_answer == "sat"
+    assert raw.evidence.unsat_promotion == "none"
+
+    result = quodlibet.check(
+        loop,
+        "f",
+        loop,
+        "f",
+        observations=["return-value"],
+        trust_smt_backend=True,
+    )
+    assert result.verdict == "proved-equivalent"
+    assert result.loop_proof.applicable is True
+    assert result.loop_proof.natural_loop_count == 1
+    assert result.loop_proof.left_loop_count == 1
+    assert result.loop_proof.right_loop_count == 1
+    assert result.loop_proof.paired_loop_count == 1
+    assert result.loop_proof.all_loops_paired is True
+    assert result.loop_proof.invariant_generated_count > 0
+    assert result.loop_proof.induction_proved_count == 1
+    assert result.loop_proof.proof_eligible is True
+    assert result.loop_proof.strategy == "structural-induction"
+    assert result.loop_proof.induction_answer == "unsat"
+    assert result.loop_proof.stage_reached["induction"] is True
+    assert result.loop_proof.stage_reached["fallback"] is False
+    assert all(result.loop_proof.digests[name].strip("0") for name in (
+        "canonical",
+        "base",
+        "guard",
+        "step",
+        "exit",
+    ))
+
+
+def test_effectful_self_pair_uses_defined_witness_reflexivity(backend):
+    loop = (
+        "unsigned total;"
+        "unsigned f(unsigned n) {"
+        " while (n != 0u) { total += n; --n; }"
+        " return total; }"
+    )
+    result = quodlibet.check(
+        loop,
+        "f",
+        loop,
+        "f",
+        observations=["return-value", "memory"],
+        trust_smt_backend=True,
+    )
+
+    assert result.verdict == "proved-equivalent"
+    assert result.evidence.checked_proof is False
+    assert result.evidence.domain_answer == "sat"
+    assert result.loop_proof.strategy == "exact-reflexivity"
+    assert result.loop_proof.concrete_domain_witness is True
+    assert result.loop_proof.invariant_generated_count == 0
+    assert result.loop_proof.induction_answer == "not-queried"
+    assert result.loop_proof.reflexivity_answer == "unsat"
+    assert result.loop_proof.reflexivity_proved_count == 1
+    assert result.loop_proof.stage_reached["reflexivity"] is True
+    assert result.loop_proof.stage_reached["fallback"] is False
+    assert result.loop_proof.digests["reflexivity"].strip("0")
+    assert result.loop_proof.digests["domain_witness"].strip("0")
+
+
+def test_guard_mismatch_is_unknown_not_a_candidate_counterexample(backend):
+    left = (
+        "unsigned f(unsigned x, unsigned n) {"
+        " while (n != 0u) { x += 3u; --n; }"
+        " return x; }"
+    )
+    right = (
+        "unsigned g(unsigned x, unsigned n) {"
+        " while (n > 1u) { x += 3u; --n; }"
+        " return x; }"
+    )
+    result = quodlibet.check(
+        left,
+        "f",
+        right,
+        "g",
+        observations=["return-value"],
+        trust_smt_backend=True,
+    )
+    assert result.verdict == "unknown"
+    assert result.counterexample is None
+    assert result.evidence.replay_confirmed is False
+    assert result.loop_proof.fallback_reached is True
+    assert result.loop_proof.fallback_attempted is False
+    assert result.loop_proof.stage_reached["fallback"] is True
 
 
 def test_a_source_outside_the_lowering_slice_stays_unknown(backend):

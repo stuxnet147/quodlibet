@@ -1054,6 +1054,10 @@ TEST(AigSatMethod, AnUnsatWhoseCertificateDoesNotCheckIsNotPromoted) {
    encoders disagree" is never to pick one. */
 TEST(AigSatMethod, TheSatBackendAndTheSmtBackendAgreeOnTheSameQuery) {
     SKIP_WITHOUT_SAT();
+    if (ql_bitwuzla_solver_descriptor()->capability.availability ==
+        QL_SOLVER_UNAVAILABLE) {
+        GTEST_SKIP() << "Bitwuzla support is disabled";
+    }
     struct Case {
         const char *left_source;
         const char *left_name;

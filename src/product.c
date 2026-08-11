@@ -664,9 +664,15 @@ static ql_status side_order_blocks(product_side *side,
   }
   allocator->deallocate(allocator->user_data, in_degree);
   if (placed != side->view.block_count) {
-    ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
-                 "IR control-flow graph is not acyclic");
-    return QL_STATUS_INTERNAL_ERROR;
+    /* The lowering conservatively marks a function CYCLIC as soon as it sees
+       a source loop, even when every path in that loop breaks or returns and
+       no backedge survives in the IR.  The graph, rather than that declaration
+       bit, is the proof boundary.  A real topological shortfall is unsupported
+       cyclic control flow; a fully ordered graph remains an ordinary exact
+       product. */
+    ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                 "cyclic IR is outside the loop-free SMT product");
+    return QL_STATUS_TYPE_MISMATCH;
   }
   return QL_STATUS_OK;
 }
@@ -848,11 +854,6 @@ static ql_status side_prepare(product_side *side, const ql_ir *ir, char prefix,
   status = ql_ir_get_view(ir, &side->view, error);
   if (status != QL_STATUS_OK) {
     return status;
-  }
-  if (side->view.cfg_kind != QL_IR_CFG_ACYCLIC) {
-    ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
-                 "cyclic IR is outside the loop-free SMT product");
-    return QL_STATUS_TYPE_MISMATCH;
   }
   side->value_symbols =
       allocator->allocate(allocator->user_data,

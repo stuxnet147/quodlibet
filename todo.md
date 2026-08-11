@@ -6,7 +6,7 @@
 
 ## 워크스트림 현황
 
-갱신일: 2026-08-10 (G8 완료, Windows 511/511, Linux ASan+UBSan 510/510)
+갱신일: 2026-08-11 (loop relational proof와 WSL 재검증 진행)
 
 | 코드 | 이름 | GOAL | 상태 | 담당 |
 |---|---|---|---|---|
@@ -57,7 +57,7 @@
 - [ ] 배열, 구조체, 공용체, 비트필드, enum
 - [ ] 정수 promotion 과 usual arithmetic conversion 을 C11 6.3.1.8 대로
 - [ ] 함수 호출과 외부 효과, 호출 순서 관찰
-- [x] 루프: `for`/`while`/`do` 구조 보존 하강, 순환 SSA와 interpreter 실행. exact proof method는 W6에 별도 미완료
+- [x] 루프: `for`/`while`/`do` 구조 보존 하강, 순환 SSA와 interpreter 실행. W6의 structural scalar relational induction fast path까지 연결했고 범용 메모리/비정형 루프는 별도 미완료
 - [ ] `switch`, `goto`, 레이블, 중첩 제어 흐름
 - [ ] 전역 변수와 정적 저장 기간
 - [ ] `volatile`, `_Atomic`, I/O 관찰 의미론
@@ -70,7 +70,7 @@
 - [x] versioned source-signature artifact (signedness, width, pointer/address-space, ABI 보존) (증거: `src/signature.c` 의 `quodlibet.source-signature` v1, `tests/test_signature.cpp`)
 - [x] problem schema v2 에 좌우 signature digest, 인자 대응, typed-precondition digest 결합 (증거: `ql_problem_artifact_create_v2` in `src/problem.c`, `tests/test_problem.cpp:308`)
 - [x] problem v1 의 non-null precondition 으로는 `PROVED_*` 를 낼 수 없도록 gate 추가 (증거: `ql_problem_require_proof_binding`, `tests/test_problem.cpp:339`, `SmtProductMethod.RefusesASchemaV1ProblemBeforeExecuting`)
-- [x] 좌우 loop-free scalar IR 을 결합하는 product program 또는 SMT miter (증거: `src/product.c`, `tests/test_product.cpp`. GOAL.md G5 의 한정대로 loop-free 슬라이스 위에서이고, 메모리 확장은 `tests/test_proof_smt_memory.cpp`. 루프는 여전히 `UNKNOWN`)
+- [x] 좌우 loop-free scalar IR 을 결합하는 product program 또는 SMT miter (증거: `src/product.c`, `tests/test_product.cpp`. GOAL.md G5 의 loop-free 슬라이스와 `tests/test_proof_smt_memory.cpp` 의 메모리 확장에 더해, method version 2는 별도 structural scalar loop induction fast path를 사용)
 - [x] relation 방향, UB policy, return/termination/trap 관찰을 SMT query 에 정확히 반영 (증거: `ProductMiter.UndefinedBehaviourDomainsSeparateTheTwoRefinementDirections`, `TrapAxisAloneDecidesADifferentTrapCode`, `TerminationAxisAloneDecidesADivergingSide`, `SmtProductMethod.DischargesRefinementDirectionsSeparately`)
 - [x] Bitwuzla SAT model 을 typed input 과 observable witness 로 decode (증거: `src/replay.c` 의 `ql_replay_decode_model`, `Replay.DecodesASolverModelAndConfirmsTheViolation`)
 - [x] SAT witness 를 별도 concrete semantic replay 로 검증한 뒤에만 `COUNTEREXAMPLE` 발행 (증거: `SmtProductMethod.EmitsAReplayedCounterexample`, `Replay.AModelThatDoesNotReproduceIsNotACounterexample`, GOAL.md G5)
@@ -122,11 +122,12 @@
 - [x] 여러 method 의 병렬 실행을 투표가 아니라 증거 우선 규칙으로 결합 (증거: `src/combine.c`, `tests/test_combine.cpp` 24개, `ThreeAgreeingUncheckedProofsStillDecideNothing`, `OneCheckedProofOutweighsAnyNumberOfUncheckedDisagreements`)
 - [x] persistent artifact/evidence cache 저장소 (증거: `src/cache.c` 의 BLAKE3 key 저장소, load 마다 두 digest 재검증, 검증 실패는 miss 가 아니라 거부, `tests/test_cache.cpp`)
 - [x] method/backend version, option, semantic contract 가 cache key 에 빠지지 않는지 통합 검증 (증거: `tests/test_cache_key.cpp` 16개가 축을 하나씩 변주. backend 를 아무 데도 적지 않으면 두 빌드가 충돌한다는 것까지 고정)
-- [ ] CHC/PDR 또는 loop invariant 연결 (루프 판정. W1 의 루프 로어링 뒤) (구현이 없습니다. `include/quodlibet/proof_method.h:19` 의 family 상수와 `METHODS.md:625` 의 권고 절만 있고 `prove.chc-pdr` method 도 시험도 없습니다. `src/c_lower.c:6135` 대로 루프는 아직 로어링되지 않습니다)
+- [x] 구조적으로 대응되는 scalar loop의 relational invariant와 exact self-pair reflexivity fast path 연결 (증거: `src/loop_analysis.c` 의 dominator/backedge natural-loop canonicalization과 PHI recurrence 분류, `src/loop_proof.c` 의 non-identical Base/guard-alignment/Step/Exit induction 및 exact IR digest reflexivity, concrete interpreter domain witness, `src/proof_smt.c` 의 trusted-backend/domain 승격 경계와 loop telemetry, `docs/perf/loop-proof-self-pair-20260811.md` 의 worker 1 fresh baseline 비교. affine summary는 common iteration count와 실제 exit observable이 연결되지 않아 telemetry-only이고 proof terminal은 없음. 반복 횟수에 따른 bounded unrolling은 proof에 사용하지 않음)
+- [ ] CHC/PDR 범용 fallback 구현 (현재 structural induction 실패, 미지원 loop shape, 또는 telemetry-only summary 후보가 proof로 연결되지 않을 때 fallback 도달만 기록하고 `fallback_attempted=false`, `UNKNOWN`. `prove.chc-pdr` 등록 method와 backend는 아직 없음)
 
 ## W7: 성능, 안정성, 배포 (2026-08-10 범위 복귀)
 
-- [ ] parser/lowering/e-graph/solver 단계별 benchmark 와 전체 latency 기준선 (일부는 docs/perf/baseline.md 에 있음) (파스+프런트엔드+로어링 총량과 배치 latency 는 `scripts/perf/bench-coverage.sh` 와 `bench-batch.py` 로 있으나 **e-graph 단계와 prove 경로의 단계 분해가 없습니다.** `docs/perf/baseline.md` "아직 없는 것" 이 판정당 87ms 가 프런트엔드/로어링/miter/SMT-LIB 직렬화/solver 중 어디로 가는지 못 쟀다고 적고 있습니다)
+- [ ] parser/lowering/e-graph/solver 단계별 benchmark 와 전체 latency 기준선 (일부는 docs/perf/baseline.md 에 있음) (loop fast path는 discover/canonicalize/pairing/invariant/induction/summary/fallback telemetry와 별도 측정 harness가 생겼지만, e-graph와 전체 prove 경로의 프런트엔드/로어링/miter/SMT-LIB/solver 분해는 아직 없음)
 - [x] 병렬 worker 수, solver 동시성, cancellation overhead 측정 (증거: `docs/perf/concurrency.md` 와 `scripts/perf/bench-concurrency.py` 의 취소 지연표, `docs/perf/baseline.md` "확장이 어디서 멈추는지" 의 worker 사다리. 취소 지연이 마감이 아니라 단계 경계로 양자화된다는 결과 포함)
 - [x] artifact decoder 와 precondition 파서 퍼징 (파서/로어링/IR 디코더는 완료) (증거: `tests/fuzz/fuzz_precondition.c`, `fuzz_problem_decoder.c`, `fuzz_signature_decoder.c`, `fuzz_policy.c`, `fuzz_policy_result.c`, `tests/fuzz/fuzz_contract_targets.h`, 매 ctest 에서 도는 `tests/test_fuzz_contracts.cpp` 6개)
 - [x] solver crash, timeout, pipe 상속, corrupt model fault-injection 확대 (증거: `tests/test_fault_injection.cpp` - 거짓말하는 backend 16가지와 프로세스 고장 9가지, 할당 계수기로 오류 경로 누수까지 고정)

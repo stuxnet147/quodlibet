@@ -72,7 +72,7 @@ A normal Bitwuzla `unknown` response is conservatively classified as backend
 unknown; only an adapter watchdog expiration is classified as timeout.
 
 If the direct child exits before stdout and stderr reach EOF, the adapter gives
-the pipes a bounded 250 millisecond drain period. It then closes inherited
+the pipes a bounded five-second drain period. It then closes inherited
 pipes locally and returns a transport error instead of allowing a descendant
 that retained a pipe to keep the event loop alive indefinitely.
 
@@ -122,6 +122,11 @@ closure are independently validated.
 
 `SAT` is a candidate model. A Quodlibet equivalence method must decode and
 replay it against the semantic IR before emitting a counterexample verdict.
+The structural loop induction query is a candidate check, not a direct
+violation query: `SAT` rejects the candidate and remains `UNKNOWN`; it is never
+reported as a counterexample. Affine-summary candidates are telemetry-only in
+method version 2, so there is no summary query to submit. Any future summary
+terminal must keep the same candidate-check discipline.
 
 `UNSAT` from Bitwuzla records backend name, exact version, executable content
 digest, transport, query digest, exit status, and the fact that a proof is
@@ -147,6 +152,17 @@ verdict. Consequently, canonical Bitwuzla `UNSAT` cannot by itself become
 evidence, used in a bounded result, or combined with a future independently
 checked certificate path.
 
+`prove.smt-product` may promote a loop-free violation `UNSAT`, a structural
+loop induction `UNSAT`, or an exact whole-IR reflexivity `UNSAT` only under its
+explicit trusted-backend policy and only after the independent comparison-
+domain query answered `SAT`, or after the exact path recorded a concrete
+defined execution as its inhabited-domain witness. Such an outcome still
+records `checked_proof=false`. The loop path additionally records the
+canonical-loop, Base, guard-alignment, Step, Exit, reflexivity, and domain-
+witness digests so a solver answer cannot be reused for a different problem.
+Affine summaries are telemetry-only because no sound summary terminal is
+currently exposed.
+
 ## Deterministic SMT-LIB subset
 
 The v1 builder emits one command per line in call order. It currently provides
@@ -168,7 +184,14 @@ typed Quodlibet request fields.
 The whitelist is not an SMT parser and makes no satisfiability decision;
 Bitwuzla performs syntax, sort, theory, and satisfiability checking.
 
+The structural loop path uses `QF_AUFBV`: loop-carried state is fixed-width,
+and canonical entry, guard, transition, and exit relations are represented by
+exactly sorted uninterpreted symbols only after structural matching. Exact
+whole-IR reflexivity uses `QF_BV` for the two 256-bit IR digests. These are
+unbounded arguments, not bounded traces or an in-process solver.
+
 Solver identity, exact options, the canonical SMT-LIB bytes, semantic problem
 digest, timeout and memory-limit policy, output ceilings, and requested
 artifacts must all participate in the calling proof method's cache and evidence
-identity.
+identity. Method version 2 also binds every loop canonicalization and obligation
+digest listed above.
