@@ -14616,6 +14616,53 @@ restore:
   return status;
 }
 
+/* `T a[][C]` declared as a parameter. C adjusts it to `T (*)[C]`, and the
+   inventory keeps only the pointer. The row is still written in the source
+   and it is what the first subscript has to scale by, so it is read off the
+   declarator the parameter came from. The outermost bound is the row, exactly
+   as it is for a local, and the one C adjusted away sits inside it. Returns
+   zero when the parameter is not a two-dimensional array. */
+static uint64_t parameter_row_length(const lower_context *context,
+                                     const ql_c_parameter_view *parameter) {
+  size_t node;
+
+  for (node = 0u; node < context->node_count; ++node) {
+    size_t declarator = node;
+    size_t guard = 0u;
+    uint64_t row = 0u;
+    size_t bounds = 0u;
+    if (!range_equal(context->nodes[node].view.range,
+                     parameter->type.declarator_range)) {
+      continue;
+    }
+    while (declarator != SIZE_MAX && guard++ < 16u) {
+      const char *kind = context->nodes[declarator].view.kind;
+      if (strcmp(kind, "array_declarator") == 0 ||
+          strcmp(kind, "abstract_array_declarator") == 0) {
+        size_t size_node = direct_field_child(context, declarator, "size");
+        uint64_t bound = 0u;
+        ++bounds;
+        if (bounds == 1u) {
+          if (size_node == SIZE_MAX ||
+              !constant_array_bound(context, size_node, &bound)) {
+            return 0u;
+          }
+          row = bound;
+        }
+      } else if (strcmp(kind, "pointer_declarator") != 0 &&
+                 strcmp(kind, "abstract_pointer_declarator") != 0 &&
+                 strcmp(kind, "parenthesized_declarator") != 0 &&
+                 strcmp(kind, "abstract_parenthesized_declarator") != 0 &&
+                 strcmp(kind, "identifier") != 0) {
+        return 0u;
+      }
+      declarator = direct_field_child(context, declarator, "declarator");
+    }
+    return bounds >= 2u ? row : 0u;
+  }
+  return 0u;
+}
+
 static ql_status initialize_parameters(lower_context *context,
                                        ql_error *error) {
   size_t index;
@@ -14637,6 +14684,10 @@ static ql_status initialize_parameters(lower_context *context,
                                  error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
+    }
+    if (type.kind == QL_C_SCALAR_POINTER && type.indirection == 1u &&
+        type.is_function_pointer == 0u) {
+      type.array_row_length = parameter_row_length(context, &parameter);
     }
     status = ensure_ir_type(context, &type, error);
     if (status != QL_STATUS_OK) {

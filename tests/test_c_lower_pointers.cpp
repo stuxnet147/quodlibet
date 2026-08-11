@@ -130,6 +130,13 @@ QL_PTR_FUNCTION(linked_walk,
         }
         return sum;
     });
+/* `T a[][C]` is adjusted to `T (*)[C]`, so the first subscript advances a row
+   and the second an element. The row is written in the source even though the
+   adjusted type keeps only the pointer. */
+QL_PTR_FUNCTION(row_parameter,
+    int ptr_row_parameter(int grid[][4], int row, int column) {
+        return grid[row][column] + grid[0][0];
+    });
 static const char void_arithmetic_source[] =
     "long ptr_void_distance(void *p, int i) {\n"
     "    void *q = p + i;\n"
@@ -350,6 +357,29 @@ uint64_t NextRandom(uint64_t *state) {
     value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
     value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
     return value ^ (value >> 31);
+}
+
+TEST(CLowerPointers, AdvancesARowThroughATwoDimensionalParameter) {
+    Lowered lowered;
+    const int32_t grid[3][4] = {{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}};
+    ASSERT_TRUE(lowered.Open(row_parameter_source, "ptr_row_parameter"));
+    for (int32_t row = 0; row < 3; ++row) {
+        for (int32_t column = 0; column < 4; ++column) {
+            SCOPED_TRACE(row * 10 + column);
+            const Outcome run =
+                Execute(lowered.ir(), kBase,
+                        {static_cast<uint64_t>(static_cast<uint32_t>(row)),
+                         static_cast<uint64_t>(static_cast<uint32_t>(column))},
+                        kBase, sizeof(grid),
+                        reinterpret_cast<const uint8_t *>(grid), nullptr);
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            EXPECT_EQ(ptr_row_parameter(const_cast<int (*)[4]>(grid), row,
+                                        column),
+                      Returned(run.result));
+        }
+    }
 }
 
 TEST(CLowerPointers, LoadsThroughAPointerParameter) {
