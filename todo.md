@@ -22,7 +22,7 @@
 
 **닫힌 백로그: W6(증거 파이프라인), W7(안정성/배포, 원격 CI 재설계만 사용자 승인 대기).**
 
-**닫힌 GOAL: G1부터 G8까지.** 열린 목표는 G9의 asm2c 데이터셋 99% 커버리지입니다.
+**닫힌 GOAL: G1부터 G8까지.** G9 의 IR 로어링 수용률은 2026-08-11 에 99% 를 넘었습니다(train 29,583 / 29,880 = 99.01%, verifier 전수 통과, status 실패 0, val 1,044 / 1,050). 파서 수용률은 99.81% 로 이미 닫혀 있었습니다. 남은 종료 조건은 G8 differential 이 같은 표본에서 정확성을 보이는 것입니다.
 
 ## 완료한 기반 마일스톤
 
@@ -52,7 +52,7 @@
 - [x] 루프 안 VLA 에 반복별 객체 수명을 준다 (증거: 객체가 크기와 별도로 미치는 범위를 지니고 선언이 그것을 묶는다, `CLowerLocals.ChecksALoopVlaAgainstTheCurrentIterationsBound`. 가변 길이 배열 타입은 계속 거부)
 - [x] 다차원 배열 (증거: `array_row_length` 가 타입과 감쇠한 포인터에 실린다, `CLowerLocals.AddressesATwoDimensionalArrayByRowThenElement`, `FillsATwoDimensionalArrayRowByRow`, `CLowerPointers.AdvancesARowThroughATwoDimensionalParameter`. 삼차원은 보폭이 둘이라 계속 거부)
 - [x] 함수 포인터로의 캐스트와 그것을 통한 호출 (증거: `CLowerCalls.CallsThroughACastToAFunctionPointer`. 되돌렸던 원인은 초기 호출 스캔이 캐스트 지정자를 못 봐서 트레이스가 없던 것)
-- [ ] 주소를 취한 이름이 서로 다른 저장 유형으로 풀린다 (12. 슬롯 표가 이름으로 키를 잡아서 같은 이름의 두 선언이 객체 하나를 나눠 쓴다. 선언마다 슬롯을 만들고 `add_variable` 이 선언 노드로 고른다)
+- [x] 주소를 취한 이름이 서로 다른 저장 유형으로 풀린다 (증거: 선언마다 슬롯을 만들고 변수가 자기 선언자의 슬롯에 묶인다, `CLowerLocals.GivesAShadowedNameItsOwnStorage`, `GivesALocalShadowingAParameterItsOwnStorage`)
 - [ ] 포인터: 연산, object identity, provenance, 유효 범위, alignment 를 IR 로 하강
 - [ ] 배열, 구조체, 공용체, 비트필드, enum
 - [ ] 정수 promotion 과 usual arithmetic conversion 을 C11 6.3.1.8 대로
