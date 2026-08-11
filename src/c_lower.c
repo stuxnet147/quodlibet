@@ -13178,6 +13178,13 @@ static ql_status lower_statement(lower_context *context, size_t node,
   if (strcmp(kind, "compound_statement") == 0) {
     return lower_compound(context, node, 1u, error);
   }
+  if (strcmp(kind, "enum_specifier") == 0 ||
+      strcmp(kind, "struct_specifier") == 0 ||
+      strcmp(kind, "union_specifier") == 0) {
+    /* A tag declared on its own, with no declarator after it. Same as a
+       block-scope typedef: it names a type and runs nothing. */
+    return QL_STATUS_OK;
+  }
   if (strcmp(kind, "type_definition") == 0) {
     /* A block-scope typedef, enum, or record declares a type and no object.
        `collect_typedefs`, `collect_enumerators`, and `collect_records` walk
