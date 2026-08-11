@@ -180,6 +180,25 @@ QL_DIFF_FUNCTION(
     done:
       return seed + 1u;
     });
+/* The label sits inside a loop and the jump reaches it from outside, carrying
+   a block-scope object the label also sees. */
+QL_DIFF_FUNCTION(
+    goto_into_loop_scope,
+    unsigned int diff_goto_loop_scope(unsigned int x, unsigned int seed) {
+      unsigned int total = seed;
+      unsigned int i;
+      for (i = 0u; i < 3u; ++i) {
+        unsigned int step;
+        step = i + 1u;
+        if ((x & 1u) != 0u) {
+          goto tally;
+        }
+        step += 4u;
+      tally:
+        total += step;
+      }
+      return total;
+    });
 QL_DIFF_FUNCTION(
     nested_goto,
     unsigned int diff_nested_goto(unsigned int x, unsigned int seed) {
@@ -669,6 +688,11 @@ const Case kCases[] = {
      "diff_bypassed_twice", 32u, 32u, 32u, AlwaysDefined,
      [](uint64_t a, uint64_t b) {
        return FromU32(diff_bypassed_twice(AsU32(a), AsU32(b)));
+     }},
+    {"goto_into_loop_scope", goto_into_loop_scope_source,
+     "diff_goto_loop_scope", 32u, 32u, 32u, AlwaysDefined,
+     [](uint64_t a, uint64_t b) {
+       return FromU32(diff_goto_loop_scope(AsU32(a), AsU32(b)));
      }},
     {"nested_goto", nested_goto_source, "diff_nested_goto", 32u, 32u, 32u,
      AlwaysDefined,

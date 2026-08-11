@@ -12602,15 +12602,6 @@ cleanup:
   return status;
 }
 
-static size_t function_scope_variable_count(const lower_context *context) {
-  size_t count = 0u;
-  while (count < context->variable_count &&
-         context->variables[count].scope_depth == 0u) {
-    ++count;
-  }
-  return count;
-}
-
 static int node_contains(const lower_context *context, size_t ancestor,
                          size_t node) {
   while (node != SIZE_MAX) {
@@ -12711,21 +12702,6 @@ static size_t goto_target_variable_count(const lower_context *context,
     ++count;
   }
   return count;
-}
-
-static int label_is_inside_loop(const lower_context *context,
-                                size_t label_node) {
-  size_t ancestor = context->nodes[label_node].parent;
-  while (ancestor != SIZE_MAX && ancestor != context->body_node) {
-    const char *kind = context->nodes[ancestor].view.kind;
-    if (strcmp(kind, "for_statement") == 0 ||
-        strcmp(kind, "while_statement") == 0 ||
-        strcmp(kind, "do_statement") == 0) {
-      return 1;
-    }
-    ancestor = context->nodes[ancestor].parent;
-  }
-  return 0;
 }
 
 static int goto_enters_structured_region(const lower_context *context,
@@ -12902,14 +12878,6 @@ static ql_status lower_goto_statement(lower_context *context, size_t node,
     return QL_STATUS_OK;
   }
   variable_count = goto_target_variable_count(context, label->node);
-  if (variable_count > function_scope_variable_count(context) &&
-      label_is_inside_loop(context, label->node)) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
-        "goto carrying nested automatic state through a loop needs cyclic "
-        "SSA integration",
-        error);
-  }
   if (label->incoming.count != 0u &&
       label->incoming.states[0].count > variable_count) {
     /* A shorter edge jumped over a declaration and is padded at the label.
