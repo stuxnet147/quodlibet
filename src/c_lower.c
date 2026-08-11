@@ -99,10 +99,9 @@ typedef struct lower_callee {
   uint32_t is_variadic;
   uint32_t resolved;
   /* Set when this entry came from a definition in the unit rather than from a
-     prototype. In this corpus that is the selected function itself, so the
-     entry is a call target and nothing else: its designator is not an external
-     token, because a token both sides share would say the two definitions
-     under comparison are the same function. */
+     prototype. In this corpus that is the selected function itself. Both its
+     call sites and its designator token then name the function under
+     comparison, and the miter refuses a fragment that mentions either. */
   uint32_t is_definition;
   lower_type return_type;
   lower_type *parameters;
@@ -5401,8 +5400,8 @@ static ql_status lower_identifier(lower_context *context, size_t node,
         errno = 0;
         ordinal = strtoull(digits, &stop, 10);
       }
-      if (callee != NULL && callee->is_definition == 0u && digits != NULL &&
-          stop != digits && stop != NULL && *stop == '\0' && errno == 0 &&
+      if (callee != NULL && digits != NULL && stop != digits &&
+          stop != NULL && *stop == '\0' && errno == 0 &&
           ordinal <= UINT64_C(0xffffffff)) {
         lower_value address;
         lower_type function_type;

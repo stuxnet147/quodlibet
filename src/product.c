@@ -345,6 +345,31 @@ static int opcode_is_memory_access(ql_ir_opcode opcode) {
   return opcode == QL_IR_OPCODE_LOAD || opcode == QL_IR_OPCODE_STORE;
 }
 
+/* The token a declared corpus function designator carries. The lowering
+   builds it from the decimal suffix of `FUN_<n>`, and the range is reserved,
+   so a constant holding exactly this value is that designator and nothing
+   else. */
+static int self_designator_token(const ql_ir_view_v1 *view, uint64_t *token) {
+  const char *name = view->function_name;
+  uint64_t ordinal = 0u;
+  size_t index;
+
+  if (name == NULL || strncmp(name, "FUN_", 4u) != 0 || name[4] == '\0') {
+    return 0;
+  }
+  for (index = 4u; name[index] != '\0'; ++index) {
+    if (name[index] < '0' || name[index] > '9') {
+      return 0;
+    }
+    ordinal = ordinal * 10u + (uint64_t)(name[index] - '0');
+    if (ordinal > UINT64_C(0xffffffff)) {
+      return 0;
+    }
+  }
+  *token = UINT64_C(0xffff000000000000) + ordinal;
+  return 1;
+}
+
 /* Refuses everything the scalar miter cannot state, so no observation axis is
    ever silently dropped. */
 static ql_status check_ir_fragment(const ql_ir *ir, const ql_ir_view_v1 *view,
@@ -383,6 +408,42 @@ static ql_status check_ir_fragment(const ql_ir *ir, const ql_ir_view_v1 *view,
                    "%s IR uses a %u-bit vector above the %u-bit miter limit",
                    side, type.bit_width, QL_PRODUCT_MAX_BV_WIDTH);
       return QL_STATUS_TYPE_MISMATCH;
+    }
+  }
+  {
+    /* The designator of the function under comparison is not an external
+       token. Both sides would carry the same constant, and every congruence
+       stated over a callee that receives it would say the two definitions are
+       one function, which is the equivalence under proof. */
+    uint64_t token = 0u;
+    if (self_designator_token(view, &token) != 0) {
+      for (index = 0u; index < view->value_count; ++index) {
+        ql_ir_value_view_v1 value;
+        uint64_t held = 0u;
+        size_t byte;
+        memset(&value, 0, sizeof(value));
+        value.struct_size = sizeof(value);
+        status = ql_ir_value_at(ir, index, &value, error);
+        if (status != QL_STATUS_OK) {
+          return status;
+        }
+        if (value.definition_kind != QL_IR_VALUE_CONSTANT ||
+            value.constant_data == NULL || value.constant_size != 8u) {
+          continue;
+        }
+        for (byte = 0u; byte < 8u; ++byte) {
+          held |= (uint64_t)((const uint8_t *)value.constant_data)[byte]
+                  << (byte * 8u);
+        }
+        if (held == token) {
+          ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
+                       "%s IR names the function under comparison as a value, "
+                       "and this miter has no assume-guarantee rule for "
+                       "recursion",
+                       side);
+          return QL_STATUS_TYPE_MISMATCH;
+        }
+      }
     }
   }
   for (index = 0u; index < view->instruction_count; ++index) {

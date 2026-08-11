@@ -429,4 +429,28 @@ TEST(SmtProductCalls, RefusesAFragmentThatCallsTheFunctionUnderComparison) {
               std::string(error.message).find("assume-guarantee"));
 }
 
+/* The designator carries the same refusal as the call. Both sides hold the
+   same token, so any congruence stated over a callee that receives it would
+   say the two definitions are one function. */
+TEST(SmtProductCalls, RefusesAFragmentThatNamesTheFunctionUnderComparison) {
+    constexpr char source[] =
+        "int FUN_3(int (*)(int), int);\n"
+        "int FUN_0(int a) { return FUN_3(FUN_0, a); }\n";
+    w2::Pair pair;
+    ql_product_query *query = nullptr;
+    ql_error error{};
+
+    ASSERT_EQ(QL_STATUS_OK,
+              pair.Build(source, "FUN_0", source, "FUN_0",
+                         w2::ContractObserving(OrderedCallObservations()),
+                         &error))
+        << error.message;
+    EXPECT_EQ(QL_STATUS_TYPE_MISMATCH,
+              ql_product_query_build(nullptr, pair.problem(), pair.left_ir(),
+                                     pair.right_ir(), &query, &error));
+    EXPECT_EQ(nullptr, query);
+    EXPECT_NE(std::string::npos,
+              std::string(error.message).find("assume-guarantee"));
+}
+
 }  // namespace

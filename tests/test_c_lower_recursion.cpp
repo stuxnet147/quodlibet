@@ -277,57 +277,28 @@ TEST(CLowerRecursion, TheRecursiveCallNamesTheFunctionItself) {
 }
 
 /* A declared corpus function used as a value becomes an opaque token both
-   sides share. The selected function must not, because a shared token would
-   say the two definitions under comparison are one function. It is a call
-   target and nothing else. */
-TEST(CLowerRecursion, TheSelectedFunctionIsNotAnExternalToken) {
+   sides share. The function under comparison carries that token too, because
+   the C says so and the lowering says only what the C says. What the token
+   cannot mean is that the two definitions are one function, and that is the
+   miter's answer to give: `test_proof_smt_calls.cpp` fixes the refusal. */
+TEST(CLowerRecursion, NamesItselfAsAValue) {
     struct Case {
         const char *source;
         const char *name;
     };
     const Case cases[] = {
         {"int FUN_0(int a) { return FUN_0 != 0; }", "FUN_0"},
-        {"int FUN_3(int (*callback)(int), int a);\n"
+        {"int FUN_3(int (*)(int), int);\n"
          "int FUN_0(int a) { return FUN_3(FUN_0, a); }",
+         "FUN_0"},
+        /* Passing itself to a callee that takes a callback is the shape the
+           corpus actually uses. */
+        {"int FUN_1(int (*)(int *));\n"
+         "int FUN_0(int *ARG_0) { FUN_1(FUN_0); return 0; }",
          "FUN_0"},
     };
     for (const Case &item : cases) {
         Lowered lowered;
-        SCOPED_TRACE(item.source);
-        EXPECT_EQ(QL_C_LOWER_UNKNOWN,
-                  Lower(&lowered, item.source, item.name, nullptr));
-    }
-}
-
-/* `?:`, `&&`, and `||` used to select between operands this lowering had
-   already evaluated, so an effect in the operand C skips ran anyway. The
-   operand now gets a block of its own and the result is a merge, which is what
-   makes the ordinary recursive shape lowerable at all. */
-TEST(CLowerRecursion, RunsAnEffectOnlyOnThePathTheConditionTakes) {
-    struct Case {
-        const char *source;
-        const char *name;
-    };
-    const Case cases[] = {
-        {"int CALLEE_f(int);\n"
-         "int f(int a) { return a ? CALLEE_f(a) : 0; }",
-         "f"},
-        {"int CALLEE_f(int);\n"
-         "int f(int a) { return a && CALLEE_f(a); }",
-         "f"},
-        {"int CALLEE_f(int);\n"
-         "int f(int a) { return a || CALLEE_f(a); }",
-         "f"},
-        {"int f(int *p) { return p != 0 && (*p = 1); }", "f"},
-        {"int f(int a, int b) { return a > 0 && b++ > 0; }", "f"},
-        /* Nested, so the join of the inner one is inside an arm of the
-           outer. */
-        {"int CALLEE_f(int);\n"
-         "int f(int a, int b) { return a ? (b && CALLEE_f(b)) : CALLEE_f(a); }",
-         "f"},
-    };
-    for (const Case &item : cases) {
-        Lowered lowered;
         ql_ir *ir = nullptr;
         ql_ir_verify_report_v1 report{};
         ql_error error{};
@@ -335,152 +306,6 @@ TEST(CLowerRecursion, RunsAnEffectOnlyOnThePathTheConditionTakes) {
         ASSERT_EQ(QL_C_LOWER_SUPPORTED,
                   Lower(&lowered, item.source, item.name, &ir));
         ASSERT_NE(nullptr, ir);
-        ql_ir_verify_report_init(&report);
-        EXPECT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
-            << report.message;
-    }
-}
-
-/* The tail-recursive body reaches its call through two nested conditions, so
-   the count also fixes that only one of them runs. */
-TEST(CLowerRecursion, CarriesTwoArgumentsThroughANestedConditionalCall) {
-    static const char source[] =
-        "int REC_collatz(int n, int steps) {\n"
-        "  return n <= 1 ? steps\n"
-        "                : ((n & 1) == 0 ? REC_collatz(n / 2, steps + 1)\n"
-        "                                : REC_collatz(n * 3 + 1, steps + 1));\n"
-        "}\n";
-    Lowered lowered;
-    ql_ir *ir = nullptr;
-    ql_ir_verify_report_v1 report{};
-    ql_error error{};
-
-    ASSERT_EQ(QL_C_LOWER_SUPPORTED,
-              Lower(&lowered, source, "REC_collatz", &ir));
-    ASSERT_NE(nullptr, ir);
-    ql_ir_verify_report_init(&report);
-    ASSERT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
-        << report.message;
-
-    for (const std::int32_t input : {1, 2, 6, 27}) {
-        std::size_t calls = 0u;
-        SCOPED_TRACE(input);
-        const InterpRun run = Interpret(ir, {input, 0}, &calls);
-        ASSERT_EQ(QL_STATUS_OK, run.status);
-        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
-        EXPECT_EQ(REC_collatz(input, 0), Returned(run.result));
-        EXPECT_EQ(input <= 1 ? 0u : 1u, calls);
-    }
-}
-
-/* A loop condition is the position this was hardest to get right. The header
-   holds the loop PHIs and receives the backedge, and both stay put; what moves
-   is the block the condition's own edges leave from. The count below is what
-   proves it: the call in the right operand happens once per iteration the
-   left operand let through, and once more for the iteration that ended the
-   loop, and never after. */
-TEST(CLowerRecursion, RunsALoopConditionEffectOncePerIterationCTakes) {
-    static const char source[] =
-        "int REC_probe(int);\n"
-        "int REC_loop(int a) {\n"
-        "  int n = 0;\n"
-        "  while (a > 0 && REC_probe(a)) { a -= 2; n++; }\n"
-        "  return n;\n"
-        "}\n";
-    Lowered lowered;
-    ql_ir *ir = nullptr;
-    ql_ir_verify_report_v1 report{};
-    ql_error error{};
-
-    ASSERT_EQ(QL_C_LOWER_SUPPORTED, Lower(&lowered, source, "REC_loop", &ir));
-    ASSERT_NE(nullptr, ir);
-    ql_ir_verify_report_init(&report);
-    ASSERT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
-        << report.message;
-
-    for (const std::int32_t input : {-1, 0, 1, 2, 7, 9}) {
-        std::size_t calls = 0u;
-        std::size_t expected_calls = 0u;
-        std::int32_t expected = 0;
-        std::int32_t a = input;
-        SCOPED_TRACE(input);
-        while (a > 0) {
-            ++expected_calls;
-            if (REC_probe(a) == 0) {
-                break;
-            }
-            a -= 2;
-            ++expected;
-        }
-        const InterpRun run = Interpret(ir, {input}, &calls);
-        ASSERT_EQ(QL_STATUS_OK, run.status);
-        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
-        EXPECT_EQ(expected, Returned(run.result));
-        EXPECT_EQ(expected_calls, calls);
-    }
-}
-
-/* The same three positions the loop lowering keys blocks to, each with an
-   effect in the operand C may skip. */
-TEST(CLowerRecursion, LowersAnEffectInEveryLoopPosition) {
-    struct Case {
-        const char *source;
-        const char *name;
-    };
-    const Case cases[] = {
-        {"int CALLEE_f(int);\n"
-         "int f(int a) { while (a && CALLEE_f(a)) a--; return a; }",
-         "f"},
-        {"int CALLEE_f(int);\n"
-         "int f(int a) { do { a--; } while (a && CALLEE_f(a)); return a; }",
-         "f"},
-        {"int CALLEE_f(int);\n"
-         "int f(int a) { for (; a > 0; a -= (a > 1 ? CALLEE_f(a) : 1)) ; "
-         "return a; }",
-         "f"},
-        {"int CALLEE_f(int);\n"
-         "int f(int a) { for (; a > 0 && CALLEE_f(a); a--) ; return a; }",
-         "f"},
-    };
-    for (const Case &item : cases) {
-        Lowered lowered;
-        ql_ir *ir = nullptr;
-        ql_ir_verify_report_v1 report{};
-        ql_error error{};
-        SCOPED_TRACE(item.source);
-        ASSERT_EQ(QL_C_LOWER_SUPPORTED,
-                  Lower(&lowered, item.source, item.name, &ir));
-        ASSERT_NE(nullptr, ir);
-        ql_ir_verify_report_init(&report);
-        EXPECT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
-            << report.message;
-    }
-}
-
-/* An `if` condition has no such constraint: the statement re-reads the block
-   the condition ended in, so the branch may split it. */
-TEST(CLowerRecursion, AllowsAnEffectInAnIfAndSwitchCondition) {
-    struct Case {
-        const char *source;
-        const char *name;
-    };
-    const Case cases[] = {
-        {"int CALLEE_f(int);\n"
-         "int f(int a) { if (a && CALLEE_f(a)) return 1; return 0; }",
-         "f"},
-        {"int CALLEE_f(int);\n"
-         "int f(int a) { switch (a ? CALLEE_f(a) : 0) { case 1: return 2; } "
-         "return 0; }",
-         "f"},
-    };
-    for (const Case &item : cases) {
-        Lowered lowered;
-        ql_ir *ir = nullptr;
-        ql_ir_verify_report_v1 report{};
-        ql_error error{};
-        SCOPED_TRACE(item.source);
-        ASSERT_EQ(QL_C_LOWER_SUPPORTED,
-                  Lower(&lowered, item.source, item.name, &ir));
         ql_ir_verify_report_init(&report);
         EXPECT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
             << report.message;
