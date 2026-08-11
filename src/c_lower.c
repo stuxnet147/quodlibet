@@ -1041,6 +1041,8 @@ static ql_status parse_type_spelling(lower_context *context,
 static ql_status resolve_type_node_allowing_void(
     lower_context *context, size_t type_node, uint32_t pointer_depth,
     lower_type *output, ql_error *error);
+static size_t cast_function_signature(const lower_context *context,
+                                      size_t cast_node);
 /* Why `member_declarator_name` refused. One message for all three made the
    residual unreadable: a second array bound, a GNU zero-sized array, and a
    declarator this pass does not read are different work. */
@@ -1771,6 +1773,15 @@ static void collect_calls(lower_context *context, size_t body_node) {
     }
     if (strcmp(context->nodes[function_node].view.kind,
                "field_expression") == 0) {
+      context->makes_calls = 1u;
+      context->uses_memory = 1u;
+      return;
+    }
+    if (strcmp(context->nodes[function_node].view.kind, "cast_expression") ==
+            0 &&
+        cast_function_signature(context, function_node) != SIZE_MAX) {
+      /* `((T (*)(A))e)(args)` is a call, and the trace it appends to has to
+         exist before the body runs. */
       context->makes_calls = 1u;
       context->uses_memory = 1u;
       return;
@@ -6304,6 +6315,51 @@ static ql_status lower_named_cast(lower_context *context, size_t type_node,
 
 /* Counts the stars an abstract declarator spells. Fails when it spells
    something else, which is an array or a function type. */
+/* `T (*)(...)` written as a type. The function declarator wraps a
+   parenthesized single pointer, exactly as it does in a declaration, and the
+   value it names is a function pointer rather than storage. Returns the
+   function declarator, which carries the parameters a call through the cast
+   has to be checked against. */
+static size_t abstract_function_pointer(const lower_context *context,
+                                        size_t declarator,
+                                        uint32_t *return_depth) {
+  size_t inner;
+  size_t guard = 0u;
+
+  *return_depth = 0u;
+  while (declarator != SIZE_MAX && guard++ < 8u &&
+         strcmp(context->nodes[declarator].view.kind,
+                "abstract_pointer_declarator") == 0) {
+    ++(*return_depth);
+    declarator = direct_field_child(context, declarator, "declarator");
+  }
+  if (declarator == SIZE_MAX ||
+      (strcmp(context->nodes[declarator].view.kind,
+              "abstract_function_declarator") != 0 &&
+       strcmp(context->nodes[declarator].view.kind, "function_declarator") !=
+           0)) {
+    return SIZE_MAX;
+  }
+  inner = direct_field_child(context, declarator, "declarator");
+  if (inner == SIZE_MAX ||
+      strcmp(context->nodes[inner].view.kind,
+             "abstract_parenthesized_declarator") != 0) {
+    return SIZE_MAX;
+  }
+  inner = first_named_child(context, inner);
+  if (inner == SIZE_MAX ||
+      strcmp(context->nodes[inner].view.kind,
+             "abstract_pointer_declarator") != 0) {
+    return SIZE_MAX;
+  }
+  /* One star only, which is the depth the rest of this slice carries for a
+     function pointer value. */
+  if (direct_field_child(context, inner, "declarator") != SIZE_MAX) {
+    return SIZE_MAX;
+  }
+  return declarator;
+}
+
 static int abstract_pointer_depth(const lower_context *context,
                                   size_t declarator, uint32_t *depth) {
   size_t guard = 0u;
@@ -6813,6 +6869,7 @@ static ql_status lower_cast_expression(lower_context *context, size_t node,
   size_t end;
   size_t child;
   uint32_t pointer_depth = 0u;
+  uint32_t function_pointer_cast = 0u;
 
   if (descriptor == SIZE_MAX || value_node == SIZE_MAX) {
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION,
@@ -6833,6 +6890,13 @@ static ql_status lower_cast_expression(lower_context *context, size_t node,
       continue;
     }
     if (!abstract_pointer_depth(context, child, &pointer_depth)) {
+      uint32_t return_depth = 0u;
+      if (abstract_function_pointer(context, child, &return_depth) !=
+          SIZE_MAX) {
+        function_pointer_cast = 1u;
+        pointer_depth = return_depth;
+        break;
+      }
       return lower_unknown(
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, child,
           "a cast to an array or function type has no value in this "
@@ -6854,6 +6918,39 @@ static ql_status lower_cast_expression(lower_context *context, size_t node,
                          "cast to an atomic type requires observable-event "
                          "semantics",
                          error);
+  }
+  if (function_pointer_cast != 0u) {
+    /* The target is a pointer to a function. The operand keeps its bits and
+       the value stops being data: a function pointer is transferred, compared,
+       and called, never dereferenced. */
+    lower_value value;
+    lower_type return_type;
+    lower_type target;
+    ql_status status =
+        resolve_type_node_allowing_void(context, type_node, pointer_depth,
+                                        &return_type, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    status = lower_expression(context, value_node, &value, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    target = make_function_pointer_type(return_type);
+    if (value.type.kind == QL_C_SCALAR_POINTER &&
+        value.type.is_function_pointer == 0u) {
+      /* A data pointer spelled into a function pointer. The two share this
+         ABI's representation and the cast is explicit, so the address is
+         carried over rather than refused. What the result cannot do is go
+         back: it is callable and comparable, never storage. */
+      lower_value address;
+      status = emit_address_of_pointer(context, value, &address, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+      return emit_pointer_of_address(context, address, target, output, error);
+    }
+    return convert_value(context, value, target, output, error);
   }
   return lower_named_cast(context, type_node, value_node, pointer_depth, output,
                           error);
@@ -7964,6 +8061,80 @@ static ql_status store_record_call_results(
    itself observable, so it consumes and produces both the memory state and
    the event trace. Whether the trace is compared is the contract's business,
    exactly as it already is for the memory a return carries. */
+/* The type descriptor of a cast to a function pointer, or SIZE_MAX when the
+   expression is any other cast. */
+static size_t cast_function_signature(const lower_context *context,
+                                      size_t cast_node) {
+  size_t descriptor = direct_field_child(context, cast_node, "type");
+  size_t end;
+  size_t child;
+
+  if (descriptor == SIZE_MAX) {
+    return SIZE_MAX;
+  }
+  end = subtree_end(context, descriptor);
+  for (child = descriptor + 1u; child < end; ++child) {
+    uint32_t depth = 0u;
+    if (context->nodes[child].parent != descriptor ||
+        context->nodes[child].view.field_name == NULL ||
+        strcmp(context->nodes[child].view.field_name, "declarator") != 0) {
+      continue;
+    }
+    if (abstract_function_pointer(context, child, &depth) != SIZE_MAX) {
+      return descriptor;
+    }
+    return SIZE_MAX;
+  }
+  return SIZE_MAX;
+}
+
+/* Adds the cast's signature to the callee table and reports its index. The
+   table owns the parameter list, so the entry outlives the call site without
+   a second lifetime to reason about. */
+static ql_status add_cast_callee(lower_context *context, size_t descriptor,
+                                 size_t *entry, ql_error *error) {
+  size_t end = subtree_end(context, descriptor);
+  size_t child;
+  size_t declarator = SIZE_MAX;
+  uint32_t return_depth = 0u;
+  lower_callee *slot;
+  ql_status status;
+
+  for (child = descriptor + 1u; child < end; ++child) {
+    if (context->nodes[child].parent != descriptor ||
+        context->nodes[child].view.field_name == NULL ||
+        strcmp(context->nodes[child].view.field_name, "declarator") != 0) {
+      continue;
+    }
+    declarator = abstract_function_pointer(context, child, &return_depth);
+    break;
+  }
+  if (declarator == SIZE_MAX) {
+    ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                 "a cast callee lost its function declarator");
+    return QL_STATUS_INTERNAL_ERROR;
+  }
+  status = grow_array(context->allocator, (void **)&context->callees,
+                      &context->callee_capacity, sizeof(*context->callees),
+                      context->callee_count + 1u, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  slot = &context->callees[context->callee_count];
+  memset(slot, 0, sizeof(*slot));
+  slot->name = copy_node_text(context, declarator);
+  if (slot->name == NULL) {
+    ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+    return QL_STATUS_OUT_OF_MEMORY;
+  }
+  slot->declaration_node = descriptor;
+  slot->declarator_node = declarator;
+  slot->return_pointer_depth = return_depth;
+  *entry = context->callee_count;
+  ++context->callee_count;
+  return QL_STATUS_OK;
+}
+
 static ql_status lower_call_expression(lower_context *context, size_t node,
                                        lower_value *output, ql_error *error) {
   size_t function_node = direct_field_child(context, node, "function");
@@ -8061,6 +8232,29 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
+    symbol = "__ql_indirect_call_v1";
+    is_indirect = 1u;
+    operand_count = 3u;
+    operands[2] = indirect_target.value;
+  } else if (strcmp(context->nodes[function_node].view.kind,
+                    "cast_expression") == 0 &&
+             cast_function_signature(context, function_node) != SIZE_MAX) {
+    /* `((T (*)(A))e)(args)`. The cast states the signature the call is
+       checked against, which is the same pair a prototype gives: the type
+       descriptor names the return type and the function declarator names the
+       parameters. The entry lives in the callee table so its parameter list
+       outlives this call site. */
+    size_t descriptor = cast_function_signature(context, function_node);
+    size_t entry;
+    status = add_cast_callee(context, descriptor, &entry, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    status = lower_expression(context, function_node, &indirect_target, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    callee = &context->callees[entry];
     symbol = "__ql_indirect_call_v1";
     is_indirect = 1u;
     operand_count = 3u;

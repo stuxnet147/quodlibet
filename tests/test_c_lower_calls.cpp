@@ -225,6 +225,14 @@ QL_CALL_FUNCTION(local_callback,
         chosen = incoming;
         return (*chosen)(value) - 1;
     });
+QL_CALL_FUNCTION(cast_void_callback,
+    int call_cast_void_callback(void *incoming, int value) {
+        return ((int (*)(int)) incoming)(value) + 2;
+    });
+QL_CALL_FUNCTION(cast_callback,
+    int call_cast_callback(int (*incoming)(int), int value) {
+        return ((int (*)(int)) incoming)(value) + 1;
+    });
 QL_CALL_FUNCTION(typedef_parameter_indirect,
     typedef int (*CALL_INT_TYPEDEF)(int);
     int call_typedef_parameter(CALL_INT_TYPEDEF callback, int value) {
@@ -1123,6 +1131,42 @@ TEST(CLowerCalls, CallsAFunctionPointerHeldInALocal) {
                       log.symbols);
         }
     }
+}
+
+/* `((T (*)(A))e)(args)`. The cast states the signature the call is checked
+   against, which is the same pair a prototype gives. */
+TEST(CLowerCalls, CallsThroughACastToAFunctionPointer) {
+    Lowered lowered;
+    uint8_t dummy = 0u;
+    ql_ir_interp_object_v1 object{};
+    ql_ir_interp_object_init(&object);
+    object.base = QL_IR_INTERP_FIRST_OBJECT_ADDRESS;
+    object.size = 1u;
+    object.initial = &dummy;
+
+    ASSERT_TRUE(lowered.Open(cast_callback_source, "call_cast_callback"));
+    for (int32_t value : {-91, 0, 37, 1000}) {
+        CallLog log;
+        const Outcome run = Execute(
+            lowered.ir(),
+            {static_cast<uint64_t>(
+                 reinterpret_cast<uintptr_t>(&CALLEE_double)),
+             Widen(value)},
+            &log, &object);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(call_cast_callback(CALLEE_double, value),
+                  Returned(run.result));
+        EXPECT_EQ(std::vector<std::string>{"__ql_indirect_call_v1"},
+                  log.symbols);
+    }
+}
+
+TEST(CLowerCalls, CallsThroughACastFromADataPointer) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(cast_void_callback_source,
+                             "call_cast_void_callback"));
 }
 
 TEST(CLowerCalls, CallsAParenthesizedFunctionPointerParameter) {
