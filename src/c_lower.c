@@ -1213,6 +1213,7 @@ static ql_status collect_storage_locals(lower_context *context,
     size_t declaration_end;
     size_t child;
     int base_is_record;
+    int base_is_volatile;
     int has_static_storage;
 
     if (strcmp(context->nodes[index].view.kind, "declaration") != 0) {
@@ -1224,6 +1225,7 @@ static ql_status collect_storage_locals(lower_context *context,
     }
     has_static_storage = declaration_has_static_storage(context, index);
     base_is_record = 0;
+    base_is_volatile = declaration_is_volatile(context, index);
     if (!has_static_storage) {
       base_is_record =
           strcmp(context->nodes[type_node].view.kind, "struct_specifier") ==
@@ -1246,6 +1248,9 @@ static ql_status collect_storage_locals(lower_context *context,
         return status;
       }
       base_is_record = resolved.kind == QL_C_SCALAR_RECORD;
+      /* A typedef can carry the qualifier, and a volatile object is storage
+         wherever the qualifier came from. */
+      base_is_volatile = resolved.is_volatile != 0u;
     }
     declaration_end = subtree_end(context, index);
     for (child = index + 1u; child < declaration_end; ++child) {
@@ -1277,7 +1282,7 @@ static ql_status collect_storage_locals(lower_context *context,
       }
       if (!has_static_storage && array_length == 0u &&
           (pointer_depth != 0u || !base_is_record) &&
-          (pointer_depth != 0u || !declaration_is_volatile(context, index))) {
+          (pointer_depth != 0u || !base_is_volatile)) {
         /* A volatile object is read and written where the C says, so it
            needs storage rather than an SSA value that a later use could
            fold away. */
@@ -3300,16 +3305,37 @@ static ql_status parse_type_spelling(lower_context *context,
   return QL_STATUS_OK;
 }
 
+static ql_status type_from_inventory_unqualified(
+    lower_context *context, const ql_c_type_inventory_v1 *inventory,
+    size_t node, uint32_t allow_void, lower_type *output, ql_error *error);
+
+/* `volatile` says something about the object, not about the shape of the
+   type, so it is lifted off here and put back on the result. */
 static ql_status type_from_inventory(lower_context *context,
                                      const ql_c_type_inventory_v1 *inventory,
                                      size_t node, uint32_t allow_void,
                                      lower_type *output, ql_error *error) {
-  if ((inventory->qualifiers &
-       (QL_C_TYPE_QUALIFIER_VOLATILE | QL_C_TYPE_QUALIFIER_ATOMIC)) != 0u ||
+  if ((inventory->qualifiers & QL_C_TYPE_QUALIFIER_VOLATILE) != 0u) {
+    ql_status status = type_from_inventory_unqualified(context, inventory, node,
+                                                       allow_void, output,
+                                                       error);
+    if (status == QL_STATUS_OK && context->unknown == 0u) {
+      output->is_volatile = 1u;
+    }
+    return status;
+  }
+  return type_from_inventory_unqualified(context, inventory, node, allow_void,
+                                         output, error);
+}
+
+static ql_status type_from_inventory_unqualified(
+    lower_context *context, const ql_c_type_inventory_v1 *inventory,
+    size_t node, uint32_t allow_void, lower_type *output, ql_error *error) {
+  if ((inventory->qualifiers & QL_C_TYPE_QUALIFIER_ATOMIC) != 0u ||
       inventory->base_kind == QL_C_TYPE_BASE_ATOMIC) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_VOLATILE_OR_ATOMIC, node,
-        "volatile and atomic objects require an observable-event lowering",
+        "an atomic object requires an ordering this slice does not carry",
         error);
   }
   if ((inventory->qualifiers & QL_C_TYPE_QUALIFIER_RESTRICT) != 0u &&
