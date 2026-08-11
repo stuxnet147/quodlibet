@@ -4305,9 +4305,11 @@ static ql_status add_variable(lower_context *context, const char *name,
       if (strcmp(context->stack_slots[slot].name, variable->name) != 0) {
         continue;
       }
-      /* The slot this declaration made, not whichever one shares the name. */
-      if (context->stack_slots[slot].declarator_node != SIZE_MAX &&
-          context->stack_slots[slot].declarator_node != node) {
+      /* The slot this declaration made, not whichever one shares the name.
+         A parameter has no declarator here and binds to the slot that has
+         none either, so a local shadowing a parameter does not take the
+         parameter's object. */
+      if (context->stack_slots[slot].declarator_node != node) {
         continue;
       }
       if (type_same(context->stack_slots[slot].type, type) == 0 ||
@@ -13513,10 +13515,12 @@ static ql_status add_stack_slot_objects(lower_context *context,
     slot->is_parameter = is_parameter;
     slot->declarator_node = named;
     ++context->stack_slot_count;
-    if (is_parameter != 0u || named == SIZE_MAX) {
+    if (is_parameter == 0u && named == SIZE_MAX) {
       break;
     }
-    from = named + 1u;
+    /* A parameter's name may also be declared inside the body. That local is
+       a different object, so the scan continues into the declarations. */
+    from = named == SIZE_MAX ? context->body_node + 1u : named + 1u;
     }
   }
   return QL_STATUS_OK;

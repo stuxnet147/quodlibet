@@ -694,6 +694,26 @@ TEST(CLowerLocals, ValueFunctionFallthroughIsUndefinedExceptForMain) {
    inner one shadowing the outer is not a collision. Each declaration made its
    own slot, and the address taken of the outer name still reaches the outer
    object. */
+/* A parameter's name declared again inside the body is a second object, and
+   the address taken of each reaches its own. */
+TEST(CLowerLocals, GivesALocalShadowingAParameterItsOwnStorage) {
+    Lowered lowered;
+    std::vector<std::vector<uint8_t>> images;
+    static const char source[] =
+        "int f(int v) { int *outer = &v; { int v = 7; *outer += v; } "
+        "return *outer; }";
+    ASSERT_TRUE(lowered.Open(source, "f"));
+    for (const int32_t v : {-2, 0, 5}) {
+        SCOPED_TRACE(v);
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(v)}, {4u, 4u}, &images);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(v + 7, Returned(run.result));
+    }
+}
+
 TEST(CLowerLocals, GivesAShadowedNameItsOwnStorage) {
     Lowered lowered;
     std::vector<std::vector<uint8_t>> images;
