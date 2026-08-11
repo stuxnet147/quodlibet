@@ -690,11 +690,26 @@ TEST(CLowerLocals, ValueFunctionFallthroughIsUndefinedExceptForMain) {
     EXPECT_EQ(0, Returned(main_result.result));
 }
 
-TEST(CLowerLocals, RefusesShadowedAddressTakenNamesWithoutAStatusFailure) {
-    const char *source =
-        "int f(int a) { int v; { long long v = a; a += (int)v; } "
+/* Two declarations of one name in disjoint scopes are two objects, so the
+   inner one shadowing the outer is not a collision. Each declaration made its
+   own slot, and the address taken of the outer name still reaches the outer
+   object. */
+TEST(CLowerLocals, GivesAShadowedNameItsOwnStorage) {
+    Lowered lowered;
+    std::vector<std::vector<uint8_t>> images;
+    static const char source[] =
+        "int f(int a) { int v; { long long v = a + 1; a += (int)v; } "
         "v = a; return *&v; }";
-    ExpectUnknown(source, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
+    ASSERT_TRUE(lowered.Open(source, "f"));
+    for (const int32_t a : {-4, 0, 9}) {
+        SCOPED_TRACE(a);
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(a)}, {4u, 8u}, &images);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(a + (a + 1), Returned(run.result));
+    }
 }
 
 }  // namespace

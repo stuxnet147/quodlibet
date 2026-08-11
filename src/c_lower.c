@@ -225,6 +225,10 @@ typedef struct lower_variable {
   uint32_t is_const;
   size_t scope_depth;
   size_t declaration_node;
+  /* The storage this name bound to, or SIZE_MAX when it lives in a value.
+     Two declarations of one name have two slots, so the name alone no longer
+     identifies one. */
+  size_t slot;
 } lower_variable;
 
 /* One descriptor for a storage region the function may touch. Pointer
@@ -282,6 +286,10 @@ typedef struct lower_stack_slot {
   size_t object;
   ql_ir_value_id address;
   uint32_t is_parameter;
+  /* The identifier this slot's declaration names, or SIZE_MAX for a
+     parameter. One name declared twice in disjoint scopes is two objects,
+     and a slot table keyed only by name would give them one. */
+  size_t declarator_node;
 } lower_stack_slot;
 
 /* Storage for the complete object image returned by one syntactic external
@@ -4281,6 +4289,7 @@ static ql_status add_variable(lower_context *context, const char *name,
   }
   variable = &context->variables[context->variable_count];
   memset(variable, 0, sizeof(*variable));
+  variable->slot = SIZE_MAX;
   variable->name = copy_text(context->allocator, name, name_size);
   if (variable->name == NULL) {
     ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
@@ -4296,19 +4305,10 @@ static ql_status add_variable(lower_context *context, const char *name,
       if (strcmp(context->stack_slots[slot].name, variable->name) != 0) {
         continue;
       }
-      for (index = context->variable_count; index != 0u; --index) {
-        const lower_variable *visible = &context->variables[index - 1u];
-        if (visible->name_size == name_size &&
-            memcmp(visible->name, name, name_size) == 0) {
-          context->allocator->deallocate(context->allocator->user_data,
-                                         variable->name);
-          memset(variable, 0, sizeof(*variable));
-          return lower_unknown(
-              context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
-              "shadowing an address-taken name needs a distinct "
-              "stack object",
-              error);
-        }
+      /* The slot this declaration made, not whichever one shares the name. */
+      if (context->stack_slots[slot].declarator_node != SIZE_MAX &&
+          context->stack_slots[slot].declarator_node != node) {
+        continue;
       }
       if (type_same(context->stack_slots[slot].type, type) == 0 ||
           context->stack_slots[slot].type.array_length != type.array_length) {
@@ -4324,6 +4324,7 @@ static ql_status add_variable(lower_context *context, const char *name,
       /* The slot was created before the entry block; the variable only
          binds to it now. */
       variable->is_stack = 1u;
+      variable->slot = slot;
       variable->address = context->stack_slots[slot].address;
       variable->has_object = 1u;
       break;
@@ -6813,13 +6814,8 @@ static ql_status lower_sizeof_type(lower_context *context, size_t node,
                                      variable_name);
       if (variable != NULL &&
           variable->type.array_length == LOWER_ARRAY_BOUND_DYNAMIC) {
-        size_t slot;
-        for (slot = 0u; slot < context->stack_slot_count; ++slot) {
-          if (strcmp(context->stack_slots[slot].name, variable->name) == 0) {
-            break;
-          }
-        }
-        if (slot == context->stack_slot_count) {
+        const size_t slot = variable->slot;
+        if (slot >= context->stack_slot_count) {
           ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
                        "VLA sizeof has no lowering-owned object");
           return QL_STATUS_INTERNAL_ERROR;
@@ -10701,12 +10697,8 @@ static ql_status bind_dynamic_array_size(lower_context *context, size_t node,
   if (status != QL_STATUS_OK) {
     return status;
   }
-  for (slot = 0u; slot < context->stack_slot_count; ++slot) {
-    if (strcmp(context->stack_slots[slot].name, variable->name) == 0) {
-      break;
-    }
-  }
-  if (slot == context->stack_slot_count || variable->is_stack == 0u) {
+  slot = variable->slot;
+  if (slot >= context->stack_slot_count || variable->is_stack == 0u) {
     ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
                  "VLA declaration has no lowering-owned object");
     return QL_STATUS_INTERNAL_ERROR;
@@ -13308,17 +13300,21 @@ static ql_status add_object(lower_context *context, const char *label,
    correctly is what keeps an out-of-bounds access out of bounds; rounding
    every slot up to a machine word would quietly make overruns look legal. */
 static ql_status stack_slot_type(lower_context *context, const char *name,
-                                 lower_type *output, uint32_t *is_parameter,
+                                 size_t from, lower_type *output,
+                                 uint32_t *is_parameter, size_t *named_out,
                                  ql_error *error) {
   size_t index;
   size_t end;
 
   *is_parameter = 0u;
-  for (index = 0u; index < context->variable_count; ++index) {
-    if (strcmp(context->variables[index].name, name) == 0) {
-      *output = context->variables[index].type;
-      *is_parameter = 1u;
-      return QL_STATUS_OK;
+  *named_out = SIZE_MAX;
+  if (from == 0u) {
+    for (index = 0u; index < context->variable_count; ++index) {
+      if (strcmp(context->variables[index].name, name) == 0) {
+        *output = context->variables[index].type;
+        *is_parameter = 1u;
+        return QL_STATUS_OK;
+      }
     }
   }
   end = subtree_end(context, context->body_node);
@@ -13373,11 +13369,12 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
         ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
         return QL_STATUS_OUT_OF_MEMORY;
       }
-      matches = strcmp(candidate, name) == 0;
+      matches = strcmp(candidate, name) == 0 && named >= from;
       context->allocator->deallocate(context->allocator->user_data, candidate);
       if (!matches) {
         continue;
       }
+      *named_out = named;
       status = parse_local_type(context, index, type_node, &base, &is_const,
                                 &is_static, error);
       if (status != QL_STATUS_OK || context->unknown != 0u) {
@@ -13408,6 +13405,11 @@ static ql_status stack_slot_type(lower_context *context, const char *name,
       return QL_STATUS_OK;
     }
   }
+  if (from != 0u) {
+    /* Resuming past the last declaration of this name is how the caller
+       learns there are no more, not an error. */
+    return QL_STATUS_OK;
+  }
   return lower_unknown(
       context, QL_C_LOWER_DIAGNOSTIC_UNDECLARED_IDENTIFIER, context->body_node,
       "an address is taken of a name this function does not declare", error);
@@ -13428,6 +13430,8 @@ static ql_status add_stack_slot_objects(lower_context *context,
     uint32_t is_parameter;
     char label[160];
     size_t object;
+    size_t named;
+    size_t from;
     ql_status status;
 
     /* A global already has an object of its own, so taking its address
@@ -13442,9 +13446,18 @@ static ql_status add_stack_slot_objects(lower_context *context,
     if (is_global) {
       continue;
     }
-    status = stack_slot_type(context, name, &type, &is_parameter, error);
+    /* One slot per declaration of the name, because a name declared twice in
+       disjoint scopes is two objects. A parameter has one. */
+    from = 0u;
+    for (;;) {
+    named = SIZE_MAX;
+    status = stack_slot_type(context, name, from, &type, &is_parameter, &named,
+                             error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
+    }
+    if (from != 0u && named == SIZE_MAX) {
+      break;
     }
     if (type.kind == QL_C_SCALAR_VOID) {
       return lower_unknown(
@@ -13498,7 +13511,13 @@ static ql_status add_stack_slot_objects(lower_context *context,
     slot->object = object;
     slot->address = QL_IR_INVALID_VALUE_ID;
     slot->is_parameter = is_parameter;
+    slot->declarator_node = named;
     ++context->stack_slot_count;
+    if (is_parameter != 0u || named == SIZE_MAX) {
+      break;
+    }
+    from = named + 1u;
+    }
   }
   return QL_STATUS_OK;
 }
@@ -14239,10 +14258,12 @@ static ql_status materialize_stack_slots(lower_context *context,
     lower_variable *variable = &context->variables[index];
     size_t slot;
     for (slot = 0u; slot < context->stack_slot_count; ++slot) {
-      if (strcmp(context->stack_slots[slot].name, variable->name) != 0) {
+      if (strcmp(context->stack_slots[slot].name, variable->name) != 0 ||
+          context->stack_slots[slot].declarator_node != SIZE_MAX) {
         continue;
       }
       variable->is_stack = 1u;
+      variable->slot = slot;
       variable->address = context->stack_slots[slot].address;
       variable->has_object = 1u;
       break;
