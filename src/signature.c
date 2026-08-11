@@ -106,7 +106,8 @@ static ql_status validate_type(const ql_source_type_v1 *type,
         }
         return QL_STATUS_OK;
     case QL_SOURCE_TYPE_FLOAT:
-        if ((type->bit_width != 32u && type->bit_width != 64u) ||
+        if ((type->bit_width != 32u && type->bit_width != 64u &&
+             type->bit_width != 80u) ||
             type->address_space != 0u || type->pointer_depth != 0u) {
             break;
         }
@@ -1111,9 +1112,13 @@ static ql_status type_from_inventory(const ql_c_type_inventory_v1 *inventory,
             return QL_STATUS_OK;
         }
         if (strcmp(normalized, "float") == 0 ||
-            strcmp(normalized, "double") == 0) {
+            strcmp(normalized, "double") == 0 ||
+            strcmp(normalized, "longdouble") == 0) {
             output->kind = QL_SOURCE_TYPE_FLOAT;
-            output->bit_width = strcmp(normalized, "float") == 0 ? 32u : 64u;
+            output->bit_width = strcmp(normalized, "float") == 0
+                                    ? 32u
+                                    : (strcmp(normalized, "double") == 0 ? 64u
+                                                                          : 80u);
             return QL_STATUS_OK;
         }
         for (index = 0u; index < sizeof(signature_integer_table) /
@@ -1325,7 +1330,9 @@ static ql_status ir_type_matches(const ql_ir *ir, ql_ir_type_id type_id,
             ((expected->bit_width == 32u &&
               type.float_format == QL_IR_FLOAT_IEEE_BINARY32) ||
              (expected->bit_width == 64u &&
-              type.float_format == QL_IR_FLOAT_IEEE_BINARY64))) {
+              type.float_format == QL_IR_FLOAT_IEEE_BINARY64) ||
+             (expected->bit_width == 80u &&
+              type.float_format == QL_IR_FLOAT_X87_BINARY80))) {
             return QL_STATUS_OK;
         }
         break;

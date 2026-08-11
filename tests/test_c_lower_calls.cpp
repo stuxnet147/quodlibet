@@ -30,6 +30,8 @@
 /* The callees the lowered bodies below call. The reference runs these; the
    interpreter is handed a specification that runs the same ones. */
 extern "C" {
+int CALLEE_unprototyped(int first, double second);
+int ql_test_call_unprototyped(short first, float second);
 int CALLEE_double(int a) { return a * 2; }
 int CALLEE_sum(int a, int b) { return a + b; }
 int CALLEE_variadic(int tag, ...) {
@@ -148,6 +150,11 @@ QL_CALL_FUNCTION(variadic, int CALLEE_variadic(int, ...);
     int call_variadic(short a, unsigned char b) {
         return CALLEE_variadic(3, a, b);
     });
+static const char unprototyped_source[] =
+    "int CALLEE_unprototyped();\n"
+    "int call_unprototyped(short first, float second) {\n"
+    "  return CALLEE_unprototyped(first, second);\n"
+    "}\n";
 /* The stars between the return type and the callee's name belong to the
    return type. Reading them is what lets this declaration be found at all. */
 QL_CALL_FUNCTION(pointerresult, char *CALLEE_high(void);
@@ -162,6 +169,14 @@ QL_CALL_FUNCTION(outlocal, int CALLEE_write_out(int *, int);
         int status = CALLEE_write_out(&output, value);
         return output + status;
     });
+static const char outlocal_disguised_cast_source[] =
+    "typedef unsigned long OUT_BITS;\n"
+    "int CALLEE_write_out_bits(OUT_BITS, int);\n"
+    "int call_out_local_bits(int value) {\n"
+    "  int output;\n"
+    "  int status = CALLEE_write_out_bits((OUT_BITS)(&output), value);\n"
+    "  return output + status;\n"
+    "}\n";
 QL_CALL_FUNCTION(float_result, double CALLEE_scale(float);
     double call_float(float value) { return CALLEE_scale(value) + 0.25; });
 QL_CALL_FUNCTION(variadic_float, double CALLEE_variadic_float(int, ...);
@@ -195,6 +210,13 @@ static const char selected_record_source[] =
     "  input.tag = (unsigned char)(input.tag + 3u);\n"
     "  return input;\n"
     "}\n";
+static const char wide_selected_record_source[] =
+    "struct WIDE_SELECTED_RECORD { int values[10]; };\n"
+    "struct WIDE_SELECTED_RECORD wide_selected_record_roundtrip(\n"
+    "    struct WIDE_SELECTED_RECORD input) {\n"
+    "  input.values[9] += input.values[0];\n"
+    "  return input;\n"
+    "}\n";
 QL_CALL_FUNCTION(indirect, struct CALL_VTABLE {
         int (*callback)(int);
         char *(*pointer_callback)(void);
@@ -225,6 +247,18 @@ QL_CALL_FUNCTION(local_callback,
         chosen = incoming;
         return (*chosen)(value) - 1;
     });
+QL_CALL_FUNCTION(typedef_local_callback,
+    typedef int (*CALL_LOCAL_TYPEDEF)(int);
+    int call_typedef_local(CALL_LOCAL_TYPEDEF incoming, int value) {
+        CALL_LOCAL_TYPEDEF chosen = incoming;
+        return chosen(value) + 3;
+    });
+static const char typedef_global_callback_source[] =
+    "typedef int (*CALL_GLOBAL_TYPEDEF)(int);\n"
+    "extern CALL_GLOBAL_TYPEDEF GLOBAL_callback;\n"
+    "int call_typedef_global(int value) {\n"
+    "  return GLOBAL_callback(value) + 4;\n"
+    "}\n";
 QL_CALL_FUNCTION(cast_void_callback,
     int call_cast_void_callback(void *incoming, int value) {
         return ((int (*)(int)) incoming)(value) + 2;
@@ -387,7 +421,21 @@ int QL_CALL Invoke(void *user_data, const char *symbol,
         log->arguments.push_back(seen);
         return 1;
     }
-    if (std::strcmp(symbol, "CALLEE_record") == 0 && argument_count == 1u) {
+    if (std::strcmp(symbol, "CALLEE_unprototyped") == 0 &&
+        argument_count == 2u) {
+        if (arguments[0].size != sizeof(int32_t) ||
+            arguments[1].size != sizeof(double) ||
+            result_size != sizeof(int32_t)) {
+            ADD_FAILURE() << "unprototyped arguments did not receive the "
+                             "default promotions";
+            return 0;
+        }
+        const int32_t first = static_cast<int32_t>(seen[0]);
+        double second = 0.0;
+        std::memcpy(&second, arguments[1].data, sizeof(second));
+        value = CALLEE_unprototyped(first, second);
+    } else if (std::strcmp(symbol, "CALLEE_record") == 0 &&
+               argument_count == 1u) {
         if (arguments[0].size != sizeof(uint64_t) ||
             result_size != sizeof(int32_t)) {
             ADD_FAILURE() << "record call image has the wrong packed width";
@@ -796,6 +844,25 @@ TEST(CLowerCalls, CarriesFloatingArgumentsResultsAndVariadicPromotion) {
     }
 }
 
+TEST(CLowerCalls, AppliesDefaultPromotionsToAnUnprototypedCall) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(unprototyped_source, "call_unprototyped"));
+    for (const short first : {short{-91}, short{0}, short{37}}) {
+        for (const float second : {-3.25f, 0.0f, 7.5f}) {
+            CallLog log;
+            const Outcome run = Execute(
+                lowered.ir(), {Widen(first), FloatBits(second)}, &log);
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            EXPECT_EQ(ql_test_call_unprototyped(first, second),
+                      Returned(run.result));
+            EXPECT_EQ(std::vector<std::string>{"CALLEE_unprototyped"},
+                      log.symbols);
+        }
+    }
+}
+
 TEST(CLowerCalls, PassesARecordByValueAsItsPackedObjectImage) {
     Lowered lowered;
     uint8_t initial[sizeof(CALL_RECORD)]{};
@@ -896,6 +963,33 @@ TEST(CLowerCalls, CarriesASelectedFunctionsRecordBoundaryAsAnObjectImage) {
     }
 }
 
+TEST(CLowerCalls, LowersAWideSelectedRecordWithoutTruncatingItsImage) {
+    Lowered lowered;
+    ql_ir_view_v1 view{};
+    ql_ir_type_view_v1 type{};
+    ql_error error{};
+
+    ASSERT_TRUE(lowered.Open(wide_selected_record_source,
+                             "wide_selected_record_roundtrip"));
+    view.struct_size = sizeof(view);
+    ASSERT_EQ(QL_STATUS_OK, ql_ir_get_view(lowered.ir(), &view, &error))
+        << error.message;
+    type.struct_size = sizeof(type);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_ir_type_at(lowered.ir(), view.return_type, &type, &error))
+        << error.message;
+    EXPECT_EQ(QL_IR_TYPE_BIT_VECTOR, type.kind);
+    EXPECT_EQ(320u, type.bit_width);
+
+    ql_ir_interp_result_v1 result{};
+    result.struct_size = sizeof(result);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_ir_interp_run(nullptr, lowered.ir(), nullptr, 0u, nullptr,
+                               &result, &error))
+        << error.message;
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNSUPPORTED, result.outcome);
+}
+
 TEST(CLowerCalls, FollowsAPointerTheCalleeReturned) {
     /* The source signature cannot name the returned object. The dynamic
        descriptor binds the interpreter to the same real storage the compiled
@@ -921,6 +1015,9 @@ TEST(CLowerCalls, FollowsAPointerTheCalleeReturned) {
 TEST(CLowerCalls, CarriesOutLocalValueAndDefinednessFromTheSameCall) {
     Lowered lowered;
     ASSERT_TRUE(lowered.Open(outlocal_source, "call_out_local"));
+    Lowered disguised_cast;
+    ASSERT_TRUE(disguised_cast.Open(outlocal_disguised_cast_source,
+                                    "call_out_local_bits"));
 
     for (int32_t value : {-91, 0, 37, 1000}) {
         int32_t initial = 0x12345678;
@@ -1102,6 +1199,7 @@ TEST(CLowerCalls, CallsAFunctionPointerHeldInALocal) {
         {"call_local_callback", &call_local_callback},
         {"call_local_callback_parenthesized",
          &call_local_callback_parenthesized},
+        {"call_typedef_local", &call_typedef_local},
     };
     uint8_t dummy = 0u;
     ql_ir_interp_object_v1 object{};
@@ -1113,7 +1211,11 @@ TEST(CLowerCalls, CallsAFunctionPointerHeldInALocal) {
     for (const Case &item : cases) {
         Lowered lowered;
         SCOPED_TRACE(item.name);
-        ASSERT_TRUE(lowered.Open(local_callback_source, item.name));
+        ASSERT_TRUE(lowered.Open(
+            std::strcmp(item.name, "call_typedef_local") == 0
+                ? typedef_local_callback_source
+                : local_callback_source,
+            item.name));
         for (int32_t value : {-91, 0, 37, 1000}) {
             CallLog log;
             const Outcome run = Execute(
@@ -1131,6 +1233,12 @@ TEST(CLowerCalls, CallsAFunctionPointerHeldInALocal) {
                       log.symbols);
         }
     }
+}
+
+TEST(CLowerCalls, RecoversAFileScopeFunctionPointerTypedefSignature) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(typedef_global_callback_source,
+                             "call_typedef_global"));
 }
 
 /* `((T (*)(A))e)(args)`. The cast states the signature the call is checked
@@ -1508,6 +1616,20 @@ TEST(CLowerCalls, CarriesSixtyFiveScalarArguments) {
 
     Lowered lowered;
     ASSERT_TRUE(lowered.Open(source.c_str(), "call_many"));
+}
+
+TEST(CLowerCalls, RecoversAFileScopeFunctionPointerSignature) {
+    constexpr char int_source[] =
+        "extern int (*GLOBAL_callback)(int);\n"
+        "int call_global(int x) { return GLOBAL_callback(x); }\n";
+    constexpr char void_source[] =
+        "extern void (*GLOBAL_notify)(int);\n"
+        "void notify_global(int x) { GLOBAL_notify(x); }\n";
+
+    Lowered int_lowered;
+    ASSERT_TRUE(int_lowered.Open(int_source, "call_global"));
+    Lowered void_lowered;
+    ASSERT_TRUE(void_lowered.Open(void_source, "notify_global"));
 }
 
 }  // namespace

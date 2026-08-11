@@ -96,6 +96,13 @@ QL_PTR_FUNCTION(address_of_element, int ptr_address(int *p, int i) {
     int *slot = &p[i];
     return *slot + 1;
 });
+QL_PTR_FUNCTION(local_uninitialized_alias,
+    int ptr_local_alias(int choose) {
+        int value;
+        int *slot = &value;
+        if (choose) *slot = 37;
+        return value;
+    });
 /* None of these designators is evaluated. In particular the far-out index
    must not emit an access guard or read memory. */
 QL_PTR_FUNCTION(sizeof_designators, int ptr_sizeof(int *p, int i) {
@@ -395,6 +402,29 @@ TEST(CLowerPointers, LoadsThroughAPointerParameter) {
     EXPECT_EQ(11, Returned(run.result));
 }
 
+TEST(CLowerPointers, TracksInitializationThroughAnExactLocalPointerAlias) {
+    Lowered lowered;
+    const int32_t initial = -999;
+
+    ASSERT_TRUE(
+        lowered.Open(local_uninitialized_alias_source, "ptr_local_alias"));
+    const Outcome written = Execute(
+        lowered.ir(), kBase, {1u}, kBase, sizeof(initial),
+        reinterpret_cast<const uint8_t *>(&initial), nullptr);
+    ASSERT_EQ(QL_STATUS_OK, written.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, written.result.outcome)
+        << ql_ir_interp_ub_reason_string(written.result.ub_reason);
+    EXPECT_EQ(37, Returned(written.result));
+
+    const Outcome unread = Execute(
+        lowered.ir(), kBase, {0u}, kBase, sizeof(initial),
+        reinterpret_cast<const uint8_t *>(&initial), nullptr);
+    ASSERT_EQ(QL_STATUS_OK, unread.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+              unread.result.outcome);
+    EXPECT_EQ(QL_IR_INTERP_UB_GUARD_FAILED, unread.result.ub_reason);
+}
+
 TEST(CLowerPointers, StoresThroughAPointerParameterAndLeavesThemVisible) {
     Lowered lowered;
     const int32_t data[kElements] = {5, 6, 7, 8};
@@ -500,6 +530,12 @@ TEST(CLowerPointers, CarriesAnIncompleteRecordAsAnOpaquePointer) {
         "int ptr_step_complete(struct COMPLETE_STEP *p, unsigned int i) {\n"
         "  return (p + i) == p;\n"
         "}\n";
+    static const char local_typedef_source[] =
+        "typedef struct LOCAL_OPAQUE LOCAL_OPAQUE;\n"
+        "int ptr_copy_opaque(LOCAL_OPAQUE *p) {\n"
+        "  struct LOCAL_OPAQUE *copy = p;\n"
+        "  return copy == 0;\n"
+        "}\n";
     Lowered lowered;
     const uint8_t dummy = 0u;
 
@@ -513,6 +549,15 @@ TEST(CLowerPointers, CarriesAnIncompleteRecordAsAnOpaquePointer) {
 
     Lowered call;
     ASSERT_TRUE(call.Open(call_source, "ptr_pass_opaque"));
+
+    Lowered local_typedef;
+    ASSERT_TRUE(local_typedef.Open(local_typedef_source, "ptr_copy_opaque"));
+    EXPECT_EQ(1, Returned(Execute(local_typedef.ir(), 0u, {}, kBase,
+                                  sizeof(dummy), &dummy, nullptr)
+                              .result));
+    EXPECT_EQ(0, Returned(Execute(local_typedef.ir(), kBase, {}, kBase,
+                                  sizeof(dummy), &dummy, nullptr)
+                              .result));
 
     Lowered complete_arithmetic;
     ASSERT_TRUE(complete_arithmetic.Open(complete_arithmetic_source,

@@ -148,6 +148,19 @@ QL_AGG_FUNCTION(static_const_array, int agg_static_const(int a) {
     static const int values[4] = {11, -3, 27, 5};
     return values[((unsigned)a) & 3u];
 });
+QL_AGG_FUNCTION(local_tag_shadow,
+    struct AGG_TAG_SHADOW { int *values; };
+    int agg_local_tag_shadow(int a, int b) {
+        struct AGG_TAG_SHADOW { int values[2]; } local = {{a, b}};
+        return local.values[0] * 3 + local.values[1];
+    });
+QL_AGG_FUNCTION(local_tag_declaration_point,
+    struct AGG_TAG_POINT { int values[2]; };
+    int agg_local_tag_declaration_point(int a, int b) {
+        struct AGG_TAG_POINT before = {{a, b}};
+        struct AGG_TAG_POINT { int *values; };
+        return before.values[0] * 5 + before.values[1];
+    });
 QL_AGG_FUNCTION(static_const_pointer_array,
     int AGG_STATIC_FIRST;
     int AGG_STATIC_SECOND;
@@ -492,6 +505,14 @@ TEST(CLowerAggregates, MatchesCompiledExecutionOnArraysAndRecords) {
         {"initialized-record", initialized_record_source, "agg_init_record",
          2, sizeof(struct AGG_INIT),
          [](int32_t a, int32_t b) { return agg_init_record(a, b); }},
+        {"local-tag-shadow", local_tag_shadow_source,
+         "agg_local_tag_shadow", 2, sizeof(int[2]),
+         [](int32_t a, int32_t b) { return agg_local_tag_shadow(a, b); }},
+        {"local-tag-declaration-point", local_tag_declaration_point_source,
+         "agg_local_tag_declaration_point", 2, sizeof(int[2]),
+         [](int32_t a, int32_t b) {
+             return agg_local_tag_declaration_point(a, b);
+         }},
         {"zero-record", zero_record_source, "agg_zero_record", 2,
          sizeof(struct AGG_ZERO),
          [](int32_t a, int32_t b) { return agg_zero_record(a, b); }},

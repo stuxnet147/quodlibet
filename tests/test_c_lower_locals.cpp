@@ -622,11 +622,17 @@ TEST(CLowerLocals, ChecksALoopVlaAgainstTheCurrentIterationsBound) {
     }
 }
 
-TEST(CLowerLocals, RefusesStorageWithNothingPutInIt) {
+TEST(CLowerLocals, MakesAnAliasedIndeterminateLocalUndefinedOnRead) {
     const char *source = "int f(int a) { int v; int *p = &v; return *p; }";
-    /* The address may escape to code that initializes the object. Modeling
-       that requires a callee memory-write contract, not an eager UB guard. */
-    ExpectUnknown(source, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ);
+    Lowered lowered;
+    std::vector<std::vector<uint8_t>> images;
+
+    ASSERT_TRUE(lowered.Open(source, "f"));
+    const Outcome run =
+        Execute(lowered.ir(), {Widen(0)}, {sizeof(int)}, &images);
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR, run.result.outcome);
+    EXPECT_EQ(QL_IR_INTERP_UB_GUARD_FAILED, run.result.ub_reason);
 }
 
 TEST(CLowerLocals, RefusesStorageInitializedOnOnlyOneBranch) {

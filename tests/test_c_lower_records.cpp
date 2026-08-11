@@ -55,6 +55,12 @@ QL_REC_FUNCTION(deref_dot,
 QL_REC_FUNCTION(overlap,
     union REC_U { int as_int; unsigned int as_unsigned; };
     int rec_union(union REC_U *p) { return p->as_unsigned > 0; });
+QL_REC_FUNCTION(anonymous_typedef,
+    typedef struct { char tag; int value; short tail; } REC_ANONYMOUS;
+    unsigned int rec_anonymous_typedef(REC_ANONYMOUS *p) {
+        return (unsigned int)p->tag + (unsigned int)p->value * 3u +
+               (unsigned int)p->tail * 7u;
+    });
 QL_REC_FUNCTION(labels,
     enum REC_E { REC_ZERO, REC_ONE, REC_TEN = 10, REC_ELEVEN };
     int rec_enum(int a) { return a + REC_TEN + REC_ELEVEN + REC_ONE; });
@@ -63,6 +69,26 @@ QL_REC_FUNCTION(sizeof_members,
     int rec_size(struct REC_SIZE *p) {
         return (int)(sizeof(p->tag) + sizeof(p->values) +
                      sizeof((*p).values[0]));
+    });
+QL_REC_FUNCTION(constant_bound_operators,
+    struct REC_CONSTANT_BOUND {
+        unsigned short values[
+            (((1 + 3) - 1) / 3) + (((258 + 31) & (~31)) / 32)];
+    };
+    int rec_constant_bound(void) {
+        return (int)sizeof(struct REC_CONSTANT_BOUND);
+    });
+QL_REC_FUNCTION(compound_literals,
+    struct REC_LITERAL { int first; int second; };
+    int rec_compound_literal(int a, int b) {
+        return ((struct REC_LITERAL){a, b}).first * 7 +
+               ((struct REC_LITERAL){a, b}).second;
+    }
+    int rec_compound_array(int index) {
+        return ((int[]){3, 7, 11})[index];
+    }
+    struct REC_LITERAL rec_compound_return(int a, int b) {
+        return (struct REC_LITERAL){a, b};
     });
 QL_REC_FUNCTION(direct_double_pointer,
     int rec_direct_double(int **p) { return **p; });
@@ -359,6 +385,13 @@ TEST(CLowerRecords, ReadsAMemberThroughADereferenceAndDot) {
         UINT64_C(0x7d3e50a1c9f28b46));
 }
 
+TEST(CLowerRecords, ResolvesAnAnonymousRecordThroughItsTypedef) {
+    CompareOverRandomRecords<REC_ANONYMOUS>(
+        anonymous_typedef_source, "rec_anonymous_typedef",
+        [](REC_ANONYMOUS *p) { return rec_anonymous_typedef(p); },
+        UINT64_C(0x6c82f4a9173db05e));
+}
+
 TEST(CLowerRecords, ReadsUnionMembersOverTheSameBytes) {
     CompareOverRandomRecords<union REC_U>(
         overlap_source, "rec_union",
@@ -371,6 +404,62 @@ TEST(CLowerRecords, QueriesMemberTypesWithoutReadingTheObject) {
         sizeof_members_source, "rec_size",
         [](struct REC_SIZE *p) { return rec_size(p); },
         UINT64_C(0x8b4f21d6a3509ce7));
+}
+
+TEST(CLowerRecords, FoldsCIntegerOperatorsInMemberArrayBounds) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(constant_bound_operators_source,
+                             "rec_constant_bound"));
+    const Outcome run = Execute(lowered.ir(), {}, {}, {});
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+        << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+    EXPECT_EQ(rec_constant_bound(), Returned(run.result));
+}
+
+TEST(CLowerRecords, MaterializesRecordCompoundLiteralsAtTheirUse) {
+    Lowered lowered;
+    ASSERT_TRUE(lowered.Open(compound_literals_source,
+                             "rec_compound_literal"));
+    for (int32_t a : {-12, 0, 39}) {
+        for (int32_t b : {-7, 3, 91}) {
+            struct REC_LITERAL first_image{};
+            struct REC_LITERAL second_image{};
+            const Region first = {
+                kBase, sizeof(first_image),
+                reinterpret_cast<const uint8_t *>(&first_image), nullptr};
+            const Region second = {
+                kBase + UINT64_C(0x1000), sizeof(second_image),
+                reinterpret_cast<const uint8_t *>(&second_image), nullptr};
+            const Outcome run = Execute(
+                lowered.ir(), {},
+                {static_cast<uint64_t>(static_cast<uint32_t>(a)),
+                 static_cast<uint64_t>(static_cast<uint32_t>(b))},
+                {first, second});
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            EXPECT_EQ(rec_compound_literal(a, b), Returned(run.result));
+        }
+    }
+    Lowered returned;
+    EXPECT_TRUE(returned.Open(compound_literals_source,
+                              "rec_compound_return", false));
+
+    Lowered array;
+    ASSERT_TRUE(array.Open(compound_literals_source, "rec_compound_array"));
+    int32_t array_image[3]{};
+    const Region array_region = {
+        kBase, sizeof(array_image),
+        reinterpret_cast<const uint8_t *>(array_image), nullptr};
+    for (int32_t index : {0, 1, 2}) {
+        const Outcome run = Execute(
+            array.ir(), {}, {static_cast<uint64_t>(index)}, {array_region});
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(rec_compound_array(index), Returned(run.result));
+    }
 }
 
 TEST(CLowerRecords, StoresIntoAMemberAndLeavesItVisible) {
@@ -565,11 +654,6 @@ TEST(CLowerRecords, RefusesRemainingWholeRecordValues) {
         const char *name;
     };
     const Case cases[] = {
-        /* The selected-function image is deliberately bounded by the
-           concrete interpreter's 32-byte value capacity. */
-        {"struct S { unsigned long long words[5]; };\n"
-         "int by_value(struct S s) { return (int)s.words[0]; }",
-         "by_value"},
         /* A discarded assignment is a byte snapshot, but using the assignment
            expression as a record value still needs an IR record value. */
         {"struct S { int a; };\nint whole(int a) "

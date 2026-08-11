@@ -321,6 +321,36 @@ TEST(SourceSignature, PreservesFloatingKindWidthAndIrBinding) {
     ql_ir_release(ir);
 }
 
+TEST(SourceSignature, BindsSysVX87LongDoubleByItsValueWidth) {
+    w2::CFunction function;
+    SignatureHandle signature;
+    ql_source_type_v1 argument{};
+    ql_ir *ir = nullptr;
+    ql_error error{};
+
+    ASSERT_NO_FATAL_FAILURE(w2::BuildOrFail(
+        &function,
+        "long double keep(long double x){ return x + 1.25L; }", "keep"));
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_source_signature_open(nullptr, function.signature_artifact(),
+                                       signature.output(), &error))
+        << error.message;
+    const ql_source_signature_view_v1 view = View(signature.get());
+    EXPECT_EQ(QL_SOURCE_TYPE_FLOAT, view.return_type.kind);
+    EXPECT_EQ(80u, view.return_type.bit_width);
+    ASSERT_EQ(QL_STATUS_OK, ql_source_signature_argument_at(
+                                signature.get(), 0u, &argument, &error));
+    EXPECT_EQ(QL_SOURCE_TYPE_FLOAT, argument.kind);
+    EXPECT_EQ(80u, argument.bit_width);
+    ASSERT_EQ(QL_STATUS_OK,
+              ql_ir_open(nullptr, function.ir_artifact(), &ir, &error))
+        << error.message;
+    EXPECT_EQ(QL_STATUS_OK,
+              ql_source_signature_bind_ir(signature.get(), ir, &error))
+        << error.message;
+    ql_ir_release(ir);
+}
+
 TEST(SourceSignature, RefusesFloatingArgumentsInPreconditionSchemaV1) {
     w2::CFunction function;
     SignatureHandle signature;

@@ -79,7 +79,8 @@ static const scalar_spelling k_spellings[] = {
     {"unsignedlonglong", QL_C_SCALAR_INTEGER, 64u, 5u, 0u},
     {"unsignedlonglongint", QL_C_SCALAR_INTEGER, 64u, 5u, 0u},
     {"float", QL_C_SCALAR_FLOAT, 32u, 6u, 0u},
-    {"double", QL_C_SCALAR_FLOAT, 64u, 7u, 0u}
+    {"double", QL_C_SCALAR_FLOAT, 64u, 7u, 0u},
+    {"longdouble", QL_C_SCALAR_FLOAT, 80u, 8u, 0u}
 };
 
 int ql_c_scalar_from_spelling(const char *spelling,

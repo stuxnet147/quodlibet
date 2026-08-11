@@ -6,6 +6,7 @@
 #include "quodlibet/ir_interp.h"
 
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
@@ -22,9 +23,17 @@
 #define LOWER_ARRAY_BOUND_DYNAMIC (UINT64_MAX - UINT64_C(1))
 #define LOWER_MAX_POINTER_INDIRECTION 4u
 /* A selected function carries one by-value record as one bit-vector image.
-   Keep it within the concrete interpreter's existing public value capacity;
-   larger records remain UNKNOWN instead of silently dropping bytes. */
-#define LOWER_MAX_BOUNDARY_RECORD_BYTES QL_IR_INTERP_VALUE_CAPACITY
+   SMT and the IR verifier accept wider vectors than the concrete interpreter,
+   so retain complete images up to the same measured aggregate-size boundary
+   used elsewhere in this lowering. Images above the interpreter's public
+   value capacity remain valid IR but concrete replay reports UNSUPPORTED. */
+#define LOWER_MAX_BOUNDARY_RECORD_BYTES 1024u
+/* The flat-memory model states pairwise disjointness for every object known
+   before lowering the body. Beyond this count the quadratic constraint graph
+   is not a practical proof IR. Refuse the extreme function explicitly rather
+   than imposing an address order that C never promised. Late authority
+   regions have their own separately tested bound. */
+#define LOWER_MAX_PREDECLARED_OBJECTS 192u
 
 typedef struct ql_c_lower_diagnostic_record {
   ql_c_lower_diagnostic_code code;
@@ -110,6 +119,9 @@ typedef struct lower_callee {
   size_t declarator_node;
   uint32_t return_pointer_depth;
   uint32_t is_variadic;
+  /* `R f()` is not a zero-argument prototype in this C profile. Calls use
+     the actual argument list after the default argument promotions. */
+  uint32_t has_unspecified_parameters;
   uint32_t resolved;
   /* Set when this entry came from a definition in the unit rather than from a
      prototype. In this corpus that is the selected function itself. Both its
@@ -145,6 +157,13 @@ typedef struct lower_record {
      as `union { int x; char bytes[4]; } value` can recover the definition
      without conflating two unrelated anonymous records. */
   size_t specifier_node;
+  /* Earliest declaration that made this named tag visible. It can precede
+     `specifier_node` when a forward declaration is completed later. */
+  size_t first_declaration_node;
+  /* C tags have lexical scope independently of ordinary identifiers. Two
+     `struct T` definitions in a file and a nested block therefore need two
+     identities even though their spelling is the same. */
+  size_t scope_node;
   size_t body_node;
   uint32_t is_union;
   uint32_t layout_state;
@@ -173,6 +192,11 @@ typedef struct lower_value {
   uint32_t may_ub;
   /* Set when the table already names every object this pointer may access. */
   uint32_t has_object;
+  /* One plus the exact object-table slot when this value is known to stay
+     within one source object. Zero keeps the existing conservative search
+     over every declared authority region. The plus-one encoding makes a
+     zero-initialized lower_value safely mean "not known". */
+  uint32_t object_identity;
   /* Set when pointer bits may name storage outside the current table. The
      target object is admitted only if an access actually follows, so merely
      comparing or returning those bits does not narrow the function domain. */
@@ -210,6 +234,7 @@ typedef struct lower_variable {
   uint32_t has_function_signature;
   /* Set for a pointer whose object the table declares. */
   uint32_t has_object;
+  uint32_t object_identity;
   uint32_t may_admit_object;
   /* Set when this variable lives in storage rather than in an SSA value,
      which is what taking its address requires. Its value is then whatever
@@ -276,6 +301,9 @@ typedef struct lower_global {
   size_t object;
   ql_ir_value_id address;
   uint32_t referenced;
+  uint32_t is_function_pointer;
+  uint32_t function_return_depth;
+  size_t function_declarator;
 } lower_global;
 
 /* Storage for one address-taken name. `is_parameter` marks the ones whose
@@ -309,6 +337,7 @@ typedef struct lower_state {
   uint8_t *initialized;
   uint8_t *has_object;
   uint8_t *may_admit_object;
+  uint32_t *object_identity;
   size_t count;
   ql_ir_value_id memory;
   ql_ir_value_id trace;
@@ -407,6 +436,10 @@ typedef struct lower_context {
      address of an uninitialised scalar local. The call result supplies the
      value and path predicate that make a later read honest. */
   uint32_t allow_uninitialized_call_address;
+  /* Set while the address is captured only in an SSA pointer local. Such an
+     alias has not escaped: exact loads inherit the pointee's definedness and
+     an exact whole-object store establishes it. */
+  uint32_t allow_uninitialized_local_alias;
   /* Names this function takes the address of, so their locals get storage
      instead of an SSA value. */
   char **address_taken;
@@ -936,6 +969,13 @@ static uint64_t pointee_byte_width(const lower_context *context,
        byte. Loading or storing a void object remains a type error. */
     return 1u;
   }
+  if (pointer.pointee.kind == QL_C_SCALAR_FLOAT &&
+      pointer.pointee.width == 80u) {
+    /* SysV stores the 80 value bits in a 16-byte object. Pointer arithmetic,
+       alignment, sizeof, and access bounds use the object representation;
+       the typed IR load/store still carries exactly the 80 value bits. */
+    return 16u;
+  }
   bits = pointer.pointee.kind == QL_C_SCALAR_BOOL ? 8u : pointer.pointee.width;
   return (bits + 7u) / 8u;
 }
@@ -969,6 +1009,9 @@ static uint64_t type_byte_width(const lower_context *context, lower_type type) {
   }
   if (type.kind == QL_C_SCALAR_POINTER) {
     return QL_C_POINTER_WIDTH / 8u;
+  }
+  if (type.kind == QL_C_SCALAR_FLOAT && type.width == 80u) {
+    return 16u;
   }
   return ((type.kind == QL_C_SCALAR_BOOL ? 8u : type.width) + 7u) / 8u;
 }
@@ -1471,11 +1514,11 @@ static int decode_string_literal(const char *text, size_t size,
 }
 
 static ql_status collect_string_literals(lower_context *context,
-                                         size_t body_node, ql_error *error) {
-  size_t end = subtree_end(context, body_node);
+                                         size_t root_node, ql_error *error) {
+  size_t end = subtree_end(context, root_node);
   size_t index;
 
-  for (index = body_node + 1u; index < end; ++index) {
+  for (index = root_node; index < end; ++index) {
     unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
     size_t decoded_size = 0u;
     lower_string *entry;
@@ -1485,6 +1528,19 @@ static ql_status collect_string_literals(lower_context *context,
 
     if (strcmp(context->nodes[index].view.kind, "string_literal") != 0) {
       continue;
+    }
+    {
+      size_t existing;
+      int already_collected = 0;
+      for (existing = 0u; existing < context->string_count; ++existing) {
+        if (context->strings[existing].node == index) {
+          already_collected = 1;
+          break;
+        }
+      }
+      if (already_collected != 0) {
+        continue;
+      }
     }
     text = copy_node_text(context, index);
     if (text == NULL) {
@@ -1612,10 +1668,15 @@ static ql_status collect_address_taken(lower_context *context, size_t body_node,
 static lower_callee *find_callee(lower_context *context, const char *name);
 static ql_status resolve_callee(lower_context *context, lower_callee *callee,
                                 size_t node, ql_error *error);
+static const lower_typedef *find_function_typedef(
+    const lower_context *context, const char *name);
 
 static size_t member_declarator_name(const lower_context *context,
                                      size_t declarator, uint32_t *pointer_depth,
                                      uint64_t *array_length, int *rejected);
+static size_t function_pointer_local_declarator(
+    const lower_context *context, size_t declarator, size_t *identifier,
+    uint32_t *return_depth);
 
 /* A file-scope declaration, or an extern object declaration in the selected
    function, that names static storage rather than a function. A block-scope
@@ -1648,8 +1709,12 @@ static ql_status collect_globals(lower_context *context, ql_error *error) {
       size_t declarator = child;
       size_t initializer = SIZE_MAX;
       size_t named;
+      size_t callback_declarator = SIZE_MAX;
+      size_t callback_identifier = SIZE_MAX;
+      uint32_t callback_return_depth = 0u;
       uint32_t pointer_depth;
       uint64_t array_length;
+      uint64_t row_length;
       int rejected;
       lower_global *entry;
       ql_status status;
@@ -1664,12 +1729,25 @@ static ql_status collect_globals(lower_context *context, ql_error *error) {
         initializer = direct_field_child(context, declarator, "value");
         declarator = direct_field_child(context, declarator, "declarator");
       }
-      if (declarator == SIZE_MAX || strcmp(context->nodes[declarator].view.kind,
-                                           "function_declarator") == 0) {
+      if (declarator == SIZE_MAX) {
         continue;
       }
-      named = member_declarator_name(context, declarator, &pointer_depth,
-                                     &array_length, &rejected);
+      callback_declarator = function_pointer_local_declarator(
+          context, declarator, &callback_identifier, &callback_return_depth);
+      if (callback_declarator != SIZE_MAX) {
+        named = callback_identifier;
+        pointer_depth = 0u;
+        array_length = 0u;
+        row_length = 0u;
+        rejected = 0;
+      } else {
+        if (strcmp(context->nodes[declarator].view.kind,
+                   "function_declarator") == 0) {
+          continue;
+        }
+        named = member_declarator_shape(context, declarator, &pointer_depth,
+                                        &array_length, &row_length, &rejected);
+      }
       if (named == SIZE_MAX || rejected != 0) {
         continue;
       }
@@ -1696,6 +1774,13 @@ static ql_status collect_globals(lower_context *context, ql_error *error) {
             context->globals[existing].declarator_node = declarator;
             context->globals[existing].initializer_node = initializer;
           }
+          if (callback_declarator != SIZE_MAX) {
+            context->globals[existing].is_function_pointer = 1u;
+            context->globals[existing].function_declarator =
+                callback_declarator;
+            context->globals[existing].function_return_depth =
+                callback_return_depth;
+          }
           break;
         }
         context->allocator->deallocate(context->allocator->user_data, text);
@@ -1719,6 +1804,9 @@ static ql_status collect_globals(lower_context *context, ql_error *error) {
       entry->declaration_node = index;
       entry->declarator_node = declarator;
       entry->initializer_node = initializer;
+      entry->is_function_pointer = callback_declarator != SIZE_MAX;
+      entry->function_declarator = callback_declarator;
+      entry->function_return_depth = callback_return_depth;
       entry->object = SIZE_MAX;
       entry->address = QL_IR_INVALID_VALUE_ID;
       ++context->global_count;
@@ -1817,6 +1905,26 @@ static void collect_calls(lower_context *context, size_t body_node) {
       continue;
     }
     is_call = find_callee(context, name) != NULL;
+    if (!is_call) {
+      size_t global;
+      for (global = 0u; global < context->global_count; ++global) {
+        lower_global *candidate = &context->globals[global];
+        if (strcmp(candidate->name, name) == 0) {
+          size_t type_node = direct_field_child(
+              context, candidate->declaration_node, "type");
+          char *spelling =
+              type_node == SIZE_MAX ? NULL : copy_node_text(context, type_node);
+          is_call = candidate->is_function_pointer != 0u ||
+                    (spelling != NULL &&
+                     find_function_typedef(context, spelling) != NULL);
+          context->allocator->deallocate(context->allocator->user_data,
+                                         spelling);
+          if (is_call) {
+            break;
+          }
+        }
+      }
+    }
     context->allocator->deallocate(context->allocator->user_data, name);
     if (!is_call) {
       continue;
@@ -1921,9 +2029,58 @@ static uint32_t record_alignment(const lower_context *context, size_t record) {
                                         : 1u;
 }
 
-/* Named records are looked up by tag. */
-static size_t find_record(const lower_context *context, const char *tag,
-                          uint32_t is_union) {
+/* The lexical scope that owns a tag introduced by this specifier. A tag in a
+   function definition's parameter list remains visible in the definition;
+   one in a mere prototype has only prototype scope. */
+static size_t record_tag_scope(const lower_context *context,
+                               size_t specifier) {
+  size_t node = specifier;
+  size_t guard = 0u;
+
+  while (node != SIZE_MAX && guard++ < 128u) {
+    const char *kind = context->nodes[node].view.kind;
+    if (strcmp(kind, "compound_statement") == 0 ||
+        strcmp(kind, "for_statement") == 0 ||
+        strcmp(kind, "translation_unit") == 0) {
+      return node;
+    }
+    if (strcmp(kind, "parameter_list") == 0) {
+      size_t ancestor = context->nodes[node].parent;
+      while (ancestor != SIZE_MAX) {
+        const char *ancestor_kind = context->nodes[ancestor].view.kind;
+        if (strcmp(ancestor_kind, "function_definition") == 0) {
+          return ancestor;
+        }
+        if (strcmp(ancestor_kind, "declaration") == 0 ||
+            strcmp(ancestor_kind, "translation_unit") == 0) {
+          return node;
+        }
+        ancestor = context->nodes[ancestor].parent;
+      }
+      return node;
+    }
+    node = context->nodes[node].parent;
+  }
+  return SIZE_MAX;
+}
+
+static int node_is_within(const lower_context *context, size_t node,
+                          size_t ancestor) {
+  size_t guard = 0u;
+  while (node != SIZE_MAX && guard++ < 128u) {
+    if (node == ancestor) {
+      return 1;
+    }
+    node = context->nodes[node].parent;
+  }
+  return 0;
+}
+
+/* Collection merges forward declarations and a definition only when they
+   belong to the same tag scope. */
+static size_t find_record_in_scope(const lower_context *context,
+                                   const char *tag, uint32_t is_union,
+                                   size_t scope) {
   size_t index;
   if (tag == NULL) {
     return SIZE_MAX;
@@ -1931,11 +2088,44 @@ static size_t find_record(const lower_context *context, const char *tag,
   for (index = 0u; index < context->record_count; ++index) {
     const lower_record *record = &context->records[index];
     if (record->tag != NULL && record->is_union == is_union &&
-        strcmp(record->tag, tag) == 0) {
+        record->scope_node == scope && strcmp(record->tag, tag) == 0) {
       return index;
     }
   }
   return SIZE_MAX;
+}
+
+/* Resolve the nearest visible tag whose declaration has begun. Precollecting
+   every record is convenient for recursive layout, but must not make a later
+   block-scope declaration visible before its declarator. */
+static size_t find_record_at(const lower_context *context, const char *tag,
+                             uint32_t is_union, size_t use_node) {
+  size_t index;
+  size_t best = SIZE_MAX;
+  uint32_t best_depth = 0u;
+
+  if (tag == NULL || use_node == SIZE_MAX) {
+    return SIZE_MAX;
+  }
+  for (index = 0u; index < context->record_count; ++index) {
+    const lower_record *record = &context->records[index];
+    const ql_source_range declaration =
+        context->nodes[record->first_declaration_node].view.range;
+    uint32_t depth;
+    if (record->tag == NULL || record->is_union != is_union ||
+        strcmp(record->tag, tag) != 0 || record->scope_node == SIZE_MAX ||
+        !node_is_within(context, use_node, record->scope_node) ||
+        (record->specifier_node != use_node &&
+         declaration.start_byte > context->nodes[use_node].view.range.start_byte)) {
+      continue;
+    }
+    depth = context->nodes[record->scope_node].depth;
+    if (best == SIZE_MAX || depth > best_depth) {
+      best = index;
+      best_depth = depth;
+    }
+  }
+  return best;
 }
 
 /* A tagless record can only be named where its complete specifier is written.
@@ -2268,6 +2458,8 @@ static ql_status append_record(lower_context *context, char *tag,
   memset(record, 0, sizeof(*record));
   record->tag = tag;
   record->specifier_node = specifier;
+  record->first_declaration_node = specifier;
+  record->scope_node = record_tag_scope(context, specifier);
   record->body_node = body;
   record->is_union = is_union;
   record->layout_state = LOWER_LAYOUT_PENDING;
@@ -2304,7 +2496,8 @@ static ql_status collect_records(lower_context *context, ql_error *error) {
       ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
       return QL_STATUS_OUT_OF_MEMORY;
     }
-    if (find_record(context, tag, is_union) != SIZE_MAX) {
+    if (find_record_in_scope(context, tag, is_union,
+                             record_tag_scope(context, index)) != SIZE_MAX) {
       context->allocator->deallocate(context->allocator->user_data, tag);
       continue;
     }
@@ -2318,6 +2511,10 @@ static ql_status collect_records(lower_context *context, ql_error *error) {
     uint32_t is_union;
     size_t name_node;
     char *tag;
+    size_t scope;
+    size_t exact;
+    size_t visible;
+    int tag_only_declaration = 0;
     ql_status status;
 
     if (strcmp(kind, "struct_specifier") == 0) {
@@ -2339,7 +2536,27 @@ static ql_status collect_records(lower_context *context, ql_error *error) {
       ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
       return QL_STATUS_OUT_OF_MEMORY;
     }
-    if (find_record(context, tag, is_union) != SIZE_MAX) {
+    scope = record_tag_scope(context, index);
+    exact = find_record_in_scope(context, tag, is_union, scope);
+    visible = find_record_at(context, tag, is_union, index);
+    {
+      size_t parent = context->nodes[index].parent;
+      if (parent != SIZE_MAX &&
+          strcmp(context->nodes[parent].view.kind, "declaration") == 0 &&
+          direct_field_child(context, parent, "declarator") == SIZE_MAX) {
+        tag_only_declaration = 1;
+      }
+    }
+    if (visible != SIZE_MAX && tag_only_declaration == 0) {
+      context->allocator->deallocate(context->allocator->user_data, tag);
+      continue;
+    }
+    if (exact != SIZE_MAX) {
+      lower_record *record = &context->records[exact];
+      if (context->nodes[index].view.range.start_byte <
+          context->nodes[record->first_declaration_node].view.range.start_byte) {
+        record->first_declaration_node = index;
+      }
       context->allocator->deallocate(context->allocator->user_data, tag);
       continue;
     }
@@ -2574,6 +2791,36 @@ static ql_status parse_type_spelling(lower_context *context,
                                      uint32_t allow_void, lower_type *output,
                                      ql_error *error);
 
+/* Finds the identity of a record specifier without demanding its object
+   layout. Declarations resolve their common base before walking each
+   declarator, so `struct T value, *pointer` must be allowed to decide which
+   occurrence needs a complete T only after the stars have been counted. */
+static ql_status resolve_record_specifier(lower_context *context,
+                                          size_t type_node,
+                                          lower_type *output,
+                                          ql_error *error) {
+  const char *kind = context->nodes[type_node].view.kind;
+  const uint32_t is_union = strcmp(kind, "union_specifier") == 0;
+  size_t name_node = direct_field_child(context, type_node, "name");
+  char *tag = name_node == SIZE_MAX ? NULL : copy_node_text(context, name_node);
+  size_t record;
+
+  if (name_node != SIZE_MAX && tag == NULL) {
+    ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+    return QL_STATUS_OUT_OF_MEMORY;
+  }
+  record = tag != NULL ? find_record_at(context, tag, is_union, type_node)
+                       : find_anonymous_record(context, type_node, is_union);
+  context->allocator->deallocate(context->allocator->user_data, tag);
+  if (record == SIZE_MAX) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, type_node,
+        "struct or union has no definition in this unit", error);
+  }
+  *output = make_record_type(record);
+  return QL_STATUS_OK;
+}
+
 /* Resolves a type node together with the indirection its declarator adds.
    This is the one place that knows how a struct, a union, an enum, a typedef
    name, and a plain scalar each turn into a lowering type. */
@@ -2590,38 +2837,26 @@ static ql_status resolve_type_node(lower_context *context, size_t type_node,
   }
   if (strcmp(kind, "struct_specifier") == 0 ||
       strcmp(kind, "union_specifier") == 0) {
-    const uint32_t is_union = strcmp(kind, "union_specifier") == 0;
-    size_t name_node = direct_field_child(context, type_node, "name");
-    char *tag =
-        name_node == SIZE_MAX ? NULL : copy_node_text(context, name_node);
-    size_t record;
-    if (name_node != SIZE_MAX && tag == NULL) {
-      ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
-      return QL_STATUS_OUT_OF_MEMORY;
-    }
-    record = tag != NULL
-                 ? find_record(context, tag, is_union)
-                 : find_anonymous_record(context, type_node, is_union);
-    context->allocator->deallocate(context->allocator->user_data, tag);
-    if (record == SIZE_MAX) {
-      return lower_unknown(
-          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, type_node,
-          "struct or union has no definition in this unit", error);
+    lower_type record_type;
+    status = resolve_record_specifier(context, type_node, &record_type, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
     }
     if (pointer_depth == 0u) {
       /* Only a member held by value needs its layout now. A pointer to
          the enclosing record is how linked structures are written, and
          demanding a layout here would call every one of them
          self-containing. */
-      status = ensure_record_layout(context, record, type_node, error);
+      status =
+          ensure_record_layout(context, record_type.record, type_node, error);
       if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
       }
-      *output = make_record_type(record);
+      *output = record_type;
       return QL_STATUS_OK;
     }
-    return add_pointer_depth(context, type_node, make_record_type(record),
-                             pointer_depth, output, error);
+    return add_pointer_depth(context, type_node, record_type, pointer_depth,
+                             output, error);
   }
   {
     char *spelling = copy_node_text(context, type_node);
@@ -2716,64 +2951,270 @@ static int positional_initializer_count(const lower_context *context,
    that is a run-time expression, or one this pass cannot fold, is refused
    rather than guessed at. `T a[]` with no bound is a pointer parameter in C,
    and is reported as a zero length for the caller to interpret. */
-static int constant_array_bound_value(const lower_context *context,
-                                      size_t node, uint64_t *value_out) {
+static int constant_type_spelling_size(const lower_context *context,
+                                       const char *spelling,
+                                       uint64_t *size_out) {
+  size_t hops;
+
+  for (hops = 0u; hops < 64u; ++hops) {
+    ql_c_scalar_type scalar;
+    const lower_typedef *entry;
+
+    if (ql_c_scalar_from_spelling(spelling, &scalar) != 0 ||
+        ql_c_scalar_from_corpus_typedef(spelling, &scalar) != 0) {
+      *size_out = scalar.kind == QL_C_SCALAR_VOID
+                      ? 1u
+                      : (uint64_t)(scalar.width + 7u) / 8u;
+      return *size_out != 0u;
+    }
+    entry = find_typedef(context, spelling);
+    if (entry == NULL) {
+      return 0;
+    }
+    if (entry->pointer_depth != 0u || entry->is_function != 0u) {
+      *size_out = QL_C_POINTER_WIDTH / 8u;
+      return 1;
+    }
+    if (entry->is_array_or_function != 0u || entry->is_aggregate != 0u) {
+      return 0;
+    }
+    spelling = entry->underlying;
+  }
+  return 0;
+}
+
+static int constant_integer_type_spelling(const lower_context *context,
+                                          const char *spelling) {
+  size_t hops;
+
+  for (hops = 0u; hops < 64u; ++hops) {
+    ql_c_scalar_type scalar;
+    const lower_typedef *entry;
+    if (ql_c_scalar_from_spelling(spelling, &scalar) != 0 ||
+        ql_c_scalar_from_corpus_typedef(spelling, &scalar) != 0) {
+      return scalar.kind == QL_C_SCALAR_INTEGER ||
+             scalar.kind == QL_C_SCALAR_BOOL;
+    }
+    entry = find_typedef(context, spelling);
+    if (entry == NULL || entry->pointer_depth != 0u ||
+        entry->is_array_or_function != 0u || entry->is_aggregate != 0u) {
+      return 0;
+    }
+    spelling = entry->underlying;
+  }
+  return 0;
+}
+
+static int constant_sizeof_expression_value(const lower_context *context,
+                                            size_t node,
+                                            int64_t *value_out) {
+  size_t descriptor = direct_field_child(context, node, "type");
+  size_t type_node;
+  size_t end;
+  size_t child;
+  uint64_t size = 0u;
+  char *spelling;
+
+  if (descriptor == SIZE_MAX) {
+    size_t value_node = direct_field_child(context, node, "value");
+    size_t identifier = SIZE_MAX;
+    if (value_node != SIZE_MAX &&
+        strcmp(context->nodes[value_node].view.kind,
+               "parenthesized_expression") == 0) {
+      identifier = first_named_child(context, value_node);
+    }
+    if (identifier == SIZE_MAX ||
+        strcmp(context->nodes[identifier].view.kind, "identifier") != 0) {
+      return 0;
+    }
+    spelling = copy_node_text(context, identifier);
+    if (spelling == NULL) {
+      return 0;
+    }
+    if (find_typedef(context, spelling) == NULL ||
+        !constant_type_spelling_size(context, spelling, &size)) {
+      context->allocator->deallocate(context->allocator->user_data, spelling);
+      return 0;
+    }
+    context->allocator->deallocate(context->allocator->user_data, spelling);
+    if (size > (uint64_t)INT_MAX) {
+      return 0;
+    }
+    *value_out = (int64_t)size;
+    return 1;
+  }
+  type_node = direct_field_child(context, descriptor, "type");
+  if (type_node == SIZE_MAX) {
+    return 0;
+  }
+  end = subtree_end(context, descriptor);
+  for (child = descriptor + 1u; child < end; ++child) {
+    const char *kind;
+    if (context->nodes[child].parent != descriptor ||
+        context->nodes[child].view.field_name == NULL ||
+        strcmp(context->nodes[child].view.field_name, "declarator") != 0) {
+      continue;
+    }
+    kind = context->nodes[child].view.kind;
+    if (strcmp(kind, "abstract_pointer_declarator") == 0 ||
+        strcmp(kind, "pointer_declarator") == 0) {
+      size = QL_C_POINTER_WIDTH / 8u;
+      break;
+    }
+    return 0;
+  }
+  if (size == 0u) {
+    spelling = copy_node_text(context, type_node);
+    if (spelling == NULL) {
+      return 0;
+    }
+    if (!constant_type_spelling_size(context, spelling, &size)) {
+      context->allocator->deallocate(context->allocator->user_data, spelling);
+      return 0;
+    }
+    context->allocator->deallocate(context->allocator->user_data, spelling);
+  }
+  if (size > (uint64_t)INT_MAX) {
+    return 0;
+  }
+  *value_out = (int64_t)size;
+  return 1;
+}
+
+static int constant_int_expression_value(const lower_context *context,
+                                         size_t node, int64_t *value_out) {
   const char *kind;
-  char *text;
-  int ok = 0;
 
   if (node == SIZE_MAX) {
     return 0;
   }
   kind = context->nodes[node].view.kind;
-  text = copy_node_text(context, node);
-  if (text == NULL) {
-    return 0;
-  }
   if (strcmp(kind, "number_literal") == 0) {
+    char *text = copy_node_text(context, node);
     char *stop = NULL;
-    unsigned long long value = strtoull(text, &stop, 0);
+    unsigned long long value;
+
+    if (text == NULL) {
+      return 0;
+    }
+    errno = 0;
+    value = strtoull(text, &stop, 0);
     /* Only a plain unsuffixed or integer-suffixed value. Zero may occur in
        an intermediate constant expression; the outer bound rejects a final
-       zero because it has no bytes for an access to be inside. */
-    if (stop != text && value <= (1ull << 32)) {
+       zero because it has no bytes for an access to be inside. Restrict the
+       evaluator to values represented by the profile's ordinary signed int;
+       that makes overflow checks below independent of host integer width. */
+    if (errno == 0 && stop != text && value <= (unsigned long long)INT_MAX) {
       while (*stop == 'u' || *stop == 'U' || *stop == 'l' || *stop == 'L') {
         ++stop;
       }
       if (*stop == '\0') {
-        *value_out = (uint64_t)value;
-        ok = 1;
+        *value_out = (int64_t)value;
+        context->allocator->deallocate(context->allocator->user_data, text);
+        return 1;
       }
     }
-  } else if (strcmp(kind, "identifier") == 0) {
-    const lower_enumerator *enumerator = find_enumerator(context, text);
-    if (enumerator != NULL) {
-      *value_out = (uint64_t)enumerator->value;
-      ok = 1;
-    }
+    context->allocator->deallocate(context->allocator->user_data, text);
+    return 0;
   }
-  context->allocator->deallocate(context->allocator->user_data, text);
-  if (ok != 0) {
+  if (strcmp(kind, "identifier") == 0) {
+    char *text = copy_node_text(context, node);
+    const lower_enumerator *enumerator;
+
+    if (text == NULL) {
+      return 0;
+    }
+    enumerator = find_enumerator(context, text);
+    context->allocator->deallocate(context->allocator->user_data, text);
+    if (enumerator == NULL || enumerator->value > (uint64_t)INT_MAX) {
+      return 0;
+    }
+    *value_out = (int64_t)enumerator->value;
     return 1;
   }
+  if (strcmp(kind, "char_literal") == 0) {
+    unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
+    size_t decoded_size = 0u;
+    size_t character_count;
+    uint32_t value = 0u;
+    char *text = copy_node_text(context, node);
+    size_t index;
+    int ok;
+
+    if (text == NULL) {
+      return 0;
+    }
+    ok = decode_quoted_literal(text, strlen(text), '\'', decoded,
+                               &decoded_size);
+    context->allocator->deallocate(context->allocator->user_data, text);
+    character_count = decoded_size == 0u ? 0u : decoded_size - 1u;
+    if (!ok || character_count == 0u || character_count > 4u) {
+      return 0;
+    }
+    if (character_count == 1u) {
+      *value_out = (int64_t)(int32_t)(int8_t)decoded[0];
+      return 1;
+    }
+    for (index = 0u; index < character_count; ++index) {
+      value = (value << 8u) | decoded[index];
+    }
+    *value_out = (int64_t)(int32_t)value;
+    return 1;
+  }
+  if (strcmp(kind, "sizeof_expression") == 0) {
+    return constant_sizeof_expression_value(context, node, value_out);
+  }
   if (strcmp(kind, "parenthesized_expression") == 0) {
-    return constant_array_bound_value(context, first_named_child(context, node),
-                                      value_out);
+    return constant_int_expression_value(
+        context, first_named_child(context, node), value_out);
+  }
+  if (strcmp(kind, "unary_expression") == 0) {
+    size_t argument_node = direct_field_child(context, node, "argument");
+    size_t operator_node = direct_field_child(context, node, "operator");
+    int64_t argument;
+    int64_t result;
+    char *operator_text;
+
+    if (argument_node == SIZE_MAX || operator_node == SIZE_MAX ||
+        !constant_int_expression_value(context, argument_node, &argument)) {
+      return 0;
+    }
+    operator_text = copy_node_text(context, operator_node);
+    if (operator_text == NULL) {
+      return 0;
+    }
+    if (strcmp(operator_text, "+") == 0) {
+      result = argument;
+    } else if (strcmp(operator_text, "-") == 0 && argument != INT_MIN) {
+      result = -argument;
+    } else if (strcmp(operator_text, "~") == 0) {
+      result = (int64_t)(int32_t)~(uint32_t)(int32_t)argument;
+    } else if (strcmp(operator_text, "!") == 0) {
+      result = argument == 0 ? 1 : 0;
+    } else {
+      context->allocator->deallocate(context->allocator->user_data,
+                                     operator_text);
+      return 0;
+    }
+    context->allocator->deallocate(context->allocator->user_data,
+                                   operator_text);
+    *value_out = result;
+    return 1;
   }
   if (strcmp(kind, "binary_expression") == 0) {
     size_t left_node = direct_field_child(context, node, "left");
     size_t right_node = direct_field_child(context, node, "right");
     size_t operator_node = direct_field_child(context, node, "operator");
-    uint64_t left;
-    uint64_t right;
-    uint64_t result = 0u;
+    int64_t left;
+    int64_t right;
+    int64_t result = 0;
     char *operator_text;
+    int ok = 0;
 
     if (left_node == SIZE_MAX || right_node == SIZE_MAX ||
         operator_node == SIZE_MAX ||
-        !constant_array_bound_value(context, left_node, &left) ||
-        !constant_array_bound_value(context, right_node, &right) ||
-        left > (uint64_t)INT_MAX || right > (uint64_t)INT_MAX) {
+        !constant_int_expression_value(context, left_node, &left) ||
+        !constant_int_expression_value(context, right_node, &right)) {
       return 0;
     }
     operator_text = copy_node_text(context, operator_node);
@@ -2781,19 +3222,71 @@ static int constant_array_bound_value(const lower_context *context,
       return 0;
     }
     if (strcmp(operator_text, "+") == 0 &&
-        left <= (uint64_t)INT_MAX - right) {
+        left + right >= (int64_t)INT_MIN &&
+        left + right <= (int64_t)INT_MAX) {
       result = left + right;
       ok = 1;
-    } else if (strcmp(operator_text, "-") == 0 && left >= right) {
+    } else if (strcmp(operator_text, "-") == 0 &&
+               left - right >= (int64_t)INT_MIN &&
+               left - right <= (int64_t)INT_MAX) {
       result = left - right;
       ok = 1;
     } else if (strcmp(operator_text, "*") == 0 &&
-               (right == 0u || left <= (uint64_t)INT_MAX / right)) {
+               left * right >= (int64_t)INT_MIN &&
+               left * right <= (int64_t)INT_MAX) {
       result = left * right;
       ok = 1;
-    } else if (strcmp(operator_text, "<<") == 0 && right < 31u &&
-               left <= ((uint64_t)INT_MAX >> right)) {
+    } else if (strcmp(operator_text, "/") == 0 && right != 0 &&
+               !(left == INT_MIN && right == -1)) {
+      result = left / right;
+      ok = 1;
+    } else if (strcmp(operator_text, "%") == 0 && right != 0 &&
+               !(left == INT_MIN && right == -1)) {
+      result = left % right;
+      ok = 1;
+    } else if (strcmp(operator_text, "<<") == 0 && left >= 0 && right >= 0 &&
+               right < 31 && left <= ((int64_t)INT_MAX >> right)) {
       result = left << right;
+      ok = 1;
+    } else if (strcmp(operator_text, ">>") == 0 && left >= 0 && right >= 0 &&
+               right < 31) {
+      result = left >> right;
+      ok = 1;
+    } else if (strcmp(operator_text, "&") == 0) {
+      result = (int64_t)(int32_t)((uint32_t)(int32_t)left &
+                                  (uint32_t)(int32_t)right);
+      ok = 1;
+    } else if (strcmp(operator_text, "|") == 0) {
+      result = (int64_t)(int32_t)((uint32_t)(int32_t)left |
+                                  (uint32_t)(int32_t)right);
+      ok = 1;
+    } else if (strcmp(operator_text, "^") == 0) {
+      result = (int64_t)(int32_t)((uint32_t)(int32_t)left ^
+                                  (uint32_t)(int32_t)right);
+      ok = 1;
+    } else if (strcmp(operator_text, "==") == 0) {
+      result = left == right ? 1 : 0;
+      ok = 1;
+    } else if (strcmp(operator_text, "!=") == 0) {
+      result = left != right ? 1 : 0;
+      ok = 1;
+    } else if (strcmp(operator_text, "<") == 0) {
+      result = left < right ? 1 : 0;
+      ok = 1;
+    } else if (strcmp(operator_text, "<=") == 0) {
+      result = left <= right ? 1 : 0;
+      ok = 1;
+    } else if (strcmp(operator_text, ">") == 0) {
+      result = left > right ? 1 : 0;
+      ok = 1;
+    } else if (strcmp(operator_text, ">=") == 0) {
+      result = left >= right ? 1 : 0;
+      ok = 1;
+    } else if (strcmp(operator_text, "&&") == 0) {
+      result = left != 0 && right != 0 ? 1 : 0;
+      ok = 1;
+    } else if (strcmp(operator_text, "||") == 0) {
+      result = left != 0 || right != 0 ? 1 : 0;
       ok = 1;
     }
     context->allocator->deallocate(context->allocator->user_data,
@@ -2801,8 +3294,58 @@ static int constant_array_bound_value(const lower_context *context,
     if (ok != 0) {
       *value_out = result;
     }
+    return ok;
   }
-  return ok;
+  if (strcmp(kind, "cast_expression") == 0) {
+    size_t descriptor = direct_field_child(context, node, "type");
+    size_t value_node = direct_field_child(context, node, "value");
+    size_t type_node =
+        descriptor == SIZE_MAX
+            ? SIZE_MAX
+            : direct_field_child(context, descriptor, "type");
+    char *spelling;
+    int result;
+
+    if (type_node == SIZE_MAX || value_node == SIZE_MAX) {
+      return 0;
+    }
+    spelling = copy_node_text(context, type_node);
+    if (spelling == NULL) {
+      return 0;
+    }
+    result = constant_integer_type_spelling(context, spelling) &&
+             constant_int_expression_value(context, value_node, value_out);
+    context->allocator->deallocate(context->allocator->user_data, spelling);
+    return result;
+  }
+  if (strcmp(kind, "conditional_expression") == 0) {
+    size_t condition = direct_field_child(context, node, "condition");
+    size_t consequence = direct_field_child(context, node, "consequence");
+    size_t alternative = direct_field_child(context, node, "alternative");
+    int64_t selected;
+    int64_t when_true;
+    int64_t when_false;
+
+    if (!constant_int_expression_value(context, condition, &selected) ||
+        !constant_int_expression_value(context, consequence, &when_true) ||
+        !constant_int_expression_value(context, alternative, &when_false)) {
+      return 0;
+    }
+    *value_out = selected != 0 ? when_true : when_false;
+    return 1;
+  }
+  return 0;
+}
+
+static int constant_array_bound_value(const lower_context *context,
+                                      size_t node, uint64_t *value_out) {
+  int64_t value;
+
+  if (!constant_int_expression_value(context, node, &value) || value < 0) {
+    return 0;
+  }
+  *value_out = (uint64_t)value;
+  return 1;
 }
 
 static int constant_array_bound(const lower_context *context, size_t node,
@@ -3074,6 +3617,7 @@ static ql_status ensure_record_layout(lower_context *context, size_t record,
     for (declarator = child + 1u; declarator < declarator_end; ++declarator) {
       uint32_t pointer_depth;
       uint64_t member_array_length;
+      uint64_t member_row_length;
       int rejected;
       size_t name_node;
       lower_member *member;
@@ -3091,8 +3635,9 @@ static ql_status ensure_record_layout(lower_context *context, size_t record,
               0) {
         continue;
       }
-      name_node = member_declarator_name(context, declarator, &pointer_depth,
-                                         &member_array_length, &rejected);
+      name_node = member_declarator_shape(
+          context, declarator, &pointer_depth, &member_array_length,
+          &member_row_length, &rejected);
       if (rejected != 0 || name_node == SIZE_MAX) {
         name_node = function_pointer_member_name(
             context, declarator, &function_return_pointer_depth,
@@ -3145,6 +3690,7 @@ static ql_status ensure_record_layout(lower_context *context, size_t record,
            element count in bytes, which is what puts the members
            after it at the offsets a compiled struct uses. */
         member_type = make_array_of(member_type, member_array_length);
+        member_type.array_row_length = member_row_length;
       }
       if (member_type.kind == QL_C_SCALAR_VOID) {
         return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR,
@@ -3237,7 +3783,7 @@ static ql_status parse_type_spelling(lower_context *context,
       while (*tag == ' ' || *tag == '\t' || *tag == '\n') {
         ++tag;
       }
-      record = find_record(context, tag, is_union);
+      record = find_record_at(context, tag, is_union, node);
       if (record == SIZE_MAX) {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
@@ -3287,6 +3833,37 @@ static ql_status parse_type_spelling(lower_context *context,
       return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
                            node, "typedef names an array or function type",
                            error);
+    }
+    if (entry->is_aggregate != 0u) {
+      size_t aggregate_type =
+          direct_field_child(context, entry->declaration_node, "type");
+      const char *aggregate_kind;
+      if (aggregate_type == SIZE_MAX) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+            "aggregate typedef has no recoverable type declaration", error);
+      }
+      aggregate_kind = context->nodes[aggregate_type].view.kind;
+      /* The spelling of an anonymous `struct { ... }` does not carry an
+         identity that can be looked up again. Resolve the original syntax
+         node instead: collect_records keyed that exact specifier node, and
+         doing the same here preserves both its identity and its complete
+         layout. Named aggregates take this path too, so an alias never has a
+         second text-only interpretation of the record it denotes. */
+      if ((strcmp(aggregate_kind, "struct_specifier") == 0 ||
+           strcmp(aggregate_kind, "union_specifier") == 0) &&
+          (allow_void != 0u || entry->pointer_depth != 0u)) {
+        lower_type base;
+        status = resolve_record_specifier(context, aggregate_type, &base,
+                                          error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          return status;
+        }
+        return add_pointer_depth(context, aggregate_type, base,
+                                 entry->pointer_depth, output, error);
+      }
+      return resolve_type_node(context, aggregate_type, entry->pointer_depth,
+                               output, error);
     }
     if (entry->pointer_depth != 0u) {
       /* `typedef int *T` is a pointer type, not a reason to give up.
@@ -3492,11 +4069,14 @@ static ql_status ensure_ir_type(lower_context *context, lower_type *type,
     ql_ir_type_definition_init(&definition, QL_IR_TYPE_BOOL);
     definition.bit_width = 1u;
   } else if (type->kind == QL_C_SCALAR_FLOAT &&
-             (type->width == 32u || type->width == 64u)) {
+             (type->width == 32u || type->width == 64u ||
+              type->width == 80u)) {
     ql_ir_type_definition_init(&definition, QL_IR_TYPE_FLOAT);
     definition.bit_width = type->width;
-    definition.float_format = type->width == 32u ? QL_IR_FLOAT_IEEE_BINARY32
-                                                  : QL_IR_FLOAT_IEEE_BINARY64;
+    definition.float_format =
+        type->width == 32u   ? QL_IR_FLOAT_IEEE_BINARY32
+        : type->width == 64u ? QL_IR_FLOAT_IEEE_BINARY64
+                             : QL_IR_FLOAT_X87_BINARY80;
   } else if (type->kind == QL_C_SCALAR_RECORD &&
              record_size(context, type->record) != 0u &&
              record_size(context, type->record) <=
@@ -3505,7 +4085,9 @@ static ql_status ensure_ir_type(lower_context *context, lower_type *type,
     definition.bit_width =
         (uint32_t)(record_size(context, type->record) * UINT64_C(8));
   } else if (type->kind == QL_C_SCALAR_INTEGER && type->width != 0u &&
-             type->width <= QL_IR_INTERP_MAX_BIT_WIDTH) {
+             (type->width <= QL_IR_INTERP_MAX_BIT_WIDTH ||
+              (type->rank == 7u &&
+               type->width <= LOWER_MAX_BOUNDARY_RECORD_BYTES * 8u))) {
     ql_ir_type_definition_init(&definition, QL_IR_TYPE_BIT_VECTOR);
     definition.bit_width = type->width;
   } else {
@@ -3555,6 +4137,16 @@ static ql_status emit_instruction(lower_context *context, ql_ir_opcode opcode,
   ql_ir_type_id result_id;
   ql_ir_instruction_id instruction;
   ql_status status;
+  size_t operand_index;
+
+  for (operand_index = 0u; operand_index < operand_count; ++operand_index) {
+    if (operands[operand_index] == QL_IR_INVALID_VALUE_ID) {
+      ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                   "lowering emitted an invalid operand for opcode %u",
+                   (unsigned)opcode);
+      return QL_STATUS_INTERNAL_ERROR;
+    }
+  }
 
   ql_ir_instruction_definition_init(&definition, opcode);
   definition.effects = effects;
@@ -3584,6 +4176,16 @@ static ql_status emit_typed_instruction(
     ql_ir_value_id *output, ql_error *error) {
   ql_ir_instruction_definition_v1 definition;
   ql_ir_instruction_id instruction;
+  size_t operand_index;
+
+  for (operand_index = 0u; operand_index < operand_count; ++operand_index) {
+    if (operands[operand_index] == QL_IR_INVALID_VALUE_ID) {
+      ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                   "lowering emitted an invalid typed operand for opcode %u",
+                   (unsigned)opcode);
+      return QL_STATUS_INTERNAL_ERROR;
+    }
+  }
 
   ql_ir_instruction_definition_init(&definition, opcode);
   definition.effects = effects;
@@ -3644,7 +4246,7 @@ static ql_status add_constant_bytes(lower_context *context, lower_type *type,
 static ql_status add_uint_constant(lower_context *context, lower_type type,
                                    uint64_t value, ql_ir_value_id *output,
                                    ql_error *error) {
-  uint8_t bytes[QL_IR_INTERP_VALUE_CAPACITY];
+  uint8_t bytes[LOWER_MAX_BOUNDARY_RECORD_BYTES];
   size_t size;
   size_t index;
 
@@ -3669,7 +4271,7 @@ static ql_status add_power_of_two_constant(lower_context *context,
                                            lower_type type, uint32_t exponent,
                                            ql_ir_value_id *output,
                                            ql_error *error) {
-  uint8_t bytes[QL_IR_INTERP_VALUE_CAPACITY];
+  uint8_t bytes[LOWER_MAX_BOUNDARY_RECORD_BYTES];
   size_t size = (type.width + 7u) / 8u;
 
   if (type.kind != QL_C_SCALAR_INTEGER || exponent >= type.width ||
@@ -3683,18 +4285,25 @@ static ql_status add_power_of_two_constant(lower_context *context,
   return add_constant_bytes(context, &type, bytes, size, output, error);
 }
 
+static int host_has_x87_binary80(void) {
+  const uint16_t one = 1u;
+  return LDBL_MANT_DIG == 64 && LDBL_MAX_EXP == 16384 &&
+         sizeof(long double) >= 10u &&
+         *(const uint8_t *)(const void *)&one == 1u;
+}
+
 static ql_status add_float_constant(lower_context *context, lower_type type,
-                                    double value, ql_ir_value_id *output,
+                                    long double value, ql_ir_value_id *output,
                                     ql_error *error) {
-  uint8_t bytes[8];
+  uint8_t bytes[10];
   uint64_t raw = 0u;
   size_t size;
   size_t index;
 
   if (type.kind != QL_C_SCALAR_FLOAT ||
-      (type.width != 32u && type.width != 64u)) {
+      (type.width != 32u && type.width != 64u && type.width != 80u)) {
     ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
-                 "floating constant has no binary32 or binary64 type");
+                 "floating constant has no supported binary format");
     return QL_STATUS_INTERNAL_ERROR;
   }
   if (type.width == 32u) {
@@ -3703,9 +4312,19 @@ static ql_status add_float_constant(lower_context *context, lower_type type,
     memcpy(&bits, &narrowed, sizeof(bits));
     raw = bits;
     size = sizeof(bits);
-  } else {
-    memcpy(&raw, &value, sizeof(raw));
+  } else if (type.width == 64u) {
+    double narrowed = (double)value;
+    memcpy(&raw, &narrowed, sizeof(raw));
     size = sizeof(raw);
+  } else {
+    if (!host_has_x87_binary80()) {
+      ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                   "host cannot encode the target x87 binary80 constant");
+      return QL_STATUS_INTERNAL_ERROR;
+    }
+    memcpy(bytes, &value, 10u);
+    size = 10u;
+    return add_constant_bytes(context, &type, bytes, size, output, error);
   }
   for (index = 0u; index < size; ++index) {
     bytes[index] = (uint8_t)((raw >> (index * 8u)) & UINT64_C(0xff));
@@ -3819,6 +4438,8 @@ static ql_status emit_access_defined(lower_context *context,
   ql_ir_value_id alignment_mask;
   ql_ir_value_id zero;
   uint32_t alignment = natural_alignment(byte_width);
+  size_t object_begin = 0u;
+  size_t object_end = context->object_count;
   size_t index;
   ql_status status;
 
@@ -3834,8 +4455,17 @@ static ql_status emit_access_defined(lower_context *context,
   if (status != QL_STATUS_OK) {
     return status;
   }
+  if (pointer.object_identity != 0u) {
+    object_begin = (size_t)pointer.object_identity - 1u;
+    if (object_begin >= context->object_count) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, SIZE_MAX,
+          "pointer names an object outside the lowering table", error);
+    }
+    object_end = object_begin + 1u;
+  }
   *output = context->false_value;
-  for (index = 0u; index < context->object_count; ++index) {
+  for (index = object_begin; index < object_end; ++index) {
     const lower_object *object = &context->objects[index];
     ql_ir_value_id operands[2];
     ql_ir_value_id offset;
@@ -3964,7 +4594,14 @@ static ql_status admit_loaded_pointer(lower_context *context, size_t node,
   }
   status = add_dynamic_object(context, error);
   if (status == QL_STATUS_OK) {
+    /* A pointer read from memory can name an object that was already in the
+       table just as legitimately as it can name storage first discovered by
+       this load. Keep the identity open so the access predicate ranges over
+       both the existing regions and the newly admitted external region.
+       Pinning it to only the latter would misclassify a stored pointer back
+       into a known global, string, or local object as undefined. */
     pointer->has_object = 1u;
+    pointer->object_identity = 0u;
     pointer->may_admit_object = 0u;
   }
   return status;
@@ -3973,6 +4610,12 @@ static ql_status admit_loaded_pointer(lower_context *context, size_t node,
 static ql_status require_pointer_object(lower_context *context, size_t node,
                                         lower_value *pointer,
                                         const char *message, ql_error *error) {
+  if (pointer->object_identity != 0u &&
+      (size_t)pointer->object_identity - 1u >= context->object_count) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+        "pointer names an object outside the lowering table", error);
+  }
   if (pointer->has_object != 0u) {
     return QL_STATUS_OK;
   }
@@ -3981,6 +4624,29 @@ static ql_status require_pointer_object(lower_context *context, size_t node,
   }
   return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
                        message, error);
+}
+
+static ql_status ensure_variable_value(lower_context *context,
+                                       lower_variable *variable,
+                                       ql_error *error);
+
+static lower_variable *uninitialized_scalar_object(
+    lower_context *context, const lower_value *pointer) {
+  size_t index;
+
+  if (pointer->object_identity == 0u) {
+    return NULL;
+  }
+  for (index = 0u; index < context->variable_count; ++index) {
+    lower_variable *variable = &context->variables[index];
+    if (variable->is_stack != 0u && variable->initialized == 0u &&
+        variable->type.array_length == 0u &&
+        variable->type.kind != QL_C_SCALAR_RECORD &&
+        variable->object_identity == pointer->object_identity) {
+      return variable;
+    }
+  }
+  return NULL;
 }
 
 /* An access to a volatile object is an event, not just a memory operation.
@@ -4016,6 +4682,7 @@ static ql_status append_volatile_event(lower_context *context,
 static ql_status emit_load(lower_context *context, lower_value pointer,
                            lower_value *output, ql_error *error) {
   lower_type pointee;
+  lower_variable *uninitialized;
   ql_ir_value_id operands[2];
   ql_status status;
 
@@ -4026,6 +4693,13 @@ static ql_status emit_load(lower_context *context, lower_value pointer,
                          error);
   }
   pointee = pointer_target(pointer.type);
+  uninitialized = uninitialized_scalar_object(context, &pointer);
+  if (uninitialized != NULL) {
+    status = ensure_variable_value(context, uninitialized, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+  }
   if (pointee.kind == QL_C_SCALAR_RECORD) {
     status = ensure_record_layout(context, pointee.record, SIZE_MAX, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
@@ -4048,7 +4722,7 @@ static ql_status emit_load(lower_context *context, lower_value pointer,
   status = emit_access_guard(context, pointer,
                              pointee_byte_width(context, pointer.type),
                              pointer.defined, pointer.may_ub, error);
-  if (status != QL_STATUS_OK) {
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
   }
   status = ensure_ir_type(context, &pointee, error);
@@ -4070,6 +4744,10 @@ static ql_status emit_load(lower_context *context, lower_value pointer,
   if (status == QL_STATUS_OK && pointee.is_volatile != 0u) {
     status = append_volatile_event(context, pointer.value, output->value,
                                    error);
+  }
+  if (status == QL_STATUS_OK && uninitialized != NULL) {
+    output->defined = uninitialized->defined;
+    output->may_ub = 1u;
   }
   if (status == QL_STATUS_OK && pointee.kind == QL_C_SCALAR_POINTER) {
     output->may_admit_object = 1u;
@@ -4123,7 +4801,7 @@ static ql_status emit_store(lower_context *context, lower_value pointer,
   status = emit_access_guard(context, pointer,
                              pointee_byte_width(context, pointer.type),
                              combined, may_ub, error);
-  if (status != QL_STATUS_OK) {
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
   }
   operands[0] = context->memory_value;
@@ -4138,6 +4816,15 @@ static ql_status emit_store(lower_context *context, lower_value pointer,
   if (status == QL_STATUS_OK && pointee.is_volatile != 0u) {
     status = append_volatile_event(context, pointer.value, converted.value,
                                    error);
+  }
+  if (status == QL_STATUS_OK && pointer.object_identity != 0u) {
+    lower_variable *uninitialized =
+        uninitialized_scalar_object(context, &pointer);
+    if (uninitialized != NULL && pointer.value == uninitialized->address &&
+        type_same(pointee, uninitialized->type)) {
+      uninitialized->initialized = 1u;
+      uninitialized->defined = context->true_value;
+    }
   }
   return status;
 }
@@ -4329,6 +5016,8 @@ static ql_status add_variable(lower_context *context, const char *name,
       variable->slot = slot;
       variable->address = context->stack_slots[slot].address;
       variable->has_object = 1u;
+      variable->object_identity =
+          (uint32_t)(context->stack_slots[slot].object + 1u);
       break;
     }
   }
@@ -4367,9 +5056,6 @@ static void pop_variables(lower_context *context, size_t marker) {
   }
 }
 
-static ql_status ensure_variable_value(lower_context *context,
-                                       lower_variable *variable,
-                                       ql_error *error);
 static void destroy_state(lower_context *context, lower_state *state);
 
 static ql_status save_state(lower_context *context, size_t count,
@@ -4393,9 +5079,12 @@ static ql_status save_state(lower_context *context, size_t count,
       context->allocator->user_data, count * sizeof(*state->has_object));
   state->may_admit_object = context->allocator->allocate(
       context->allocator->user_data, count * sizeof(*state->may_admit_object));
+  state->object_identity = context->allocator->allocate(
+      context->allocator->user_data, count * sizeof(*state->object_identity));
   if (state->values == NULL || state->defined == NULL ||
       state->initialized == NULL ||
-      state->has_object == NULL || state->may_admit_object == NULL) {
+      state->has_object == NULL || state->may_admit_object == NULL ||
+      state->object_identity == NULL) {
     context->allocator->deallocate(context->allocator->user_data,
                                    state->values);
     context->allocator->deallocate(context->allocator->user_data,
@@ -4406,6 +5095,8 @@ static ql_status save_state(lower_context *context, size_t count,
                                    state->has_object);
     context->allocator->deallocate(context->allocator->user_data,
                                    state->may_admit_object);
+    context->allocator->deallocate(context->allocator->user_data,
+                                   state->object_identity);
     memset(state, 0, sizeof(*state));
     ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
     return QL_STATUS_OUT_OF_MEMORY;
@@ -4422,6 +5113,8 @@ static ql_status save_state(lower_context *context, size_t count,
     state->has_object[index] = (uint8_t)context->variables[index].has_object;
     state->may_admit_object[index] =
         (uint8_t)context->variables[index].may_admit_object;
+    state->object_identity[index] =
+        context->variables[index].object_identity;
   }
   return QL_STATUS_OK;
 }
@@ -4435,6 +5128,7 @@ static void restore_state(lower_context *context, const lower_state *state) {
     context->variables[index].defined = state->defined[index];
     context->variables[index].has_object = state->has_object[index];
     context->variables[index].may_admit_object = state->may_admit_object[index];
+    context->variables[index].object_identity = state->object_identity[index];
     if (context->variables[index].is_stack != 0u) {
       continue;
     }
@@ -4452,6 +5146,8 @@ static void destroy_state(lower_context *context, lower_state *state) {
                                  state->has_object);
   context->allocator->deallocate(context->allocator->user_data,
                                  state->may_admit_object);
+  context->allocator->deallocate(context->allocator->user_data,
+                                 state->object_identity);
   memset(state, 0, sizeof(*state));
 }
 
@@ -4508,34 +5204,46 @@ static ql_status lower_float_literal(lower_context *context, size_t node,
   char *end = NULL;
   size_t length = strlen(text);
   int is_float = 0;
-  double value;
+  int is_long_double = 0;
+  long double value;
   lower_type type;
   ql_status status;
 
   if (length != 0u && (text[length - 1u] == 'l' || text[length - 1u] == 'L')) {
-    return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
-                         "long double literals are outside the binary32 and "
-                         "binary64 profile",
-                         error);
+    if (!host_has_x87_binary80()) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
+          "this host cannot encode the target x87 binary80 literal", error);
+    }
+    is_long_double = 1;
   }
   errno = 0;
-  if (length != 0u && (text[length - 1u] == 'f' || text[length - 1u] == 'F')) {
+  if (is_long_double != 0) {
+    value = strtold(text, &end);
+  } else if (length != 0u &&
+             (text[length - 1u] == 'f' || text[length - 1u] == 'F')) {
     float parsed = strtof(text, &end);
     is_float = 1;
-    value = (double)parsed;
+    value = (long double)parsed;
   } else {
-    value = strtod(text, &end);
+    value = (long double)strtod(text, &end);
   }
   if (end == text ||
-      (is_float != 0 ? end != text + length - 1u : end != text + length) ||
+      ((is_float != 0 || is_long_double != 0)
+           ? end != text + length - 1u
+           : end != text + length) ||
       (errno == ERANGE && !isfinite(value))) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_INTEGER_LITERAL_OUT_OF_RANGE, node,
-        "floating literal is invalid or outside binary32/binary64", error);
+        "floating literal is invalid or outside its binary format", error);
   }
   type = type_from_scalar(
-      ql_c_scalar_make_float(is_float != 0 ? 32u : 64u,
-                             is_float != 0 ? 6u : 7u));
+      ql_c_scalar_make_float(is_long_double != 0 ? 80u
+                             : is_float != 0      ? 32u
+                                                  : 64u,
+                             is_long_double != 0 ? 8u
+                             : is_float != 0      ? 6u
+                                                  : 7u));
   status = add_float_constant(context, type, value, &output->value, error);
   if (status != QL_STATUS_OK) {
     return status;
@@ -4745,9 +5453,24 @@ static int is_literal_null_pointer_constant(lower_context *context,
     return 0;
   }
   kind = context->nodes[node].view.kind;
+  if (strcmp(kind, "null") == 0) {
+    return 1;
+  }
   if (strcmp(kind, "parenthesized_expression") == 0) {
     return is_literal_null_pointer_constant(context,
                                             first_named_child(context, node));
+  }
+  if (strcmp(kind, "identifier") == 0) {
+    int is_null;
+    text = copy_node_text(context, node);
+    if (text == NULL) {
+      return 0;
+    }
+    is_null = strcmp(text, "NULL") == 0 &&
+              find_variable(context, text, strlen(text)) == NULL &&
+              find_enumerator(context, text) == NULL;
+    context->allocator->deallocate(context->allocator->user_data, text);
+    return is_null;
   }
   if (strcmp(kind, "number_literal") != 0) {
     return 0;
@@ -4816,6 +5539,21 @@ static ql_status emit_pointer_of_address(lower_context *context,
   return emit_instruction(context, QL_IR_OPCODE_BV_TO_PTR, &target,
                           &address.value, 1u, NULL, 0u, QL_IR_EFFECT_NONE,
                           &output->value, error);
+}
+
+static ql_status add_null_pointer_constant(lower_context *context,
+                                           lower_type type,
+                                           ql_ir_value_id *output,
+                                           ql_error *error) {
+  uint8_t bytes[QL_C_POINTER_WIDTH / 8u];
+  ql_status status = ensure_ir_type(context, &type, error);
+
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  memset(bytes, 0, sizeof(bytes));
+  return ql_ir_builder_add_constant(context->builder, type.ir_type, bytes,
+                                    sizeof(bytes), output, error);
 }
 
 /* Conversions with a pointer on either side all route through the address,
@@ -4928,6 +5666,7 @@ static ql_status convert_value(lower_context *context, lower_value input,
       status = emit_pointer_of_address(context, address, target, output, error);
       if (status == QL_STATUS_OK) {
         output->has_object = 0u;
+        output->object_identity = 0u;
         output->may_admit_object = 0u;
       }
       return status;
@@ -4951,6 +5690,7 @@ static ql_status convert_value(lower_context *context, lower_value input,
       status = emit_pointer_of_address(context, address, target, output, error);
       if (status == QL_STATUS_OK) {
         output->has_object = 0u;
+        output->object_identity = 0u;
         output->may_admit_object = 0u;
       }
       return status;
@@ -5606,20 +6346,11 @@ static ql_status ensure_variable_value(lower_context *context,
     return QL_STATUS_OK;
   }
   if (variable->type.kind == QL_C_SCALAR_POINTER) {
-    lower_value address;
-    lower_value pointer;
-    memset(&address, 0, sizeof(address));
-    address.type = address_type();
-    address.defined = context->true_value;
-    status = add_uint_constant(context, address.type, 0u, &address.value,
-                               error);
+    status = add_null_pointer_constant(context, variable->type,
+                                       &variable->value, error);
     if (status == QL_STATUS_OK) {
-      status = emit_pointer_of_address(context, address, variable->type,
-                                       &pointer, error);
-    }
-    if (status == QL_STATUS_OK) {
-      variable->value = pointer.value;
       variable->has_object = 0u;
+      variable->object_identity = 0u;
       variable->may_admit_object = 1u;
     }
   } else if (variable->type.kind == QL_C_SCALAR_FLOAT) {
@@ -5658,6 +6389,27 @@ static ql_status lower_identifier(lower_context *context, size_t node,
       output->defined = context->true_value;
       return add_uint_constant(context, type, enumerator->value, &output->value,
                                error);
+    }
+    /* Corpus extraction removes system-header macro definitions but retains
+       these three C17 spellings. Their expansions are fixed by the headers,
+       unlike project macros such as TOKEN_EOF, so restoring 0, 1, and 0 here
+       does not guess a program-specific value. A visible declaration still
+       wins because this fallback is reached only after find_variable. */
+    if (strcmp(name, "NULL") == 0 || strcmp(name, "true") == 0 ||
+        strcmp(name, "false") == 0) {
+      lower_type type = make_integer_type(32u, 3u, 1u);
+      const uint64_t value = strcmp(name, "true") == 0 ? 1u : 0u;
+      const uint32_t is_null = strcmp(name, "NULL") == 0 ? 1u : 0u;
+      context->allocator->deallocate(context->allocator->user_data, name);
+      memset(output, 0, sizeof(*output));
+      output->type = type;
+      output->is_null_pointer_constant = is_null;
+      status = ensure_bool_constants(context, error);
+      if (status != QL_STATUS_OK) {
+        return status;
+      }
+      output->defined = context->true_value;
+      return add_uint_constant(context, type, value, &output->value, error);
     }
     {
       lower_callee *callee = find_callee(context, name);
@@ -5699,6 +6451,7 @@ static ql_status lower_identifier(lower_context *context, size_t node,
         if (status == QL_STATUS_OK) {
           output->defined = context->true_value;
           output->has_object = 0u;
+          output->object_identity = 0u;
           output->may_admit_object = 0u;
         }
         return status;
@@ -5745,6 +6498,7 @@ static ql_status lower_identifier(lower_context *context, size_t node,
   output->type = variable->type;
   output->may_ub = variable->initialized == 0u;
   output->has_object = variable->has_object;
+  output->object_identity = variable->object_identity;
   output->may_admit_object = variable->may_admit_object;
   return QL_STATUS_OK;
 }
@@ -7084,6 +7838,7 @@ static ql_status lower_named_cast(lower_context *context, size_t type_node,
     output->type = target;
     output->value = QL_IR_INVALID_VALUE_ID;
     output->has_object = 0u;
+    output->object_identity = 0u;
     output->may_admit_object = 0u;
     return QL_STATUS_OK;
   }
@@ -7239,7 +7994,9 @@ static ql_status lower_member_address(lower_context *context, size_t node,
     }
     record = base.type.record;
   } else {
-    if (is_call_expression(context, argument_node)) {
+    if (is_call_expression(context, argument_node) ||
+        strcmp(context->nodes[argument_node].view.kind,
+               "compound_literal_expression") == 0) {
       /* A returned record is not an lvalue, but its value is carried by the
          temporary object's address. Keep ordinary record lvalues on the
          designator path below: a partially initialised local may have one
@@ -7319,6 +8076,22 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
   const char *kind = context->nodes[node].view.kind;
   ql_status status;
 
+  if (strcmp(kind, "compound_literal_expression") == 0) {
+    status = lower_expression(context, node, output, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    if (output->type.kind != QL_C_SCALAR_RECORD) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
+          "taking the address of an array compound literal needs a "
+          "pointer-to-array type",
+          error);
+    }
+    *declared = output->type;
+    output->type = make_pointer_to(*declared);
+    return QL_STATUS_OK;
+  }
   if (strcmp(kind, "pointer_expression") == 0) {
     size_t operator_node = direct_field_child(context, node, "operator");
     size_t argument_node = direct_field_child(context, node, "argument");
@@ -7433,7 +8206,8 @@ static ql_status lower_designator_address(lower_context *context, size_t node,
     }
     if (variable->initialized == 0u &&
         variable->type.kind != QL_C_SCALAR_RECORD &&
-        context->allow_uninitialized_call_address == 0u) {
+        context->allow_uninitialized_call_address == 0u &&
+        context->allow_uninitialized_local_alias == 0u) {
       /* A plain assignment to the local reaches its stack address
          through resolve_assignment_target instead of this path. Any
          other address use can escape to a read before the lowering has
@@ -7629,6 +8403,7 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
   size_t type_node;
   size_t end;
   size_t child;
+  uint32_t saw_void_parameter = 0u;
   ql_status status;
 
   if (callee->resolved != 0u) {
@@ -7705,6 +8480,7 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
       is_void = strcmp(spelling, "void") == 0;
       context->allocator->deallocate(context->allocator->user_data, spelling);
       if (is_void) {
+        saw_void_parameter = 1u;
         continue;
       }
     }
@@ -7745,6 +8521,13 @@ static ql_status resolve_callee(lower_context *context, lower_callee *callee,
     }
     callee->parameters[callee->parameter_count++] = parameter;
   }
+  if (callee->is_definition == 0u && callee->parameter_count == 0u &&
+      callee->is_variadic == 0u && saw_void_parameter == 0u) {
+    /* A declaration with empty parentheses supplies no parameter type
+       information. C applies the default promotions at each call site; it
+       does not reject arguments as if the declaration had said `(void)`. */
+    callee->has_unspecified_parameters = 1u;
+  }
   callee->resolved = 1u;
   return QL_STATUS_OK;
 }
@@ -7771,6 +8554,13 @@ static ql_status direct_uninitialized_call_local(
     if (strcmp(kind, "cast_expression") == 0) {
       node = direct_field_child(context, node, "value");
       continue;
+    }
+    if (strcmp(kind, "call_expression") == 0) {
+      size_t operand = SIZE_MAX;
+      if (disguised_cast_type(context, node, &operand) != SIZE_MAX) {
+        node = operand;
+        continue;
+      }
     }
     break;
   }
@@ -8097,6 +8887,7 @@ static ql_status store_record_call_results(
   destination.type = make_pointer_to(temporary->type);
   destination.defined = context->true_value;
   destination.has_object = 1u;
+  destination.object_identity = (uint32_t)(temporary->object + 1u);
 
   for (offset = 0u; offset < size; ++offset) {
     const size_t chunk = (size_t)(offset / 8u);
@@ -8382,14 +9173,17 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     lower_variable *out_variable = NULL;
     uint32_t saved_allow_uninitialized;
     size_t out_index;
-    const int is_variadic_argument = argument_index >= callee->parameter_count;
+    const int is_extra_argument = argument_index >= callee->parameter_count;
+    const int uses_default_promotions =
+        callee->has_unspecified_parameters != 0u || is_extra_argument != 0;
 
     if (context->nodes[child].parent != arguments_node ||
         (context->nodes[child].view.flags & QL_C_SYNTAX_NODE_NAMED) == 0u ||
         strcmp(context->nodes[child].view.kind, "comment") == 0) {
       continue;
     }
-    if (is_variadic_argument != 0 && callee->is_variadic == 0u) {
+    if (is_extra_argument != 0 && callee->is_variadic == 0u &&
+        callee->has_unspecified_parameters == 0u) {
       return lower_unknown(
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, node,
           "the call passes more arguments than the callee declares", error);
@@ -8412,7 +9206,7 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
-    if (is_variadic_argument == 0 &&
+    if (uses_default_promotions == 0 &&
         callee->parameters[argument_index].kind == QL_C_SCALAR_RECORD) {
       if (argument.type.kind != QL_C_SCALAR_RECORD ||
           argument.type.array_length != 0u ||
@@ -8431,10 +9225,12 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
       ++argument_index;
       continue;
     }
-    if (is_variadic_argument != 0) {
-      /* C's default argument promotions are the only type contract the
-         ellipsis supplies: narrow integers promote to int, float promotes
-         to double, and pointers retain their type. */
+    if (uses_default_promotions != 0) {
+      /* C's default argument promotions are the only type contract an
+         ellipsis or a non-prototype declaration supplies: narrow integers
+         promote to int, float promotes to double, and pointers retain their
+         type. Aggregate values have no such promotion and remain outside
+         this call slice when no prototype states their ABI contract. */
       if (argument.type.kind == QL_C_SCALAR_POINTER) {
         converted = argument;
         status = QL_STATUS_OK;
@@ -8448,8 +9244,8 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
       } else {
         status = lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, child,
-            "a variadic argument has no default promotion in this "
-            "slice",
+            "a variadic or unprototyped argument has no default promotion "
+            "in this slice",
             error);
       }
     } else {
@@ -8459,6 +9255,15 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     }
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
+    }
+    if (out_variable == NULL &&
+        converted.type.kind == QL_C_SCALAR_POINTER &&
+        uninitialized_scalar_object(context, &converted) != NULL) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, child,
+          "a pointer alias to an uninitialized local cannot escape through "
+          "a call",
+          error);
     }
     status = emit_ub_guard(context, &converted, error);
     if (status != QL_STATUS_OK) {
@@ -8615,12 +9420,12 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
                               select_operands, 3u, NULL, 0u,
                               QL_IR_EFFECT_NONE, &selected.value, error);
     if (status == QL_STATUS_OK) {
-      status = emit_store(context, stack_address(context, variable), selected,
-                          error);
-    }
-    if (status == QL_STATUS_OK) {
       status = emit_bool_or(context, variable->defined, wrote, &now_defined,
                             error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = emit_store(context, stack_address(context, variable), selected,
+                          error);
     }
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
@@ -8629,6 +9434,7 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
     variable->defined = now_defined;
     if (variable->type.kind == QL_C_SCALAR_POINTER) {
       variable->has_object = 0u;
+      variable->object_identity = 0u;
       variable->may_admit_object = 1u;
     }
   }
@@ -8657,6 +9463,7 @@ static ql_status lower_call_expression(lower_context *context, size_t node,
                                         : results[value_result];
   if (record_return != NULL) {
     output->has_object = 1u;
+    output->object_identity = (uint32_t)(record_return->object + 1u);
   }
   if (output->type.kind == QL_C_SCALAR_POINTER) {
     /* The callee may return an existing or newly exposed live object.
@@ -8675,6 +9482,9 @@ static ql_status lower_update_expression(lower_context *context, size_t node,
 static ql_status initialize_record_copy(lower_context *context, size_t node,
                                         lower_value destination,
                                         lower_type type, ql_error *error);
+static ql_status initialize_object(lower_context *context, size_t node,
+                                   lower_value address, lower_type type,
+                                   uint32_t brace_elided, ql_error *error);
 static ql_status copy_record_bytes(lower_context *context, size_t node,
                                    lower_value source,
                                    lower_value destination, lower_type type,
@@ -8861,6 +9671,7 @@ static ql_status lower_conditional_expression(lower_context *context,
            the table vacuously. If the other arm names an object, selecting
            between it and null does not introduce another authority. */
         right.has_object = 1u;
+        right.object_identity = left.object_identity;
         right.may_admit_object = 0u;
       } else if (alternative.type.kind == QL_C_SCALAR_POINTER &&
                  is_literal_null_pointer_constant(context, consequence_node)) {
@@ -8872,6 +9683,7 @@ static ql_status lower_conditional_expression(lower_context *context,
           goto cleanup;
         }
         left.has_object = 1u;
+        left.object_identity = right.object_identity;
         left.may_admit_object = 0u;
       } else {
         status = lower_unknown(
@@ -9024,6 +9836,11 @@ authority:
         right.has_object | right.may_admit_object;
     output->has_object =
         left.has_object != 0u && right.has_object != 0u ? 1u : 0u;
+    output->object_identity =
+        left.object_identity != 0u &&
+                left.object_identity == right.object_identity
+            ? left.object_identity
+            : 0u;
     output->may_admit_object = output->has_object == 0u &&
                                        consequence_accessible != 0u &&
                                        alternative_accessible != 0u
@@ -9188,6 +10005,55 @@ static ql_status lower_comma_expression(lower_context *context, size_t node,
   return lower_expression(context, right_node, output, error);
 }
 
+/* A block-scope record compound literal has automatic storage duration. Its
+   object is allocated during the parameter-only prepass, while evaluating the
+   expression writes the initializer in source order. Re-evaluating the same
+   syntactic literal overwrites the same object, matching one automatic object
+   for that literal in its enclosing block. */
+static ql_status lower_compound_literal(lower_context *context, size_t node,
+                                        lower_value *output,
+                                        ql_error *error) {
+  lower_record_call_temp *temporary = find_record_call_temp(context, node);
+  size_t initializer = direct_field_child(context, node, "value");
+  lower_value destination;
+  ql_status status;
+
+  if (temporary == NULL || initializer == SIZE_MAX) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
+        "compound literal needs a supported complete object type and an "
+        "initializer",
+        error);
+  }
+  if (temporary->address == QL_IR_INVALID_VALUE_ID) {
+    ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                 "compound literal has no materialised object");
+    return QL_STATUS_INTERNAL_ERROR;
+  }
+  memset(&destination, 0, sizeof(destination));
+  destination.value = temporary->address;
+  destination.type = make_pointer_to(temporary->type.array_length != 0u
+                                         ? array_element(temporary->type)
+                                         : temporary->type);
+  destination.defined = context->true_value;
+  destination.has_object = 1u;
+  destination.object_identity = (uint32_t)(temporary->object + 1u);
+  status = initialize_object(context, initializer, destination,
+                             temporary->type, 0u, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  memset(output, 0, sizeof(*output));
+  output->value = temporary->address;
+  output->defined = context->true_value;
+  output->type = temporary->type.array_length != 0u
+                     ? make_pointer_to(array_element(temporary->type))
+                     : temporary->type;
+  output->has_object = 1u;
+  output->object_identity = (uint32_t)(temporary->object + 1u);
+  return QL_STATUS_OK;
+}
+
 static ql_status lower_expression(lower_context *context, size_t node,
                                   lower_value *output, ql_error *error) {
   const char *kind;
@@ -9202,8 +10068,25 @@ static ql_status lower_expression(lower_context *context, size_t node,
   if (strcmp(kind, "identifier") == 0) {
     return lower_identifier(context, node, output, error);
   }
+  if (strcmp(kind, "null") == 0 || strcmp(kind, "true") == 0 ||
+      strcmp(kind, "false") == 0) {
+    lower_type type = make_integer_type(32u, 3u, 1u);
+    ql_status status = ensure_bool_constants(context, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    output->type = type;
+    output->defined = context->true_value;
+    output->is_null_pointer_constant = strcmp(kind, "null") == 0 ? 1u : 0u;
+    return add_uint_constant(context, type,
+                             strcmp(kind, "true") == 0 ? 1u : 0u,
+                             &output->value, error);
+  }
   if (strcmp(kind, "number_literal") == 0) {
     return lower_integer_literal(context, node, output, error);
+  }
+  if (strcmp(kind, "compound_literal_expression") == 0) {
+    return lower_compound_literal(context, node, output, error);
   }
   if (strcmp(kind, "parenthesized_expression") == 0) {
     size_t child = first_named_child(context, node);
@@ -9284,6 +10167,7 @@ static ql_status lower_expression(lower_context *context, size_t node,
     output->value = literal->address;
     output->type = make_pointer_to(make_integer_type(8u, 1u, 1u));
     output->has_object = 1u;
+    output->object_identity = (uint32_t)(literal->object + 1u);
     status = ensure_bool_constants(context, error);
     if (status != QL_STATUS_OK) {
       return status;
@@ -9495,6 +10379,14 @@ static ql_status write_assignment_target(lower_context *context, size_t node,
   if (stored != NULL) {
     *stored = converted;
   }
+  if (target->variable == NULL &&
+      converted.type.kind == QL_C_SCALAR_POINTER &&
+      uninitialized_scalar_object(context, &converted) != NULL) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, node,
+        "a pointer to an uninitialized local cannot escape into memory",
+        error);
+  }
   if (target->variable != NULL) {
     status = emit_ub_guard(context, &converted, error);
     if (status != QL_STATUS_OK) {
@@ -9504,6 +10396,7 @@ static ql_status write_assignment_target(lower_context *context, size_t node,
     target->variable->initialized = 1u;
     target->variable->defined = context->true_value;
     target->variable->has_object = converted.has_object;
+    target->variable->object_identity = converted.object_identity;
     target->variable->may_admit_object = converted.may_admit_object;
     if (stored != NULL) {
       *stored = converted;
@@ -9564,6 +10457,7 @@ static ql_status lower_read_modify_write(lower_context *context, size_t node,
     old.value = target.variable->value;
     old.type = target.variable->type;
     old.has_object = target.variable->has_object;
+    old.object_identity = target.variable->object_identity;
     old.may_admit_object = target.variable->may_admit_object;
     old.defined = target.variable->defined;
     old.may_ub = target.variable->initialized == 0u;
@@ -9628,6 +10522,8 @@ static ql_status lower_assignment_value(lower_context *context, size_t node,
   const char *binary = NULL;
   char *operator_text;
   lower_value value;
+  uint32_t saved_allow_alias;
+  int allow_alias = 0;
   ql_status status;
 
   if (left_node == SIZE_MAX || right_node == SIZE_MAX ||
@@ -9652,9 +10548,27 @@ static ql_status lower_assignment_value(lower_context *context, size_t node,
     }
   }
   context->allocator->deallocate(context->allocator->user_data, operator_text);
+  if (binary == NULL &&
+      strcmp(context->nodes[left_node].view.kind, "identifier") == 0) {
+    char *name = copy_node_text(context, left_node);
+    lower_variable *variable;
+    if (name == NULL) {
+      ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+      return QL_STATUS_OUT_OF_MEMORY;
+    }
+    variable = find_variable(context, name, strlen(name));
+    context->allocator->deallocate(context->allocator->user_data, name);
+    allow_alias = variable != NULL && variable->is_stack == 0u &&
+                  variable->type.kind == QL_C_SCALAR_POINTER;
+  }
   /* The right operand is evaluated before the target is written, so a
      partial operation inside it is already guarded when the store happens. */
+  saved_allow_alias = context->allow_uninitialized_local_alias;
+  if (allow_alias != 0) {
+    context->allow_uninitialized_local_alias = 1u;
+  }
   status = lower_expression(context, right_node, &value, error);
+  context->allow_uninitialized_local_alias = saved_allow_alias;
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
   }
@@ -9820,12 +10734,11 @@ static ql_status parse_local_type_qualified(
   }
   if (strcmp(context->nodes[type_node].view.kind, "struct_specifier") == 0 ||
       strcmp(context->nodes[type_node].view.kind, "union_specifier") == 0) {
-    /* A record local is storage, and resolve_type_node already knows how
-       to find the declared record and lay it out. Whether a declarator
-       then adds a star is decided per declarator, as it is for every
-       other base type here. */
+    /* The shared base is not necessarily an object. Each declarator below
+       decides whether it adds a star; only the remaining by-value record
+       path asks for layout. */
     context->allocator->deallocate(context->allocator->user_data, spelling);
-    return resolve_type_node(context, type_node, 0u, output, error);
+    return resolve_record_specifier(context, type_node, output, error);
   }
   if (strcmp(context->nodes[type_node].view.kind, "primitive_type") != 0 &&
       strcmp(context->nodes[type_node].view.kind, "sized_type_specifier") !=
@@ -10968,6 +11881,18 @@ static ql_status lower_declaration(lower_context *context, size_t node,
       variable->function.declarator_node = callback_declarator;
       variable->function.return_pointer_depth = callback_return_depth;
       variable->has_function_signature = 1u;
+    } else if (declarator_type.is_function_pointer != 0u) {
+      char *spelling = copy_node_text(context, type_node);
+      if (spelling == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+      }
+      status = attach_function_typedef_signature(context, spelling, variable,
+                                                 error);
+      context->allocator->deallocate(context->allocator->user_data, spelling);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
     }
     if (declarator_type.array_length == LOWER_ARRAY_BOUND_DYNAMIC) {
       status = bind_dynamic_array_size(context, node, dynamic_bound, variable,
@@ -11023,10 +11948,17 @@ static ql_status lower_declaration(lower_context *context, size_t node,
       lower_value value;
       lower_value converted;
       size_t expression_node;
+      uint32_t saved_allow_alias;
       status = scalar_initializer_expression(context, value_node,
                                              &expression_node, error);
       if (status == QL_STATUS_OK && context->unknown == 0u) {
+        saved_allow_alias = context->allow_uninitialized_local_alias;
+        if (declarator_type.kind == QL_C_SCALAR_POINTER &&
+            variable->is_stack == 0u) {
+          context->allow_uninitialized_local_alias = 1u;
+        }
         status = lower_expression(context, expression_node, &value, error);
+        context->allow_uninitialized_local_alias = saved_allow_alias;
       }
       if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
@@ -11057,6 +11989,7 @@ static ql_status lower_declaration(lower_context *context, size_t node,
         /* A pointer local is only as well-founded as what was put in
            it. */
         variable->has_object = converted.has_object;
+        variable->object_identity = converted.object_identity;
         variable->may_admit_object = converted.may_admit_object;
       }
     }
@@ -11177,6 +12110,7 @@ static ql_status merge_states_many(lower_context *context,
     uint32_t all_initialized = 1u;
     uint32_t all_have_object = 1u;
     uint32_t all_can_name_object = 1u;
+    uint32_t object_identity = states[0].object_identity[index];
     uint32_t same_value = 1u;
     uint32_t same_defined = 1u;
 
@@ -11185,6 +12119,9 @@ static ql_status merge_states_many(lower_context *context,
       all_have_object &= states[incoming].has_object[index] != 0u;
       all_can_name_object &= states[incoming].has_object[index] != 0u ||
                              states[incoming].may_admit_object[index] != 0u;
+      if (states[incoming].object_identity[index] != object_identity) {
+        object_identity = 0u;
+      }
       operands[incoming] = states[incoming].values[index];
       if (incoming != 0u && operands[incoming] != operands[0]) {
         same_value = 0u;
@@ -11200,6 +12137,8 @@ static ql_status merge_states_many(lower_context *context,
       variable->has_object = all_have_object;
       variable->may_admit_object =
           all_have_object == 0u && all_can_name_object != 0u;
+      variable->object_identity =
+          all_have_object != 0u ? object_identity : 0u;
       if (same_value != 0u) {
         variable->value = operands[0];
       } else {
@@ -11433,6 +12372,10 @@ typedef struct lower_switch_case {
   ql_ir_block_id dispatch_block;
 } lower_switch_case;
 
+static ql_status pad_incoming_state(lower_context *context, lower_state *state,
+                                    ql_ir_block_id block, size_t count,
+                                    ql_error *error);
+
 static void destroy_break_scope(lower_context *context,
                                 lower_break_scope *scope) {
   size_t index;
@@ -11631,14 +12574,6 @@ static ql_status collect_switch_cases(lower_context *context, size_t body,
         statement_kind = context->nodes[statement].view.kind;
         if (strcmp(statement_kind, "comment") == 0) {
           continue;
-        }
-        if (strcmp(statement_kind, "declaration") == 0) {
-          return lower_unknown(
-              context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
-              statement,
-              "a declaration shared by later case labels must be "
-              "wrapped in its own compound statement",
-              error);
         }
         if (strcmp(statement_kind, "case_statement") == 0) {
           return lower_unknown(
@@ -11864,6 +12799,12 @@ static ql_status lower_switch_statement(lower_context *context, size_t node,
   scope.variable_count = variable_count;
   context->break_scope = &scope;
   for (index = 0u; index < case_count; ++index) {
+    status = pad_incoming_state(context, &entry_state,
+                                cases[index].dispatch_block,
+                                context->variable_count, error);
+    if (status != QL_STATUS_OK) {
+      goto cleanup;
+    }
     restore_state(context, &entry_state);
     context->current_block = cases[index].block;
     context->current_terminated = 0u;
@@ -11882,21 +12823,25 @@ static ql_status lower_switch_statement(lower_context *context, size_t node,
       }
     }
     status = lower_switch_case_body(context, &cases[index], error);
-    pop_variables(context, variable_count);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       goto cleanup;
     }
     if (context->current_terminated == 0u) {
       fallthrough_block = context->current_block;
-      status = save_state(context, variable_count, &fallthrough_state, error);
+      status = save_state(context, context->variable_count,
+                          &fallthrough_state, error);
       if (status != QL_STATUS_OK) {
         goto cleanup;
       }
       fallthrough_live = 1u;
     }
   }
+  pop_variables(context, variable_count);
   context->break_scope = parent_scope;
   if (fallthrough_live != 0u) {
+    /* Switch-scope locals end at the closing brace. They are carried between
+       case labels above, but no edge leaving the switch may expose them. */
+    fallthrough_state.count = variable_count;
     status = append_pending_state(context, &scope, fallthrough_block,
                                   &fallthrough_state, error);
     fallthrough_live = 0u;
@@ -12088,7 +13033,9 @@ append_loop_backedge(lower_context *context, const lower_loop_phis *phis,
     }
     if (context->variables[index].type.kind == QL_C_SCALAR_POINTER &&
         (entry->has_object[index] != backedge->has_object[index] ||
-         entry->may_admit_object[index] != backedge->may_admit_object[index])) {
+         entry->may_admit_object[index] != backedge->may_admit_object[index] ||
+         entry->object_identity[index] !=
+             backedge->object_identity[index])) {
       /* A pointer identified as loop-carried before the body was lowered uses
          one conservative authority region at every access site. Its concrete
          producer on the backedge may still be a parameter, a loaded pointer,
@@ -12179,6 +13126,7 @@ static void widen_loop_pointer_authority(lower_context *context, size_t node,
         continue;
       }
       variable->has_object = 0u;
+      variable->object_identity = 0u;
       variable->may_admit_object = 1u;
       break;
     }
@@ -12752,6 +13700,7 @@ static ql_status pad_incoming_state(lower_context *context, lower_state *state,
   QL_GROW_STATE(initialized)
   QL_GROW_STATE(has_object)
   QL_GROW_STATE(may_admit_object)
+  QL_GROW_STATE(object_identity)
 #undef QL_GROW_STATE
 
   context->current_block = block;
@@ -12763,18 +13712,8 @@ static ql_status pad_incoming_state(lower_context *context, lower_state *state,
     if (variable->is_stack == 0u && variable->type.array_length == 0u &&
         variable->type.kind != QL_C_SCALAR_RECORD) {
       if (variable->type.kind == QL_C_SCALAR_POINTER) {
-        lower_value address;
-        lower_value pointer;
-        memset(&address, 0, sizeof(address));
-        address.type = address_type();
-        address.defined = context->true_value;
-        status =
-            add_uint_constant(context, address.type, 0u, &address.value, error);
-        if (status == QL_STATUS_OK) {
-          status = emit_pointer_of_address(context, address, variable->type,
-                                           &pointer, error);
-        }
-        value = pointer.value;
+        status = add_null_pointer_constant(context, variable->type, &value,
+                                           error);
         admits = 1u;
       } else if (variable->type.kind == QL_C_SCALAR_FLOAT) {
         status = add_float_constant(context, variable->type, 0.0, &value,
@@ -12793,6 +13732,7 @@ static ql_status pad_incoming_state(lower_context *context, lower_state *state,
     state->initialized[index] = 0u;
     state->has_object[index] = 0u;
     state->may_admit_object[index] = admits;
+    state->object_identity[index] = 0u;
   }
   state->count = count;
   context->current_block = saved_block;
@@ -13526,27 +14466,6 @@ static ql_status add_stack_slot_objects(lower_context *context,
   return QL_STATUS_OK;
 }
 
-/* The byte count a global's string initialiser states, including the
-   terminating NUL, or zero when it does not state one this pass can read. */
-static size_t global_string_bytes(lower_context *context, size_t node) {
-  unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
-  size_t decoded_size = 0u;
-  char *text;
-  int ok;
-
-  if (node == SIZE_MAX ||
-      strcmp(context->nodes[node].view.kind, "string_literal") != 0) {
-    return 0u;
-  }
-  text = copy_node_text(context, node);
-  if (text == NULL) {
-    return 0u;
-  }
-  ok = decode_string_literal(text, strlen(text), decoded, &decoded_size);
-  context->allocator->deallocate(context->allocator->user_data, text);
-  return ok ? decoded_size : 0u;
-}
-
 /* Storage with static storage duration becomes an object under exactly the
    discipline a pointer parameter's region gets: a base and a size parameter,
    the three standing model constraints, and a pinned size. Reads become loads
@@ -13560,6 +14479,7 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
     size_t type_node;
     uint32_t pointer_depth = 0u;
     uint64_t array_length = 0u;
+    uint64_t row_length = 0u;
     int rejected = 0;
     uint32_t is_const = 0u;
     uint32_t is_static = 0u;
@@ -13585,20 +14505,65 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
           global->declaration_node,
           "a global with no declared type has no size to give it", error);
     }
-    (void)member_declarator_name(context, global->declarator_node,
-                                 &pointer_depth, &array_length, &rejected);
+    if (global->is_function_pointer == 0u) {
+      (void)member_declarator_shape(context, global->declarator_node,
+                                    &pointer_depth, &array_length, &row_length,
+                                    &rejected);
+    }
     if (rejected != 0) {
       return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
                            global->declaration_node,
                            "this global's declarator is outside this slice",
                            error);
     }
-    context->parsing_global = 1u;
-    status = parse_local_type(context, global->declaration_node, type_node,
-                              &type, &is_const, &is_static, error);
-    context->parsing_global = 0u;
+    if (global->is_function_pointer != 0u) {
+      if (global->function_return_depth > 1u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
+            global->declaration_node,
+            "only one-level function-pointer returns are in this call slice",
+            error);
+      }
+      status = resolve_type_node_allowing_void(
+          context, type_node, global->function_return_depth, &type, error);
+      if (status == QL_STATUS_OK && context->unknown == 0u) {
+        type = make_function_pointer_type(type);
+      }
+    } else {
+      context->parsing_global = 1u;
+      status = parse_local_type(context, global->declaration_node, type_node,
+                                &type, &is_const, &is_static, error);
+      context->parsing_global = 0u;
+    }
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
+    }
+    if (type.is_function_pointer != 0u &&
+        global->is_function_pointer == 0u) {
+      char *spelling = copy_node_text(context, type_node);
+      const lower_typedef *entry;
+      uint32_t return_depth = 0u;
+      uint32_t value_depth = 0u;
+      size_t function_declarator;
+      if (spelling == NULL) {
+        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+        return QL_STATUS_OUT_OF_MEMORY;
+      }
+      entry = find_function_typedef(context, spelling);
+      context->allocator->deallocate(context->allocator->user_data, spelling);
+      function_declarator = typedef_function_shape(
+          context, entry, &return_depth, &value_depth);
+      if (function_declarator == SIZE_MAX || value_depth != 1u ||
+          return_depth > 1u) {
+        return lower_unknown(
+            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL,
+            global->declaration_node,
+            "a global callback typedef has no supported function declarator",
+            error);
+      }
+      global->is_function_pointer = 1u;
+      global->function_declarator = function_declarator;
+      global->function_return_depth = return_depth;
     }
     if (pointer_depth > LOWER_MAX_POINTER_INDIRECTION) {
       return lower_unknown(
@@ -13617,19 +14582,32 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
           error);
     }
     if (array_length == LOWER_ARRAY_BOUND_FROM_INITIALIZER) {
-      /* Only a string literal states a bound this pass can read. The
-         object's size is what keeps an out-of-bounds access out of
-         bounds, so a bound nobody states is refused, not assumed. */
-      size_t bytes = global_string_bytes(context, global->initializer_node);
-      if (bytes == 0u) {
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
-            global->declaration_node,
-            "an array with no bound needs a string initialiser this "
-            "pass can read",
-            error);
+      /* A string or an aggregate initializer states the missing bound. The
+         same bounded positional/designated counter used for automatic arrays
+         is independent of storage duration, so file-scope arrays can use it
+         without inventing an extent. */
+      if (global->initializer_node != SIZE_MAX &&
+          inferred_array_length(context, global->initializer_node, type,
+                                &array_length)) {
+        /* `inferred_array_length` includes a string's terminating NUL. */
+      } else {
+        if (global->initializer_node == SIZE_MAX &&
+            declaration_has_extern_storage(context,
+                                           global->declaration_node)) {
+          /* An extern incomplete array has storage supplied by another
+             translation unit. Its descriptor's size parameter is the exact
+             bound available to this invocation; accesses remain guarded by
+             that symbolic extent, so no element count is invented here. */
+          array_length = LOWER_ARRAY_BOUND_DYNAMIC;
+        } else {
+          return lower_unknown(
+              context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
+              global->declaration_node,
+              "an array with no bound needs a string initialiser this "
+              "pass can read",
+              error);
+        }
       }
-      array_length = (uint64_t)bytes;
     }
     if (type.kind == QL_C_SCALAR_VOID) {
       return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
@@ -13639,6 +14617,7 @@ static ql_status add_global_objects(lower_context *context, ql_error *error) {
     }
     if (array_length != 0u) {
       type = make_array_of(type, array_length);
+      type.array_row_length = row_length;
     }
     if (type.kind == QL_C_SCALAR_RECORD) {
       status = ensure_record_layout(context, type.record,
@@ -13759,14 +14738,48 @@ static ql_status resolve_callee_record_return(
   return ensure_record_layout(context, output->record, node, error);
 }
 
-/* Record-valued call expressions need stable object identity even when they
-   execute in a loop. Allocate one temporary per syntactic call before the IR
-   builder's parameter prefix closes; repeated evaluations overwrite that
-   temporary after the previous full expression has ended. */
+static ql_status add_record_temporary(lower_context *context, size_t node,
+                                      lower_type type, const char *prefix,
+                                      size_t ordinal, ql_error *error) {
+  lower_record_call_temp *temporary;
+  char label[96];
+  size_t object;
+  ql_status status = grow_array(
+      context->allocator, (void **)&context->record_call_temps,
+      &context->record_call_temp_capacity, sizeof(*context->record_call_temps),
+      context->record_call_temp_count + 1u, error);
+
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  if (snprintf(label, sizeof(label), "%s%zu@%zu", prefix, ordinal,
+               context->object_count) < 0) {
+    ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                 "record temporary object label does not fit");
+    return QL_STATUS_INTERNAL_ERROR;
+  }
+  status = add_object(context, label, NULL, &object, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  temporary = &context->record_call_temps[context->record_call_temp_count++];
+  memset(temporary, 0, sizeof(*temporary));
+  temporary->node = node;
+  temporary->type = type;
+  temporary->object = object;
+  temporary->address = QL_IR_INVALID_VALUE_ID;
+  return QL_STATUS_OK;
+}
+
+/* Record-valued calls and compound literals need stable object identity.
+   Allocate one temporary per syntactic expression before the IR builder's
+   parameter prefix closes; repeated evaluations overwrite that temporary
+   after the previous full expression has ended. */
 static ql_status add_record_call_objects(lower_context *context,
                                          ql_error *error) {
   size_t node;
   size_t ordinal = 0u;
+  size_t literal_ordinal = 0u;
 
   for (node = context->body_node + 1u;
        node < subtree_end(context, context->body_node); ++node) {
@@ -13774,11 +14787,72 @@ static ql_status add_record_call_objects(lower_context *context,
     char *name;
     lower_callee *callee;
     lower_type return_type;
-    lower_record_call_temp *temporary;
-    char label[96];
-    size_t object;
     ql_status status;
 
+    if (strcmp(context->nodes[node].view.kind,
+               "compound_literal_expression") == 0) {
+      size_t descriptor = direct_field_child(context, node, "type");
+      size_t type_node;
+      size_t declarator;
+      lower_type base_type;
+
+      if (descriptor == SIZE_MAX) {
+        continue;
+      }
+      declarator = direct_field_child(context, descriptor, "declarator");
+      type_node = direct_field_child(context, descriptor, "type");
+      if (type_node == SIZE_MAX) {
+        continue;
+      }
+      status = resolve_type_node(context, type_node, 0u, &base_type, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+      if (declarator == SIZE_MAX) {
+        return_type = base_type;
+      } else if (strcmp(context->nodes[declarator].view.kind,
+                        "abstract_array_declarator") == 0 &&
+                 direct_field_child(context, declarator, "declarator") ==
+                     SIZE_MAX) {
+        size_t size_node = direct_field_child(context, declarator, "size");
+        size_t initializer = direct_field_child(context, node, "value");
+        uint64_t length = 0u;
+
+        if (size_node != SIZE_MAX) {
+          if (!constant_array_bound(context, size_node, &length)) {
+            continue;
+          }
+        } else if (!inferred_array_length(context, initializer, base_type,
+                                          &length)) {
+          continue;
+        }
+        if (length == 0u || length > LOWER_MAX_INITIALIZER_ELEMENTS) {
+          continue;
+        }
+        return_type = make_array_of(base_type, length);
+      } else {
+        /* More than one array dimension and pointer-to-array compound
+           literals need a richer abstract declarator shape. */
+        continue;
+      }
+      if (base_type.kind == QL_C_SCALAR_RECORD) {
+        status = ensure_record_layout(context, base_type.record, node, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          return status;
+        }
+      }
+      if (return_type.array_length == 0u &&
+          return_type.kind != QL_C_SCALAR_RECORD) {
+        continue;
+      }
+      status = add_record_temporary(context, node, return_type,
+                                    "__compound_record", literal_ordinal++,
+                                    error);
+      if (status != QL_STATUS_OK) {
+        return status;
+      }
+      continue;
+    }
     if (strcmp(context->nodes[node].view.kind, "call_expression") != 0) {
       continue;
     }
@@ -13820,32 +14894,11 @@ static ql_status add_record_call_objects(lower_context *context,
           "the packed record return exceeds the bounded CALL result list",
           error);
     }
-    status = grow_array(context->allocator,
-                        (void **)&context->record_call_temps,
-                        &context->record_call_temp_capacity,
-                        sizeof(*context->record_call_temps),
-                        context->record_call_temp_count + 1u, error);
+    status = add_record_temporary(context, node, return_type, "__call_record",
+                                  ordinal++, error);
     if (status != QL_STATUS_OK) {
       return status;
     }
-    if (snprintf(label, sizeof(label), "__call_record%zu@%zu", ordinal,
-                 context->object_count) < 0) {
-      ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
-                   "record call object label does not fit");
-      return QL_STATUS_INTERNAL_ERROR;
-    }
-    status = add_object(context, label, NULL, &object, error);
-    if (status != QL_STATUS_OK) {
-      return status;
-    }
-    temporary =
-        &context->record_call_temps[context->record_call_temp_count++];
-    memset(temporary, 0, sizeof(*temporary));
-    temporary->node = node;
-    temporary->type = return_type;
-    temporary->object = object;
-    temporary->address = QL_IR_INVALID_VALUE_ID;
-    ++ordinal;
   }
   return QL_STATUS_OK;
 }
@@ -13854,7 +14907,6 @@ static ql_status add_object_parameters(lower_context *context,
                                        ql_error *error) {
   lower_type u64 = address_type();
   size_t index;
-  size_t next = 0u;
   ql_status status;
 
   if (context->uses_memory == 0u) {
@@ -13886,7 +14938,7 @@ static ql_status add_object_parameters(lower_context *context,
     return status;
   }
   for (index = 0u; index < context->variable_count; ++index) {
-    const lower_variable *variable = &context->variables[index];
+    lower_variable *variable = &context->variables[index];
     size_t object;
     if (variable->type.kind != QL_C_SCALAR_POINTER) {
       continue;
@@ -13895,7 +14947,7 @@ static ql_status add_object_parameters(lower_context *context,
     if (status != QL_STATUS_OK) {
       return status;
     }
-    (void)next;
+    variable->object_identity = (uint32_t)(object + 1u);
   }
   context->parameter_object_count = context->object_count;
   status = add_stack_slot_objects(context, error);
@@ -13938,6 +14990,14 @@ static ql_status add_object(lower_context *context, const char *label,
   lower_object *object;
   char name[160];
   ql_status status;
+
+  if (context->object_count >= LOWER_MAX_PREDECLARED_OBJECTS) {
+    return lower_unknown(
+        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, SIZE_MAX,
+        "this function references more predeclared objects than the bounded "
+        "flat-memory constraint graph carries",
+        error);
+  }
 
   status = ensure_ir_type(context, &u64, error);
   if (status != QL_STATUS_OK) {
@@ -14091,6 +15151,7 @@ static lower_value stack_address(const lower_context *context,
   address.defined = context->true_value;
   address.may_ub = 0u;
   address.has_object = 1u;
+  address.object_identity = variable->object_identity;
   return address;
 }
 
@@ -14249,6 +15310,7 @@ static ql_status materialize_stack_slots(lower_context *context,
     address.type = address_type();
     address.defined = context->true_value;
     address.has_object = 1u;
+    address.object_identity = (uint32_t)(slot->object + 1u);
     status = emit_pointer_of_address(context, address, pointer, &pointer_value,
                                      error);
     if (status != QL_STATUS_OK) {
@@ -14270,6 +15332,8 @@ static ql_status materialize_stack_slots(lower_context *context,
       variable->slot = slot;
       variable->address = context->stack_slots[slot].address;
       variable->has_object = 1u;
+      variable->object_identity =
+          (uint32_t)(context->stack_slots[slot].object + 1u);
       break;
     }
   }
@@ -14287,6 +15351,7 @@ static ql_status materialize_stack_slots(lower_context *context,
     incoming.type = variable->type;
     incoming.defined = context->true_value;
     incoming.has_object = variable->has_object;
+    incoming.object_identity = variable->object_identity;
     if (variable->type.kind == QL_C_SCALAR_RECORD) {
       status = store_record_image(context, stack_address(context, variable),
                                   variable->type, variable->value, error);
@@ -14307,12 +15372,14 @@ static ql_status materialize_record_call_temporaries(lower_context *context,
 
   for (index = 0u; index < context->record_call_temp_count; ++index) {
     lower_record_call_temp *temporary = &context->record_call_temps[index];
-    lower_type pointer = make_pointer_to(temporary->type);
+    lower_type pointer = make_pointer_to(temporary->type.array_length != 0u
+                                             ? array_element(temporary->type)
+                                             : temporary->type);
     lower_value raw;
     lower_value typed;
     ql_ir_value_id expected;
     ql_ir_value_id predicate;
-    const uint64_t size = record_size(context, temporary->type.record);
+    const uint64_t size = type_byte_width(context, temporary->type);
     ql_status status =
         emit_assumptions_for_object(context, temporary->object, error);
 
@@ -14339,6 +15406,7 @@ static ql_status materialize_record_call_temporaries(lower_context *context,
     raw.type = address_type();
     raw.defined = context->true_value;
     raw.has_object = 1u;
+    raw.object_identity = (uint32_t)(temporary->object + 1u);
     status = emit_pointer_of_address(context, raw, pointer, &typed, error);
     if (status != QL_STATUS_OK) {
       return status;
@@ -14417,16 +15485,19 @@ static ql_status materialize_globals(lower_context *context, ql_error *error) {
     pointer = make_pointer_to(global->type);
     size = type_byte_width(context, global->type);
     status = emit_assumptions_for_object(context, global->object, error);
-    if (status == QL_STATUS_OK) {
+    if (status == QL_STATUS_OK &&
+        global->type.array_length != LOWER_ARRAY_BOUND_DYNAMIC) {
       status =
           add_uint_constant(context, address_type(), size, &expected, error);
     }
-    if (status == QL_STATUS_OK) {
+    if (status == QL_STATUS_OK &&
+        global->type.array_length != LOWER_ARRAY_BOUND_DYNAMIC) {
       status = emit_compare(context, QL_IR_OPCODE_EQ,
                             context->objects[global->object].size, expected,
                             &predicate, error);
     }
-    if (status == QL_STATUS_OK) {
+    if (status == QL_STATUS_OK &&
+        global->type.array_length != LOWER_ARRAY_BOUND_DYNAMIC) {
       status = emit_assume(context, predicate, error);
     }
     if (status == QL_STATUS_OK) {
@@ -14440,6 +15511,7 @@ static ql_status materialize_globals(lower_context *context, ql_error *error) {
     address.type = address_type();
     address.defined = context->true_value;
     address.has_object = 1u;
+    address.object_identity = (uint32_t)(global->object + 1u);
     status = emit_pointer_of_address(context, address, pointer, &pointer_value,
                                      error);
     if (status != QL_STATUS_OK) {
@@ -14467,11 +15539,36 @@ static ql_status materialize_globals(lower_context *context, ql_error *error) {
     variable->is_stack = 1u;
     variable->address = global->address;
     variable->has_object = 1u;
+    variable->object_identity = (uint32_t)(global->object + 1u);
     variable->initialized = 1u;
     variable->defined = context->true_value;
+    if (global->is_function_pointer != 0u) {
+      size_t signature_declaration = global->declaration_node;
+      size_t type_node =
+          direct_field_child(context, global->declaration_node, "type");
+      char *spelling = type_node == SIZE_MAX
+                           ? NULL
+                           : copy_node_text(context, type_node);
+      const lower_typedef *entry =
+          spelling == NULL ? NULL : find_function_typedef(context, spelling);
+      context->allocator->deallocate(context->allocator->user_data, spelling);
+      if (entry != NULL) {
+        signature_declaration = entry->declaration_node;
+      }
+      variable->function.declaration_node = signature_declaration;
+      variable->function.declarator_node = global->function_declarator;
+      variable->function.return_pointer_depth =
+          global->function_return_depth;
+      variable->has_function_signature = 1u;
+    }
     /* File scope, so a local of the same name shadows it: find_variable
        searches from the most recent entry backwards. */
-    variable->scope_depth = 0u;
+    /* File scope is outside every block/function scope. SIZE_MAX is a
+       sentinel here rather than a nesting depth: a parameter or outer-body
+       local with the same name legally shadows this entry, while reverse
+       lookup still finds that newer declaration first. */
+    variable->scope_depth = SIZE_MAX;
+    variable->declaration_node = SIZE_MAX;
     ++context->variable_count;
 
     /* A stated initial value is written before the body runs, so the
@@ -14483,14 +15580,9 @@ static ql_status materialize_globals(lower_context *context, ql_error *error) {
     if (global->type.array_length != 0u) {
       unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
       size_t decoded_size = 0u;
-      char *text = global->initializer_node == SIZE_MAX
-                       ? NULL
-                       : copy_node_text(context, global->initializer_node);
-      int ok = 0;
-      if (text != NULL) {
-        ok = decode_string_literal(text, strlen(text), decoded, &decoded_size);
-        context->allocator->deallocate(context->allocator->user_data, text);
-      }
+      const int ok = decode_character_array_initializer(
+          context, global->initializer_node, array_element(global->type),
+          decoded, &decoded_size);
       if (ok) {
         status = assume_bytes(context, stack_address(context, variable),
                               decoded, decoded_size, error);
@@ -14498,20 +15590,33 @@ static ql_status materialize_globals(lower_context *context, ql_error *error) {
           return status;
         }
       } else if (global->initializer_node != SIZE_MAX) {
-        return lower_unknown(
-            context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION,
-            global->initializer_node,
-            "an array initialiser other than a string literal this "
-            "pass can read is outside this slice",
-            error);
+        status = initialize_object(context, global->initializer_node,
+                                   stack_address(context, variable),
+                                   global->type, 0u, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          return status;
+        }
       }
       continue;
     }
     if (global->initializer_node != SIZE_MAX) {
+      if (global->type.kind == QL_C_SCALAR_RECORD) {
+        status = initialize_object(context, global->initializer_node,
+                                   stack_address(context, variable),
+                                   global->type, 0u, error);
+        if (status != QL_STATUS_OK || context->unknown != 0u) {
+          return status;
+        }
+        continue;
+      }
       lower_value initial;
       lower_value converted;
-      status =
-          lower_expression(context, global->initializer_node, &initial, error);
+      size_t expression_node;
+      status = scalar_initializer_expression(
+          context, global->initializer_node, &expression_node, error);
+      if (status == QL_STATUS_OK && context->unknown == 0u) {
+        status = lower_expression(context, expression_node, &initial, error);
+      }
       if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
       }
@@ -14573,6 +15678,7 @@ static ql_status materialize_strings(lower_context *context, ql_error *error) {
     address.type = address_type();
     address.defined = context->true_value;
     address.has_object = 1u;
+    address.object_identity = (uint32_t)(literal->object + 1u);
     status = emit_pointer_of_address(context, address, pointer, &base, error);
     if (status != QL_STATUS_OK) {
       return status;
@@ -14697,6 +15803,8 @@ static ql_status initialize_parameters(lower_context *context,
     ql_c_parameter_view parameter;
     lower_type type;
     ql_ir_value_id value;
+    size_t type_node = SIZE_MAX;
+    size_t type_node_index;
 
     memset(&parameter, 0, sizeof(parameter));
     parameter.struct_size = sizeof(parameter);
@@ -14705,8 +15813,16 @@ static ql_status initialize_parameters(lower_context *context,
     if (status != QL_STATUS_OK) {
       return status;
     }
-    status = type_from_inventory(context, &parameter.type, SIZE_MAX, 0u, &type,
-                                 error);
+    for (type_node_index = 0u; type_node_index < context->node_count;
+         ++type_node_index) {
+      if (range_equal(context->nodes[type_node_index].view.range,
+                      parameter.type.base_range)) {
+        type_node = type_node_index;
+        break;
+      }
+    }
+    status = type_from_inventory(context, &parameter.type, type_node, 0u,
+                                 &type, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
       return status;
     }
@@ -14842,6 +15958,16 @@ static ql_status initialize_parameters(lower_context *context,
   }
   if (context->address_taken_count != 0u) {
     context->uses_memory = 1u;
+  }
+  if (context->uses_memory == 0u) {
+    for (index = context->body_node + 1u;
+         index < subtree_end(context, context->body_node); ++index) {
+      if (strcmp(context->nodes[index].view.kind,
+                 "compound_literal_expression") == 0) {
+        context->uses_memory = 1u;
+        break;
+      }
+    }
   }
   return add_object_parameters(context, error);
 }
@@ -15074,6 +16200,21 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
         context.uses_memory = 1u;
         break;
       }
+      {
+        size_t type_node = direct_field_child(&context, scan, "type");
+        char *spelling = type_node == SIZE_MAX
+                             ? NULL
+                             : copy_node_text(&context, type_node);
+        const int callback_typedef =
+            spelling != NULL &&
+            find_function_typedef(&context, spelling) != NULL;
+        context.allocator->deallocate(context.allocator->user_data, spelling);
+        if (callback_typedef != 0) {
+          context.makes_calls = 1u;
+          context.uses_memory = 1u;
+          break;
+        }
+      }
       declarator = direct_field_child(&context, scan, "declarator");
       if (declarator != SIZE_MAX &&
           strcmp(context.nodes[declarator].view.kind, "init_declarator") == 0) {
@@ -15090,6 +16231,33 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
   }
   collect_global_uses(&context, body_node);
   status = collect_string_literals(&context, body_node, error);
+  if (status == QL_STATUS_OK) {
+    size_t global;
+    for (global = 0u; global < context.global_count; ++global) {
+      uint32_t pointer_depth = 0u;
+      uint64_t array_length = 0u;
+      uint64_t row_length = 0u;
+      int rejected = 0;
+      if (context.globals[global].referenced == 0u ||
+          context.globals[global].initializer_node == SIZE_MAX) {
+        continue;
+      }
+      (void)member_declarator_shape(
+          &context, context.globals[global].declarator_node, &pointer_depth,
+          &array_length, &row_length, &rejected);
+      /* A character array owns the literal's bytes itself. Only a pointer
+         initializer needs the literal to remain a distinct addressable
+         object after initialization. */
+      if (rejected != 0 || pointer_depth == 0u || array_length != 0u) {
+        continue;
+      }
+      status = collect_string_literals(
+          &context, context.globals[global].initializer_node, error);
+      if (status != QL_STATUS_OK) {
+        break;
+      }
+    }
+  }
   if (status == QL_STATUS_OK) {
     status = collect_storage_locals(&context, body_node, error);
   }
@@ -15141,10 +16309,10 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
       status = materialize_record_call_temporaries(&context, error);
     }
     if (status == QL_STATUS_OK && context.unknown == 0u) {
-      status = materialize_globals(&context, error);
+      status = materialize_strings(&context, error);
     }
     if (status == QL_STATUS_OK && context.unknown == 0u) {
-      status = materialize_strings(&context, error);
+      status = materialize_globals(&context, error);
     }
     if (status == QL_STATUS_OK && context.unknown == 0u) {
       status = lower_compound(&context, body_node, 0u, error);

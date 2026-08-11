@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -257,13 +258,6 @@ struct UnsupportedCase {
 
 TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
   const UnsupportedCase cases[] = {
-      /* Dereferencing a pointer parameter is modelled now; taking an
-         address still is not, because it would need an object this slice
-         does not create. */
-      /* Storage without an initialiser holds an indeterminate value,
-         which C does not let you read. */
-      {"int address(int a) { int v; int *p = &v; return *p; }", "address",
-       QL_C_LOWER_DIAGNOSTIC_UNINITIALIZED_READ, "identifier"},
       {"int invoke(int x) { return helper(x); }", "invoke",
        QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CALL, "call_expression"},
       {"char next(void); int loop_escape(void) { char x; do { x = next(); "
@@ -295,6 +289,13 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
        "values[0][0][0] = 1; return values[0][0][0]; }",
        "three_dimensional", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
        "array_declarator"},
+      {R"QL(struct TYP_0{int FLD_0;};struct TYP_1{unsigned long FLD_1;unsigned long FLD_2;};
+unsigned long GLB_0;
+const char STR_0[]="addr_base=%lx offset=0x%x\n";
+int FUN_1(struct TYP_0*,unsigned long,unsigned long*,int*);scalar_t__ FUN_2(unsigned long);scalar_t__ FUN_3(unsigned long);int FUN_4(char*,unsigned long,scalar_t__);
+static void FUN_0(unsigned long ARG_0,unsigned long*ARG_1,int*ARG_2,struct TYP_0*ARG_3){struct TYP_1*VAR_0=((struct TYP_1*)ARG_3)-1;unsigned long VAR_1;unsigned long*VAR_2;if(ARG_0>=GLB_0){FUN_1(ARG_3,ARG_0,ARG_1,ARG_2);return;}if(ARG_0==0){*ARG_1=0;if(ARG_2)*ARG_2=0;return;}if(FUN_2(ARG_0)){VAR_1=(unsigned long)VAR_0;VAR_2=&VAR_0->FLD_1;}else{VAR_1=(unsigned long)ARG_3;VAR_2=&VAR_0->FLD_2;}FUN_4(STR_0,VAR_1,FUN_3(ARG_0));VAR_1+=FUN_3(ARG_0);*ARG_1=*((unsigned long*)VAR_1);if(ARG_2)*ARG_2=((*VAR_2)>>((VAR_1>>3)&0x3f))&0x1UL;})QL",
+       "FUN_0", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
+       "function_definition"},
   };
 
   for (const UnsupportedCase &test_case : cases) {
@@ -314,6 +315,72 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
     EXPECT_STREQ(test_case.construct, diagnostic.construct_kind);
     EXPECT_LT(diagnostic.range.start_byte, diagnostic.range.end_byte);
   }
+}
+
+TEST(CLower, CarriesMoreThanSixtyFourPreciselyKnownGlobalObjects) {
+  std::string source;
+  for (std::size_t index = 0u; index < 80u; ++index) {
+    source += "extern int GLOBAL_many_" + std::to_string(index) + ";\n";
+  }
+  source += "int global_many(void) { return ";
+  for (std::size_t index = 0u; index < 80u; ++index) {
+    if (index != 0u) {
+      source += " + ";
+    }
+    source += "GLOBAL_many_" + std::to_string(index);
+  }
+  source += "; }\n";
+
+  LoweredFunction lowered;
+  ql_error error{};
+  ASSERT_EQ(QL_STATUS_OK,
+            lowered.Lower(source.c_str(), "global_many", &error))
+      << error.message;
+  const ql_c_lower_result_view_v1 result = ResultView(lowered.get());
+  ASSERT_EQ(QL_C_LOWER_SUPPORTED, result.support);
+  EXPECT_EQ(0u, result.diagnostic_count);
+}
+
+TEST(CLower, RestoresTheThreeFixedC17HeaderConstantsAfterExtraction) {
+  constexpr char source[] =
+      "int predefined(int *p) {"
+      "  if (true && !false && p != NULL) return 1;"
+      "  return 0;"
+      "}";
+  LoweredFunction lowered;
+  ql_error error{};
+
+  ASSERT_EQ(QL_STATUS_OK, lowered.Lower(source, "predefined", &error))
+      << error.message;
+  const ql_c_lower_result_view_v1 result = ResultView(lowered.get());
+  ASSERT_EQ(QL_C_LOWER_SUPPORTED, result.support);
+  EXPECT_EQ(0u, result.diagnostic_count);
+}
+
+TEST(CLower, BoundsTheRemainingStaticObjectConstraintGraph) {
+  std::string source;
+  for (std::size_t index = 0u; index < 193u; ++index) {
+    source += "extern int GLOBAL_many_" + std::to_string(index) + ";\n";
+  }
+  source += "int global_many(void) { return ";
+  for (std::size_t index = 0u; index < 193u; ++index) {
+    if (index != 0u) {
+      source += " + ";
+    }
+    source += "GLOBAL_many_" + std::to_string(index);
+  }
+  source += "; }\n";
+
+  LoweredFunction lowered;
+  ql_error error{};
+  ASSERT_EQ(QL_STATUS_OK,
+            lowered.Lower(source.c_str(), "global_many", &error))
+      << error.message;
+  const ql_c_lower_result_view_v1 result = ResultView(lowered.get());
+  ASSERT_EQ(QL_C_LOWER_UNKNOWN, result.support);
+  ASSERT_EQ(1u, result.diagnostic_count);
+  EXPECT_EQ(QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER,
+            FirstDiagnostic(lowered.get()).code);
 }
 
 TEST(CLower, LowersReachableMissingReturnAsUndefined) {

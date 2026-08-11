@@ -237,6 +237,28 @@ TEST(IrInterp, ExecutesSwitchFallthroughBreakAndDefaultExactly) {
   EXPECT_EQ(9, ExpectReturn(module, {3u}, 32u));
 }
 
+TEST(IrInterp, CarriesSwitchScopeDeclarationsAcrossLaterCaseLabels) {
+  Module module;
+  ASSERT_TRUE(module.Open("int dispatch(int x) {\n"
+                          "  int result = 1;\n"
+                          "  switch (x) {\n"
+                          "  case 0:\n"
+                          "    int local = 7;\n"
+                          "    result = local;\n"
+                          "  case 1:\n"
+                          "    result += 3;\n"
+                          "    break;\n"
+                          "  default:\n"
+                          "    result = 9;\n"
+                          "  }\n"
+                          "  return result;\n"
+                          "}",
+                          "dispatch"));
+  EXPECT_EQ(10, ExpectReturn(module, {0u}, 32u));
+  EXPECT_EQ(4, ExpectReturn(module, {1u}, 32u));
+  EXPECT_EQ(9, ExpectReturn(module, {2u}, 32u));
+}
+
 TEST(IrInterp, ExecutesDefaultInSourceOrderAndAnAllReturningSwitch) {
   Module middle_default;
   Module all_return;

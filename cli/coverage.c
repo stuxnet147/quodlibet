@@ -193,14 +193,18 @@ static void coverage_count_lower(ql_coverage_totals *totals,
 
 /* Keep the detail file one physical TSV row per definition even if a future
    diagnostic grows structured whitespace. Existing consumers read the first
-   four fields; the diagnostic message is an append-only fifth field. */
-static void coverage_write_message(FILE *detail, const char *message) {
-    const unsigned char *cursor = (const unsigned char *)message;
+   four fields; message, construct, range, and source are append-only fields. */
+static void coverage_write_field(FILE *detail, const char *value,
+                                 size_t value_size) {
+    const unsigned char *cursor;
+    const unsigned char *end;
 
-    if (cursor == NULL) {
+    if (value == NULL) {
         return;
     }
-    while (*cursor != '\0') {
+    cursor = (const unsigned char *)value;
+    end = cursor + value_size;
+    while (cursor < end && *cursor != '\0') {
         const int byte = *cursor++;
         (void)fputc(byte == '\t' || byte == '\r' || byte == '\n' ? ' ' : byte,
                     detail);
@@ -267,6 +271,8 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
         const char *outcome = "lower_error";
         const char *detail_code = NULL;
         const char *detail_message = NULL;
+        const char *detail_construct = NULL;
+        ql_source_range detail_range = { 0 };
         unsigned first_lower_code = 0u;
 
         function.struct_size = sizeof(function);
@@ -292,11 +298,13 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
                                                    &lowered,
                                                    &error) != QL_STATUS_OK) {
             totals->definitions_lower_failed_status += 1u;
+            detail_message = error.message;
         } else {
             lower_view.struct_size = sizeof(lower_view);
             if (ql_c_lower_result_get_view(lowered, &lower_view, &error) !=
                 QL_STATUS_OK) {
                 totals->definitions_lower_failed_status += 1u;
+                detail_message = error.message;
             } else if (lower_view.support == QL_C_LOWER_SUPPORTED) {
                 ql_ir *ir = NULL;
                 ql_ir_verify_report_v1 report;
@@ -312,6 +320,7 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
                 } else {
                     totals->definitions_lower_verification_failed += 1u;
                     outcome = "verify_failed";
+                    detail_message = error.message;
                     detail_code = report.code != QL_IR_VERIFY_OK
                                       ? ql_ir_verify_code_string(report.code)
                                       : "ir_open_or_verify_error";
@@ -329,6 +338,8 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
                         QL_STATUS_OK) {
                         first_lower_code = (unsigned)first.code;
                         detail_message = first.message;
+                        detail_construct = first.construct_kind;
+                        detail_range = first.range;
                     }
                 }
             }
@@ -344,7 +355,23 @@ static void coverage_measure_unit(ql_coverage_totals *totals,
             (void)fprintf(detail, "%s\t%s\t%s\t%s\t", path,
                           function.name != NULL ? function.name : "?", outcome,
                           code_name);
-            coverage_write_message(detail, detail_message);
+            coverage_write_field(detail, detail_message,
+                                 detail_message != NULL
+                                     ? strlen(detail_message)
+                                     : 0u);
+            (void)fputc('\t', detail);
+            coverage_write_field(detail, detail_construct,
+                                 detail_construct != NULL
+                                     ? strlen(detail_construct)
+                                     : 0u);
+            (void)fprintf(detail, "\t%u\t%u\t", detail_range.start_byte,
+                          detail_range.end_byte);
+            if (detail_range.start_byte <= detail_range.end_byte &&
+                detail_range.end_byte <= source_size) {
+                coverage_write_field(
+                    detail, source + detail_range.start_byte,
+                    (size_t)(detail_range.end_byte - detail_range.start_byte));
+            }
             (void)fputc('\n', detail);
         }
         ql_c_lower_result_destroy(lowered);

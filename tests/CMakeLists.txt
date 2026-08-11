@@ -16,6 +16,7 @@ endif()
 list(SORT QL_TEST_SOURCES)
 
 add_executable(quodlibet_tests ${QL_TEST_SOURCES})
+target_sources(quodlibet_tests PRIVATE call_unprototyped_fixture.c)
 target_link_libraries(quodlibet_tests PRIVATE
     quodlibet::quodlibet
     GTest::gtest

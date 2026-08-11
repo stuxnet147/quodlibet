@@ -262,6 +262,19 @@ TEST(CLowerTypes, UsesTheGnuSizeForVoidOnlyInsideSizeof) {
     EXPECT_EQ(2, ReturnedSigned(result, 64u));
 }
 
+TEST(CLowerTypes, UsesTheSysVObjectSizeForX87LongDouble) {
+    Lowered lowered;
+    ASSERT_EQ(QL_STATUS_OK,
+              lowered.Lower("unsigned long size_of_long_double(void) {\n"
+                            "  return sizeof(long double);\n"
+                            "}",
+                            "size_of_long_double"));
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED, lowered.support());
+    const ql_ir_interp_result_v1 result = RunModule(lowered.ir(), {});
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, result.outcome);
+    EXPECT_EQ(16, ReturnedSigned(result, 64u));
+}
+
 TEST(CLowerTypes, ResolvesTypedefNamesThroughTheirDeclaredChain) {
     Lowered lowered;
     ASSERT_EQ(QL_STATUS_OK,
@@ -311,10 +324,6 @@ TEST(CLowerTypes, NamesTheRealObstacleBehindATypedef) {
     ExpectUnknown("typedef int TYP_0[4];\n"
                   "int indexed(TYP_0 a) { return 0; }",
                   "indexed", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER);
-    ExpectUnknown("struct TYP_0 { unsigned long long words[5]; };\n"
-                  "typedef struct TYP_0 TYP_1;\n"
-                  "int aggregate(TYP_1 a) { return 0; }",
-                  "aggregate", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
     /* Typedef and surface stars add together. Counting only the ones
        the declarator spells would make the signature wrong. */
     ExpectUnknown("typedef int ****TYP_0;\n"

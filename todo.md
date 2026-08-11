@@ -49,6 +49,7 @@
 - [ ] 재귀에 assume-guarantee 규칙을 준다 (로어링은 열렸고 miter 가 거부한다. 재귀 깊이 귀납이지만 종료 side condition 을 가정으로 기록해야 한다. 증거와 policy 까지 걸리는 별개 작업)
 - [x] 직접 재귀 호출 로어링 (증거: `collect_callees` 가 `function_definition` 도 훑는다, `tests/test_c_lower_recursion.cpp` 6개, 컴파일된 같은 함수를 callee 명세로 준 differential 포함. 정의 항목은 호출 대상일 뿐이고 값으로 쓰면 거부된다)
 - [x] 커버리지 측정으로 드러난 미수용 구문을 진단 코드별 빈도순으로 정리 (증거: `docs/coverage/coverage-20260811-buckets.md` 의 잔여표. 배열 선언 거부와 goto 거부는 한 메시지가 여러 형태를 덮고 있어서 갈랐고, `duplicate_declaration` 58 과 `undeclared_identifier` 33 은 clang 이 거부하는 C 라 로어링 공백이 아님을 확인)
+- [x] asm2c-01 실제 train 전체를 최종 Linux 바이너리로 재측정 (증거: `docs/coverage/asm2c-01-lowering-20260811.md`. 1,181,212/1,204,532, 98.0640%, verifier 실패 0. status 오류 256은 성공에서 제외했고 G9 99%는 계속 미달성)
 - [x] 루프 안 VLA 에 반복별 객체 수명을 준다 (증거: 객체가 크기와 별도로 미치는 범위를 지니고 선언이 그것을 묶는다, `CLowerLocals.ChecksALoopVlaAgainstTheCurrentIterationsBound`. 가변 길이 배열 타입은 계속 거부)
 - [x] 다차원 배열 (증거: `array_row_length` 가 타입과 감쇠한 포인터에 실린다, `CLowerLocals.AddressesATwoDimensionalArrayByRowThenElement`, `FillsATwoDimensionalArrayRowByRow`, `CLowerPointers.AdvancesARowThroughATwoDimensionalParameter`. 삼차원은 보폭이 둘이라 계속 거부)
 - [x] 함수 포인터로의 캐스트와 그것을 통한 호출 (증거: `CLowerCalls.CallsThroughACastToAFunctionPointer`. 되돌렸던 원인은 초기 호출 스캔이 캐스트 지정자를 못 봐서 트레이스가 없던 것)

@@ -16,8 +16,9 @@ typedef enum ql_c_scalar_kind {
     QL_C_SCALAR_VOID,
     QL_C_SCALAR_BOOL,
     QL_C_SCALAR_INTEGER,
-    /* IEC 60559 binary32 or binary64 under ASM2C_GNU_V1. `width` identifies
-       the format and `rank` carries the usual arithmetic conversions. */
+    /* IEC 60559 binary32/binary64 or SysV x87 binary80 under
+       ASM2C_GNU_V1. `width` identifies the value format and `rank` carries
+       the usual arithmetic conversions. */
     QL_C_SCALAR_FLOAT,
     /* A pointer under this profile is an address and nothing else, so its
        width and signedness are the address's. What it points at is carried

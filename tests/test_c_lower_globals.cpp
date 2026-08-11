@@ -34,6 +34,7 @@
    these; the interpreter is handed an object with the same initial bytes. */
 extern "C" {
 int GLOBAL_a = 0;
+int GLOBAL_values[4] = {0, 0, 0, 0};
 static int GLOBAL_double_impl(int a) { return a * 2; }
 int GLOBAL_double(int a) { return GLOBAL_double_impl(a); }
 }
@@ -75,6 +76,31 @@ QL_GLOBAL_FUNCTION(ordering, extern int GLOBAL_a; int GLOBAL_double(int);
    supplied for the object. */
 QL_GLOBAL_FUNCTION(initialized, int GLOBAL_init = 7;
     int global_init(int x) { return GLOBAL_init + x; });
+QL_GLOBAL_FUNCTION(initialized_record,
+    struct GLOBAL_PAIR { int first; int second; };
+    struct GLOBAL_PAIR GLOBAL_pair = {3, 4};
+    int global_pair_sum(void) { return GLOBAL_pair.first + GLOBAL_pair.second; });
+QL_GLOBAL_FUNCTION(initialized_array, int GLOBAL_array[4] = {2, 3, 5, 7};
+    int global_array_sum(void) {
+        return GLOBAL_array[0] + GLOBAL_array[1] +
+               GLOBAL_array[2] + GLOBAL_array[3];
+    });
+QL_GLOBAL_FUNCTION(initialized_matrix,
+    int GLOBAL_matrix[3][4] = {
+        {1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}};
+    int global_matrix_sum(void) {
+        return GLOBAL_matrix[0][3] + GLOBAL_matrix[1][2] +
+               GLOBAL_matrix[2][0];
+    });
+QL_GLOBAL_FUNCTION(inferred_array, int GLOBAL_inferred[] = {4, 8, 15, 16, 23};
+    int global_inferred_sum(void) {
+        return GLOBAL_inferred[1] + GLOBAL_inferred[4];
+    });
+QL_GLOBAL_FUNCTION(initialized_string_pointer,
+    static const char *GLOBAL_state = "idle";
+    int global_string_first(void) { return GLOBAL_state[0]; });
+QL_GLOBAL_FUNCTION(incomplete_array, extern int GLOBAL_values[];
+    int global_array_read(unsigned int index) { return GLOBAL_values[index]; });
 
 /* Two declarations of one name. Written out rather than compiled, because a
    redeclaration is legal C but a redefinition is not legal C++. */
@@ -88,6 +114,10 @@ static const char shadow_source[] =
     "extern int GLOBAL_a;\n"
     "int global_shadow(int GLOBAL_a) { return GLOBAL_a + 1; }\n";
 
+static const char local_shadow_source[] =
+    "extern int GLOBAL_a;\n"
+    "int global_local_shadow(void) { int GLOBAL_a = 9; return GLOBAL_a; }\n";
+
 /* A function is interpreted at an arbitrary invocation, so a mutable static
    begins with the persistent image supplied by the caller. Its source
    initializer ran before that invocation and must not be replayed here. */
@@ -99,6 +129,13 @@ static const char persistent_static_source[] =
     "    if (rounds == 0) return value;\n"
     "  }\n"
     "  return 0;\n"
+    "}\n";
+
+static const char sizeof_array_bound_source[] =
+    "typedef unsigned long long WORD;\n"
+    "static WORD pages[4096 / sizeof(WORD)];\n"
+    "WORD sizeof_array_bound(unsigned int index) {\n"
+    "  return pages[index & 511u];\n"
     "}\n";
 
 namespace {
@@ -239,7 +276,9 @@ struct Outcome {
 /* `initial` gives the bytes each named global starts from, which is how the
    run is put in the same starting state as the compiled reference. */
 Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
-                const std::map<std::string, int32_t> &initial, CallLog *log) {
+                const std::map<std::string, int32_t> &initial, CallLog *log,
+                const std::map<std::string, std::vector<uint8_t>>
+                    &byte_images = {}) {
     ql_ir_view_v1 view{};
     std::vector<std::vector<uint8_t>> storage;
     std::vector<ql_ir_interp_input_v1> inputs;
@@ -280,8 +319,12 @@ Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
             storage.push_back(
                 Encode(kBase + kStride * object_names.size(), type.bit_width));
         } else if (name.find(".__size") != std::string::npos) {
-            /* Everything these tests declare is a four-byte int. */
-            storage.push_back(Encode(4u, type.bit_width));
+            const std::map<std::string, std::vector<uint8_t>>::const_iterator
+                image = byte_images.find(object_names[next_size]);
+            storage.push_back(Encode(image != byte_images.end()
+                                         ? image->second.size()
+                                         : 4u,
+                                     type.bit_width));
             ++next_size;
         } else {
             EXPECT_LT(next_scalar, scalars.size());
@@ -303,15 +346,22 @@ Outcome Execute(ql_ir *ir, const std::vector<uint64_t> &scalars,
         ql_ir_interp_object_v1 object{};
         const std::map<std::string, int32_t>::const_iterator found =
             initial.find(object_names[index]);
-        finals[index].assign(4u, 0u);
-        initials[index] = Encode(found != initial.end()
-                                     ? static_cast<uint64_t>(
-                                           static_cast<uint32_t>(found->second))
-                                     : 0u,
-                                 32u);
+        const std::map<std::string, std::vector<uint8_t>>::const_iterator image =
+            byte_images.find(object_names[index]);
+        if (image != byte_images.end()) {
+            initials[index] = image->second;
+        } else {
+            initials[index] = Encode(
+                found != initial.end()
+                    ? static_cast<uint64_t>(
+                          static_cast<uint32_t>(found->second))
+                    : 0u,
+                32u);
+        }
+        finals[index].assign(initials[index].size(), 0u);
         ql_ir_interp_object_init(&object);
         object.base = kBase + kStride * (index + 1u);
-        object.size = 4u;
+        object.size = initials[index].size();
         object.initial = initials[index].data();
         object.final_image = finals[index].data();
         objects.push_back(object);
@@ -432,6 +482,9 @@ TEST(CLowerGlobals, KeepsWritesAndCallsInTheOrderTheSourceWroteThem) {
             Execute(lowered.ir(), {Widen(x)}, {{"GLOBAL_a", 999}}, &log);
         ASSERT_EQ(QL_STATUS_OK, run.status);
         ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_outcome_string(run.result.outcome) << " at block "
+            << run.result.block << ", instruction " << run.result.instruction
+            << ", after " << run.result.steps << " steps; "
             << ql_ir_interp_ub_reason_string(run.result.ub_reason);
         EXPECT_EQ(expected_return, Returned(run.result));
         EXPECT_EQ(expected_global,
@@ -456,10 +509,108 @@ TEST(CLowerGlobals, TakesTheStatedInitialValueOverWhateverMemoryHeld) {
                                     {{"GLOBAL_init", -12345}}, &log);
         ASSERT_EQ(QL_STATUS_OK, run.status);
         ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_outcome_string(run.result.outcome) << " at block "
+            << run.result.block << ", instruction " << run.result.instruction
+            << ", after " << run.result.steps << " steps; "
             << ql_ir_interp_ub_reason_string(run.result.ub_reason);
         EXPECT_EQ(global_init(x), Returned(run.result));
         EXPECT_EQ(7, ImageValue(run.images.find("GLOBAL_init")->second));
     }
+}
+
+TEST(CLowerGlobals, LetsAFunctionLocalShadowAFileScopeObject) {
+    Lowered lowered;
+    CallLog log;
+    ASSERT_TRUE(lowered.Open(local_shadow_source, "global_local_shadow"));
+    const Outcome run = Execute(lowered.ir(), {}, {}, &log);
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
+    EXPECT_EQ(9, Returned(run.result));
+}
+
+TEST(CLowerGlobals, InitializesGlobalAggregateObjectsBeforeTheBody) {
+    struct Case {
+        const char *source;
+        const char *function;
+        const char *object;
+        std::size_t size;
+        int32_t expected;
+    };
+    const Case cases[] = {
+        {initialized_record_source, "global_pair_sum", "GLOBAL_pair", 8u, 7},
+        {initialized_array_source, "global_array_sum", "GLOBAL_array", 16u,
+         17},
+        {initialized_matrix_source, "global_matrix_sum", "GLOBAL_matrix",
+         48u, 20},
+        {inferred_array_source, "global_inferred_sum", "GLOBAL_inferred",
+         20u, 31},
+    };
+    for (const Case &item : cases) {
+        Lowered lowered;
+        CallLog log;
+        SCOPED_TRACE(item.function);
+        ASSERT_TRUE(lowered.Open(item.source, item.function));
+        const Outcome run = Execute(
+            lowered.ir(), {}, {}, &log,
+            {{item.object, std::vector<uint8_t>(item.size, UINT8_C(0xa5))}});
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_outcome_string(run.result.outcome) << " at block "
+            << run.result.block << ", instruction " << run.result.instruction
+            << ", after " << run.result.steps << " steps; "
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(item.expected, Returned(run.result));
+    }
+}
+
+TEST(CLowerGlobals, UsesTheSuppliedExtentForAnExternIncompleteArray) {
+    Lowered lowered;
+    std::vector<uint8_t> image;
+    CallLog log;
+
+    ASSERT_TRUE(
+        lowered.Open(incomplete_array_source, "global_array_read"));
+    for (int32_t value : {17, -29, 100003, 0}) {
+        const std::vector<uint8_t> encoded = Encode(
+            static_cast<uint64_t>(static_cast<uint32_t>(value)), 32u);
+        image.insert(image.end(), encoded.begin(), encoded.end());
+    }
+    for (uint32_t index = 0u; index < 4u; ++index) {
+        const Outcome run = Execute(
+            lowered.ir(), {index}, {}, &log, {{"GLOBAL_values", image}});
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(index == 0u   ? 17
+                  : index == 1u ? -29
+                  : index == 2u ? 100003
+                                : 0,
+                  Returned(run.result));
+    }
+    const Outcome out_of_bounds =
+        Execute(lowered.ir(), {4u}, {}, &log, {{"GLOBAL_values", image}});
+    ASSERT_EQ(QL_STATUS_OK, out_of_bounds.status);
+    EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
+              out_of_bounds.result.outcome);
+}
+
+TEST(CLowerGlobals, MaterializesStringsReferencedOnlyByGlobalInitializers) {
+    Lowered lowered;
+    CallLog log;
+
+    ASSERT_TRUE(lowered.Open(initialized_string_pointer_source,
+                             "global_string_first"));
+    const Outcome run = Execute(
+        lowered.ir(), {}, {}, &log,
+        {{"GLOBAL_state", std::vector<uint8_t>(sizeof(void *), UINT8_C(0xa5))},
+         {"__string0", std::vector<uint8_t>{'i', 'd', 'l', 'e', 0u}}});
+    ASSERT_EQ(QL_STATUS_OK, run.status);
+    ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+        << ql_ir_interp_outcome_string(run.result.outcome) << " at block "
+        << run.result.block << ", instruction " << run.result.instruction
+        << ", after " << run.result.steps << " steps; "
+        << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+    EXPECT_EQ(static_cast<int32_t>('i'), Returned(run.result));
 }
 
 TEST(CLowerGlobals, DeclaringOneNameTwiceStillNamesOneObject) {
@@ -497,6 +648,12 @@ TEST(CLowerGlobals, AParameterOfTheSameNameHidesTheGlobal) {
         EXPECT_TRUE(run.images.empty());
         EXPECT_EQ(x + 1, Returned(run.result));
     }
+}
+
+TEST(CLowerGlobals, FoldsSizeofInsideAStaticArrayBound) {
+    Lowered lowered;
+    ASSERT_TRUE(
+        lowered.Open(sizeof_array_bound_source, "sizeof_array_bound"));
 }
 
 TEST(CLowerGlobals, CarriesMutableStaticStateWithoutReplayingItsInitializer) {
