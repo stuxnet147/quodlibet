@@ -10124,6 +10124,18 @@ static ql_status initialize_object(lower_context *context, size_t node,
         }
         child_type = member->type;
         offset = member->offset;
+      } else if (type.array_row_length != 0u) {
+        /* `{{...}, {...}}` initializes rows, not elements. Each child is a
+           row of its own, which is the same array the first subscript
+           reaches. */
+        const uint64_t rows = type.array_length / type.array_row_length;
+        if ((uint64_t)ordinal >= rows) {
+          return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, child,
+                               "too many positional array initializers", error);
+        }
+        child_type =
+            make_array_of(array_element(type), type.array_row_length);
+        offset = (uint64_t)ordinal * type_byte_width(context, child_type);
       } else if (type.array_length != 0u) {
         if ((uint64_t)ordinal >= type.array_length) {
           return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, child,

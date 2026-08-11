@@ -38,6 +38,12 @@ QL_LOCAL_FUNCTION(grid, int loc_grid(int x, int y) {
     }
     return cells[2][3] + cells[0][0] + cells[1][2] + y;
 });
+/* Rows, not elements: each brace pair fills one row of the same object. */
+QL_LOCAL_FUNCTION(grid_init, int loc_grid_init(int x) {
+    int cells[2][3] = {{1, 2, 3}, {4, 5, 6}};
+    cells[1][0] += x;
+    return cells[0][0] + cells[0][2] + cells[1][0] + cells[1][2];
+});
 /* Three reads and two writes, in that order. A lowering that kept the object
    in an SSA value would fold the reads into one and the compiled reference
    would stop agreeing about how many accesses happened. */
@@ -474,6 +480,21 @@ TEST(CLowerLocals, AddressesATwoDimensionalArrayByRowThenElement) {
                 << ql_ir_interp_ub_reason_string(run.result.ub_reason);
             EXPECT_EQ(loc_grid(x, y), Returned(run.result));
         }
+    }
+}
+
+TEST(CLowerLocals, FillsATwoDimensionalArrayRowByRow) {
+    Lowered lowered;
+    std::vector<std::vector<uint8_t>> images;
+    ASSERT_TRUE(lowered.Open(grid_init_source, "loc_grid_init"));
+    for (const int32_t x : {-9, 0, 4}) {
+        SCOPED_TRACE(x);
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(x)}, {2u * 3u * 4u}, &images);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        EXPECT_EQ(loc_grid_init(x), Returned(run.result));
     }
 }
 
