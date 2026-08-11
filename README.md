@@ -80,6 +80,7 @@ The builtin registry currently contains:
 | `prove.aig-sat` | Bit-blasted scalar product using CaDiCaL | LRAT certificate accepted by the independent `lrat-check`, recorded as `checked_proof=true` |
 | `refute.concrete-differential` | Deterministic boundary and random input search | Replay-confirmed counterexample only |
 | `search.bounded-symbolic` | Bounded unrolling of cyclic IR into the same product encoding | Replay-confirmed counterexample against the original loops; UNSAT is `BOUNDED_CLEAN` with its bound, never a proof |
+| `prove.egraph` | Equality saturation over one shared-variable e-graph, guard-free pure scalar fragment | Independent merge-log replay by `egraph_check`, recorded as `checked_proof=true`; failure to merge stays `UNKNOWN` |
 
 The loop-free SMT and AIG/SAT paths use the same product-query encoding. A SAT
 assignment from that encoding is only a candidate until the shared concrete

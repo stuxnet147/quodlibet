@@ -4,6 +4,7 @@
 #include "quodlibet/proof_aigsat.h"
 #include "quodlibet/proof_bounded.h"
 #include "quodlibet/proof_diff.h"
+#include "quodlibet/proof_egraph.h"
 #include "quodlibet/proof_smt.h"
 
 static ql_status QL_CALL identity_run(void *instance,
@@ -76,5 +77,12 @@ ql_status QL_CALL ql_register_builtin_methods(ql_registry *registry,
   /* The bounded search covers the cyclic territory the loop-free provers
      refuse: it unrolls, refutes with a replayed model, and reports UNSAT as
      BOUNDED_CLEAN with its bound rather than as any kind of proof. */
-  return ql_register_bounded_method(registry, error);
+  status = ql_register_bounded_method(registry, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  /* The e-graph prover is the solver-free rung: rewrite-distance pairs close
+     with a checked proof at saturation cost, and the claim rests on the
+     independent merge-log replay, never on the engine's own matcher. */
+  return ql_register_egraph_proof_method(registry, error);
 }

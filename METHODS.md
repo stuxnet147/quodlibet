@@ -201,6 +201,43 @@ is kept only when the extracted term is available strictly earlier in the block
 than the value it replaces. The output IR is verified again before it leaves the
 method.
 
+#### The shipped `prove.egraph` method
+
+`src/proof_egraph.c` registers `prove.egraph` as a built-in proof method, the
+solver-free rung between the concrete refuter and the two solver-backed
+provers. It consumes one schema v2 problem, lowers both sides, and builds ONE
+e-graph in which the argument correspondence maps each left parameter and its
+right counterpart onto the same variable term. The graph is saturated with
+the versioned catalogue, and the two return roots landing in one class is the
+equivalence claim.
+
+The verdict is issued only on the independent replay: every recorded merge
+must be `JUSTIFIED` by `src/egraph_check.c`, none may be `ASSUMED`, and the
+checker's own replayed union-find must merge the two roots. Only then does
+the outcome carry `PROVED_*`, `QL_EVIDENCE_PROOF`, and `checked_proof: true`.
+The trusted computing base is this file's IR-to-term conversion, the replay
+checker, and the rule catalogue whose version and digest the evidence names;
+the engine's rewrite matcher is not in it, exactly as CaDiCaL is not in the
+AIG path's.
+
+The accepted fragment is one where root equality IS the selected behavior:
+one basic block per side ending in RETURN of a bool or bit-vector, every
+instruction effect-free with a pure term operator, no UB_GUARD, ASSUME,
+memory, calls, or traps, and a literal-true typed precondition (this method
+has no solver to witness a narrower domain's inhabitation; all-inputs
+equality of total functions is never vacuous). There are no opaque leaves: a
+prover may not copy what it cannot model, because an unshared leaf can never
+merge across sides. Under the ASM2C_GNU_V1 profile signed `+`, `-`, and `*`
+lower with an overflow UB guard and therefore fall outside the fragment;
+unsigned and bitwise arithmetic is the practical territory. Inside it both
+sides are total, deterministic, and defined everywhere, so each behavior set
+is a singleton and return equality discharges equivalence and both
+refinement directions at once.
+
+Failure to merge -- saturation completing without connecting the roots, or
+stopping on a limit -- is `UNKNOWN` and never a counterexample, because
+equality saturation is incomplete and cannot refute anything.
+
 #### The rewrite rule catalogue
 
 A merge record carries only the rule name that fired. The premises that make
