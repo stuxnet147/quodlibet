@@ -81,6 +81,7 @@ The builtin registry currently contains:
 | `refute.concrete-differential` | Deterministic boundary and random input search | Replay-confirmed counterexample only |
 | `search.bounded-symbolic` | Bounded unrolling of cyclic IR into the same product encoding | Replay-confirmed counterexample against the original loops; UNSAT is `BOUNDED_CLEAN` with its bound, never a proof |
 | `prove.egraph` | Equality saturation over one shared-variable e-graph, guard-free pure scalar fragment | Independent merge-log replay by `egraph_check`, recorded as `checked_proof=true`; failure to merge stays `UNKNOWN` |
+| `prove.chc-pdr` | IC3/PDR invariant synthesis over the serialized relational loop pair | Re-verified inductive invariant recorded in the outcome, promoted only under trusted-Bitwuzla, `checked_proof=false`; bad-state traces stay `UNKNOWN` |
 
 The loop-free SMT and AIG/SAT paths use the same product-query encoding. A SAT
 assignment from that encoding is only a candidate until the shared concrete
@@ -107,8 +108,11 @@ the disequality of identical IR digests, and a concrete defined interpreter
 execution proves that the comparison domain is inhabited. This rule reports no
 generated invariant. Fixed-stride pointers and disconnected fixed-additive
 closed forms are telemetry-only. No summary proof terminal is exposed or
-attempted. If neither unbounded rule applies, the unavailable CHC/PDR fallback
-leaves `UNKNOWN`; finite unrolling is never used as proof.
+attempted. If neither unbounded rule applies, the SMT product's in-process
+fallback still leaves `UNKNOWN`, and the registered `prove.chc-pdr` method is
+how that boundary is attempted: it synthesizes an inductive invariant over
+the same serialized transition system, as its own method or pipeline node.
+Finite unrolling is never used as proof.
 
 The core also provides:
 
@@ -145,8 +149,7 @@ directives are detected but not expanded, so callers must supply preprocessed
 source. Volatile and atomic behavior is represented in the contract and IR
 vocabulary but is not yet lowered from general C.
 
-CHC/PDR and bounded symbolic execution are documented future methods, not
-registered implementations. The actual relational loop path is deliberately
+The actual relational loop path is deliberately
 limited to one paired reducible pre-test scalar loop. Exact self-pairs can use
 shared-transition induction for clean canonical shapes or whole-IR
 reflexivity, including effectful, UB-bearing, nested, and ambiguous-guard

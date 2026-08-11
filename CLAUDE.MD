@@ -58,4 +58,4 @@ Linux preset은 `linux-clang`입니다. Bitwuzla 없는 구성은 별도 build d
 
 ## 현재 구현 경계
 
-공통 기반은 마련되어 있지만 end-to-end 동치 proof path는 아직 없습니다. 다음 핵심 단계는 problem schema v2, source-signature와 typed-precondition binding, product-program SMT query, counterexample replay, trusted UNSAT checker입니다. 우선순위와 세부 항목은 `todo.md`를 기준으로 합니다.
+end-to-end 동치 proof path는 구현되어 있습니다. problem schema v2, signature와 typed-precondition binding, product-program SMT query, counterexample replay, trusted UNSAT 경계까지 W2 에서 닫혔고, 등록된 proof method 는 `prove.smt-product`, `prove.aig-sat`, `refute.concrete-differential`, `search.bounded-symbolic`, `prove.egraph`, `prove.chc-pdr` 여섯 개입니다. 이 절이 아니라 `README.md` 의 구현 현황 표와 `todo.md` 를 기준으로 삼습니다. 이 문서의 상태 서술이 소스와 어긋나면 소스가 맞습니다.

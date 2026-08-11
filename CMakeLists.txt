@@ -92,6 +92,7 @@ file(GLOB QL_OPTIONAL_CORE_SOURCES CONFIGURE_DEPENDS LIST_DIRECTORIES false
     "${CMAKE_CURRENT_SOURCE_DIR}/src/product.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_aigsat.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_bounded.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_chcpdr.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_diff.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_egraph.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_method.c"

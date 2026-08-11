@@ -3,6 +3,7 @@
 #include "quodlibet/egraph_method.h"
 #include "quodlibet/proof_aigsat.h"
 #include "quodlibet/proof_bounded.h"
+#include "quodlibet/proof_chcpdr.h"
 #include "quodlibet/proof_diff.h"
 #include "quodlibet/proof_egraph.h"
 #include "quodlibet/proof_smt.h"
@@ -84,5 +85,12 @@ ql_status QL_CALL ql_register_builtin_methods(ql_registry *registry,
   /* The e-graph prover is the solver-free rung: rewrite-distance pairs close
      with a checked proof at saturation cost, and the claim rests on the
      independent merge-log replay, never on the engine's own matcher. */
-  return ql_register_egraph_proof_method(registry, error);
+  status = ql_register_egraph_proof_method(registry, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  /* CHC/PDR is the loop prover the structural fast path falls back toward:
+     it synthesizes an inductive invariant over the same serialized
+     transition system instead of checking one fixed relation. */
+  return ql_register_chcpdr_method(registry, error);
 }

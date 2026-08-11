@@ -2297,7 +2297,7 @@ add_candidate_relation(loop_buffer *buffer,
 static ql_status add_state_candidate_relation(
     loop_buffer *buffer, const ql_loop_proof_query *query, size_t left_loop,
     const char *left_kind, const char *right_kind, size_t pair_index,
-    const ql_loop_view *loop, ql_error *error) {
+    const ql_loop_view *loop, uint32_t missing_ok, ql_error *error) {
   size_t phi_index;
   ql_status status = buffer_add(buffer, "(and true", error);
 
@@ -2306,6 +2306,12 @@ static ql_status add_state_candidate_relation(
     const ql_loop_relation_candidate_v1 *candidate =
         selected_candidate(query, left_loop, phi_index);
     if (candidate == NULL) {
+      /* With missing_ok the caller keeps the prefix for an external CHC/PDR
+         backend, which synthesizes its own invariant; the fixed-vocabulary
+         terminals stay meaningless and the disposition says so. */
+      if (missing_ok != 0u) {
+        continue;
+      }
       ql_error_set(error, QL_STATUS_TYPE_MISMATCH,
                    "loop PHI has no Base-and-recurrence-justified relation");
       return QL_STATUS_TYPE_MISMATCH;
@@ -2888,7 +2894,7 @@ static ql_status build_actual_scalar_loop_terms(
     loop_buffer *guard_terms, loop_buffer *step_terms, loop_buffer *exit_terms,
     const ql_ir *left_ir, const ql_ir *right_ir, size_t left_loop_index,
     size_t pair_index, const ql_loop_view *left, const ql_loop_view *right,
-    uint32_t *maximum_width, ql_error *error) {
+    uint32_t *maximum_width, uint32_t missing_candidate_ok, ql_error *error) {
   size_t phi_index;
   ql_status status = QL_STATUS_OK;
 
@@ -2927,7 +2933,8 @@ static ql_status build_actual_scalar_loop_terms(
   if (status == QL_STATUS_OK) {
     status =
         add_state_candidate_relation(prefix, query, left_loop_index, "l_entry",
-                                     "r_entry", pair_index, left, error);
+                                     "r_entry", pair_index, left,
+                                     missing_candidate_ok, error);
   }
   if (status == QL_STATUS_OK) {
     status = buffer_add(prefix, ")\n", error);
@@ -2938,7 +2945,8 @@ static ql_status build_actual_scalar_loop_terms(
   }
   if (status == QL_STATUS_OK) {
     status = add_state_candidate_relation(prefix, query, left_loop_index, "l",
-                                          "r", pair_index, left, error);
+                                          "r", pair_index, left,
+                                          missing_candidate_ok, error);
   }
   if (status == QL_STATUS_OK) {
     status = buffer_add(prefix, ")\n", error);
@@ -2950,7 +2958,8 @@ static ql_status build_actual_scalar_loop_terms(
   if (status == QL_STATUS_OK) {
     status =
         add_state_candidate_relation(prefix, query, left_loop_index, "l_next",
-                                     "r_next", pair_index, left, error);
+                                     "r_next", pair_index, left,
+                                     missing_candidate_ok, error);
   }
   if (status == QL_STATUS_OK) {
     status = buffer_add(prefix, ")\n", error);
@@ -3333,7 +3342,8 @@ static ql_status build_query_artifacts(
     ql_loop_proof_query *query, const ql_loop_analysis *left_analysis,
     const ql_loop_analysis *right_analysis, const ql_ir *left_ir,
     const ql_ir *right_ir, const loop_pair *pairs, size_t pair_count,
-    uint32_t actual_scalar_path, ql_error *error) {
+    uint32_t actual_scalar_path, uint32_t missing_candidate_ok,
+    ql_error *error) {
   static const char induction_terminal[] =
       "(assert quodlibet_loop_induction_bad)\n";
   static const char summary_terminal[] =
@@ -3391,7 +3401,7 @@ static ql_status build_query_artifacts(
       status = build_actual_scalar_loop_terms(
           query, &prefix, &base_terms, &guard_terms, &step_terms, &exit_terms,
           left_ir, right_ir, pairs[pair_index].left, pair_index, left, right,
-          &maximum_width, error);
+          &maximum_width, missing_candidate_ok, error);
     } else {
       status = build_structural_loop_terms(&prefix, &base_terms, &guard_terms,
                                            &step_terms, &exit_terms, pair_index,
@@ -3658,6 +3668,7 @@ ql_status ql_loop_proof_query_build(const ql_allocator *allocator,
   uint32_t actual_scalar_path = 0u;
   uint32_t exact_shared_path = 0u;
   uint32_t semantic_fallback = 0u;
+  uint32_t deferred_candidate_fallback = 0u;
   uint32_t concrete_domain_witness = 0u;
   ql_digest concrete_domain_witness_digest;
   char concrete_domain_witness_reason[QL_ERROR_MESSAGE_CAPACITY];
@@ -4050,12 +4061,12 @@ ql_status ql_loop_proof_query_build(const ql_allocator *allocator,
         actual_scalar_path = 0u;
         exact_shared_path = 1u;
       } else {
-        semantic_fallback = 1u;
-        fallback_reason = QL_LOOP_PROOF_UNSUPPORTED_AFFINE_SUMMARY;
-        fallback_diagnostic =
-            "no Base-and-recurrence-preserving equality, offset, or affine "
-            "relation covers every header PHI";
-        goto finish_dispatch;
+        /* The fixed relation vocabulary cannot cover this pair, but the
+           actual transition serialization does not depend on it. The
+           remaining structural gates run as usual, and when they pass the
+           prefix is built and kept for a CHC/PDR backend while the
+           disposition still records the fallback. */
+        deferred_candidate_fallback = 1u;
       }
     }
   }
@@ -4197,7 +4208,8 @@ ql_status ql_loop_proof_query_build(const ql_allocator *allocator,
   if (status == QL_STATUS_OK) {
     status = build_query_artifacts(query, left_analysis, right_analysis,
                                    left_ir, right_ir, pairs, pair_count,
-                                   actual_scalar_path, error);
+                                   actual_scalar_path,
+                                   deferred_candidate_fallback, error);
   }
   if (status == QL_STATUS_TYPE_MISMATCH && actual_scalar_path != 0u &&
       query->view.self_pair != 0u && query->view.ir_structural_match != 0u) {
@@ -4213,7 +4225,7 @@ ql_status ql_loop_proof_query_build(const ql_allocator *allocator,
     if (status == QL_STATUS_OK) {
       status = build_query_artifacts(query, left_analysis, right_analysis,
                                      left_ir, right_ir, pairs, pair_count,
-                                     actual_scalar_path, error);
+                                     actual_scalar_path, 0u, error);
     }
   }
   query->view.metrics.query_build_ns = elapsed_ns(stage_started);
@@ -4229,7 +4241,8 @@ ql_status ql_loop_proof_query_build(const ql_allocator *allocator,
   if (status != QL_STATUS_OK) {
     goto failure;
   }
-  query->view.metrics.invariant_generated_count = pair_count;
+  query->view.metrics.invariant_generated_count =
+      deferred_candidate_fallback != 0u ? 0u : pair_count;
 
   query->view.nonvacuity_eligible =
       (actual_scalar_path != 0u ||
@@ -4251,6 +4264,22 @@ ql_status ql_loop_proof_query_build(const ql_allocator *allocator,
       selected_options.contract_binding_match != 0u &&
       query->view.has_ub_guard_or_terminator == 0u;
   query->promotion_gate_satisfied = query->view.promotion_eligible;
+  if (deferred_candidate_fallback != 0u) {
+    /* The prefix and its raw entry, guard, next, and exit definitions were
+       built and are kept, but the fixed-vocabulary induction terminal has
+       nothing selected to check, so the fast path still records the
+       fallback. `chc_pdr_available` says the serialized transition system
+       is there for a CHC/PDR backend to synthesize an invariant over;
+       nonvacuity and UB flags above stay meaningful for that backend's own
+       promotion gate. */
+    mark_fallback(query, QL_LOOP_PROOF_UNSUPPORTED_AFFINE_SUMMARY,
+                  "no Base-and-recurrence-preserving equality, offset, or "
+                  "affine relation covers every header PHI; the serialized "
+                  "transition prefix remains available for CHC/PDR");
+    query->promotion_gate_satisfied = 0u;
+    query->view.chc_pdr_available = 1u;
+    goto success;
+  }
   query->view.disposition = QL_LOOP_PROOF_QUERY_READY;
   query->view.strategy = QL_LOOP_PROOF_STRATEGY_STRUCTURAL_INDUCTION;
   if (query->view.promotion_eligible != 0u) {

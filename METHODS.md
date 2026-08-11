@@ -409,9 +409,10 @@ does not expose a summary proof terminal. A summary that is disconnected from
 a common iteration count and the actual exit observable would be unsound.
 Consequently summary attempts and proved counts remain zero. An induction
 `SAT`, an unsupported summary connection, or an unsupported loop shape reaches
-the CHC/PDR boundary. No `prove.chc-pdr` method or CHC engine is registered, so
-the fallback is recorded as reached but not attempted and the result is
-`UNKNOWN`.
+the CHC/PDR boundary. The in-process fallback is still recorded as reached
+but not attempted and this method's result is `UNKNOWN`; the registered
+`prove.chc-pdr` method (below) is how that boundary is attempted, over the
+same serialized prefix.
 
 The promotion gate requires the problem and contract binding, literal-true
 typed precondition, and explicit `trusted-backend` selection. Actual or shared-
@@ -851,12 +852,52 @@ always false because this method never claims a proof.
 
 ### CHC/PDR
 
-Recommended method name: `prove.chc-pdr`.
+Method name: `prove.chc-pdr`.
 
-This is still a design contract, not a registered implementation. The
-structural SMT loop path records when it reaches this fallback, but
-`fallback_attempted` remains false because no CHC/PDR backend is available.
-The enclosing method returns `UNKNOWN` at that point.
+#### The implemented method
+
+`src/proof_chcpdr.c` registers `prove.chc-pdr` as a built-in. It runs
+IC3/PDR over the transition system `src/loop_proof.c` already serializes for
+the induction fast path: shared input symbols, one current-state constant
+per loop-carried PHI on each side, and entry, guard, next-state, and exit
+expressions defined over them. When the fast path's fixed relation
+vocabulary cannot cover a pair, the serializer now still emits that prefix
+and records `chc_pdr_available` on the fallback disposition, which is
+exactly the territory this method exists for; it also accepts the
+QUERY_READY prefixes whose single induction query failed.
+
+Frames of lemmas are strengthened by blocking counterexamples-to-induction
+cube by cube, with literal-drop generalization and forward propagation.
+The lemma vocabulary is concrete-value cubes, the analyzer's own
+equality/offset/affine candidates, an entry anchor (a variable the latch
+never updates stays at its entry expression), and entry-anchored sums and
+differences of state pairs. The last two are what close a pair like "count
+up" against "count down": its invariant `i + j = n` names an input and is
+outside the fast path's constant-coefficient vocabulary. Every seed still
+passes the ordinary initiation and consecution queries before any frame
+carries it, so an unsound heuristic cannot become an unsound lemma.
+
+The safety property is the fast path's own: reachable synchronized states
+never disagree on the continue guards, and a state where both sides exit
+never disagrees on the exit observable. A fixpoint is re-verified with
+fresh initiation, consecution, and exclusion queries, the comparison domain
+must answer `sat`, and promotion additionally requires the whole-IR
+non-vacuity flags, the positional binding, the literal-true precondition,
+and the explicit `trusted-backend` policy -- the same gate shape as the SMT
+product's, with `checked_proof: false` because Bitwuzla answers every
+clause query. The verified invariant is recorded lemma by lemma in the
+outcome over the prefix's own state symbols, so an external checker can
+re-discharge all three obligations against the same prefix.
+
+A reachable bad state is never concretized here: the diagnostic routes the
+caller to `search.bounded-symbolic` or `refute.concrete-differential`, and
+the verdict stays `UNKNOWN`. Frame, lemma, query, and time budgets also
+leave `UNKNOWN`. The SMT product's own in-process fallback telemetry still
+records `fallback_attempted = false`; running this method, standalone or as
+a pipeline branch beside `prove.smt-product`, is how the boundary is
+attempted.
+
+#### Interface
 
 This method encodes the relational product as constrained Horn clauses and uses
 property-directed reachability or another CHC engine to infer inductive

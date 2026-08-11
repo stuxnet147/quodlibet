@@ -117,11 +117,11 @@ TEST(ConcreteDifferential, IsRegisteredBesideTheSmtMethodAsABuiltin) {
   EXPECT_NE(nullptr, ql_registry_find(registry.get(), QL_DIFF_METHOD_NAME));
   EXPECT_NE(nullptr,
             ql_registry_find(registry.get(), QL_SMT_PRODUCT_METHOD_NAME));
-  /* The AIG/SAT prover, the bounded search, and the e-graph prover joined
-     them; the count is pinned so a method that appears without anyone
-     noticing fails here. */
+  /* The AIG/SAT prover, the bounded search, the e-graph prover, and the
+     CHC/PDR prover joined them; the count is pinned so a method that
+     appears without anyone noticing fails here. */
   EXPECT_NE(nullptr, ql_registry_find(registry.get(), QL_AIG_SAT_METHOD_NAME));
-  EXPECT_EQ(5u, ql_registry_proof_method_count(registry.get()));
+  EXPECT_EQ(6u, ql_registry_proof_method_count(registry.get()));
 }
 
 TEST(ConcreteDifferential, NeverAdvertisesProofOrBoundedSoundness) {
