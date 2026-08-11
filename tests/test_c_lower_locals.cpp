@@ -25,8 +25,19 @@
     static const char name##_source[] = #__VA_ARGS__
 
 QL_LOCAL_FUNCTION(echo, int loc_echo(int x) { return *&x; });
-/* One object with a shape. The first subscript advances a row and the second
-   an element, which is the only thing a second bound changes. */
+/* `[index] = value` fills the elements it names and leaves the rest zero, and
+   an omitted bound is the largest index plus one. The reference is stated
+   rather than compiled here: an array designator is a C99 form that C++ warns
+   about, and the expected value is short enough to write down. */
+static const char sparse_source[] =
+    "int loc_sparse(int x) {\n"
+    "  int table[] = {[4] = 40, [0] = 1, [2] = 20};\n"
+    "  table[1] += x;\n"
+    "  return table[0] + table[1] + table[2] + table[3] + table[4];\n"
+    "}\n";
+
+/* One object with a shape. The first subscript advances a row and the
+   second an element, which is the only thing a second bound changes. */
 QL_LOCAL_FUNCTION(grid, int loc_grid(int x, int y) {
     int cells[3][4];
     int row;
@@ -495,6 +506,22 @@ TEST(CLowerLocals, FillsATwoDimensionalArrayRowByRow) {
         ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
             << ql_ir_interp_ub_reason_string(run.result.ub_reason);
         EXPECT_EQ(loc_grid_init(x), Returned(run.result));
+    }
+}
+
+TEST(CLowerLocals, FillsTheElementsAnIndexDesignatorNames) {
+    Lowered lowered;
+    std::vector<std::vector<uint8_t>> images;
+    ASSERT_TRUE(lowered.Open(sparse_source, "loc_sparse"));
+    for (const int32_t x : {-3, 0, 11}) {
+        SCOPED_TRACE(x);
+        const Outcome run =
+            Execute(lowered.ir(), {Widen(x)}, {5u * 4u}, &images);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        /* 1 + x + 20 + 0 + 40, with the three unnamed elements zero. */
+        EXPECT_EQ(61 + x, Returned(run.result));
     }
 }
 

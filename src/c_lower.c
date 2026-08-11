@@ -9921,6 +9921,9 @@ static int decode_character_array_initializer(
   return ok;
 }
 
+static int index_designated_initializer(const lower_context *context,
+                                        size_t node, uint64_t *bound);
+
 static int inferred_array_length(lower_context *context, size_t initializer,
                                  lower_type element, uint64_t *length) {
   unsigned char decoded[LOWER_MAX_STRING_BYTES + 1u];
@@ -9929,12 +9932,66 @@ static int inferred_array_length(lower_context *context, size_t initializer,
   if (positional_initializer_count(context, initializer, length)) {
     return 1;
   }
+  if (index_designated_initializer(context, initializer, length)) {
+    return 1;
+  }
   if (!decode_character_array_initializer(context, initializer, element,
                                           decoded, &decoded_size)) {
     return 0;
   }
   *length = (uint64_t)decoded_size;
   return 1;
+}
+
+/* True only for a non-empty list made entirely of `[index] = value` pairs
+   whose indices this pass can fold. Reports the smallest bound that holds
+   them, which is what `T a[] = {[7] = 1}` states. Mixing positional and
+   designated entries moves the next positional index in C, so that larger
+   state machine stays outside this slice. */
+static int index_designated_initializer(const lower_context *context,
+                                        size_t node, uint64_t *bound) {
+  size_t end;
+  size_t child;
+  int saw_pair = 0;
+
+  *bound = 0u;
+  if (node == SIZE_MAX ||
+      strcmp(context->nodes[node].view.kind, "initializer_list") != 0) {
+    return 0;
+  }
+  end = subtree_end(context, node);
+  for (child = node + 1u; child < end; ++child) {
+    size_t designator;
+    size_t value;
+    size_t index_node;
+    uint64_t index = 0u;
+    if (context->nodes[child].parent != node ||
+        (context->nodes[child].view.flags & QL_C_SYNTAX_NODE_NAMED) == 0u ||
+        strcmp(context->nodes[child].view.kind, "comment") == 0) {
+      continue;
+    }
+    if (strcmp(context->nodes[child].view.kind, "initializer_pair") != 0) {
+      return 0;
+    }
+    designator = direct_field_child(context, child, "designator");
+    value = direct_field_child(context, child, "value");
+    if (designator == SIZE_MAX || value == SIZE_MAX ||
+        strcmp(context->nodes[designator].view.kind,
+               "subscript_designator") != 0) {
+      return 0;
+    }
+    index_node = first_named_child(context, designator);
+    if (index_node == SIZE_MAX ||
+        !constant_array_bound_value(context, index_node, &index) ||
+        index >= LOWER_MAX_INITIALIZER_ELEMENTS) {
+      return 0;
+    }
+    if (index + 1u > *bound) {
+      *bound = index + 1u;
+    }
+    saw_pair = 1;
+  }
+  return saw_pair;
 }
 
 /* True only for a non-empty list made entirely of `.member = value` pairs.
@@ -10199,6 +10256,7 @@ static ql_status initialize_object(lower_context *context, size_t node,
   const int is_list =
       strcmp(context->nodes[node].view.kind, "initializer_list") == 0;
   int is_field_designated = 0;
+  int is_index_designated = 0;
   ql_status status;
 
   if (type.array_length == 0u && type.kind != QL_C_SCALAR_RECORD) {
@@ -10300,9 +10358,14 @@ static ql_status initialize_object(lower_context *context, size_t node,
   if (is_list) {
     uint64_t count;
     if (!positional_initializer_count(context, node, &count)) {
+      uint64_t bound = 0u;
       if (type.array_length == 0u && type.kind == QL_C_SCALAR_RECORD &&
           is_field_designated_initializer(context, node)) {
         is_field_designated = 1;
+      } else if (type.array_length != 0u && type.array_row_length == 0u &&
+                 index_designated_initializer(context, node, &bound) &&
+                 bound <= type.array_length) {
+        is_index_designated = 1;
       } else {
         return lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
@@ -10362,7 +10425,24 @@ static ql_status initialize_object(lower_context *context, size_t node,
           strcmp(context->nodes[child].view.kind, "comment") == 0) {
         continue;
       }
-      if (strcmp(context->nodes[child].view.kind, "initializer_pair") == 0) {
+      if (strcmp(context->nodes[child].view.kind, "initializer_pair") == 0 &&
+          is_index_designated != 0) {
+        size_t designator = direct_field_child(context, child, "designator");
+        size_t index_node =
+            designator == SIZE_MAX ? SIZE_MAX
+                                   : first_named_child(context, designator);
+        uint64_t index = 0u;
+        initializer = direct_field_child(context, child, "value");
+        if (index_node == SIZE_MAX || initializer == SIZE_MAX ||
+            !constant_array_bound_value(context, index_node, &index)) {
+          return lower_unknown(
+              context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, child,
+              "array designator does not name one constant index", error);
+        }
+        child_type = array_element(type);
+        offset = index * type_byte_width(context, child_type);
+      } else if (strcmp(context->nodes[child].view.kind, "initializer_pair") ==
+                 0) {
         size_t designator;
         size_t field;
         lower_record *record;
@@ -10436,9 +10516,10 @@ static ql_status initialize_object(lower_context *context, size_t node,
       status = aggregate_child_address(context, address, offset, child_type,
                                        &child_address, error);
       if (status == QL_STATUS_OK) {
-        status = initialize_object(context, initializer, child_address,
-                                   child_type,
-                                   is_field_designated != 0 ? 0u : 1u, error);
+        status = initialize_object(
+            context, initializer, child_address, child_type,
+            (is_field_designated != 0 || is_index_designated != 0) ? 0u : 1u,
+            error);
       }
       if (status != QL_STATUS_OK || context->unknown != 0u) {
         return status;
