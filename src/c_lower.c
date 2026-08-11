@@ -232,6 +232,14 @@ typedef struct lower_variable {
 typedef struct lower_object {
   ql_ir_value_id base;
   ql_ir_value_id size;
+  /* How many bytes of this object are addressable right now. It is the size
+     everywhere except inside the scope of a variably modified object, where
+     the declaration binds it to that iteration's byte count. Invalid means
+     the size, so an object that never holds a VLA needs no bookkeeping.
+     The value is defined at the declaration, which dominates the rest of the
+     scope; leaving the scope restores the size, which is a parameter and
+     dominates everything. */
+  ql_ir_value_id extent;
   uint32_t may_alias;
 } lower_object;
 
@@ -3841,12 +3849,15 @@ static ql_status emit_access_defined(lower_context *context,
     if (status != QL_STATUS_OK) {
       return status;
     }
-    status = emit_compare(context, QL_IR_OPCODE_ULE, offset, object->size,
-                          &within, error);
+    const ql_ir_value_id reach = object->extent != QL_IR_INVALID_VALUE_ID
+                                     ? object->extent
+                                     : object->size;
+    status = emit_compare(context, QL_IR_OPCODE_ULE, offset, reach, &within,
+                          error);
     if (status != QL_STATUS_OK) {
       return status;
     }
-    operands[0] = object->size;
+    operands[0] = reach;
     operands[1] = offset;
     status = emit_instruction(context, QL_IR_OPCODE_SUB, &u64, operands, 2u,
                               NULL, 0u, QL_IR_EFFECT_NONE, &room, error);
@@ -10548,12 +10559,6 @@ static ql_status bind_dynamic_array_size(lower_context *context, size_t node,
   size_t slot;
   ql_status status;
 
-  if (declaration_is_inside_loop(context, node)) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
-        "a VLA declared inside a loop needs per-iteration object lifetime",
-        error);
-  }
   if (bound_node == SIZE_MAX || element_size == 0u) {
     return lower_unknown(context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE, node,
                          "a VLA needs one evaluable bound and a sized element",
@@ -10625,12 +10630,31 @@ static ql_status bind_dynamic_array_size(lower_context *context, size_t node,
                  "VLA declaration has no lowering-owned object");
     return QL_STATUS_INTERNAL_ERROR;
   }
-  status = emit_compare(context, QL_IR_OPCODE_EQ,
-                        context->objects[context->stack_slots[slot].object]
-                            .size,
-                        bytes, &equal, error);
-  if (status == QL_STATUS_OK) {
-    status = emit_assume(context, equal, error);
+  {
+    lower_object *object =
+        &context->objects[context->stack_slots[slot].object];
+    /* The slot is one region for the whole function, and the declaration says
+       how much of it this object is. Outside a loop the two are the same and
+       the binding is an equality. Inside one the byte count is recomputed on
+       every iteration, so the region only has to be large enough, and what
+       the accesses are checked against is this iteration's count.
+
+       That is the per-iteration lifetime this model can state. It does not
+       give the iterations distinct addresses, which C also does not require
+       of anything that cannot observe them: a pointer to the object does not
+       outlive its iteration, and reading a byte no iteration wrote is
+       undefined either way. */
+    const int in_loop = declaration_is_inside_loop(context, node);
+    status = emit_compare(context, in_loop != 0 ? QL_IR_OPCODE_ULE
+                                                : QL_IR_OPCODE_EQ,
+                          in_loop != 0 ? bytes : object->size,
+                          in_loop != 0 ? object->size : bytes, &equal, error);
+    if (status == QL_STATUS_OK) {
+      status = emit_assume(context, equal, error);
+    }
+    if (status == QL_STATUS_OK) {
+      object->extent = bytes;
+    }
   }
   return status;
 }
@@ -10973,6 +10997,7 @@ static ql_status lower_declaration(lower_context *context, size_t node,
 static ql_status lower_compound(lower_context *context, size_t node,
                                 uint32_t create_scope, ql_error *error) {
   size_t marker = context->variable_count;
+  size_t object_marker = context->object_count;
   size_t end = subtree_end(context, node);
   size_t index;
   ql_status status = QL_STATUS_OK;
@@ -11002,6 +11027,16 @@ static ql_status lower_compound(lower_context *context, size_t node,
     }
   }
   if (create_scope != 0u) {
+    size_t object;
+    for (object = 0u; object < context->object_count; ++object) {
+      /* An extent this block bound belongs to a name this block declared.
+         Outside it the object reaches as far as its size again, and that
+         value dominates every access. */
+      if (object >= object_marker ||
+          context->objects[object].extent != QL_IR_INVALID_VALUE_ID) {
+        context->objects[object].extent = QL_IR_INVALID_VALUE_ID;
+      }
+    }
     pop_variables(context, marker);
     --context->scope_depth;
   }
@@ -13837,6 +13872,7 @@ static ql_status add_object(lower_context *context, const char *label,
   }
   object = &context->objects[context->object_count];
   memset(object, 0, sizeof(*object));
+  object->extent = QL_IR_INVALID_VALUE_ID;
   if (snprintf(name, sizeof(name), "%s.__base", label) < 0) {
     ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
                  "object parameter name does not fit");
@@ -13926,6 +13962,7 @@ static ql_status add_dynamic_object(lower_context *context, ql_error *error) {
   index = context->object_count;
   object = &context->objects[index];
   memset(object, 0, sizeof(*object));
+  object->extent = QL_IR_INVALID_VALUE_ID;
   object->may_alias = 1u;
   if (snprintf(name, sizeof(name), "__dynamic%zu.__base",
                context->dynamic_object_count) < 0) {

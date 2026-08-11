@@ -548,14 +548,51 @@ TEST(CLowerLocals, EvaluatesAVlaBoundOnceAndKeepsItsSize) {
     EXPECT_EQ(16, Returned(run.result));
 }
 
-TEST(CLowerLocals, KeepsPerIterationAndMultidimensionalVlasOutsideTheSlice) {
-    ExpectUnknown("int f(int n) { while (n-- > 0) { int a[n + 1]; a[0] = n; } "
-                  "return n; }",
-                  QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW);
+TEST(CLowerLocals, KeepsVariablyModifiedTypesOutsideTheSlice) {
+    /* A variably modified array type, as opposed to a plain variable-length
+       array object, is still outside this slice. */
     ExpectUnknown("int f(int n) { int a[n][2]; return a[0][0]; }",
                   QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
     ExpectUnknown("int f(int n) { int (*p)[n]; return (int)sizeof(*p); }",
                   QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE);
+}
+
+/* A VLA declared inside a loop is sized again on every iteration. One region
+   serves the whole function and only has to be large enough; what the
+   accesses are checked against is this iteration's byte count. An index that
+   the current bound admits but an earlier, larger one would have allowed is
+   therefore still out of bounds. */
+TEST(CLowerLocals, ChecksALoopVlaAgainstTheCurrentIterationsBound) {
+    Lowered lowered;
+    std::vector<std::vector<uint8_t>> images;
+    static const char source[] =
+        "int f(int n) {\n"
+        "  int total = 0;\n"
+        "  while (n > 0) {\n"
+        "    int a[n];\n"
+        "    a[n - 1] = n;\n"
+        "    total += a[n - 1];\n"
+        "    n--;\n"
+        "  }\n"
+        "  return total;\n"
+        "}\n";
+    ASSERT_TRUE(lowered.Open(source, "f"));
+    for (const int32_t n : {0, 1, 3, 5}) {
+        SCOPED_TRACE(n);
+        /* The region is sized for the first iteration, which is the largest,
+           and every later iteration fits inside it. */
+        const Outcome run = Execute(
+            lowered.ir(), {Widen(n)},
+            {static_cast<uint64_t>(n > 0 ? n : 1) * 4u}, &images);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+            << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+        int32_t expected = 0;
+        for (int32_t k = n; k > 0; --k) {
+            expected += k;
+        }
+        EXPECT_EQ(expected, Returned(run.result));
+    }
 }
 
 TEST(CLowerLocals, RefusesStorageWithNothingPutInIt) {
