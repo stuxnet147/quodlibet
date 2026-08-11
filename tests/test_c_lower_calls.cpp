@@ -1163,10 +1163,53 @@ TEST(CLowerCalls, CallsThroughACastToAFunctionPointer) {
     }
 }
 
+/* A data pointer spelled into a function pointer and back. Both share this
+   profile's representation, so the address carries; what does not carry is
+   the authority to read through the result. */
 TEST(CLowerCalls, CallsThroughACastFromADataPointer) {
     Lowered lowered;
     ASSERT_TRUE(lowered.Open(cast_void_callback_source,
                              "call_cast_void_callback"));
+}
+
+TEST(CLowerCalls, RefusesToReadThroughAFunctionAddress) {
+    struct Case {
+        const char *source;
+        const char *name;
+    };
+    const Case cases[] = {
+        /* The address converts. Reading an object at it does not, because the
+           result names none and admits none. */
+        {"int CALLEE_double(int);\n"
+         "int f(void) { void *p = (void *) CALLEE_double; return *(int *) p; }",
+         "f"},
+    };
+    for (const Case &item : cases) {
+        ql_c_frontend_unit *unit = nullptr;
+        ql_c_lower_result *result = nullptr;
+        ql_c_function_view function{};
+        ql_c_lower_result_view_v1 view{};
+        ql_error error{};
+        const std::size_t size = std::strlen(item.source);
+        SCOPED_TRACE(item.source);
+        ASSERT_EQ(QL_STATUS_OK, ql_c_frontend_analyze(nullptr, item.source,
+                                                      size, &unit, &error));
+        function.struct_size = sizeof(function);
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_c_frontend_select_function(unit, item.name,
+                                                std::strlen(item.name),
+                                                &function, &error));
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_c_lower_selected_function(nullptr, item.source, size, unit,
+                                               &function, &result, &error))
+            << error.message;
+        view.struct_size = sizeof(view);
+        ASSERT_EQ(QL_STATUS_OK,
+                  ql_c_lower_result_get_view(result, &view, &error));
+        EXPECT_EQ(QL_C_LOWER_UNKNOWN, view.support);
+        ql_c_lower_result_destroy(result);
+        ql_c_frontend_unit_destroy(unit);
+    }
 }
 
 TEST(CLowerCalls, CallsAParenthesizedFunctionPointerParameter) {

@@ -4869,6 +4869,29 @@ static ql_status convert_value(lower_context *context, lower_value input,
       }
       return emit_pointer_of_address(context, address, target, output, error);
     }
+    if (input.type.is_function_pointer != 0u &&
+        (target.kind == QL_C_SCALAR_POINTER ||
+         target.kind == QL_C_SCALAR_INTEGER)) {
+      /* A function pointer spelled into a data pointer or an integer. This
+         profile's function and data pointers share a representation, so the
+         address carries over. What does not carry over is any authority to
+         read through it: the result names no object and admits none, and a
+         dereference therefore still fails to find one. */
+      lower_value address;
+      status = emit_address_of_pointer(context, input, &address, error);
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+      if (target.kind == QL_C_SCALAR_INTEGER) {
+        return convert_value(context, address, target, output, error);
+      }
+      status = emit_pointer_of_address(context, address, target, output, error);
+      if (status == QL_STATUS_OK) {
+        output->has_object = 0u;
+        output->may_admit_object = 0u;
+      }
+      return status;
+    }
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_TYPE_ERROR, SIZE_MAX,
         "function pointers do not convert to data pointers or integers",
