@@ -81,10 +81,20 @@ The binding does not soften any of the core's boundaries.
   Exact whole-IR self-pairs may separately use digest-bound reflexivity when a
   concrete defined interpreter run establishes an inhabited domain.
 * The induction path proves Base, guard alignment, Step, and Exit with one
-  symbolic transition. It does not execute or finitely unroll the loop. A
-  failed structural candidate records the unavailable CHC/PDR fallback and
-  remains `unknown`. Affine summary opportunities are telemetry-only and no
-  summary terminal is attempted.
+  symbolic transition. It does not execute or finitely unroll the loop.
+  Affine summary opportunities are telemetry-only and no summary terminal is
+  attempted.
+* Where the SMT product fails to *answer* -- the violation query not answered
+  `UNSAT` and the domain not vacuous, which is the loop territory -- the check
+  continues down a follow-up chain: `search.bounded-symbolic` hunts a
+  counterexample within `bounded_unroll` retreating-edge traversals (a model
+  counts only after concrete replay on the original cyclic functions; a clean
+  bound is `bounded-clean` and is never promoted), then `prove.chc-pdr`
+  attempts an inductive proof over the serialized loop transition prefix,
+  promoted only under the same trusted-backend policy. `result.decided_by`
+  names the deciding method. `bounded_unroll=0, chc_pdr=False` restores the
+  bare product. The chain never enters the trust-policy territory: a withheld
+  `UNSAT` is already stronger evidence than anything it could add.
 * An exhausted budget is `unknown` with `result.evidence.budget_exhausted` set.
   Exhaustion is a run state, not a logical verdict.
 * A verdict policy that would manufacture a proof, promote a verdict, or accept

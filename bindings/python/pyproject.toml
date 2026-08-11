@@ -10,7 +10,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "quodlibet-engine"
-version = "0.1.0"
+version = "0.2.0"
 description = "CPython C extension bindings for the Quodlibet function-equivalence engine"
 readme = "README.md"
 requires-python = ">=3.11"

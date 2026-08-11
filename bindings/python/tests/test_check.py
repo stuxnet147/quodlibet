@@ -56,7 +56,12 @@ def test_counterexample_is_replayed_before_it_is_reported(backend):
 
 
 def test_unpaired_cyclic_sources_reach_the_explicit_fallback(backend):
-    result = quodlibet.check(LOOPING, "add", SUM, "sum")
+    # The follow-up chain is disabled explicitly: this test pins the bare
+    # product's fallback telemetry, and the chain would turn the verdict
+    # into the refuter's bounded-clean. The chain has tests of its own.
+    result = quodlibet.check(
+        LOOPING, "add", SUM, "sum", bounded_unroll=0, chc_pdr=False
+    )
     assert result.verdict == "unknown"
     assert result.status.kind == "method"
     assert result.status.ok is True
@@ -154,6 +159,10 @@ def test_effectful_self_pair_uses_defined_witness_reflexivity(backend):
 
 
 def test_guard_mismatch_is_unknown_not_a_candidate_counterexample(backend):
+    """The fast path must abstain rather than fabricate a counterexample --
+    and with the follow-up chain on, the same pair's genuine difference
+    (n == 1) is found by the bounded refuter and concretely replayed, which
+    is the sound way for this verdict to exist."""
     left = (
         "unsigned f(unsigned x, unsigned n) {"
         " while (n != 0u) { x += 3u; --n; }"
@@ -164,7 +173,24 @@ def test_guard_mismatch_is_unknown_not_a_candidate_counterexample(backend):
         " while (n > 1u) { x += 3u; --n; }"
         " return x; }"
     )
-    result = quodlibet.check(
+    bare = quodlibet.check(
+        left,
+        "f",
+        right,
+        "g",
+        observations=["return-value"],
+        trust_smt_backend=True,
+        bounded_unroll=0,
+        chc_pdr=False,
+    )
+    assert bare.verdict == "unknown"
+    assert bare.counterexample is None
+    assert bare.evidence.replay_confirmed is False
+    assert bare.loop_proof.fallback_reached is True
+    assert bare.loop_proof.fallback_attempted is False
+    assert bare.loop_proof.stage_reached["fallback"] is True
+
+    chained = quodlibet.check(
         left,
         "f",
         right,
@@ -172,12 +198,10 @@ def test_guard_mismatch_is_unknown_not_a_candidate_counterexample(backend):
         observations=["return-value"],
         trust_smt_backend=True,
     )
-    assert result.verdict == "unknown"
-    assert result.counterexample is None
-    assert result.evidence.replay_confirmed is False
-    assert result.loop_proof.fallback_reached is True
-    assert result.loop_proof.fallback_attempted is False
-    assert result.loop_proof.stage_reached["fallback"] is True
+    assert chained.verdict == "counterexample"
+    assert chained.decided_by == "search.bounded-symbolic"
+    assert chained.evidence.replay_confirmed is True
+    assert chained.counterexample is not None
 
 
 def test_a_source_outside_the_lowering_slice_stays_unknown(backend):

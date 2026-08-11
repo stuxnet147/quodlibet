@@ -10,6 +10,7 @@
 #include "quodlibet/replay.h"
 #include "quodlibet/solver.h"
 
+#include "internal.h"
 #include "unroll.h"
 #include "yyjson.h"
 
@@ -443,8 +444,18 @@ static ql_status replay_model(const ql_allocator *allocator,
     status = ql_replay_execute(allocator, problem, query, left_ir, right_ir,
                                witness, &replay, error);
     if (status != QL_STATUS_OK) {
+        /* A witness the replay machinery cannot even set up -- the recorded
+           case is an object table whose two sides paired positionally while
+           the lowerings discovered different dynamic objects -- is the same
+           outcome as a model that does not reproduce: no counterexample is
+           claimed and the verdict stays UNKNOWN. This method refutes or
+           abstains; it must not turn its own confirmation limit into a run
+           failure. */
+        QL_LOGE(QL_BOUNDED_CATEGORY,
+                "a decoded model could not be replayed: %s", error->message);
+        ql_error_clear(error);
         ql_replay_witness_destroy(witness);
-        return status;
+        return QL_STATUS_OK;
     }
     if (replay.conclusive == 0u || replay.violated == 0u) {
         ql_replay_witness_destroy(witness);
@@ -899,7 +910,18 @@ static ql_status QL_CALL bounded_run(void *instance,
     decision.backend_binary_digest = violation.backend_binary_digest;
     decision.solver_query_digest = violation.query_digest;
 
-    if (violation.kind == QL_SOLVER_CHECK_SAT) {
+    if (violation.kind == QL_SOLVER_CHECK_SAT &&
+        ql_internal_ir_threads_event_trace(left.ir, right.ir)) {
+        /* The same gate the SMT product's replay takes, for the same reason:
+           the miter's violation is a real claim about the encoding, but
+           replay runs the original functions concretely and running a call
+           needs a callee the witness does not carry. An unreplayed model is
+           not a counterexample, so this stays UNKNOWN and says why. */
+        set_diagnostic(&decision,
+                       "the violation involves an external call, and "
+                       "replaying one needs a callee the witness does not "
+                       "carry, so no counterexample is claimed");
+    } else if (violation.kind == QL_SOLVER_CHECK_SAT) {
         if (violation.model_artifact != NULL) {
             status = replay_model(allocator, problem, query, left.ir,
                                   right.ir, violation.model_artifact,

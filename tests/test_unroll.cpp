@@ -266,4 +266,23 @@ TEST(Unroll, RefusesAZeroBound) {
     EXPECT_EQ(nullptr, artifact);
 }
 
+TEST(Unroll, CopiesAnInterleavedValueTableFaithfully) {
+    /* Lowering a function that touches fixed-size globals interleaves object
+       base/size parameters with the constants its standing constraints need
+       (internal.h: artifacts permit parameters anywhere in the value table).
+       The copy must follow that artifact contract, not the public builder's
+       parameters-first rule. This pins the failure the first real-corpus run
+       surfaced: "IR parameters must precede constants and instructions". */
+    LoweredFunction lowered;
+    lowered.Build(
+        "int total; int extra;"
+        "int bump(int steps) { int i = 0;"
+        " while (i != steps) { total = total + extra; i = i + 1; }"
+        " return total; }",
+        "bump");
+    UnrolledFunction unrolled;
+    unrolled.Build(lowered.ir(), 4u);
+    EXPECT_GT(unrolled.stats().retreating_edges, 0u);
+}
+
 }  // namespace

@@ -27,5 +27,11 @@ ql_status ql_internal_ir_builder_add_late_parameter(
 ql_status ql_internal_ir_builder_replace_entry_block(
     ql_ir_builder *builder, ql_ir_block_id expected,
     ql_ir_block_id replacement, ql_error *error);
+/* Does either side thread an event trace? A body that calls takes the
+   incoming history as a parameter. Every refutation path that replays a
+   solver model concretely must gate on this: running a call needs a callee
+   the witness does not carry, so a violation that threads a trace stays a
+   claim about the encoding rather than becoming a counterexample. */
+int ql_internal_ir_threads_event_trace(const ql_ir *left, const ql_ir *right);
 
 #endif

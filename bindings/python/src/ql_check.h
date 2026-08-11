@@ -54,6 +54,15 @@ typedef struct ql_py_spec {
     uint64_t solver_timeout_ms;
     uint64_t solver_memory_limit_mb;
     char *solver_executable;
+
+    /* The follow-up chain, entered only when the SMT product leaves UNKNOWN
+       with budget to spare. `bounded_unroll` is the retreating-edge bound
+       handed to search.bounded-symbolic, zero to skip it; `chc_pdr` is
+       whether prove.chc-pdr runs after it. Both default on in the package
+       wrapper: the chain is the reason the loop territory answers at all,
+       and a caller that wants the bare product asks for it explicitly. */
+    uint64_t bounded_unroll;
+    uint32_t chc_pdr;
     /* Borrowed ql_solver_session*, or null to establish one for this check
        alone. Not owned by the spec and not freed with it: the caller keeps a
        session alive across many checks, which is the whole reason it exists.
@@ -95,6 +104,11 @@ typedef struct ql_py_result {
     uint32_t budget_exhausted;
     ql_budget_state budget_state;
     char diagnostic[QL_PY_DIAGNOSTIC_CAPACITY];
+
+    /* Which registered method produced the final verdict. Always the SMT
+       product's name unless a follow-up decided; `violation_answer` and
+       `domain_answer` always describe the SMT product stage regardless. */
+    char decided_by[64];
 
     char problem_digest[QL_DIGEST_HEX_SIZE];
     char solver_query_digest[QL_DIGEST_HEX_SIZE];

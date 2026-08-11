@@ -381,6 +381,7 @@ static PyObject *build_result_dict(const ql_py_result *result) {
         dict_set_str(dict, "budget_state",
                      ql_budget_state_string(result->budget_state)) != 0 ||
         dict_set_str(dict, "diagnostic", result->diagnostic) != 0 ||
+        dict_set_str(dict, "decided_by", result->decided_by) != 0 ||
         dict_set_str(dict, "problem_digest", result->problem_digest) != 0 ||
         dict_set_str(dict, "solver_query_digest",
                      result->solver_query_digest) != 0 ||
@@ -452,6 +453,8 @@ static char *kwlist[] = {"left_source",
                          "policy_json",
                          "argument_bindings",
                          "solver_session",
+                         "bounded_unroll",
+                         "chc_pdr",
                          NULL};
 
 /* The session travels as a capsule rather than a new heap type: the extension
@@ -532,6 +535,8 @@ static PyObject *quodlibet_check(PyObject *self, PyObject *args,
     Py_ssize_t policy_json_size = 0;
     PyObject *argument_bindings = NULL;
     PyObject *session_capsule = NULL;
+    unsigned long long bounded_unroll = 0u;
+    int chc_pdr = 0;
     void *session_pointer = NULL;
     ql_py_spec spec;
     ql_py_result result;
@@ -539,7 +544,7 @@ static PyObject *quodlibet_check(PyObject *self, PyObject *args,
 
     (void)self;
     if (!PyArg_ParseTupleAndKeywords(
-            args, keywords, "s#ss#siiKiiz#pKKzKKKKKz#OO:check", kwlist,
+            args, keywords, "s#ss#siiKiiz#pKKzKKKKKz#OOKp:check", kwlist,
             &left_source, &left_source_size, &left_function, &right_source,
             &right_source_size, &right_function, &relation, &ub_policy,
             &observations, &memory_observation, &external_call_observation,
@@ -547,7 +552,8 @@ static PyObject *quodlibet_check(PyObject *self, PyObject *args,
             &solver_timeout_ms, &solver_memory_limit_mb, &solver_executable,
             &total_ns, &node_ns, &solver_ns, &memory_bytes,
             &single_allocation_bytes, &policy_json, &policy_json_size,
-            &argument_bindings, &session_capsule)) {
+            &argument_bindings, &session_capsule, &bounded_unroll,
+            &chc_pdr)) {
         return NULL;
     }
 
@@ -614,6 +620,8 @@ static PyObject *quodlibet_check(PyObject *self, PyObject *args,
     spec.external_call_observation =
         (ql_external_call_observation)external_call_observation;
     spec.trust_smt_backend = trust_smt_backend != 0 ? 1u : 0u;
+    spec.bounded_unroll = (uint64_t)bounded_unroll;
+    spec.chc_pdr = chc_pdr != 0 ? 1u : 0u;
     spec.solver_timeout_ms = (uint64_t)solver_timeout_ms;
     spec.solver_memory_limit_mb = (uint64_t)solver_memory_limit_mb;
     spec.limits.total_wall_clock_ns = (uint64_t)total_ns;

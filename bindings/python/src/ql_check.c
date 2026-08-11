@@ -4,6 +4,8 @@
 #include "quodlibet/c_lower.h"
 #include "quodlibet/pipeline.h"
 #include "quodlibet/problem.h"
+#include "quodlibet/proof_bounded.h"
+#include "quodlibet/proof_chcpdr.h"
 #include "quodlibet/registry.h"
 #include "quodlibet/scheduler.h"
 #include "quodlibet/signature.h"
@@ -308,6 +310,272 @@ static ql_status build_options(const ql_py_spec *spec, char *buffer,
     return QL_STATUS_OK;
 }
 
+/* --- the follow-up chain -------------------------------------------------- */
+
+/* The nested solver_options field, `,"solver_options":"{...}"`, or an empty
+   string when no executable override was given. The same double escaping
+   build_options performs, factored for the follow-up methods' options. */
+static ql_status build_solver_suffix(const ql_py_spec *spec, char *buffer,
+                                     size_t capacity, ql_error *error) {
+    char escaped_once[1024];
+    char escaped_twice[2048];
+    char nested[1200];
+    size_t written = 0u;
+    int printed;
+
+    if (spec->solver_executable == NULL ||
+        spec->solver_executable[0] == '\0') {
+        if (capacity == 0u) {
+            ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                         "method options do not fit");
+            return QL_STATUS_INVALID_ARGUMENT;
+        }
+        buffer[0] = '\0';
+        return QL_STATUS_OK;
+    }
+    if (json_escape(spec->solver_executable, escaped_once,
+                    sizeof(escaped_once), &written) != QL_STATUS_OK) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "solver_executable cannot be encoded as JSON");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    printed = snprintf(nested, sizeof(nested), "{\"executable\":\"%s\"}",
+                       escaped_once);
+    if (printed < 0 || (size_t)printed >= sizeof(nested)) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "solver_executable is too long");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    if (json_escape(nested, escaped_twice, sizeof(escaped_twice), &written) !=
+        QL_STATUS_OK) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "solver options cannot be encoded as JSON");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    printed = snprintf(buffer, capacity, ",\"solver_options\":\"%s\"",
+                       escaped_twice);
+    if (printed < 0 || (size_t)printed >= capacity) {
+        ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                     "method options do not fit");
+        return QL_STATUS_INVALID_ARGUMENT;
+    }
+    return QL_STATUS_OK;
+}
+
+/* One follow-up method over the same problem artifact, registry, budget and
+   session. The pipeline outlives the result until the caller is done, which
+   is why both handles come back together. */
+static ql_status run_chain_method(const ql_py_spec *spec,
+                                  const ql_allocator *allocator,
+                                  ql_registry *registry,
+                                  ql_scheduler *scheduler, ql_budget *budget,
+                                  ql_artifact *problem_artifact,
+                                  const char *method_name,
+                                  const char *options, ql_pipeline **pipeline,
+                                  ql_pipeline_result **run_result,
+                                  ql_error *error) {
+    ql_node_id node_id = QL_INVALID_NODE_ID;
+    ql_status status;
+
+    *pipeline = NULL;
+    *run_result = NULL;
+    status = ql_pipeline_create(registry, allocator, pipeline, error);
+    if (status == QL_STATUS_OK) {
+        status = ql_pipeline_add_node(*pipeline, QL_PY_NODE_NAME, method_name,
+                                      options, NULL, 0u, &node_id, error);
+    }
+    if (status == QL_STATUS_OK && spec->solver_session != NULL) {
+        status = ql_pipeline_set_solver_session(*pipeline,
+                                                spec->solver_session, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = ql_pipeline_compile(*pipeline, error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = ql_pipeline_run_with_budget(*pipeline, scheduler,
+                                             problem_artifact, NULL, budget,
+                                             run_result, error);
+    }
+    if (status == QL_STATUS_OK && ql_pipeline_result_count(*run_result) != 1u) {
+        ql_error_set(error, QL_STATUS_INTERNAL_ERROR,
+                     "the follow-up pipeline produced no outcome");
+        status = QL_STATUS_INTERNAL_ERROR;
+    }
+    if (status != QL_STATUS_OK) {
+        ql_pipeline_result_destroy(*run_result);
+        ql_pipeline_destroy(*pipeline);
+        *run_result = NULL;
+        *pipeline = NULL;
+    }
+    return status;
+}
+
+/* search.bounded-symbolic, then prove.chc-pdr, entered only on an SMT-product
+   UNKNOWN. The refuter runs first because a wrong candidate is the common
+   case in the consumer this chain was built for, and its counterexample is
+   final; a BOUNDED_CLEAN is adopted provisionally and a CHC/PDR proof
+   overwrites it. Everything else leaves the result exactly as the SMT
+   product said it. */
+static ql_status run_followups(const ql_py_spec *spec,
+                               const ql_allocator *allocator,
+                               ql_registry *registry, ql_scheduler *scheduler,
+                               ql_budget *budget,
+                               ql_artifact *problem_artifact,
+                               ql_py_result *result, ql_error *error) {
+    char suffix[2400];
+    char options[QL_PY_OPTIONS_CAPACITY];
+    ql_pipeline *pipeline = NULL;
+    ql_pipeline_result *run_result = NULL;
+    ql_status status;
+    int printed;
+
+    status = build_solver_suffix(spec, suffix, sizeof(suffix), error);
+    if (status != QL_STATUS_OK) {
+        return status;
+    }
+
+    if (spec->bounded_unroll != 0u) {
+        ql_bounded_outcome_view_v1 view;
+
+        if (spec->solver_timeout_ms != 0u) {
+            printed = snprintf(options, sizeof(options),
+                               "{\"unroll_bound\":%llu,\"timeout_ms\":%llu%s}",
+                               (unsigned long long)spec->bounded_unroll,
+                               (unsigned long long)spec->solver_timeout_ms,
+                               suffix);
+        } else {
+            printed = snprintf(options, sizeof(options),
+                               "{\"unroll_bound\":%llu%s}",
+                               (unsigned long long)spec->bounded_unroll,
+                               suffix);
+        }
+        if (printed < 0 || (size_t)printed >= sizeof(options)) {
+            ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                         "bounded options do not fit");
+            return QL_STATUS_INVALID_ARGUMENT;
+        }
+        status = run_chain_method(spec, allocator, registry, scheduler,
+                                  budget, problem_artifact,
+                                  QL_BOUNDED_METHOD_NAME, options, &pipeline,
+                                  &run_result, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        memset(&view, 0, sizeof(view));
+        view.struct_size = sizeof(view);
+        status = ql_bounded_outcome_read(
+            ql_pipeline_result_artifact(run_result, 0u), &view, error);
+        if (status == QL_STATUS_OK &&
+            (view.verdict == QL_VERDICT_COUNTEREXAMPLE ||
+             view.verdict == QL_VERDICT_BOUNDED_CLEAN)) {
+            result->verdict = view.verdict;
+            result->evidence_class = view.evidence_class;
+            result->checked_proof = 0u;
+            result->replay_confirmed = view.replay_confirmed;
+            (void)snprintf(result->diagnostic, sizeof(result->diagnostic),
+                           "%s", view.diagnostic);
+            ql_digest_hex(&view.cache_key, result->cache_key);
+            ql_digest_hex(&view.counterexample_digest,
+                          result->counterexample_digest);
+            (void)snprintf(result->decided_by, sizeof(result->decided_by),
+                           "%s", QL_BOUNDED_METHOD_NAME);
+        }
+        if (status == QL_STATUS_OK &&
+            view.verdict == QL_VERDICT_COUNTEREXAMPLE) {
+            ql_artifact *counterexample = NULL;
+
+            status = ql_bounded_outcome_counterexample(
+                allocator, ql_pipeline_result_artifact(run_result, 0u),
+                &counterexample, error);
+            if (status == QL_STATUS_OK && counterexample != NULL) {
+                ql_artifact_view counterexample_view;
+
+                memset(&counterexample_view, 0, sizeof(counterexample_view));
+                counterexample_view.struct_size = sizeof(counterexample_view);
+                status = ql_artifact_get_view(counterexample,
+                                              &counterexample_view, error);
+                if (status == QL_STATUS_OK) {
+                    result->counterexample_json = ql_py_strdup(
+                        (const char *)counterexample_view.data,
+                        counterexample_view.size);
+                    if (result->counterexample_json == NULL) {
+                        ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
+                        status = QL_STATUS_OUT_OF_MEMORY;
+                    } else {
+                        result->counterexample_json_size =
+                            counterexample_view.size;
+                    }
+                }
+            }
+            ql_artifact_release(counterexample);
+        }
+        ql_pipeline_result_destroy(run_result);
+        ql_pipeline_destroy(pipeline);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        if (result->verdict == QL_VERDICT_COUNTEREXAMPLE) {
+            return QL_STATUS_OK;
+        }
+    }
+
+    if (spec->chc_pdr != 0u) {
+        ql_chcpdr_outcome_view_v1 view;
+
+        if (spec->solver_timeout_ms != 0u) {
+            printed = snprintf(
+                options, sizeof(options),
+                "{\"unsat_promotion\":\"%s\",\"timeout_ms\":%llu%s}",
+                spec->trust_smt_backend != 0u ? "trusted-backend" : "none",
+                (unsigned long long)spec->solver_timeout_ms, suffix);
+        } else {
+            printed = snprintf(
+                options, sizeof(options), "{\"unsat_promotion\":\"%s\"%s}",
+                spec->trust_smt_backend != 0u ? "trusted-backend" : "none",
+                suffix);
+        }
+        if (printed < 0 || (size_t)printed >= sizeof(options)) {
+            ql_error_set(error, QL_STATUS_INVALID_ARGUMENT,
+                         "chc-pdr options do not fit");
+            return QL_STATUS_INVALID_ARGUMENT;
+        }
+        status = run_chain_method(spec, allocator, registry, scheduler,
+                                  budget, problem_artifact,
+                                  QL_CHCPDR_METHOD_NAME, options, &pipeline,
+                                  &run_result, error);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+        memset(&view, 0, sizeof(view));
+        view.struct_size = sizeof(view);
+        status = ql_chcpdr_outcome_read(
+            ql_pipeline_result_artifact(run_result, 0u), &view, error);
+        if (status == QL_STATUS_OK &&
+            (view.verdict == QL_VERDICT_PROVED_EQUIVALENT ||
+             view.verdict == QL_VERDICT_PROVED_LEFT_REFINES_RIGHT ||
+             view.verdict == QL_VERDICT_PROVED_RIGHT_REFINES_LEFT)) {
+            result->verdict = view.verdict;
+            result->evidence_class = view.evidence_class;
+            result->checked_proof = 0u;
+            result->replay_confirmed = 0u;
+            result->unsat_promotion = spec->trust_smt_backend != 0u
+                                          ? QL_UNSAT_PROMOTION_TRUSTED_BACKEND
+                                          : QL_UNSAT_PROMOTION_NONE;
+            (void)snprintf(result->diagnostic, sizeof(result->diagnostic),
+                           "%s", view.diagnostic);
+            ql_digest_hex(&view.cache_key, result->cache_key);
+            (void)snprintf(result->decided_by, sizeof(result->decided_by),
+                           "%s", QL_CHCPDR_METHOD_NAME);
+        }
+        ql_pipeline_result_destroy(run_result);
+        ql_pipeline_destroy(pipeline);
+        if (status != QL_STATUS_OK) {
+            return status;
+        }
+    }
+    return QL_STATUS_OK;
+}
+
 /* --- the run -------------------------------------------------------------- */
 
 static void record_digests(ql_py_result *result,
@@ -509,6 +777,15 @@ void ql_py_check(const ql_py_spec *spec, ql_py_result *result) {
     if (status == QL_STATUS_OK) {
         status = ql_register_smt_product_method(registry, &error);
     }
+    /* The follow-up methods are registered up front even when the spec skips
+       them: registration is cheap and a chain that fails to register at step
+       0 beats one that fails after the SMT product already ran. */
+    if (status == QL_STATUS_OK) {
+        status = ql_register_bounded_method(registry, &error);
+    }
+    if (status == QL_STATUS_OK) {
+        status = ql_register_chcpdr_method(registry, &error);
+    }
     if (status == QL_STATUS_OK) {
         status = ql_pipeline_create(registry, allocator, &pipeline, &error);
     }
@@ -568,6 +845,8 @@ void ql_py_check(const ql_py_spec *spec, ql_py_result *result) {
     result->replay_confirmed = view.replay_confirmed;
     (void)snprintf(result->diagnostic, sizeof(result->diagnostic), "%s",
                    view.diagnostic);
+    (void)snprintf(result->decided_by, sizeof(result->decided_by), "%s",
+                   QL_SMT_PRODUCT_METHOD_NAME);
     record_digests(result, &view);
 
     status = ql_smt_product_outcome_loop_stats(
@@ -603,6 +882,25 @@ void ql_py_check(const ql_py_spec *spec, ql_py_result *result) {
             goto failed;
         }
         result->counterexample_json_size = counterexample_view.size;
+    }
+
+    /* The chain runs only where the SMT product failed to *answer*, not
+       where an answer exists and a trust policy withheld the verdict: a
+       violation UNSAT held back by `unsat_promotion` is strictly stronger
+       evidence than anything the refuter could add, and a vacuous domain
+       stays vacuous under every method. Budget keeps running through the
+       chain, so the guard in `finish` still has the final word. */
+    if (result->verdict == QL_VERDICT_UNKNOWN &&
+        view.violation_answer != QL_SMT_PRODUCT_ANSWER_UNSAT &&
+        view.domain_answer != QL_SMT_PRODUCT_ANSWER_UNSAT &&
+        (spec->bounded_unroll != 0u || spec->chc_pdr != 0u) &&
+        ql_budget_is_exhausted(budget) == 0u) {
+        status = run_followups(spec, allocator, registry, scheduler, budget,
+                               problem_artifact, result, &error);
+        result->budget_state = ql_budget_get_state(budget);
+        if (status != QL_STATUS_OK) {
+            goto failed;
+        }
     }
     goto finish;
 

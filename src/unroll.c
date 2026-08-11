@@ -1,5 +1,7 @@
 #include "unroll.h"
 
+#include "internal.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -253,7 +255,12 @@ static ql_status copy_parameters_and_constants(unroll_state *state,
         }
         switch (value_view.definition_kind) {
         case QL_IR_VALUE_PARAMETER:
-            status = ql_ir_builder_add_parameter(
+            /* The late variant, not the public one: lowering interleaves
+               object base/size parameters with the constants its standing
+               constraints need (internal.h records why artifacts permit
+               parameters anywhere), so a faithful copy in table order must
+               be allowed to add a parameter after a constant too. */
+            status = ql_internal_ir_builder_add_late_parameter(
                 state->builder, value_view.type, value_view.name,
                 value_view.name_size, &created, error);
             break;

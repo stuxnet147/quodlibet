@@ -3131,3 +3131,42 @@ ql_status QL_CALL ql_ir_block_at(const ql_ir *ir, size_t index,
   ql_error_clear(error);
   return QL_STATUS_OK;
 }
+
+/* internal.h records the contract: every refutation path that replays a
+   solver model concretely gates on this, because running a call needs a
+   callee the witness does not carry. */
+static int ir_side_threads_event_trace(const ql_ir *ir) {
+  ql_ir_view_v1 view;
+  ql_error ignored;
+  size_t index;
+
+  memset(&view, 0, sizeof(view));
+  view.struct_size = sizeof(view);
+  if (ql_ir_get_view(ir, &view, &ignored) != QL_STATUS_OK) {
+    return 0;
+  }
+  for (index = 0u; index < view.value_count; ++index) {
+    ql_ir_value_view_v1 value;
+    ql_ir_type_view_v1 type;
+    memset(&value, 0, sizeof(value));
+    value.struct_size = sizeof(value);
+    if (ql_ir_value_at(ir, index, &value, &ignored) != QL_STATUS_OK) {
+      return 0;
+    }
+    if (value.definition_kind != QL_IR_VALUE_PARAMETER) {
+      continue;
+    }
+    memset(&type, 0, sizeof(type));
+    type.struct_size = sizeof(type);
+    if (ql_ir_type_at(ir, value.type, &type, &ignored) == QL_STATUS_OK &&
+        type.kind == QL_IR_TYPE_EVENT_TRACE) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int ql_internal_ir_threads_event_trace(const ql_ir *left, const ql_ir *right) {
+  return ir_side_threads_event_trace(left) != 0 ||
+         ir_side_threads_event_trace(right) != 0;
+}

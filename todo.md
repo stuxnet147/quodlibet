@@ -100,6 +100,8 @@
 - [x] 예산, 판정 정책, 결과의 파이썬 노출 (증거: `budget=` 다섯 축, `policy_json=`, `result.verdict/.status/.evidence/.counterexample/.policy`, `bindings/python/tests/test_budget_and_policy.py`)
 - [x] `pip install .` 과 Windows/Linux import 시험 (증거: `pip install ./bindings/python` abi3 wheel, Windows 3.11/3.13 과 WSL Ubuntu 24.04, CTest 항목 `quodlibet.python_bindings`, GOAL.md G4)
 - [x] 강화학습기에서 부를 배치 API (증거: `bindings/python/quodlibet/__init__.py:489` 의 `check_batch` 와 워커별 `SolverSession`, `tests/test_concurrency.py:100`, VM 채점기 경로 측정 `docs/vm/asm2c-03-plan-20260810.md`)
+- [x] 바인딩의 follow-up method 체인: smt-product 가 답을 못 낸 곳(위반 질의 미응답, 도메인 비공허)에서만 `search.bounded-symbolic` 후 `prove.chc-pdr` 로 이어짐 (증거: `bindings/python/src/ql_check.c` 의 `run_followups` 와 trust-policy 게이트, `result.decided_by`, `bindings/python/tests/test_chain.py` 5개 - count-up 대 count-down 을 chc-pdr 가 닫고, guard 불일치 쌍을 bounded 가 replay 확정 반례로 닫고, 신뢰 정책 영역에는 체인이 진입하지 않는 것까지 고정. 기본 on(`bounded_unroll=8`, `chc_pdr=True`), 끄면 종전 동작)
+- [ ] product 의 lowering-made dynamic object 위치 기반 페어링이 양측 발견 수가 다를 때 replay witness 를 깨뜨림 (asm2c records-sample 의 static const 배열 + 포인터 파라미터 함수에서 "the object table names parameter 21 outside the IR" 재현. `src/proof_bounded.c` 의 replay_model 은 이제 이 실패를 반례 미확정(UNKNOWN)으로 강등해 실행은 계속되지만, 근본 원인인 `src/product.c` 의 `left_bases[next]`/`right_bases[next]` 위치 페어링은 미해결)
 
 ## W0: 조율, 프로파일링, VM
 

@@ -216,6 +216,11 @@ class CheckResult:
     policy: PolicyResult | None
     diagnostic: str
     loop_proof: LoopProofStats
+    #: Which registered method produced the final verdict:
+    #: ``prove.smt-product`` unless a follow-up decided, then
+    #: ``search.bounded-symbolic`` or ``prove.chc-pdr``. Empty on the paths
+    #: that never reached a method (unsupported input, early budget).
+    decided_by: str = "prove.smt-product"
 
     @property
     def proved(self) -> bool:
@@ -244,6 +249,12 @@ class CheckSpec:
     solver_timeout_ms: int | None = None
     solver_memory_limit_mb: int = 0
     argument_bindings: Sequence[tuple[int, int]] | None = None
+    #: The follow-up chain past an SMT-product ``unknown``: the retreating-edge
+    #: bound search.bounded-symbolic unrolls to (0 skips the refuter), and
+    #: whether prove.chc-pdr runs after it. Both on by default -- the loop
+    #: territory only answers through them.
+    bounded_unroll: int = 8
+    chc_pdr: bool = True
     #: Reuse an already-established backend rather than building one for this
     #: judgement alone. See :class:`SolverSession`; a spec that leaves this
     #: null keeps the old behaviour, and one handed to :func:`check_batch`
@@ -267,6 +278,8 @@ class CheckSpec:
             "solver_timeout_ms": self.solver_timeout_ms,
             "solver_memory_limit_mb": self.solver_memory_limit_mb,
             "argument_bindings": self.argument_bindings,
+            "bounded_unroll": self.bounded_unroll,
+            "chc_pdr": self.chc_pdr,
             "session": self.session,
         }
 
@@ -411,6 +424,7 @@ def _build_result(raw: Mapping[str, Any]) -> CheckResult:
         policy=policy,
         diagnostic=raw["diagnostic"],
         loop_proof=loop_proof,
+        decided_by=raw.get("decided_by") or "",
     )
 
 
@@ -482,15 +496,32 @@ def check(
     solver_timeout_ms: int | None = None,
     solver_memory_limit_mb: int = 0,
     argument_bindings: Sequence[tuple[int, int]] | None = None,
+    bounded_unroll: int = 8,
+    chc_pdr: bool = True,
     session: "SolverSession | None" = None,
 ) -> CheckResult:
-    """Judge one pair of loop-free scalar C functions.
+    """Judge one pair of restricted-C functions.
 
     ``trust_smt_backend=True`` selects the recorded trusted-backend policy;
     without it a solver UNSAT stays evidence and the verdict stays
     ``unknown``. Budget exhaustion arrives as ``unknown`` with
     ``evidence.budget_exhausted`` set, never as a logical verdict. A malformed
     verdict policy raises before the run starts.
+
+    When the SMT product fails to *answer* -- ``unknown`` with the violation
+    query not answered UNSAT and the domain not vacuous, which is the loop
+    territory and the solver-timeout territory, not the trust-policy
+    territory -- the check continues down a follow-up chain:
+    ``search.bounded-symbolic`` unrolls
+    both sides ``bounded_unroll`` retreating-edge traversals deep and hunts a
+    counterexample (only a model replayed on the original cyclic functions is
+    one; a clean bound comes back as ``bounded-clean`` and is never promoted),
+    then ``prove.chc-pdr`` attempts an inductive proof over the serialized
+    loop transition prefix (promoted only under the same trusted-backend
+    policy as the product's UNSAT). ``result.decided_by`` names the method
+    whose verdict came back; ``evidence.violation_answer`` and
+    ``evidence.domain_answer`` always describe the SMT-product stage.
+    ``bounded_unroll=0`` and ``chc_pdr=False`` restore the bare product.
 
     **Pass a session when you judge more than once.** Without one this call
     establishes a private backend installation of its own, and it does so
@@ -557,6 +588,8 @@ def check(
             else [tuple(pair) for pair in argument_bindings]
         ),
         solver_session=None if session is None else session._handle(),
+        bounded_unroll=int(bounded_unroll),
+        chc_pdr=bool(chc_pdr),
         **limits,
     )
     return _build_result(raw)
