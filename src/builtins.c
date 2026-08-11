@@ -2,6 +2,7 @@
 
 #include "quodlibet/egraph_method.h"
 #include "quodlibet/proof_aigsat.h"
+#include "quodlibet/proof_bounded.h"
 #include "quodlibet/proof_diff.h"
 #include "quodlibet/proof_smt.h"
 
@@ -68,5 +69,12 @@ ql_status QL_CALL ql_register_builtin_methods(ql_registry *registry,
      less to do it: its UNSAT is promoted only after an independent checker
      verifies the certificate. It is registered beside both so a pipeline can
      choose how much trust it is willing to spend. */
-  return ql_aig_sat_register_method(registry, error);
+  status = ql_aig_sat_register_method(registry, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  /* The bounded search covers the cyclic territory the loop-free provers
+     refuse: it unrolls, refutes with a replayed model, and reports UNSAT as
+     BOUNDED_CLEAN with its bound rather than as any kind of proof. */
+  return ql_register_bounded_method(registry, error);
 }

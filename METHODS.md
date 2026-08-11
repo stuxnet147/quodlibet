@@ -684,6 +684,44 @@ defect in one backend or in the blaster.
 
 Recommended method name: `search.bounded-symbolic`.
 
+#### The implemented method
+
+`src/proof_bounded.c` registers `search.bounded-symbolic` as a built-in over
+the product encoder's scalar and flat-memory fragment. It does not maintain
+its own symbolic-state engine. Each side's lowered IR is rebuilt by
+`src/unroll.c` into an acyclic graph covering every execution that traverses
+at most `unroll_bound` retreating edges -- the copy-based unrolling routes
+each retreating edge to the next copy and, in the last copy, to one cut block
+whose body is `ASSUME(false)`. The product encoding conditions every ASSUME
+on its block being reached, so inputs beyond the bound leave the comparison
+domain on both terminal queries instead of being given invented behavior. The
+rebuilt graph is re-validated by the ordinary IR reader; a shape whose SSA
+the copy-based renaming cannot order is refused as `UNKNOWN`, never emitted
+wrong.
+
+The unrolled pair then flows through `ql_product_query_build` and the pinned
+Bitwuzla backend exactly as `prove.smt-product`'s loop-free path does, and
+the verdict discipline is the bounded one:
+
+- a SAT model is decoded by the shared replay decoder and executed against
+  the **original cyclic IR**, so a confirmed `COUNTEREXAMPLE` is a statement
+  about the real functions and not about the unrolling;
+- UNSAT is `BOUNDED_CLEAN` with the bound vector recorded (`unroll_bound`,
+  whether any cut was reachable, and the emitted block counts). It is never
+  promoted, and the capability never advertises proof soundness under any
+  option;
+- a backend timeout, cancellation, or an unreplayable model is `UNKNOWN`
+  with a diagnostic.
+
+The bound is a total budget of retreating-edge traversals per side, not a
+per-loop trip count: two sequential loops or a nested pair draw on the same
+budget. `bound_cut_used = 0` in the outcome records that neither side's
+graph reached the bound, so the search was exhaustive over the encoded
+fragment; the verdict still stays `BOUNDED_CLEAN`, because promotion is a
+combiner and policy decision, not this method's.
+
+#### Interface
+
 Bounded symbolic execution forks or merges symbolic states along CFG paths and
 uses a constraint solver to search for an observed mismatch. It is effective on
 branch-heavy code and supplies focused counterexamples without bit-blasting the

@@ -91,12 +91,14 @@ file(GLOB QL_OPTIONAL_CORE_SOURCES CONFIGURE_DEPENDS LIST_DIRECTORIES false
     "${CMAKE_CURRENT_SOURCE_DIR}/src/process_runner.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/product.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_aigsat.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_bounded.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_diff.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_method.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/proof_smt.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/replay.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/signature.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/solver.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/unroll.c"
 )
 list(APPEND QL_CORE_SOURCES ${QL_OPTIONAL_CORE_SOURCES})
 

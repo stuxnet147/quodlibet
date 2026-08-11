@@ -4,7 +4,10 @@ Quodlibet 0.1.0 is a native C17 function-equivalence engine and a framework
 for composing proof and refutation methods. It has an end-to-end path for the
 currently supported subset of the `ASM2C_GNU_V1` C profile. The SMT product
 also has a narrow unbounded relational-induction path for structurally paired
-loops; AIG/SAT and the general product encoding remain loop-free. The lowering,
+loops; AIG/SAT and the general product encoding remain loop-free, and the
+bounded symbolic search covers cyclic pairs by finite unrolling, with
+counterexamples replayed against the original loops and clean results reported
+as bounded, never as proof. The lowering,
 verifier, and interpreter carry cyclic CFGs:
 
 1. parse and resolve two C functions;
@@ -76,6 +79,7 @@ The builtin registry currently contains:
 | `prove.smt-product` | Relational SMT product over loop-free IR and a structural scalar-loop induction fast path | Explicit trusted-Bitwuzla policy, recorded as `checked_proof=false` |
 | `prove.aig-sat` | Bit-blasted scalar product using CaDiCaL | LRAT certificate accepted by the independent `lrat-check`, recorded as `checked_proof=true` |
 | `refute.concrete-differential` | Deterministic boundary and random input search | Replay-confirmed counterexample only |
+| `search.bounded-symbolic` | Bounded unrolling of cyclic IR into the same product encoding | Replay-confirmed counterexample against the original loops; UNSAT is `BOUNDED_CLEAN` with its bound, never a proof |
 
 The loop-free SMT and AIG/SAT paths use the same product-query encoding. A SAT
 assignment from that encoding is only a candidate until the shared concrete
