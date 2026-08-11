@@ -6063,6 +6063,13 @@ static ql_status apply_binary_operator(lower_context *context,
   return status;
 }
 
+/* `a && b` and `a || b` when `b` has an effect. Defined below, next to the
+   conditional expression it shares its join with. */
+static ql_status lower_short_circuit_expression(lower_context *context,
+                                                size_t node, int is_and,
+                                                lower_value *output,
+                                                ql_error *error);
+
 static ql_status lower_binary_expression(lower_context *context, size_t node,
                                          lower_value *output, ql_error *error) {
   size_t left_node = direct_field_child(context, node, "left");
@@ -6079,21 +6086,23 @@ static ql_status lower_binary_expression(lower_context *context, size_t node,
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
         "binary expression is missing an operand or operator", error);
   }
+  /* The select lowering evaluates both operands. That is only sound while the
+     right one is a pure computation, so an effect there takes the branch
+     lowering instead. */
   if (subtree_has_effect(context, right_node)) {
     char *text = copy_node_text(context, operator_node);
+    int is_and;
     int short_circuit;
     if (text == NULL) {
       ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);
       return QL_STATUS_OUT_OF_MEMORY;
     }
-    short_circuit = strcmp(text, "&&") == 0 || strcmp(text, "||") == 0;
+    is_and = strcmp(text, "&&") == 0;
+    short_circuit = is_and || strcmp(text, "||") == 0;
     context->allocator->deallocate(context->allocator->user_data, text);
     if (short_circuit) {
-      return lower_unknown(
-          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
-          "the right operand of a short-circuit operator has an effect this "
-          "slice would run on the path C skips",
-          error);
+      return lower_short_circuit_expression(context, node, is_and, output,
+                                            error);
     }
   }
   status = lower_expression(context, left_node, &left, error);
@@ -8214,6 +8223,34 @@ static ql_status copy_record_bytes(lower_context *context, size_t node,
                                    lower_value source,
                                    lower_value destination, lower_type type,
                                    ql_error *error);
+static ql_status
+merge_branch_states(lower_context *context, const lower_state *left,
+                    ql_ir_block_id left_block, const lower_state *right,
+                    ql_ir_block_id right_block, ql_error *error);
+
+/* Both arms of a conditional and both operands of `&&` reach the same join,
+   so the value there is a PHI over blocks rather than a SELECT over values
+   the current block already holds. Two of these merges are needed, one for
+   the value and one for the definedness predicate, and neither is worth
+   writing twice. */
+static ql_status merge_two(lower_context *context, lower_type type,
+                           ql_ir_value_id left, ql_ir_block_id left_block,
+                           ql_ir_value_id right, ql_ir_block_id right_block,
+                           ql_ir_value_id *output, ql_error *error) {
+  ql_ir_value_id operands[2];
+  ql_ir_block_id blocks[2];
+  if (left == right) {
+    *output = left;
+    return QL_STATUS_OK;
+  }
+  operands[0] = left;
+  operands[1] = right;
+  blocks[0] = left_block;
+  blocks[1] = right_block;
+  return emit_instruction(context, QL_IR_OPCODE_PHI, &type, operands, 2u,
+                          blocks, 2u, QL_IR_EFFECT_NONE, output, error);
+}
+
 
 /* `c ? a : b`. The value is selected, but the definedness short-circuits the
    way `&&` already does: only the arm the condition chooses has to be defined.
@@ -8232,6 +8269,13 @@ static ql_status lower_conditional_expression(lower_context *context,
   lower_value left;
   lower_value right;
   lower_type common;
+  lower_state entry_state;
+  lower_state then_state;
+  lower_state else_state;
+  size_t variable_count = context->variable_count;
+  ql_ir_block_id arm_block[2];
+  ql_ir_block_id condition_block = QL_IR_INVALID_BLOCK_ID;
+  ql_ir_block_id join = QL_IR_INVALID_BLOCK_ID;
   ql_ir_value_id operands[3];
   ql_ir_value_id not_condition;
   ql_ir_value_id then_safe;
@@ -8240,31 +8284,25 @@ static ql_status lower_conditional_expression(lower_context *context,
   ql_ir_value_id condition_defined;
   ql_ir_value_id consequence_defined;
   ql_ir_value_id alternative_defined;
+  uint32_t branching;
   ql_status status;
 
+  memset(&entry_state, 0, sizeof(entry_state));
+  memset(&then_state, 0, sizeof(then_state));
+  memset(&else_state, 0, sizeof(else_state));
+  arm_block[0] = QL_IR_INVALID_BLOCK_ID;
+  arm_block[1] = QL_IR_INVALID_BLOCK_ID;
   if (condition_node == SIZE_MAX || consequence_node == SIZE_MAX ||
       alternative_node == SIZE_MAX) {
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
         "conditional expression is missing one of its three operands", error);
   }
-  if (subtree_has_effect(context, consequence_node) ||
-      subtree_has_effect(context, alternative_node)) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_EXPRESSION, node,
-        "an arm of a conditional expression has an effect this slice would "
-        "run on the path C skips",
-        error);
-  }
+  branching = subtree_has_effect(context, consequence_node) ||
+                      subtree_has_effect(context, alternative_node)
+                  ? 1u
+                  : 0u;
   status = lower_expression(context, condition_node, &condition, error);
-  if (status != QL_STATUS_OK || context->unknown != 0u) {
-    return status;
-  }
-  status = lower_expression(context, consequence_node, &consequence, error);
-  if (status != QL_STATUS_OK || context->unknown != 0u) {
-    return status;
-  }
-  status = lower_expression(context, alternative_node, &alternative, error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
   }
@@ -8272,6 +8310,69 @@ static ql_status lower_conditional_expression(lower_context *context,
                          error);
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     return status;
+  }
+  status = ensure_bool_constants(context, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+  if (branching == 0u) {
+    status = lower_expression(context, consequence_node, &consequence, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    status = lower_expression(context, alternative_node, &alternative, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      return status;
+    }
+    arm_block[0] = context->current_block;
+    arm_block[1] = context->current_block;
+  } else {
+    /* The branch is taken on this value, so it has to be defined here rather
+       than folded into the result's definedness the way the select path
+       does. */
+    status = emit_ub_guard(context, &condition_bool, error);
+    if (status != QL_STATUS_OK) {
+      return status;
+    }
+    condition_block = context->current_block;
+    status = save_state(context, variable_count, &entry_state, error);
+    if (status == QL_STATUS_OK) {
+      status = add_block(context, "cond.then", &arm_block[0], error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = add_block(context, "cond.else", &arm_block[1], error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = set_cond_branch(context, condition_block, condition_bool.value,
+                               arm_block[0], arm_block[1], error);
+    }
+    if (status != QL_STATUS_OK) {
+      goto cleanup;
+    }
+    restore_state(context, &entry_state);
+    context->current_block = arm_block[0];
+    context->current_terminated = 0u;
+    status = lower_expression(context, consequence_node, &consequence, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      goto cleanup;
+    }
+    arm_block[0] = context->current_block;
+    status = save_state(context, variable_count, &then_state, error);
+    if (status != QL_STATUS_OK) {
+      goto cleanup;
+    }
+    restore_state(context, &entry_state);
+    context->current_block = arm_block[1];
+    context->current_terminated = 0u;
+    status = lower_expression(context, alternative_node, &alternative, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      goto cleanup;
+    }
+    arm_block[1] = context->current_block;
+    status = save_state(context, variable_count, &else_state, error);
+    if (status != QL_STATUS_OK) {
+      goto cleanup;
+    }
   }
   if (consequence.type.kind == QL_C_SCALAR_VOID ||
       alternative.type.kind == QL_C_SCALAR_VOID ||
@@ -8285,6 +8386,9 @@ static ql_status lower_conditional_expression(lower_context *context,
         "outside this slice",
         error);
   }
+  /* A conversion emits instructions, and they belong to the arm that will run
+     them. When the arms share a block this is the ordinary in-place lowering;
+     when they do not, each conversion lands in its own arm. */
   if (consequence.type.kind == QL_C_SCALAR_POINTER ||
       alternative.type.kind == QL_C_SCALAR_POINTER) {
     if (consequence.type.kind != alternative.type.kind) {
@@ -8292,9 +8396,10 @@ static ql_status lower_conditional_expression(lower_context *context,
           is_literal_null_pointer_constant(context, alternative_node)) {
         common = consequence.type;
         left = consequence;
+        context->current_block = arm_block[1];
         status = convert_value(context, alternative, common, &right, error);
         if (status != QL_STATUS_OK || context->unknown != 0u) {
-          return status;
+          goto cleanup;
         }
         /* Null names no object, so every object it could access is already in
            the table vacuously. If the other arm names an object, selecting
@@ -8305,18 +8410,20 @@ static ql_status lower_conditional_expression(lower_context *context,
                  is_literal_null_pointer_constant(context, consequence_node)) {
         common = alternative.type;
         right = alternative;
+        context->current_block = arm_block[0];
         status = convert_value(context, consequence, common, &left, error);
         if (status != QL_STATUS_OK || context->unknown != 0u) {
-          return status;
+          goto cleanup;
         }
         left.has_object = 1u;
         left.may_admit_object = 0u;
       } else {
-        return lower_unknown(
+        status = lower_unknown(
             context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
             "a conditional mixing a pointer and a non-null integer is "
             "outside this slice",
             error);
+        goto cleanup;
       }
     } else if (type_same(consequence.type, alternative.type)) {
       common = consequence.type;
@@ -8326,35 +8433,93 @@ static ql_status lower_conditional_expression(lower_context *context,
                consequence.type.pointee.kind == QL_C_SCALAR_VOID) {
       common = consequence.type;
       left = consequence;
+      context->current_block = arm_block[1];
       status = convert_value(context, alternative, common, &right, error);
       if (status != QL_STATUS_OK || context->unknown != 0u) {
-        return status;
+        goto cleanup;
       }
     } else if (alternative.type.indirection == 1u &&
                alternative.type.pointee.kind == QL_C_SCALAR_VOID) {
       common = alternative.type;
       right = alternative;
+      context->current_block = arm_block[0];
       status = convert_value(context, consequence, common, &left, error);
       if (status != QL_STATUS_OK || context->unknown != 0u) {
-        return status;
+        goto cleanup;
       }
     } else {
-      return lower_unknown(
+      status = lower_unknown(
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_POINTER, node,
           "a conditional needs compatible pointer arm types", error);
+      goto cleanup;
     }
   } else {
-    status = usual_arithmetic_conversions(context, consequence, alternative,
-                                          &left, &right, &common, error);
+    /* `usual_arithmetic_conversions` unrolled, because the promotion and the
+       conversion of each operand have to be emitted where that operand is. */
+    lower_value promoted_left;
+    lower_value promoted_right;
+    context->current_block = arm_block[0];
+    status = integer_promote(context, consequence, &promoted_left, error);
     if (status != QL_STATUS_OK || context->unknown != 0u) {
-      return status;
+      goto cleanup;
+    }
+    context->current_block = arm_block[1];
+    status = integer_promote(context, alternative, &promoted_right, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      goto cleanup;
+    }
+    common = usual_common_type(promoted_left.type, promoted_right.type);
+    context->current_block = arm_block[0];
+    status = convert_value(context, promoted_left, common, &left, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      goto cleanup;
+    }
+    context->current_block = arm_block[1];
+    status = convert_value(context, promoted_right, common, &right, error);
+    if (status != QL_STATUS_OK || context->unknown != 0u) {
+      goto cleanup;
     }
   }
-  status = ensure_bool_constants(context, error);
-  if (status != QL_STATUS_OK) {
-    return status;
-  }
   memset(output, 0, sizeof(*output));
+  if (branching != 0u) {
+    /* The select path can carry an arm's partiality past the merge and let
+       the observation guard it, because both arms were computed anyway. A
+       branch cannot: the arm that runs has evaluated its expression, so C has
+       already reached the undefined behaviour, and no guard in the join
+       dominates the arm that produced it. Each arm discharges its own. */
+    context->current_block = arm_block[0];
+    status = emit_ub_guard(context, &left, error);
+    if (status == QL_STATUS_OK) {
+      context->current_block = arm_block[1];
+      status = emit_ub_guard(context, &right, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = add_block(context, "cond.join", &join, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = set_branch(context, arm_block[0], join, error);
+    }
+    if (status == QL_STATUS_OK) {
+      status = set_branch(context, arm_block[1], join, error);
+    }
+    if (status != QL_STATUS_OK) {
+      goto cleanup;
+    }
+    context->current_block = join;
+    context->current_terminated = 0u;
+    status = merge_branch_states(context, &then_state, arm_block[0],
+                                 &else_state, arm_block[1], error);
+    if (status == QL_STATUS_OK) {
+      status = merge_two(context, common, left.value, arm_block[0], right.value,
+                         arm_block[1], &output->value, error);
+    }
+    if (status != QL_STATUS_OK) {
+      goto cleanup;
+    }
+    output->defined = context->true_value;
+    output->may_ub = 0u;
+    goto authority;
+  }
   operands[0] = condition_bool.value;
   operands[1] = left.value;
   operands[2] = right.value;
@@ -8392,8 +8557,10 @@ static ql_status lower_conditional_expression(lower_context *context,
   if (status != QL_STATUS_OK) {
     return status;
   }
-  output->type = common;
   output->may_ub = 1u;
+
+authority:
+  output->type = common;
   if (common.kind == QL_C_SCALAR_POINTER) {
     const uint32_t consequence_accessible =
         left.has_object | left.may_admit_object;
@@ -8406,9 +8573,132 @@ static ql_status lower_conditional_expression(lower_context *context,
                                        alternative_accessible != 0u
                                    ? 1u
                                    : 0u;
-    return QL_STATUS_OK;
   }
-  return QL_STATUS_OK;
+  status = QL_STATUS_OK;
+
+cleanup:
+  destroy_state(context, &entry_state);
+  destroy_state(context, &then_state);
+  destroy_state(context, &else_state);
+  return status;
+}
+
+/* `a && b` and `a || b` with an effect in `b`. C evaluates `b` only when `a`
+   leaves the answer open, so the operand gets a block of its own and the
+   result is a merge: the constant the left operand already decided, or what
+   the right one computed. The select lowering stays for pure operands, where
+   it says the same thing with fewer blocks. */
+static ql_status lower_short_circuit_expression(lower_context *context,
+                                                size_t node, int is_and,
+                                                lower_value *output,
+                                                ql_error *error) {
+  size_t left_node = direct_field_child(context, node, "left");
+  size_t right_node = direct_field_child(context, node, "right");
+  size_t variable_count = context->variable_count;
+  lower_type boolean = make_bool_type();
+  lower_type int_type = make_integer_type(32u, 3u, 1u);
+  lower_value left;
+  lower_value left_bool;
+  lower_value right;
+  lower_value right_bool;
+  lower_value merged;
+  lower_state entry_state;
+  lower_state rhs_state;
+  ql_ir_block_id entry_block;
+  ql_ir_block_id rhs_block = QL_IR_INVALID_BLOCK_ID;
+  ql_ir_block_id rhs_end = QL_IR_INVALID_BLOCK_ID;
+  ql_ir_block_id join = QL_IR_INVALID_BLOCK_ID;
+  ql_status status;
+
+  memset(&entry_state, 0, sizeof(entry_state));
+  memset(&rhs_state, 0, sizeof(rhs_state));
+  memset(&merged, 0, sizeof(merged));
+
+  status = lower_expression(context, left_node, &left, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  status = convert_value(context, left, boolean, &left_bool, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    return status;
+  }
+  /* The branch is taken on this value, so it has to be defined here. The
+     select lowering can carry an undefined left operand into the result's
+     definedness; a branch cannot. */
+  status = emit_ub_guard(context, &left_bool, error);
+  if (status == QL_STATUS_OK) {
+    status = ensure_bool_constants(context, error);
+  }
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+
+  entry_block = context->current_block;
+  status = save_state(context, variable_count, &entry_state, error);
+  if (status == QL_STATUS_OK) {
+    status = add_block(context, is_and != 0 ? "and.rhs" : "or.rhs", &rhs_block,
+                       error);
+  }
+  if (status == QL_STATUS_OK) {
+    status = add_block(context, is_and != 0 ? "and.join" : "or.join", &join,
+                       error);
+  }
+  if (status == QL_STATUS_OK) {
+    status = set_cond_branch(context, entry_block, left_bool.value,
+                             is_and != 0 ? rhs_block : join,
+                             is_and != 0 ? join : rhs_block, error);
+  }
+  if (status != QL_STATUS_OK) {
+    goto cleanup;
+  }
+
+  context->current_block = rhs_block;
+  context->current_terminated = 0u;
+  status = lower_expression(context, right_node, &right, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    goto cleanup;
+  }
+  status = convert_value(context, right, boolean, &right_bool, error);
+  if (status != QL_STATUS_OK || context->unknown != 0u) {
+    goto cleanup;
+  }
+  /* The operand that ran has been evaluated, so its partiality is discharged
+     where it happened rather than after the merge. */
+  status = emit_ub_guard(context, &right_bool, error);
+  if (status != QL_STATUS_OK) {
+    goto cleanup;
+  }
+  rhs_end = context->current_block;
+  status = save_state(context, variable_count, &rhs_state, error);
+  if (status == QL_STATUS_OK) {
+    status = set_branch(context, rhs_end, join, error);
+  }
+  if (status != QL_STATUS_OK) {
+    goto cleanup;
+  }
+
+  context->current_block = join;
+  context->current_terminated = 0u;
+  status = merge_branch_states(context, &entry_state, entry_block, &rhs_state,
+                               rhs_end, error);
+  if (status == QL_STATUS_OK) {
+    status = merge_two(
+        context, boolean,
+        is_and != 0 ? context->false_value : context->true_value, entry_block,
+        right_bool.value, rhs_end, &merged.value, error);
+  }
+  if (status != QL_STATUS_OK) {
+    goto cleanup;
+  }
+  merged.type = boolean;
+  merged.defined = context->true_value;
+  merged.may_ub = 0u;
+  status = convert_value(context, merged, int_type, output, error);
+
+cleanup:
+  destroy_state(context, &entry_state);
+  destroy_state(context, &rhs_state);
+  return status;
 }
 
 /* `a, b`. The left operand is evaluated for its effects and discarded, and
@@ -10372,6 +10662,10 @@ static ql_status lower_if_statement(lower_context *context, size_t node,
   if (status != QL_STATUS_OK) {
     return status;
   }
+  /* Re-read rather than trusting the block this statement started in. An
+     operand with an effect splits the condition across blocks, and the edge
+     out of the condition leaves the block it actually ended in. */
+  condition_block = context->current_block;
   status = save_state(context, variable_count, &entry_state, error);
   if (status != QL_STATUS_OK) {
     return status;
@@ -10793,6 +11087,10 @@ static ql_status lower_switch_statement(lower_context *context, size_t node,
   if (status != QL_STATUS_OK || context->unknown != 0u) {
     goto cleanup;
   }
+  /* Re-read rather than trusting the block this statement started in. An
+     operand with an effect splits the condition across blocks, and the
+     dispatch chain leaves the block it actually ended in. */
+  condition_block = context->current_block;
   if (case_count == 0u) {
     status = QL_STATUS_OK;
     goto cleanup;
@@ -11275,6 +11573,7 @@ static ql_status lower_pretest_loop(lower_context *context, size_t node,
   size_t variable_count;
   ql_ir_block_id preheader = context->current_block;
   ql_ir_block_id header = QL_IR_INVALID_BLOCK_ID;
+  ql_ir_block_id condition_end = QL_IR_INVALID_BLOCK_ID;
   ql_ir_block_id body = QL_IR_INVALID_BLOCK_ID;
   ql_ir_block_id exit_block = QL_IR_INVALID_BLOCK_ID;
   lower_state entry_state;
@@ -11336,6 +11635,10 @@ static ql_status lower_pretest_loop(lower_context *context, size_t node,
     status = add_block(context, "loop.exit", &exit_block, error);
   }
   if (status == QL_STATUS_OK) {
+  /* Re-read rather than trusting the block this statement started in. An
+     operand with an effect splits the condition across blocks, and the edge
+     out of the condition leaves the block it actually ended in. */
+    preheader = context->current_block;
     status = set_branch(context, preheader, header, error);
   }
   if (status != QL_STATUS_OK) {
@@ -11351,6 +11654,12 @@ static ql_status lower_pretest_loop(lower_context *context, size_t node,
   if (has_condition != 0u) {
     lower_value condition;
     lower_value boolean;
+    /* The header holds the loop PHIs and receives the backedge, and both stay
+       where they are. What the condition may move is the block its own edges
+       leave from: an operand with an effect splits it, and the edge into the
+       body and the edge into the exit then leave the block the condition
+       ended in. Those blocks run once per iteration and the header dominates
+       them, so the loop's shape is unchanged. */
     status = lower_expression(context, condition_node, &condition, error);
     if (status == QL_STATUS_OK && context->unknown == 0u) {
       status =
@@ -11360,11 +11669,12 @@ static ql_status lower_pretest_loop(lower_context *context, size_t node,
       status = emit_ub_guard(context, &boolean, error);
     }
     if (status == QL_STATUS_OK && context->unknown == 0u) {
+      condition_end = context->current_block;
       status = save_state(context, variable_count, &condition_exit, error);
     }
     if (status == QL_STATUS_OK && context->unknown == 0u) {
-      status = set_cond_branch(context, header, boolean.value, body, exit_block,
-                               error);
+      status = set_cond_branch(context, condition_end, boolean.value, body,
+                               exit_block, error);
     }
   } else {
     status = set_branch(context, header, body, error);
@@ -11421,6 +11731,8 @@ static ql_status lower_pretest_loop(lower_context *context, size_t node,
       status = lower_discarded_expression(context, update_node, error);
     }
     if (status == QL_STATUS_OK && context->unknown == 0u) {
+      /* The backedge leaves where the update ended, not where it started. */
+      update_block = context->current_block;
       status = save_state(context, variable_count, &backedge_state, error);
     }
     if (status == QL_STATUS_OK && context->unknown == 0u) {
@@ -11447,7 +11759,7 @@ static ql_status lower_pretest_loop(lower_context *context, size_t node,
     goto cleanup;
   }
   status = finish_loop_exit(context, &breaks, exit_block, &condition_exit,
-                            header, has_condition, error);
+                            condition_end, has_condition, error);
 
 cleanup:
   if (scopes_installed != 0u) {
@@ -11566,6 +11878,8 @@ static ql_status lower_do_loop(lower_context *context, size_t node,
     context->current_terminated = 0u;
     status = merge_states_many(context, continues.states, continues.blocks,
                                continues.count, error);
+    /* The backedge leaves the block the condition ended in, which is this one
+       only while nothing split it. */
     if (status == QL_STATUS_OK) {
       status = lower_expression(context, condition_node, &condition, error);
     }
@@ -11577,6 +11891,7 @@ static ql_status lower_do_loop(lower_context *context, size_t node,
       status = emit_ub_guard(context, &boolean, error);
     }
     if (status == QL_STATUS_OK && context->unknown == 0u) {
+      condition_block = context->current_block;
       status = save_state(context, variable_count, &backedge_state, error);
     }
     if (status == QL_STATUS_OK && context->unknown == 0u) {

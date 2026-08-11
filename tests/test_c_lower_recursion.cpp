@@ -34,6 +34,7 @@ int REC_sum(int n) {
     }
     return n + REC_sum(n - 1);
 }
+int REC_probe(int n) { return n & 1; }
 int REC_collatz(int n, int steps) {
     if (n <= 1) {
         return steps;
@@ -130,6 +131,8 @@ int QL_CALL InvokeSelf(void *user_data, const char *symbol,
     }
     if (std::strcmp(symbol, "REC_sum") == 0 && argument_count == 1u) {
         returned = REC_sum(Read(arguments[0]));
+    } else if (std::strcmp(symbol, "REC_probe") == 0 && argument_count == 1u) {
+        returned = REC_probe(Read(arguments[0]));
     } else if (std::strcmp(symbol, "REC_collatz") == 0 &&
                argument_count == 2u) {
         returned = REC_collatz(Read(arguments[0]), Read(arguments[1]));
@@ -212,10 +215,7 @@ std::int32_t Returned(const ql_ir_interp_result_v1 &result) {
 
 TEST(CLowerRecursion, MatchesCompiledExecutionForADirectRecursiveCall) {
     static const char source[] =
-        "int REC_sum(int n) {\n"
-        "  if (n <= 0) return 0;\n"
-        "  return n + REC_sum(n - 1);\n"
-        "}\n";
+        "int REC_sum(int n) { return n <= 0 ? 0 : n + REC_sum(n - 1); }";
     Lowered lowered;
     ql_ir *ir = nullptr;
     ql_ir_verify_report_v1 report{};
@@ -234,38 +234,9 @@ TEST(CLowerRecursion, MatchesCompiledExecutionForADirectRecursiveCall) {
         ASSERT_EQ(QL_STATUS_OK, run.status);
         ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
         EXPECT_EQ(REC_sum(input), Returned(run.result));
-        /* The body makes the call on exactly the path the C takes. */
+        /* The arm the base case skips is never run. Evaluating it here would
+           not be a wrong value but unbounded recursion. */
         EXPECT_EQ(input <= 0 ? 0u : 1u, calls);
-    }
-}
-
-TEST(CLowerRecursion, CarriesTwoArgumentsThroughATailRecursiveCall) {
-    static const char source[] =
-        "int REC_collatz(int n, int steps) {\n"
-        "  if (n <= 1) return steps;\n"
-        "  if ((n & 1) == 0) return REC_collatz(n / 2, steps + 1);\n"
-        "  return REC_collatz(n * 3 + 1, steps + 1);\n"
-        "}\n";
-    Lowered lowered;
-    ql_ir *ir = nullptr;
-    ql_ir_verify_report_v1 report{};
-    ql_error error{};
-
-    ASSERT_EQ(QL_C_LOWER_SUPPORTED,
-              Lower(&lowered, source, "REC_collatz", &ir));
-    ASSERT_NE(nullptr, ir);
-    ql_ir_verify_report_init(&report);
-    ASSERT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
-        << report.message;
-
-    for (const std::int32_t input : {1, 2, 6, 27}) {
-        std::size_t calls = 0u;
-        SCOPED_TRACE(input);
-        const InterpRun run = Interpret(ir, {input, 0}, &calls);
-        ASSERT_EQ(QL_STATUS_OK, run.status);
-        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
-        EXPECT_EQ(REC_collatz(input, 0), Returned(run.result));
-        EXPECT_EQ(input <= 1 ? 0u : 1u, calls);
     }
 }
 
@@ -328,24 +299,16 @@ TEST(CLowerRecursion, TheSelectedFunctionIsNotAnExternalToken) {
     }
 }
 
-/* `?:`, `&&`, and `||` select between operands this lowering has already
-   evaluated. For a pure operand that is only a definedness question, and the
-   guards answer it. For an operand with an effect it is not: the call, store,
-   or increment would run on the path C skips, and the IR would not record that
-   it was conditional. Refusing is the only honest answer until the operands
-   get real control flow.
-
-   Recursion is where this bites hardest, because `return n <= 0 ? 0 : f(n-1)`
-   is the ordinary shape, and evaluating the false arm at the base case is
-   unbounded recursion rather than a wrong value. */
-TEST(CLowerRecursion, RefusesAnEffectOnAPathTheConditionSkips) {
+/* `?:`, `&&`, and `||` used to select between operands this lowering had
+   already evaluated, so an effect in the operand C skips ran anyway. The
+   operand now gets a block of its own and the result is a merge, which is what
+   makes the ordinary recursive shape lowerable at all. */
+TEST(CLowerRecursion, RunsAnEffectOnlyOnThePathTheConditionTakes) {
     struct Case {
         const char *source;
         const char *name;
     };
     const Case cases[] = {
-        {"int REC_sum(int n) { return n <= 0 ? 0 : n + REC_sum(n - 1); }",
-         "REC_sum"},
         {"int CALLEE_f(int);\n"
          "int f(int a) { return a ? CALLEE_f(a) : 0; }",
          "f"},
@@ -357,36 +320,170 @@ TEST(CLowerRecursion, RefusesAnEffectOnAPathTheConditionSkips) {
          "f"},
         {"int f(int *p) { return p != 0 && (*p = 1); }", "f"},
         {"int f(int a, int b) { return a > 0 && b++ > 0; }", "f"},
+        /* Nested, so the join of the inner one is inside an arm of the
+           outer. */
+        {"int CALLEE_f(int);\n"
+         "int f(int a, int b) { return a ? (b && CALLEE_f(b)) : CALLEE_f(a); }",
+         "f"},
     };
     for (const Case &item : cases) {
         Lowered lowered;
+        ql_ir *ir = nullptr;
+        ql_ir_verify_report_v1 report{};
+        ql_error error{};
         SCOPED_TRACE(item.source);
-        EXPECT_EQ(QL_C_LOWER_UNKNOWN,
-                  Lower(&lowered, item.source, item.name, nullptr));
+        ASSERT_EQ(QL_C_LOWER_SUPPORTED,
+                  Lower(&lowered, item.source, item.name, &ir));
+        ASSERT_NE(nullptr, ir);
+        ql_ir_verify_report_init(&report);
+        EXPECT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
+            << report.message;
     }
 }
 
-/* The left operand of a short-circuit operator is always evaluated, and so is
-   the condition of a conditional expression. Neither is on a skipped path, so
-   neither is refused. */
-TEST(CLowerRecursion, KeepsAnEffectTheConditionAlwaysEvaluates) {
+/* The tail-recursive body reaches its call through two nested conditions, so
+   the count also fixes that only one of them runs. */
+TEST(CLowerRecursion, CarriesTwoArgumentsThroughANestedConditionalCall) {
+    static const char source[] =
+        "int REC_collatz(int n, int steps) {\n"
+        "  return n <= 1 ? steps\n"
+        "                : ((n & 1) == 0 ? REC_collatz(n / 2, steps + 1)\n"
+        "                                : REC_collatz(n * 3 + 1, steps + 1));\n"
+        "}\n";
+    Lowered lowered;
+    ql_ir *ir = nullptr;
+    ql_ir_verify_report_v1 report{};
+    ql_error error{};
+
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED,
+              Lower(&lowered, source, "REC_collatz", &ir));
+    ASSERT_NE(nullptr, ir);
+    ql_ir_verify_report_init(&report);
+    ASSERT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
+        << report.message;
+
+    for (const std::int32_t input : {1, 2, 6, 27}) {
+        std::size_t calls = 0u;
+        SCOPED_TRACE(input);
+        const InterpRun run = Interpret(ir, {input, 0}, &calls);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
+        EXPECT_EQ(REC_collatz(input, 0), Returned(run.result));
+        EXPECT_EQ(input <= 1 ? 0u : 1u, calls);
+    }
+}
+
+/* A loop condition is the position this was hardest to get right. The header
+   holds the loop PHIs and receives the backedge, and both stay put; what moves
+   is the block the condition's own edges leave from. The count below is what
+   proves it: the call in the right operand happens once per iteration the
+   left operand let through, and once more for the iteration that ended the
+   loop, and never after. */
+TEST(CLowerRecursion, RunsALoopConditionEffectOncePerIterationCTakes) {
+    static const char source[] =
+        "int REC_probe(int);\n"
+        "int REC_loop(int a) {\n"
+        "  int n = 0;\n"
+        "  while (a > 0 && REC_probe(a)) { a -= 2; n++; }\n"
+        "  return n;\n"
+        "}\n";
+    Lowered lowered;
+    ql_ir *ir = nullptr;
+    ql_ir_verify_report_v1 report{};
+    ql_error error{};
+
+    ASSERT_EQ(QL_C_LOWER_SUPPORTED, Lower(&lowered, source, "REC_loop", &ir));
+    ASSERT_NE(nullptr, ir);
+    ql_ir_verify_report_init(&report);
+    ASSERT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
+        << report.message;
+
+    for (const std::int32_t input : {-1, 0, 1, 2, 7, 9}) {
+        std::size_t calls = 0u;
+        std::size_t expected_calls = 0u;
+        std::int32_t expected = 0;
+        std::int32_t a = input;
+        SCOPED_TRACE(input);
+        while (a > 0) {
+            ++expected_calls;
+            if (REC_probe(a) == 0) {
+                break;
+            }
+            a -= 2;
+            ++expected;
+        }
+        const InterpRun run = Interpret(ir, {input}, &calls);
+        ASSERT_EQ(QL_STATUS_OK, run.status);
+        ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome);
+        EXPECT_EQ(expected, Returned(run.result));
+        EXPECT_EQ(expected_calls, calls);
+    }
+}
+
+/* The same three positions the loop lowering keys blocks to, each with an
+   effect in the operand C may skip. */
+TEST(CLowerRecursion, LowersAnEffectInEveryLoopPosition) {
     struct Case {
         const char *source;
         const char *name;
     };
     const Case cases[] = {
         {"int CALLEE_f(int);\n"
-         "int f(int a) { return CALLEE_f(a) && a; }",
+         "int f(int a) { while (a && CALLEE_f(a)) a--; return a; }",
          "f"},
         {"int CALLEE_f(int);\n"
-         "int f(int a) { return CALLEE_f(a) ? 1 : 0; }",
+         "int f(int a) { do { a--; } while (a && CALLEE_f(a)); return a; }",
+         "f"},
+        {"int CALLEE_f(int);\n"
+         "int f(int a) { for (; a > 0; a -= (a > 1 ? CALLEE_f(a) : 1)) ; "
+         "return a; }",
+         "f"},
+        {"int CALLEE_f(int);\n"
+         "int f(int a) { for (; a > 0 && CALLEE_f(a); a--) ; return a; }",
          "f"},
     };
     for (const Case &item : cases) {
         Lowered lowered;
+        ql_ir *ir = nullptr;
+        ql_ir_verify_report_v1 report{};
+        ql_error error{};
         SCOPED_TRACE(item.source);
-        EXPECT_EQ(QL_C_LOWER_SUPPORTED,
-                  Lower(&lowered, item.source, item.name, nullptr));
+        ASSERT_EQ(QL_C_LOWER_SUPPORTED,
+                  Lower(&lowered, item.source, item.name, &ir));
+        ASSERT_NE(nullptr, ir);
+        ql_ir_verify_report_init(&report);
+        EXPECT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
+            << report.message;
+    }
+}
+
+/* An `if` condition has no such constraint: the statement re-reads the block
+   the condition ended in, so the branch may split it. */
+TEST(CLowerRecursion, AllowsAnEffectInAnIfAndSwitchCondition) {
+    struct Case {
+        const char *source;
+        const char *name;
+    };
+    const Case cases[] = {
+        {"int CALLEE_f(int);\n"
+         "int f(int a) { if (a && CALLEE_f(a)) return 1; return 0; }",
+         "f"},
+        {"int CALLEE_f(int);\n"
+         "int f(int a) { switch (a ? CALLEE_f(a) : 0) { case 1: return 2; } "
+         "return 0; }",
+         "f"},
+    };
+    for (const Case &item : cases) {
+        Lowered lowered;
+        ql_ir *ir = nullptr;
+        ql_ir_verify_report_v1 report{};
+        ql_error error{};
+        SCOPED_TRACE(item.source);
+        ASSERT_EQ(QL_C_LOWER_SUPPORTED,
+                  Lower(&lowered, item.source, item.name, &ir));
+        ql_ir_verify_report_init(&report);
+        EXPECT_EQ(QL_STATUS_OK, ql_ir_verify(nullptr, ir, &report, &error))
+            << report.message;
     }
 }
 

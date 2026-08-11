@@ -312,19 +312,34 @@ recursion depth, but only as a recorded assumption carrying the termination
 side condition that induction needs. Until that exists, these bodies have IR
 and no verdict.
 
-#### An operand on a path the condition skips carries no effect
+#### An operand on a path the condition skips gets its own block
 
-`?:`, `&&`, and `||` lower both operands and select between the results.
-Definedness short-circuits separately, so a pure operand whose undefined
-behaviour C never reaches does not poison the result. An operand with an effect
-is a different question: a call, an assignment, or an increment lowered this
-way runs on the path C skips, and the selected IR no longer records that the
-effect was conditional. Nothing downstream can recover it.
+`?:`, `&&`, and `||` select between results. While both operands are pure
+computations that is exact, and definedness short-circuits separately so an
+operand whose undefined behaviour C never reaches does not poison the result.
+An operand with an effect is a different question: a call, an assignment, or
+an increment lowered that way runs on the path C skips, and the selected IR no
+longer records that the effect was conditional.
 
-Such an operand is refused. This is a real boundary rather than a conservative
-one: with `return n <= 0 ? 0 : n + FUN_0(n - 1)`, evaluating the arm the base
-case skips is unbounded recursion, not a wrong value. Closing it means lowering
-the operands through real control flow, which the IR already has for loops.
+So an effectful operand gets a block of its own and the result becomes a merge.
+Three things follow.
+
+A conversion belongs to the operand that will run it. Promotion and conversion
+emit instructions, so when the operands sit in different blocks each one is
+emitted where its operand is, rather than once in a block both share.
+
+Partiality is discharged in the operand, not after the merge. The verifier
+requires each PHI incoming value to have its obligation already met at the end
+of the predecessor it arrives from, because no guard in the join dominates the
+branches. That is also what C says: the operand that ran has been evaluated, so
+undefined behaviour in it has already happened there.
+
+A statement may not assume the block it started in is the block its condition
+ended in. `if`, `switch`, and both loop forms attach terminators to the block
+their condition leaves, and an effectful operand splits it. For a loop this
+moves only the condition's own two edges. The header still holds the loop PHIs
+and still receives the backedge, and it dominates the blocks the condition
+adds, so the loop's shape does not change.
 
 #### Corpus globals carry no promised initial value
 
