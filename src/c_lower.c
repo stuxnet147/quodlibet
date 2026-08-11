@@ -4869,6 +4869,29 @@ static ql_status convert_value(lower_context *context, lower_value input,
       }
       return emit_pointer_of_address(context, address, target, output, error);
     }
+    if (target.is_function_pointer != 0u &&
+        (input.type.kind == QL_C_SCALAR_POINTER ||
+         input.type.kind == QL_C_SCALAR_INTEGER ||
+         input.type.kind == QL_C_SCALAR_BOOL)) {
+      /* The same equivalence read the other way. A function pointer is only
+         ever transferred, compared, or called, so an address arriving from a
+         data pointer or an integer needs no object and is given none. */
+      lower_value address;
+      if (input.type.kind == QL_C_SCALAR_POINTER) {
+        status = emit_address_of_pointer(context, input, &address, error);
+      } else {
+        status = convert_value(context, input, address_type(), &address, error);
+      }
+      if (status != QL_STATUS_OK || context->unknown != 0u) {
+        return status;
+      }
+      status = emit_pointer_of_address(context, address, target, output, error);
+      if (status == QL_STATUS_OK) {
+        output->has_object = 0u;
+        output->may_admit_object = 0u;
+      }
+      return status;
+    }
     if (input.type.is_function_pointer != 0u &&
         (target.kind == QL_C_SCALAR_POINTER ||
          target.kind == QL_C_SCALAR_INTEGER)) {
