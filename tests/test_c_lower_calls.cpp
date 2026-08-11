@@ -215,6 +215,16 @@ QL_CALL_FUNCTION(parameter_indirect,
     int call_parameter_indirect_parenthesized(int (*callback)(int), int value) {
         return (*callback)(value) + 1;
     });
+QL_CALL_FUNCTION(local_callback,
+    int call_local_callback(int (*incoming)(int), int value) {
+        int (*chosen)(int) = incoming;
+        return chosen(value) + 1;
+    }
+    int call_local_callback_parenthesized(int (*incoming)(int), int value) {
+        int (*chosen)(int);
+        chosen = incoming;
+        return (*chosen)(value) - 1;
+    });
 QL_CALL_FUNCTION(typedef_parameter_indirect,
     typedef int (*CALL_INT_TYPEDEF)(int);
     int call_typedef_parameter(CALL_INT_TYPEDEF callback, int value) {
@@ -1069,6 +1079,50 @@ TEST(CLowerCalls, CallsAFunctionPointerParameterWithItsDeclaredSignature) {
     EXPECT_EQ(QL_IR_INTERP_OUTCOME_UNDEFINED_BEHAVIOR,
               null_run.result.outcome);
     EXPECT_TRUE(null_log.symbols.empty());
+}
+
+/* A local that holds a function pointer is a call target like a parameter is.
+   The declaration states the return type and the function declarator states
+   the parameters, which is the same pair a prototype gives a callee, so the
+   call through it is checked rather than guessed. */
+TEST(CLowerCalls, CallsAFunctionPointerHeldInALocal) {
+    struct Case {
+        const char *name;
+        int32_t (*reference)(int (*)(int), int);
+    };
+    const Case cases[] = {
+        {"call_local_callback", &call_local_callback},
+        {"call_local_callback_parenthesized",
+         &call_local_callback_parenthesized},
+    };
+    uint8_t dummy = 0u;
+    ql_ir_interp_object_v1 object{};
+    ql_ir_interp_object_init(&object);
+    object.base = QL_IR_INTERP_FIRST_OBJECT_ADDRESS;
+    object.size = 1u;
+    object.initial = &dummy;
+
+    for (const Case &item : cases) {
+        Lowered lowered;
+        SCOPED_TRACE(item.name);
+        ASSERT_TRUE(lowered.Open(local_callback_source, item.name));
+        for (int32_t value : {-91, 0, 37, 1000}) {
+            CallLog log;
+            const Outcome run = Execute(
+                lowered.ir(),
+                {static_cast<uint64_t>(
+                     reinterpret_cast<uintptr_t>(&CALLEE_double)),
+                 Widen(value)},
+                &log, &object);
+            ASSERT_EQ(QL_STATUS_OK, run.status);
+            ASSERT_EQ(QL_IR_INTERP_OUTCOME_RETURN, run.result.outcome)
+                << ql_ir_interp_ub_reason_string(run.result.ub_reason);
+            EXPECT_EQ(item.reference(CALLEE_double, value),
+                      Returned(run.result));
+            EXPECT_EQ(std::vector<std::string>{"__ql_indirect_call_v1"},
+                      log.symbols);
+        }
+    }
 }
 
 TEST(CLowerCalls, CallsAParenthesizedFunctionPointerParameter) {

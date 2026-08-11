@@ -10290,6 +10290,51 @@ static ql_status bind_dynamic_array_size(lower_context *context, size_t node,
   return status;
 }
 
+/* `T (*name)(...)` declared as a local. The declarator spine is a function
+   declarator whose own declarator is a parenthesized single pointer, which is
+   why the ordinary object walk refuses it: there is no object here, only a
+   pointer to a function. Returns the function declarator and the identifier it
+   names, or SIZE_MAX when the shape is anything else. */
+static size_t function_pointer_local_declarator(const lower_context *context,
+                                                size_t declarator,
+                                                size_t *identifier,
+                                                uint32_t *return_depth) {
+  size_t inner;
+  size_t guard = 0u;
+
+  *identifier = SIZE_MAX;
+  *return_depth = 0u;
+  while (declarator != SIZE_MAX && guard++ < 8u &&
+         strcmp(context->nodes[declarator].view.kind, "pointer_declarator") ==
+             0) {
+    ++(*return_depth);
+    declarator = direct_field_child(context, declarator, "declarator");
+  }
+  if (declarator == SIZE_MAX ||
+      strcmp(context->nodes[declarator].view.kind, "function_declarator") != 0) {
+    return SIZE_MAX;
+  }
+  inner = direct_field_child(context, declarator, "declarator");
+  if (inner == SIZE_MAX || strcmp(context->nodes[inner].view.kind,
+                                  "parenthesized_declarator") != 0) {
+    return SIZE_MAX;
+  }
+  inner = first_named_child(context, inner);
+  if (inner == SIZE_MAX ||
+      strcmp(context->nodes[inner].view.kind, "pointer_declarator") != 0) {
+    return SIZE_MAX;
+  }
+  inner = direct_field_child(context, inner, "declarator");
+  if (inner == SIZE_MAX ||
+      strcmp(context->nodes[inner].view.kind, "identifier") != 0) {
+    /* `(**f)(...)` and the like stay outside this slice, which already
+       carries only one-level function pointer values. */
+    return SIZE_MAX;
+  }
+  *identifier = inner;
+  return declarator;
+}
+
 static ql_status lower_declaration(lower_context *context, size_t node,
                                    ql_error *error) {
   size_t type_node = direct_field_child(context, node, "type");
@@ -10328,11 +10373,13 @@ static ql_status lower_declaration(lower_context *context, size_t node,
   for (index = node + 1u; index < end; ++index) {
     size_t declarator;
     size_t value_node = SIZE_MAX;
-    size_t identifier;
+    size_t identifier = SIZE_MAX;
     char *name;
     lower_variable *variable;
     uint32_t object_is_const = is_const;
     size_t dynamic_bound = SIZE_MAX;
+    size_t callback_declarator = SIZE_MAX;
+    uint32_t callback_return_depth = 0u;
 
     if (context->nodes[index].parent != node ||
         context->nodes[index].view.field_name == NULL ||
@@ -10345,7 +10392,20 @@ static ql_status lower_declaration(lower_context *context, size_t node,
       value_node = direct_field_child(context, declarator, "value");
       declarator = direct_field_child(context, declarator, "declarator");
     }
-    {
+    callback_declarator =
+        declarator == SIZE_MAX
+            ? SIZE_MAX
+            : function_pointer_local_declarator(context, declarator, &identifier,
+                                                &callback_return_depth);
+    if (callback_declarator != SIZE_MAX) {
+      /* A pointer to a function is a value, not storage, so it skips the
+         object walk entirely and takes the ordinary scalar path below. */
+      declarator_type = make_function_pointer_type(base_type);
+      status = ensure_ir_type(context, &declarator_type, error);
+      if (status != QL_STATUS_OK) {
+        return status;
+      }
+    } else {
       size_t declarator_root = declarator;
       uint32_t pointer_depth = 0u;
       uint64_t array_length = 0u;
@@ -10454,6 +10514,15 @@ static ql_status lower_declaration(lower_context *context, size_t node,
       return status;
     }
     variable = &context->variables[context->variable_count - 1u];
+    if (callback_declarator != SIZE_MAX) {
+      /* The declaration states the return type and the function declarator
+         states the parameters, which is the same pair a prototype gives a
+         callee. That is what makes a call through this local checkable. */
+      variable->function.declaration_node = node;
+      variable->function.declarator_node = callback_declarator;
+      variable->function.return_pointer_depth = callback_return_depth;
+      variable->has_function_signature = 1u;
+    }
     if (declarator_type.array_length == LOWER_ARRAY_BOUND_DYNAMIC) {
       status = bind_dynamic_array_size(context, node, dynamic_bound, variable,
                                        error);
@@ -14465,13 +14534,33 @@ ql_status QL_CALL ql_c_lower_selected_function_with_tree(
   collect_calls(&context, body_node);
   {
     /* A volatile access is an observable event even in a body that calls
-       nothing, and events are threaded on the trace. Without this the trace
-       parameter would not exist and the append would have nothing to extend. */
+       nothing, and events are threaded on the trace. A call through a
+       function pointer the body declares is an event the early call scan
+       cannot see either, because that local does not exist until the body is
+       lowered. Without this the trace parameter would not exist and the
+       event would have nothing to extend. */
     size_t scan;
     size_t scan_end = subtree_end(&context, body_node);
     for (scan = body_node + 1u; scan < scan_end; ++scan) {
-      if (strcmp(context.nodes[scan].view.kind, "declaration") == 0 &&
-          declaration_is_volatile(&context, scan)) {
+      size_t identifier = SIZE_MAX;
+      uint32_t depth = 0u;
+      size_t declarator;
+      if (strcmp(context.nodes[scan].view.kind, "declaration") != 0) {
+        continue;
+      }
+      if (declaration_is_volatile(&context, scan)) {
+        context.makes_calls = 1u;
+        context.uses_memory = 1u;
+        break;
+      }
+      declarator = direct_field_child(&context, scan, "declarator");
+      if (declarator != SIZE_MAX &&
+          strcmp(context.nodes[declarator].view.kind, "init_declarator") == 0) {
+        declarator = direct_field_child(&context, declarator, "declarator");
+      }
+      if (declarator != SIZE_MAX &&
+          function_pointer_local_declarator(&context, declarator, &identifier,
+                                            &depth) != SIZE_MAX) {
         context.makes_calls = 1u;
         context.uses_memory = 1u;
         break;
