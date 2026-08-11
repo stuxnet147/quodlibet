@@ -49,9 +49,10 @@
 - [ ] 재귀에 assume-guarantee 규칙을 준다 (로어링은 열렸고 miter 가 거부한다. 재귀 깊이 귀납이지만 종료 side condition 을 가정으로 기록해야 한다. 증거와 policy 까지 걸리는 별개 작업)
 - [x] 직접 재귀 호출 로어링 (증거: `collect_callees` 가 `function_definition` 도 훑는다, `tests/test_c_lower_recursion.cpp` 6개, 컴파일된 같은 함수를 callee 명세로 준 differential 포함. 정의 항목은 호출 대상일 뿐이고 값으로 쓰면 거부된다)
 - [x] 커버리지 측정으로 드러난 미수용 구문을 진단 코드별 빈도순으로 정리 (증거: `docs/coverage/coverage-20260811-buckets.md` 의 잔여표. 배열 선언 거부와 goto 거부는 한 메시지가 여러 형태를 덮고 있어서 갈랐고, `duplicate_declaration` 58 과 `undeclared_identifier` 33 은 clang 이 거부하는 C 라 로어링 공백이 아님을 확인)
-- [ ] 루프 안 VLA 에 반복별 객체 수명을 준다 (46. 객체가 표의 고정 항목이라 `size == bytes` 가정이 반복마다 모순이 된다)
-- [ ] 다차원 배열 (24. `lower_type` 의 `pointee` 가 스칼라 종류만 담아서 `T (*)[C]` 를 표현할 자리가 없다. 15 건은 중첩 중괄호 초기화도 필요)
-- [ ] 함수 포인터로의 캐스트와 그것을 통한 호출 (41. 한 번 구현했다가 `((int (*)(int)) p)(x)` 가 `lower_error` 를 내서 되돌렸다. 그 형태를 먼저 시험에 넣고 다시 한다)
+- [x] 루프 안 VLA 에 반복별 객체 수명을 준다 (증거: 객체가 크기와 별도로 미치는 범위를 지니고 선언이 그것을 묶는다, `CLowerLocals.ChecksALoopVlaAgainstTheCurrentIterationsBound`. 가변 길이 배열 타입은 계속 거부)
+- [x] 다차원 배열 (증거: `array_row_length` 가 타입과 감쇠한 포인터에 실린다, `CLowerLocals.AddressesATwoDimensionalArrayByRowThenElement`, `FillsATwoDimensionalArrayRowByRow`, `CLowerPointers.AdvancesARowThroughATwoDimensionalParameter`. 삼차원은 보폭이 둘이라 계속 거부)
+- [x] 함수 포인터로의 캐스트와 그것을 통한 호출 (증거: `CLowerCalls.CallsThroughACastToAFunctionPointer`. 되돌렸던 원인은 초기 호출 스캔이 캐스트 지정자를 못 봐서 트레이스가 없던 것)
+- [ ] 주소를 취한 이름이 서로 다른 저장 유형으로 풀린다 (12. 슬롯 표가 이름으로 키를 잡아서 같은 이름의 두 선언이 객체 하나를 나눠 쓴다. 선언마다 슬롯을 만들고 `add_variable` 이 선언 노드로 고른다)
 - [ ] 포인터: 연산, object identity, provenance, 유효 범위, alignment 를 IR 로 하강
 - [ ] 배열, 구조체, 공용체, 비트필드, enum
 - [ ] 정수 promotion 과 usual arithmetic conversion 을 C11 6.3.1.8 대로
