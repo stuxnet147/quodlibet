@@ -142,6 +142,44 @@ QL_DIFF_FUNCTION(
     out:
       return seed;
     });
+/* The jump skips the declaration of `skipped`, which is in scope at the label
+   and holds no value there. The reference reads it only on the path that
+   assigned it, so the two sides agree exactly when the lowering carries the
+   bypassed object as uninitialized rather than as anything in particular. */
+QL_DIFF_FUNCTION(
+    bypassed_declaration,
+    unsigned int diff_bypassed(unsigned int x, unsigned int seed) {
+      if ((x & 1u) != 0u) {
+        goto done;
+      }
+      unsigned int skipped;
+      skipped = seed + 17u;
+      seed ^= skipped;
+    done:
+      return seed + 3u;
+    });
+/* Two edges reach the label having seen different numbers of declarations,
+   and one of them leaves a scope the label is not in. */
+QL_DIFF_FUNCTION(
+    bypassed_declaration_twice,
+    unsigned int diff_bypassed_twice(unsigned int x, unsigned int seed) {
+      if ((x & 1u) != 0u) {
+        goto done;
+      }
+      unsigned int first;
+      first = seed + 5u;
+      if ((x & 2u) != 0u) {
+        unsigned int inner;
+        inner = first * 3u;
+        seed ^= inner;
+        goto done;
+      }
+      unsigned int second;
+      second = first ^ 9u;
+      seed += second;
+    done:
+      return seed + 1u;
+    });
 QL_DIFF_FUNCTION(
     nested_goto,
     unsigned int diff_nested_goto(unsigned int x, unsigned int seed) {
@@ -621,6 +659,16 @@ const Case kCases[] = {
     {"goto_flow", goto_flow_source, "diff_goto", 32u, 32u, 32u, AlwaysDefined,
      [](uint64_t a, uint64_t b) {
        return FromU32(diff_goto(AsU32(a), AsU32(b)));
+     }},
+    {"bypassed_declaration", bypassed_declaration_source, "diff_bypassed", 32u,
+     32u, 32u, AlwaysDefined,
+     [](uint64_t a, uint64_t b) {
+       return FromU32(diff_bypassed(AsU32(a), AsU32(b)));
+     }},
+    {"bypassed_declaration_twice", bypassed_declaration_twice_source,
+     "diff_bypassed_twice", 32u, 32u, 32u, AlwaysDefined,
+     [](uint64_t a, uint64_t b) {
+       return FromU32(diff_bypassed_twice(AsU32(a), AsU32(b)));
      }},
     {"nested_goto", nested_goto_source, "diff_nested_goto", 32u, 32u, 32u,
      AlwaysDefined,

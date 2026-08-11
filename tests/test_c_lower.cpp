@@ -283,8 +283,10 @@ TEST(CLower, RejectsUnmodeledSemanticSurfacesAsUnknown) {
        "{ return (p + 1) == p; }",
        "incomplete_step", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_TYPE,
        "binary_expression"},
-      {"int bypass(int x) { goto done; int y = x; done: return x; }", "bypass",
-       QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, "goto_statement"},
+      {"int bypass_vla(int n) { if (n) goto done; int a[n]; a[0] = 1; "
+       "done: return n; }",
+       "bypass_vla", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,
+       "goto_statement"},
       {"int loop_goto_state(int x) { int i; for (i = 0; i < 3; ++i) { "
        "int y = x; if (x & 1) goto done; y += 2; done: x += y; } return x; }",
        "loop_goto_state", QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW,

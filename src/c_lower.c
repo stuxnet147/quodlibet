@@ -11969,6 +11969,27 @@ static int node_contains(const lower_context *context, size_t ancestor,
   return 0;
 }
 
+/* A declaration whose array bound is not a constant expression, which is
+   what makes jumping into its scope undefined rather than merely awkward. */
+static int declaration_has_variable_bound(const lower_context *context,
+                                          size_t declaration) {
+  size_t end = subtree_end(context, declaration);
+  size_t index;
+  for (index = declaration + 1u; index < end; ++index) {
+    size_t size_node;
+    uint64_t bound = 0u;
+    if (strcmp(context->nodes[index].view.kind, "array_declarator") != 0) {
+      continue;
+    }
+    size_node = direct_field_child(context, index, "size");
+    if (size_node != SIZE_MAX &&
+        !constant_array_bound(context, size_node, &bound)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int goto_skips_declaration(const lower_context *context,
                                   size_t goto_node, size_t label_node) {
   size_t end = subtree_end(context, context->body_node);
@@ -11993,9 +12014,13 @@ static int goto_skips_declaration(const lower_context *context,
            Entering a nested scope with a live automatic still requires a
            second lexical state map. An edge that starts inside the same
            scope can carry that automatic in its label-entry state. */
-        return 1;
+        return 2;
       }
-      if (at > begin && at < finish) {
+      if (at > begin && at < finish &&
+          declaration_has_variable_bound(context, node)) {
+        /* Jumping into the scope of a variably modified object is undefined
+           in C. Every other bypassed declaration is legal, and the object is
+           simply uninitialized when the label is reached. */
         return 1;
       }
     }
@@ -12068,6 +12093,90 @@ static int goto_enters_structured_region(const lower_context *context,
   return 0;
 }
 
+/* An incoming edge that jumped over a declaration carries fewer variables
+   than the label sees. The ones it skipped are in scope there and hold no
+   value, which is exactly what an uninitialized local is. The padding value
+   has to be materialized in the predecessor the edge leaves, because that is
+   where the PHI will read it. */
+static ql_status pad_incoming_state(lower_context *context, lower_state *state,
+                                    ql_ir_block_id block, size_t count,
+                                    ql_error *error) {
+  ql_ir_block_id saved_block = context->current_block;
+  uint32_t saved_terminated = context->current_terminated;
+  size_t index;
+  ql_status status;
+  void *grown;
+
+  if (state->count >= count) {
+    return QL_STATUS_OK;
+  }
+  status = ensure_bool_constants(context, error);
+  if (status != QL_STATUS_OK) {
+    return status;
+  }
+#define QL_GROW_STATE(field)                                                   \
+  grown = context->allocator->reallocate(context->allocator->user_data,        \
+                                         state->field,                         \
+                                         count * sizeof(*state->field));       \
+  if (grown == NULL) {                                                         \
+    ql_error_set(error, QL_STATUS_OUT_OF_MEMORY, NULL);                        \
+    return QL_STATUS_OUT_OF_MEMORY;                                            \
+  }                                                                            \
+  state->field = grown;
+
+  QL_GROW_STATE(values)
+  QL_GROW_STATE(defined)
+  QL_GROW_STATE(initialized)
+  QL_GROW_STATE(has_object)
+  QL_GROW_STATE(may_admit_object)
+#undef QL_GROW_STATE
+
+  context->current_block = block;
+  context->current_terminated = 0u;
+  for (index = state->count; index < count; ++index) {
+    lower_variable *variable = &context->variables[index];
+    ql_ir_value_id value = QL_IR_INVALID_VALUE_ID;
+    uint8_t admits = 0u;
+    if (variable->is_stack == 0u && variable->type.array_length == 0u &&
+        variable->type.kind != QL_C_SCALAR_RECORD) {
+      if (variable->type.kind == QL_C_SCALAR_POINTER) {
+        lower_value address;
+        lower_value pointer;
+        memset(&address, 0, sizeof(address));
+        address.type = address_type();
+        address.defined = context->true_value;
+        status =
+            add_uint_constant(context, address.type, 0u, &address.value, error);
+        if (status == QL_STATUS_OK) {
+          status = emit_pointer_of_address(context, address, variable->type,
+                                           &pointer, error);
+        }
+        value = pointer.value;
+        admits = 1u;
+      } else if (variable->type.kind == QL_C_SCALAR_FLOAT) {
+        status = add_float_constant(context, variable->type, 0.0, &value,
+                                    error);
+      } else {
+        status = add_uint_constant(context, variable->type, 0u, &value, error);
+      }
+      if (status != QL_STATUS_OK) {
+        context->current_block = saved_block;
+        context->current_terminated = saved_terminated;
+        return status;
+      }
+    }
+    state->values[index] = value;
+    state->defined[index] = context->false_value;
+    state->initialized[index] = 0u;
+    state->has_object[index] = 0u;
+    state->may_admit_object[index] = admits;
+  }
+  state->count = count;
+  context->current_block = saved_block;
+  context->current_terminated = saved_terminated;
+  return QL_STATUS_OK;
+}
+
 static ql_status lower_goto_statement(lower_context *context, size_t node,
                                       ql_error *error) {
   size_t label_node = direct_field_child(context, node, "label");
@@ -12095,11 +12204,16 @@ static ql_status lower_goto_statement(lower_context *context, size_t node,
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, label_node,
         "goto target has no label in the function", error);
   }
-  if (goto_skips_declaration(context, node, label->node)) {
-    return lower_unknown(
-        context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
-        "goto needs bypassed initialization or nested automatic state",
-        error);
+  {
+    const int skipped = goto_skips_declaration(context, node, label->node);
+    if (skipped != 0) {
+      return lower_unknown(
+          context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
+          skipped == 2
+              ? "goto enters a nested scope holding a live automatic"
+              : "goto jumps over a declaration in the label's scope",
+          error);
+    }
   }
   if (goto_enters_structured_region(context, node, label->node)) {
     return lower_unknown(
@@ -12144,7 +12258,10 @@ static ql_status lower_goto_statement(lower_context *context, size_t node,
         error);
   }
   if (label->incoming.count != 0u &&
-      label->incoming.states[0].count != variable_count) {
+      label->incoming.states[0].count > variable_count) {
+    /* A shorter edge jumped over a declaration and is padded at the label.
+       A longer one saw a variable the label does not, which is a scope this
+       pass does not model. */
     return lower_unknown(
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
         "goto paths disagree on the variables visible at the label", error);
@@ -12183,16 +12300,24 @@ static ql_status lower_labeled_statement(lower_context *context, size_t node,
         context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
         "label was not collected in the function scope", error);
   }
+  /* What the label sees, not what the first edge that reached it happened to
+     carry. An edge that jumped over a declaration carries less and is padded
+     below; taking the first edge's count as the truth made every later edge
+     look like a disagreement. */
   variable_count = label->has_backward_incoming != 0u
                        ? context->variable_count
-                       : label->incoming.count != 0u
-                             ? label->incoming.states[0].count
-                             : function_scope_variable_count(context);
+                       : goto_target_variable_count(context, label->node);
   for (index = 0u; index < label->incoming.count; ++index) {
-    if (label->incoming.states[index].count != variable_count) {
+    if (label->incoming.states[index].count > variable_count) {
       return lower_unknown(
           context, QL_C_LOWER_DIAGNOSTIC_UNSUPPORTED_CONTROL_FLOW, node,
           "goto paths disagree on the variables visible at the label", error);
+    }
+    status = pad_incoming_state(context, &label->incoming.states[index],
+                                label->incoming.blocks[index], variable_count,
+                                error);
+    if (status != QL_STATUS_OK) {
+      return status;
     }
   }
   label->lowered = 1u;
