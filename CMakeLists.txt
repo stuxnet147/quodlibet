@@ -205,6 +205,13 @@ set_target_properties(quodlibet_cli PROPERTIES OUTPUT_NAME quodlibet)
 target_link_libraries(quodlibet_cli PRIVATE quodlibet::quodlibet)
 target_include_directories(quodlibet_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli)
 
+# A direct pair-check tool: any single registered method on one C pair. The
+# CLI's own subcommands stop short of it, and the Python binding only runs the
+# smt-product chain, so this is how a method is measured on its own.
+add_executable(quodlibet_pair_check cli/pair_check.c)
+set_target_properties(quodlibet_pair_check PROPERTIES OUTPUT_NAME quodlibet-pair-check)
+target_link_libraries(quodlibet_pair_check PRIVATE quodlibet::quodlibet)
+
 if(QL_ENABLE_BITWUZLA)
     if(WIN32)
         set(QL_BITWUZLA_RUNTIME_NAME bitwuzla.exe)
@@ -259,7 +266,7 @@ install(TARGETS quodlibet
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(TARGETS quodlibet_cli
+install(TARGETS quodlibet_cli quodlibet_pair_check
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY include/quodlibet
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
